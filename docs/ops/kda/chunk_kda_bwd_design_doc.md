@@ -3,16 +3,16 @@
 Reference: Kimi Linear tech report — https://github.com/MoonshotAI/Kimi-Linear/blob/master/tech_report.pdf
 
 Code:
-- `tokamax/_src/ops/experimental/kda/base.py` — public KDA argument and recurrent-state contract
-- `tokamax/_src/ops/experimental/kda/reference.py` — pure JAX recurrent reference implementation
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu.py` — Tokamax custom-VJP adapter
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel.py` — public low-level kernel entry points
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_types.py` — typed `KdaResiduals` contract
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_fwd_kernel.py` — construction of forward residual matrices and saved states
-- `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_bwd_kernel.py` — backward orchestrator and Pallas kernels
-- `tokamax/_src/ops/experimental/kda/common.py` — shared gate cumsum, state recurrence, and mini-batch helper
-- `tokamax/_src/ops/experimental/kda/cp_utils.py` — context-parallel gradient merge
-- `tokamax/_src/ops/experimental/kda/utils.py` — alignment, unalignment, and L2-normalization backward helpers
+- `tokamax/_src/ops/kda/base.py` — public KDA argument and recurrent-state contract
+- `tokamax/_src/ops/kda/reference.py` — pure JAX recurrent reference implementation
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu.py` — Tokamax custom-VJP adapter
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel.py` — public low-level kernel entry points
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_types.py` — typed `KdaResiduals` contract
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_kernel.py` — construction of forward residual matrices and saved states
+- `tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_kernel.py` — backward orchestrator and Pallas kernels
+- `tokamax/_src/ops/kda/common.py` — shared gate cumsum, state recurrence, and mini-batch helper
+- `tokamax/_src/ops/kda/cp_utils.py` — context-parallel gradient merge
+- `tokamax/_src/ops/kda/utils.py` — alignment, unalignment, and L2-normalization backward helpers
 
 ---
 
@@ -104,7 +104,7 @@ The corresponding inter-chunk recurrence is:
 
 ### 1.3 API and Variable Reference
 
-Entry point: `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu.py::PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, followed by `tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel.py::chunk_kda_bwd_custom(...)`.
+Entry point: `tokamax/_src/ops/kda/pallas_mosaic_tpu.py::PallasMosaicTpuKimiDeltaAttentionVjp._fwd(...)`, followed by `tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel.py::chunk_kda_bwd_custom(...)`.
 
 All main-path tensors use the head-first `[H, B, T, ...]` layout. The public KDA API and the Pallas backend already use this layout; there is no input transpose at the custom-VJP boundary. The backward consumes the aligned and optionally L2-normalized copies stored in `KdaResiduals`, rather than the replayed original tensors supplied by Tokamax's generic VJP contract.
 

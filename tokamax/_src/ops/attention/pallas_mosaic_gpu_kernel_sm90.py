@@ -228,6 +228,7 @@ def flash_attention_kernel(
   block_kv = config.block_kv
   num_stages = config.num_stages
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
+  early_q_consumed = config.persistent and (bias is None or head_dim < 64)
 
   if bias is not None and bias.shape[-2] != 1:
     bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
@@ -375,7 +376,14 @@ def flash_attention_kernel(
             lambda: (await_k(), plgpu.barrier_wait(q_produced)),
         )
 
-        pl.when(wg == 1)(schedule_barrier_arrive_and_wait)
+        if early_q_consumed:
+          schedule_barrier_pred = (wg == 1) | (loop_info.local_index > 0)
+          schedule_barrier_arrive_and_wait(predicate=schedule_barrier_pred)
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=288, predicate=ub <= lb
+          )
+        else:
+          schedule_barrier_arrive_and_wait(predicate=wg == 1)
 
         def kv_loop(ki, carry, *, do_causal=False):
           acc, m_scale, m_i, l_i = carry
@@ -398,6 +406,10 @@ def flash_attention_kernel(
           acc_type = plgpu.ACC((block_q, block_kv), jnp.float32)
           s, bias, mask = pl.run_scoped(compute_qk, acc_type)
           mgpu_lib.bar_arrive(k_consumed_barrier + si, num_threads=288)
+          if early_q_consumed:
+            mgpu_lib.bar_arrive(
+                q_consumed_barrier, num_threads=288, predicate=ki == ub - 1
+            )
 
           scale = logits_scale
 
@@ -499,14 +511,18 @@ def flash_attention_kernel(
         else:
           acc, m_scale, m_i, l_i = lax.fori_loop(lb, ub, kv_loop, carry)
 
-        @pl.when(wg == 0)
-        def unblock_wg1_and_q_load():
-          if config.persistent:
-            # We must sync here to ensure that WG1 is finished with `q_smem`.
-            mgpu_lib.bar_sync(schedule_barrier + 1, num_threads=256)
-            mgpu_lib.bar_arrive(q_consumed_barrier, num_threads=160)
-          else:
-            schedule_barrier_arrive()
+        if early_q_consumed:
+          schedule_barrier_arrive()
+        elif config.persistent:
+          # We must sync here to ensure that WG1 is finished with `q_smem`.
+          mgpu_lib.bar_sync(
+              schedule_barrier + 1, num_threads=256, predicate=wg == 0
+          )
+          mgpu_lib.bar_arrive(
+              q_consumed_barrier, num_threads=160, predicate=wg == 0
+          )
+        else:
+          schedule_barrier_arrive(predicate=wg == 0)
 
         m_valid = (mask is None and not has_k_range) | (m_i != -jnp.inf)
         alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
@@ -601,7 +617,8 @@ def flash_attention_kernel(
             @pl.when((warp_id == 1) & (loop_info.local_index > 0))
             def tma_q_load_warp():
               plgpu.async_prefetch(q_gmem.at[qs, hi])
-              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=160)
+              num_threads = 288 if early_q_consumed else 160
+              mgpu_lib.bar_sync(q_consumed_barrier, num_threads=num_threads)
               plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
         return lb, ub
@@ -611,25 +628,8 @@ def flash_attention_kernel(
 
   # Pre-reduce the k_start/k_end to a single value per `2 * block_q` (as compute
   # warpgroups share the same k/v blocks).
-  if k_start is None:
-    k_start_minmax = None
-  elif k_start.shape[-1] == 1:
-    k_start_minmax = (k_start, k_start)
-  else:
-    k_start_ = shape_lib.pad_to_next_multiple_of(
-        k_start, 2 * block_q, -1, kv_seq_len
-    )
-    k_start_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_start_)
-    k_start_minmax = (jnp.min(k_start_, -1), jnp.max(k_start_, -1))
-
-  if k_end is None:
-    k_end_minmax = None
-  elif k_end.shape[-1] == 1:
-    k_end_minmax = (k_end, k_end)
-  else:
-    k_end_ = shape_lib.pad_to_next_multiple_of(k_end, 2 * block_q, -1, 0)
-    k_end_ = shape_lib.einshape("...(qb)->...qb", b=2 * block_q)(k_end_)
-    k_end_minmax = (jnp.min(k_end_, -1), jnp.max(k_end_, -1))
+  k_start_minmax = common.k_range_block_minmax(k_start, kv_seq_len, 2 * block_q)
+  k_end_minmax = common.k_range_block_minmax(k_end, kv_seq_len, 2 * block_q)
 
   out_shape = [jax.ShapeDtypeStruct((*q.shape[:-1], head_dim_out), out_dtype)]
   if return_residuals:

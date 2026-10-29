@@ -19,7 +19,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.batched_rpa import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
+from tokamax._src.ops.batched_rpa import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_base
 from tokamax.experimental.torch_tpu.ops.batched_rpa import torch_pallas_mosaic_tpu
@@ -92,7 +92,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         device=device,
     )
     kv_cache = torch.randn(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -192,7 +192,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         device=device,
     )
     kv_cache = torch.randn(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -211,11 +211,12 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         from_autotuning_cache=False,
     )
 
+    kv_cache_expected = kv_cache.cpu().to(device)
     out, kv = op_pallas(
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
@@ -225,7 +226,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache_expected,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
@@ -272,7 +273,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         device=device,
     )
     kv_cache = torch.randn(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -313,11 +314,12 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
           distribution=distribution,
       )
 
+    kv_cache_expected = kv_cache.cpu().to(device)
     out, kv = compiled_fn(
         queries,
         keys,
         values,
-        kv_cache.clone(),
+        kv_cache,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -327,7 +329,7 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
         queries=queries,
         keys=keys,
         values=values,
-        kv_cache=kv_cache.clone(),
+        kv_cache=kv_cache_expected,
         kv_lens=kv_lens,
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,

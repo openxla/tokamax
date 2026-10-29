@@ -23,6 +23,46 @@ from tokamax._src.autotuning import arg_spec
 
 ShapeDtype = jax.ShapeDtypeStruct
 
+# `jax.Device.device_kind` values for TPU v5e and TPU v5p.
+_TPU_V5E_PLATFORMS: Final[tuple[str, ...]] = ('TPU v5 lite', 'TPU v5e')
+_TPU_V5P_PLATFORMS: Final[tuple[str, ...]] = ('TPU v5', 'TPU v5p')
+# HBM capacity per TPU v5p chip.
+_TPU_V5P_HBM_BYTES: Final[int] = 95 * 2**30
+
+
+def _reference_peak_hbm_bytes(
+    batch_dim: int,
+    hidden_dim: int,
+    output_dim: int,
+    x_dtype: jax.typing.DTypeLike,
+    w_dtype: jax.typing.DTypeLike,
+) -> int:
+  """Conservatively estimates the peak HBM usage of the XLA reference impl.
+
+  The reference implementation materializes the full `[B, V]` logits in the
+  forward pass and the full `[B, V]` softmax gradient in the backward pass. We
+  budget for two such buffers being live at once, plus the inputs and their
+  gradients.
+
+  Args:
+    batch_dim: The batch dimension `B`.
+    hidden_dim: The hidden dimension `H`.
+    output_dim: The output (vocabulary) dimension `V`.
+    x_dtype: The dtype of `x`.
+    w_dtype: The dtype of `w`.
+
+  Returns:
+    The estimated peak HBM usage in bytes.
+  """
+  x_itemsize = jnp.dtype(x_dtype).itemsize
+  w_itemsize = jnp.dtype(w_dtype).itemsize
+  logits_itemsize = jnp.promote_types(x_dtype, w_dtype).itemsize
+  logits_bytes = batch_dim * output_dim * logits_itemsize
+  inputs_bytes = (
+      batch_dim * hidden_dim * x_itemsize + hidden_dim * output_dim * w_itemsize
+  )
+  return 2 * logits_bytes + 2 * inputs_bytes
+
 
 def _create_arg_spec(
     batch_dim: int,
@@ -35,6 +75,20 @@ def _create_arg_spec(
     tags: tuple[arg_spec.Tag, ...] = (),
     excluded_platforms: tuple[str, ...] = (),
 ) -> arg_spec.ArgSpec:
+  excluded = list(excluded_platforms)
+  # The reference impl's `[B, V]` intermediate buffers exceed the 16 GiB HBM of
+  # TPU v5e for large `B * V`.
+  if batch_dim * output_dim >= 10**9:
+    excluded.extend(_TPU_V5E_PLATFORMS)
+  # TPU v5p has 95 GiB of HBM, so only exclude shapes whose estimated reference
+  # footprint does not fit.
+  if (
+      _reference_peak_hbm_bytes(
+          batch_dim, hidden_dim, output_dim, x_dtype, w_dtype
+      )
+      > _TPU_V5P_HBM_BYTES
+  ):
+    excluded.extend(_TPU_V5P_PLATFORMS)
   return arg_spec.ArgSpec(
       dict(
           x=ShapeDtype((batch_dim, hidden_dim), x_dtype),
@@ -44,7 +98,7 @@ def _create_arg_spec(
       ),
       project=project,
       tags=tags,
-      excluded_platforms=excluded_platforms,
+      excluded_platforms=tuple(dict.fromkeys(excluded)),
   )
 
 
@@ -66,7 +120,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
                 else ()
             ),
             # TODO: HBM page fault on TPU v5p.
-            excluded_platforms=('TPU v5p', 'TPU v5'),
+            excluded_platforms=('TPU v5p', 'TPU v5', 'TPU v5 lite', 'TPU v5e'),
         )
         for batch_dim, reduction, x_dtype in itertools.product(
             [1024, 2048, 4096, 16384, 32768, 131072],

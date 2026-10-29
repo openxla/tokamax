@@ -43,12 +43,13 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 import fnmatch
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tomllib
 from typing import TypedDict
@@ -144,11 +145,29 @@ EXCLUDED_TESTS = ()
 # installs; every version in `older_jaxs()` gets a compat rerun
 # on each of `COMPAT_RUNNERS`, so that a downstream still on
 # the older release is not broken by a change that only works on the newer one.
-JAX_VERSIONS = ('0.11.2', '0.11.1', '0.11.0', '0.10.2')
+JAX_VERSIONS = ('0.11.2', '0.11.1')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
 COMPAT_RUNNERS = ('linux-x86-tpu7x-56-1tpu',)
+
+# The compat reruns are not one job per shard. They run in smoke mode --
+# `TOKAMAX_COMPAT_SMOKE=1`, one case per test function, see `tokamax/conftest.py`
+# -- which is a fraction of a shard's full run, so `compat_bins` packs the
+# selected shards into bins of about this many minutes and each older JAX runs
+# each bin once. Sized against `compat_minutes` where a shard has one, and its
+# full `minutes` otherwise, which over-estimates and so errs toward more bins.
+COMPAT_BIN_MINUTES = 20
+
+# Repo-relative path of this module, as `git diff --name-only` reports it.
+SHARDS_PATH = '.github/ci/shards.py'
+
+# Maximum number and fraction of shards a table-only edit in `shards.py` may
+# touch before selection falls back to running every shard. Small edits (adding
+# a shard, moving a test file, splitting by `::Class`, or updating `minutes`)
+# run only the affected shards; a broad rebalance runs the full suite.
+MAX_DIFF_SHARDS = 10
+MAX_DIFF_FRACTION = 0.25
 
 
 class _RequiredSpec(TypedDict):
@@ -167,6 +186,7 @@ class Spec(_RequiredSpec, total=False):
   """
 
   minutes: float
+  compat_minutes: float
 
 
 # Shard name -> spec, as `SHARDS` and as `resolve_shards` returns it.
@@ -209,6 +229,14 @@ MatrixEntry = dict[str, str]
 #            number yet, which is not the same as fast. The one exception is
 #            the catch-all shard, where it is a target rather than a
 #            measurement -- see its entry.
+#   compat_minutes
+#            measured wall clock of the shard's tests in compat smoke mode on
+#            a compat runner, which `compat_bins` packs by. Like `minutes`, it
+#            is set by hand from a real CI run; nothing in CI writes either
+#            one. Read it off a `compat-tests` job whose bin holds only this
+#            shard, or off the shard's files in a shared bin's log. Until a
+#            shard has one it is packed by `minutes`, which over-counts it and
+#            so costs an extra compat job, never a slow one.
 #
 # There is no key for which runners a shard belongs on, and `Spec` has no
 # field for one: every shard runs on every runner in `RUNNERS`. Restricting a
@@ -217,43 +245,68 @@ MatrixEntry = dict[str, str]
 # rebalanced whenever the timings move, so a per-file fact stated at shard
 # granularity gets forced onto every file that happens to be grouped with it.
 #
-#            Every shard below is measured, from run 33423920015
-#            (2026-08-31), a 72-job all-green run on all three runners. That
-#            run's shards were coarser than these, so the numbers are not
-#            copied across by name: they are per-file times recovered from the
-#            job logs and re-summed against the `paths` here. pytest flushes a
+#            Every shard below is measured, from the `ci-build.yml` runs of
+#            2026-10-16 to 2026-10-21 (runs 38829132068 through 39651533822)
+#            that had a green shard job. Change-based selection is enforced,
+#            so most runs schedule only the shards a change reaches; each
+#            number is therefore the `Run shard` step's median over a shard's
+#            10 most recent green jobs on one runner, with `latest_jax()`,
+#            worst runner taken. The compat jobs are not included: they are
+#            smoke-mode bins now, and are what `compat_minutes` measures
+#            instead.
+#
+#            `compat_minutes` is the same per-file arithmetic as below, applied
+#            to the logs of the smoke-mode `compat-tests` jobs since
+#            2026-10-20 (the median of up to six bins per file), re-summed
+#            against the `paths` here. A shard's first file in a bin also
+#            carries the bin's collection time, so these err high, which only
+#            ever costs an extra bin.
+#
+#            Files that were in the catch-all in those runs -- the shards new
+#            since, and the files added to existing ones -- have no step of
+#            their own to time. Their numbers are per-file times recovered from
+#            the catch-all job logs (the five most recent green jobs per
+#            runner), re-summed against the `paths` here, plus 0.3m for the
+#            fixed cost either side of the pytest session. pytest flushes a
 #            progress line when the file finishes, so the timestamp on
 #            `foo_test.py ....` is that file's end, and the gap back to the
-#            previous one is its duration. The recovered per-file times account
-#            for all but 0.5-0.9m of each job's wall clock, which is the
-#            fixed cost either side of the pytest session.
+#            previous one is its duration.
 #
-#            Two traps, if this is ever redone.
+#            The previous numbers came from the runs of 2026-10-05 to
+#            2026-10-07, and many have since moved, in both directions:
+#            `ops-ragged-gather` went from 20m to 7m, `experimental-sparse-mla`
+#            from 11m to 2m, and `ops-linear-softmax-xent` from 13m to 20m.
+#            Treat these as a snapshot and re-measure rather than adjust one by
+#            hand.
+#
+#            Two traps, if this is ever redone per file.
 #
 #            The gap-back arithmetic needs every progress line, and a file
 #            whose tests print to stdout does not produce a bare one: under
 #            `-s`, `mla/pallas_mosaic_tpu_kernel_test.py` emits
-#            `<path> Test case: ...`. Matching only `<path> <progress chars>`
-#            drops it silently, and dropping it charges its time to whichever
-#            file ran before it. Match on the path and take the rest as it
-#            comes.
+#            `<path> Test case: ...`, and so do the mhc and
+#            proj_and_save_state kernel tests. Matching only
+#            `<path> <progress chars>` drops it silently, and dropping it
+#            charges its time to whichever file ran before it. Match on the
+#            path and take the rest as it comes.
 #
 #            `attention/base_test.py` is split across two shards by node ID,
-#            so its time is per class group, not per file: 28.9m for the two
-#            classes in `attention-base` and 36.1m for the one in
-#            `attention-base-vjp` on tpu6e. Summing the file to 65.0m and
-#            giving that to both is the mistake to avoid. An earlier pass took
-#            these from run 32866355103, whose shards also overlapped on
+#            so its time is per class group, not per file: in run 33423920015,
+#            28.9m for the two classes in `attention-base` and 36.1m for the
+#            one in `attention-base-vjp` on tpu6e. Summing the file to 65.0m
+#            and giving that to both is the mistake to avoid. An earlier pass
+#            took these from run 32866355103, whose shards also overlapped on
 #            gmm_v2 -- `linear_softmax_and_experimental` ran it a second time
 #            because of a stale `--ignore` path, since fixed in e6142dc.
 #            Summing that overlap doubled `gmm-v2-perf` to 11m and
 #            `gmm-v2-kernel` to 8m, which read as plausible drift and were
-#            not. This run is post-fix, so base_test.py is the only overlap
-#            left.
+#            not. Timing each shard's own step, as is done now, cannot make
+#            either mistake.
 #
 #            Rounded up to whole minutes, floored at 1, because the field must
-#            be a positive number and 12 shards here finish in under a minute.
-#            A 1 means "too fast to matter", not "measured at 60s".
+#            be a positive number and 9 shards here finish in under a minute.
+#            A 1 means "too fast to matter", not "measured at 60s". The same
+#            rounding applies to `compat_minutes`, where most shards are a 1.
 #
 # Every file is named. No shard targets a directory, which is why there are no
 # `--ignore=` flags either: a directory target and the file shards carved out
@@ -298,46 +351,57 @@ MatrixEntry = dict[str, str]
 # pylint: disable=line-too-long
 SHARDS: ShardMap = {
     # -- attention ---------------------------------------------------------
-    # `base_test.py` was one ~65m job, the longest in CI, because
-    # `AttentionTestBase` contributes its 32 methods to both
-    # `DotProductAttentionTest` and the explicit-VJP subclass below: the file
-    # is two full passes over the attention suite plus `MaskTest`'s 7, and
-    # every one of the 32 is a `parameterized.product` or `.parameters` grid.
-    #
     # The file declares exactly three classes and the two shards name all
     # three, so the split covers it completely. That is checked, not asserted
     # -- see `declared_test_classes` and the orphan error in
     # `check_consistency`.
     #
-    # Split here on the class boundary, by node ID. The 29m/36m below are the
-    # two halves of the old workflow's `-k` split on tpu6e, and are an upper
-    # bound now, since each half paid its own startup there too. That puts
-    # both under `splash-kernel`, which is why the split stops at
-    # two: a third shard would not move the suite.
+    # Split here on the class boundary, by node ID. The halves now measure
+    # 13m and 11m, both on tpu6e and both far under `splash-kernel`, which is
+    # why the split stops at two: a third shard would not move the suite.
     #
     # `check_consistency` parses this file and fails if it grows a class that
     # neither shard names -- the failure the node IDs introduce, and the only
     # one no path here going stale would catch.
+    #
+    # Their `compat_minutes` are per class group, not per file: the two halves
+    # never shared a compat bin, so each bin's time for the file is its half's.
     'attention-base-vjp': Spec(
         paths=(
             'tokamax/_src/ops/attention/base_test.py::DotProductAttentionWithExplicitVjpTest',
         ),
-        minutes=37,
+        minutes=13,
+        compat_minutes=9,
     ),
     'attention-base': Spec(
         paths=(
             'tokamax/_src/ops/attention/base_test.py::MaskTest',
             'tokamax/_src/ops/attention/base_test.py::DotProductAttentionTest',
         ),
-        minutes=29,
-    ),
-    'attention-triton': Spec(
-        paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
-        minutes=12,
+        minutes=11,
+        compat_minutes=8,
     ),
     'attention-xla-chunked': Spec(
         paths=('tokamax/_src/ops/attention/xla_chunked_test.py',),
-        minutes=11,
+        minutes=6,
+        compat_minutes=3,
+    ),
+    'attention-pallas-triton': Spec(
+        paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
+        minutes=5,
+        compat_minutes=1,
+    ),
+    # GPU only: `TritonFlashAttentionTest` skips itself on TPU. Its forward
+    # tests run since openxla/tokamax#1706 (2026-10-22), 3.4-4.0m on h100.
+    'attention-triton': Spec(
+        paths=('tokamax/_src/ops/attention/triton_test.py',),
+        minutes=4,
+        compat_minutes=1,
+    ),
+    'attention-api': Spec(
+        paths=('tokamax/_src/ops/attention/api_test.py',),
+        minutes=2,
+        compat_minutes=1,
     ),
     # CUDA-pinned on measurement, not on inspection: 0 of its 257 cases run on
     # either TPU runner, and `jax_nn_test.py` says why -- two
@@ -345,62 +409,61 @@ SHARDS: ShardMap = {
     # TPUs.")` guards, one per class, covering the file.
     'attention-jax-nn': Spec(
         paths=('tokamax/_src/ops/attention/jax_nn_test.py',),
-        minutes=4,
-    ),
-    'attention-api': Spec(
-        paths=('tokamax/_src/ops/attention/api_test.py',),
         minutes=2,
+        compat_minutes=1,
     ),
-    'attention-api-sharding': Spec(
-        paths=('tokamax/_src/ops/attention/api_sharding_test.py',),
+    # Files that were a shard each, all well under a minute. Every shard
+    # costs one job per runner (3 today) against GitHub's 256-job matrix
+    # limit, so shards this small are merged rather than kept apart.
+    'attention-misc': Spec(
+        paths=(
+            'tokamax/_src/ops/attention/api_sharding_test.py',
+            'tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py',
+            'tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',
+        ),
         minutes=1,
-    ),
-    'attention-mosaic-gpu': Spec(
-        paths=('tokamax/_src/ops/attention/pallas_mosaic_gpu_test.py',),
-        minutes=1,
-    ),
-    'attention-mosaic-tpu': Spec(
-        paths=('tokamax/_src/ops/attention/pallas_mosaic_tpu_test.py',),
-        minutes=1,
+        compat_minutes=1,
     ),
     # -- splash ------------------------------------------------------------
-    # The longest TPU job, and the only shard whose runtime is set by something
-    # other than the hardware: 337 tests, stable across runs, 37.5m on tpu6e
-    # and 34.9m on tpu7x. It is no longer the longest job in CI -- that is
-    # `ragged-dot-misc` at 43m, on h100 -- but it still sets the TPU wall clock,
-    # so splitting it is the only thing that shortens a TPU run.
+    # The longest job in CI, and the only shard whose runtime is set by
+    # something other than the hardware: 399 tests, 42m on tpu6e and 39m on
+    # tpu7x. It sets the wall clock of every run, so splitting it is the only
+    # thing that shortens one.
     #
-    # It cannot be split the way `attention-base` below is. The file declares
-    # one test class, so there is no class boundary to cut on, and its five
-    # methods are `parameterized.product` grids -- `test_splash_attention_fwd`
-    # alone is 256 of the 337 cases. absl names product cases by index
-    # (`test_splash_attention_fwd0`, `...1`), not by argument, so neither a
-    # node ID nor `-k` can address a subset of one grid by what it varies.
-    # Splitting the remaining 81 cases off would leave a 30m shard and gain
-    # ~10m; going further needs pytest-split, or a smaller grid upstream.
+    # It cannot usefully be split the way `attention-base` above is. The file
+    # now declares a second test class, `SplashAttentionDropoutTest`, but none
+    # of the 25 slowest cases is in it, so cutting there would move little;
+    # and it also declares public helper classes (`ModelConfig`, the `Mask`
+    # family) that `check_consistency` would require a node ID for. The time
+    # is in `SplashAttentionTest`, whose methods are `parameterized.product`
+    # grids. absl names product cases by index (`test_splash_attention_fwd0`,
+    # `...1`), not by argument, so neither a node ID nor `-k` can address a
+    # subset of one grid by what it varies. Going further needs pytest-split,
+    # or a smaller grid upstream.
     'splash-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_kernel_test.py',
         ),
-        minutes=38,
+        minutes=42,
+        compat_minutes=2,
     ),
     'splash-misc': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/splash_attention/ring_attention_kernel_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_kernel_sharded_test.py',
-            'tokamax/_src/ops/experimental/tpu/splash_attention/splash_attention_mask_test.py',
+            'tokamax/_src/ops/splash_attention/api_test.py',
+            'tokamax/_src/ops/splash_attention/base_test.py',
+            'tokamax/_src/ops/splash_attention/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/splash_attention/ring_attention_kernel_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_kernel_sharded_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_mask_test.py',
+            'tokamax/_src/ops/splash_attention/splash_attention_segments_test.py',
         ),
-        minutes=1,
+        minutes=2,
+        compat_minutes=2,
     ),
     # -- ragged-dot --------------------------------------------------------
-    # The longest job in CI, and the whole of it is one file: `api_test.py` is
-    # 35.7m of the 42.8m `ragged-dot-misc` measured on h100 before this split,
-    # and nothing else scheduled on h100 is over 13m. So the GPU wall clock was
-    # this one file plus 7m of other people's tests waiting behind it.
-    #
     # Split out rather than split up: 925 of its 1117 cases run on h100, all in
     # one class, so there is no class boundary to cut on and node IDs would not
-    # help. On its own it sets the h100 wall clock at ~36m, which is under
+    # help. On its own it sets the h100 wall clock at ~25m, which is under
     # `splash-kernel`, so cutting it further would not shorten a CI run --
     # something else has to get faster first.
     #
@@ -408,15 +471,13 @@ SHARDS: ShardMap = {
     # and 6 seconds of TPU is not worth the chance of losing them silently.
     'ragged-dot-api': Spec(
         paths=('tokamax/_src/ops/ragged_dot/api_test.py',),
-        minutes=33,
+        minutes=25,
+        compat_minutes=1,
     ),
     'ragged-dot-mosaic-gpu': Spec(
         paths=('tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_test.py',),
-        minutes=13,
-    ),
-    'ragged-dot-triton': Spec(
-        paths=('tokamax/_src/ops/ragged_dot/triton_test.py',),
-        minutes=8,
+        minutes=11,
+        compat_minutes=1,
     ),
     # The ragged_dot tests with no shard of their own.
     'ragged-dot-misc': Spec(
@@ -426,40 +487,33 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu_v2_test.py',
         ),
+        minutes=7,
+        compat_minutes=2,
+    ),
+    'ragged-dot-triton': Spec(
+        paths=('tokamax/_src/ops/ragged_dot/triton_test.py',),
         minutes=6,
+        compat_minutes=1,
     ),
-    # GPU-only and additionally gated on sm100/B200, so both of these skip
-    # every test on the H100 runner. They are shards rather than entries in
-    # EXCLUDED_TESTS because the files are real tests that pass on the right
-    # hardware; there is just no runner for them in RUNNERS.
-    'ragged-dot-sm100-fp8': Spec(
+    'ragged-dot-sm100': Spec(
         paths=(
-            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_fp8_quant_test.py',
+            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_quant_test.py',
         ),
         minutes=1,
-    ),
-    'ragged-dot-sm100-i8': Spec(
-        paths=(
-            'tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm100_i8_quant_test.py',
-        ),
-        minutes=1,
+        compat_minutes=1,
     ),
     # -- gmm ---------------------------------------------------------------
-    'gmm-v2-perf': Spec(
-        paths=('tokamax/_src/ops/experimental/gmm_v2/gmm_v2_perf_test.py',),
-        minutes=6,
-    ),
     'gmm-v2-kernel': Spec(
-        paths=('tokamax/_src/ops/experimental/gmm_v2/gmm_v2_test.py',),
-        minutes=5,
+        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_test.py',),
+        minutes=4,
+        compat_minutes=2,
+    ),
+    'gmm-v2-perf': Spec(
+        paths=('tokamax/_src/ops/gmm_v2/gmm_v2_perf_test.py',),
+        minutes=4,
+        compat_minutes=3,
     ),
     # -- ops ---------------------------------------------------------------
-    # These were three mixed bundles -- `experimental_misc`, `flex_and_scatter`,
-    # `glu_and_norm`, `triangle_and_gathers` -- each holding two or three
-    # unrelated ops because none was long enough to fill a job on its own.
-    # Packing them saved runner slots and cost the shard name its meaning:
-    # `flex_and_scatter` told you what was in it only if you already knew.
-    #
     # Split one-op-per-shard. It costs 5 shards and 15 jobs at worst, and buys
     # two things. A job title now names the op it is testing, so a red X in the
     # PR checks says what broke without opening it. And it is the
@@ -472,10 +526,8 @@ SHARDS: ShardMap = {
     # `tokamax/__init__.py`, so a change to a *base* module still fans out
     # widely regardless of how these are packed. Splitting helps at the leaves,
     # not at the roots.
-    'ops-flex-attention': Spec(
-        paths=('tokamax/_src/ops/flex_attention/base_test.py',),
-        minutes=13,
-    ),
+    # The longest ops shard, nearly all of it `pallas_mosaic_tpu_kernel_test.py`:
+    # 17m of the 20m on tpu6e, 12m of 14m on tpu7x, and nothing on h100.
     'ops-linear-softmax-xent': Spec(
         paths=(
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/api_test.py',
@@ -485,48 +537,38 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/reference_test.py',
         ),
-        minutes=13,
+        minutes=20,
+        compat_minutes=4,
     ),
+    'ops-causal-conv1d': Spec(
+        paths=(
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/gdn_attention_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/kda_attention_test.py',
+            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=15,
+        compat_minutes=8,
+    ),
+    # Slow only on tpu7x: 6m there against well under a minute on h100 and
+    # tpu6e. It was 18-20m there in the previous measurement.
     'ops-ragged-gather': Spec(
         paths=(
             'tokamax/_src/ops/ragged_gather/api_test.py',
             'tokamax/_src/ops/ragged_gather/base_test.py',
             'tokamax/_src/ops/ragged_gather/pallas_mosaic_tpu_test.py',
-            'tokamax/_src/ops/ragged_gather/pallas_mosaic_v2_tpu_test.py',
         ),
-        minutes=8,
-    ),
-    'ops-causal-conv1d': Spec(
-        paths=(
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/base_test.py',
-            'tokamax/_src/ops/causal_conv1d_gated_delta_rule/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=5,
+        minutes=7,
+        compat_minutes=1,
     ),
     'ops-normalization': Spec(
         paths=(
             'tokamax/_src/ops/normalization/api_test.py',
             'tokamax/_src/ops/normalization/base_test.py',
-            'tokamax/_src/ops/normalization/pallas_triton_test.py',
+            'tokamax/_src/ops/normalization/triton_test.py',
         ),
         minutes=3,
-    ),
-    'ops-ragged-scatter': Spec(
-        paths=(
-            'tokamax/_src/ops/ragged_scatter/api_test.py',
-            'tokamax/_src/ops/ragged_scatter/base_test.py',
-            'tokamax/_src/ops/ragged_scatter/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=3,
-    ),
-    'ops-gated-linear-unit': Spec(
-        paths=(
-            'tokamax/_src/ops/gated_linear_unit/api_test.py',
-            'tokamax/_src/ops/gated_linear_unit/base_test.py',
-            'tokamax/_src/ops/gated_linear_unit/pallas_mosaic_gpu_test.py',
-            'tokamax/_src/ops/gated_linear_unit/triton_test.py',
-        ),
-        minutes=1,
+        compat_minutes=1,
     ),
     'ops-ragged-gather-reduce': Spec(
         paths=(
@@ -534,28 +576,226 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/ragged_gather_reduce/base_test.py',
             'tokamax/_src/ops/ragged_gather_reduce/pallas_mosaic_tpu_test.py',
         ),
-        minutes=1,
+        minutes=3,
+        compat_minutes=1,
+    ),
+    'ops-flex-attention': Spec(
+        paths=('tokamax/_src/ops/experimental/flex_attention/base_test.py',),
+        minutes=2,
+        compat_minutes=1,
     ),
     'ops-triangle-multiplication': Spec(
         paths=(
             'tokamax/_src/ops/triangle_multiplication/api_test.py',
             'tokamax/_src/ops/triangle_multiplication/base_test.py',
+            'tokamax/_src/ops/triangle_multiplication/triton_test.py',
+        ),
+        minutes=2,
+        compat_minutes=1,
+    ),
+    'ops-gated-linear-unit': Spec(
+        paths=(
+            'tokamax/_src/ops/gated_linear_unit/api_test.py',
+            'tokamax/_src/ops/gated_linear_unit/base_test.py',
+            'tokamax/_src/ops/gated_linear_unit/cutedsl_test.py',
+            'tokamax/_src/ops/gated_linear_unit/pallas_mosaic_gpu_test.py',
+            'tokamax/_src/ops/gated_linear_unit/triton_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     # -- experimental ------------------------------------------------------
+    'experimental-mla-v2-kernel': Spec(
+        paths=('tokamax/_src/ops/experimental/mla/v2/mla_kernel_v2_test.py',),
+        minutes=35,
+        compat_minutes=4,
+    ),
     # kda was in the catch-all, which is where an unscheduled file is supposed
     # to end up and be noticed: at 15.4m on tpu6e it was the entire catch-all's
     # runtime, and the fifth-longest job in CI, under a name that said nothing
-    # about what was slow. Split on the same line as topk above, and for the
+    # about what was slow. Split on the same line as topk below, and for the
     # same reason -- the kernel test runs 0 of its 217 cases on h100, while
     # `base_test.py` runs all 20 everywhere, so pinning them together would
     # either waste a GPU job or drop the CUDA coverage.
     'experimental-kda-kernel': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_kernel_test.py',
-        ),
+        paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
         minutes=16,
+        compat_minutes=1,
+    ),
+    # Unmeasured until now. Slow only on tpu7x, against well under a minute on
+    # h100 and tpu6e: 10m there (`gmm_prod_test.py` 5.7m, `moe_prod_test.py` 4.4m)
+    # until the gmm-up/gmm-down fusion change of 2026-10-21, and 14-15m in
+    # each of the three runs since.
+    'experimental-routing-moe': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
+        ),
+        minutes=15,
+        compat_minutes=1,
+    ),
+    # The masked dense MLA op. Its 1 was an estimate, from a catch-all run
+    # that held it together with `sparse_mla`; timed on its own it is 10m on
+    # tpu7x, 8m of that `scatter_test.py`, and about a minute elsewhere.
+    'experimental-masked-dense-mla': Spec(
+        paths=(
+            'tokamax/_src/ops/masked_dense_mla/api_test.py',
+            'tokamax/_src/ops/masked_dense_mla/base_test.py',
+            'tokamax/_src/ops/masked_dense_mla/kv_cache_utils_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/masked_dense_mla/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/masked_dense_mla/scatter_test.py',
+        ),
+        minutes=10,
+        compat_minutes=3,
+    ),
+    # The DeepSeek-V4 compressor projection. Out of the catch-all, where it
+    # was the largest single op at 7.7m on tpu6e, nearly all of it
+    # `pallas_mosaic_tpu_test.py`.
+    'experimental-proj-and-save-state': Spec(
+        paths=(
+            'tokamax/_src/ops/proj_and_save_state/api_test.py',
+            'tokamax/_src/ops/proj_and_save_state/base_test.py',
+            'tokamax/_src/ops/proj_and_save_state/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/proj_and_save_state/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=8,
+        compat_minutes=3,
+    ),
+    'experimental-batched-rpa': Spec(
+        paths=(
+            'tokamax/_src/ops/batched_rpa/base_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/configs_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/seq_along_lane_parity_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/speculative_decode_test.py',
+            'tokamax/_src/ops/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
+            'tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=6,
+        compat_minutes=2,
+    ),
+    'experimental-mla-v2': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
+            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
+        ),
+        minutes=6,
+        compat_minutes=1,
+    ),
+    'experimental-mhc': Spec(
+        paths=(
+            'tokamax/_src/ops/mhc/api_test.py',
+            'tokamax/_src/ops/mhc/base_test.py',
+            'tokamax/_src/ops/mhc/mhc_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/mhc/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    # The rest of the DeepSeek-V4 ops -- dsv4_compressor, grouped_lowrank_proj,
+    # deepseek_rope -- out of the catch-all, one op per shard like
+    # `experimental-sparse-mla` and `experimental-proj-and-save-state`.
+    'experimental-dsv4-compressor': Spec(
+        paths=(
+            'tokamax/_src/ops/dsv4_compressor/api_test.py',
+            'tokamax/_src/ops/dsv4_compressor/base_test.py',
+            'tokamax/_src/ops/dsv4_compressor/dsv4_compressor_test.py',
+            'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/dsv4_compressor/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=4,
+        compat_minutes=2,
+    ),
+    # The dlhs-kernel and vjp tests joined from the catch-all, at 0.5m between
+    # them on tpu7x and nothing elsewhere.
+    'experimental-fused-fp8-matmul': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/base_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_dlhs_kernel_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_fp8_matmul/pallas_mosaic_tpu_vjp_test.py',
+        ),
+        minutes=4,
+        compat_minutes=2,
+    ),
+    'experimental-grouped-lowrank-proj': Spec(
+        paths=(
+            'tokamax/_src/ops/grouped_lowrank_proj/api_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/base_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/grouped_lowrank_proj_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=4,
+        compat_minutes=2,
+    ),
+    'experimental-lightning-indexer': Spec(
+        paths=(
+            'tokamax/_src/ops/lightning_indexer/api_test.py',
+            'tokamax/_src/ops/lightning_indexer/base_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/metadata_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_dcp_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_test.py',
+            'tokamax/_src/ops/lightning_indexer/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=4,
+        compat_minutes=2,
+    ),
+    # The mHC-lite op, out of the catch-all, where it landed after the timing
+    # window: 3.2m on h100, nearly all of it `api_test.py`, and about a minute
+    # on either TPU.
+    'experimental-mhc-lite': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mhc_lite/api_test.py',
+            'tokamax/_src/ops/experimental/mhc_lite/mhc_test.py',
+        ),
+        minutes=4,
+        compat_minutes=1,
+    ),
+    # The sliding-window MLA op, out of the catch-all: 2.9m on tpu7x, nearly
+    # all of it the two TPU tests, and well under a minute elsewhere.
+    'experimental-mla-swa': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla_swa/api_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/base_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/experimental/mla_swa/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=4,
+        compat_minutes=3,
+    ),
+    'experimental-deepseek-rope': Spec(
+        paths=(
+            'tokamax/_src/ops/deepseek_rope/api_test.py',
+            'tokamax/_src/ops/deepseek_rope/base_test.py',
+            'tokamax/_src/ops/deepseek_rope/deepseek_rope_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/deepseek_rope/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=3,
+        compat_minutes=1,
+    ),
+    'experimental-csa-gather': Spec(
+        paths=(
+            'tokamax/_src/ops/csa_gather/api_test.py',
+            'tokamax/_src/ops/csa_gather/base_test.py',
+            'tokamax/_src/ops/csa_gather/csa_gather_test.py',
+            'tokamax/_src/ops/csa_gather/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/csa_gather/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=2,
+        compat_minutes=1,
+    ),
+    # The kda tests that are not the kernel; see `experimental-kda-kernel`.
+    'experimental-kda': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/base_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/kda/xla_chunked_test.py',
+        ),
+        minutes=2,
+        compat_minutes=1,
     ),
     'experimental-mla': Spec(
         paths=(
@@ -564,69 +804,101 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',
         ),
         minutes=2,
+        compat_minutes=2,
     ),
-    'experimental-mla-v2-kernel': Spec(
-        paths=('tokamax/_src/ops/experimental/mla/v2/mla_kernel_v2_test.py',),
-        minutes=34,
-    ),
-    'experimental-mla-v2': Spec(
+    # Timed per file from the catch-all logs of run 37853506309: 1.8m on
+    # tpu6e, nearly all of it `pallas_mosaic_tpu_test.py`.
+    'experimental-router-topk': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
-            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
+            'tokamax/_src/ops/router_topk/api_test.py',
+            'tokamax/_src/ops/router_topk/base_test.py',
+            'tokamax/_src/ops/router_topk/pallas_mosaic_tpu_test.py',
         ),
-        minutes=6,
+        minutes=2,
+        compat_minutes=1,
     ),
-    # The kda tests that are not the kernel; see `experimental-kda-kernel`.
-    'experimental-kda': Spec(
+    # The DeepSeek-V4 sparse MLA op. First timed from the catch-all of run
+    # 38087594559, where it was the only file group, at 11.2m on tpu7x; on
+    # its own it now takes 1.7m there.
+    'experimental-sparse-mla': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/kda/base_test.py',
-            'tokamax/_src/ops/experimental/kda/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/sparse_mla/api_test.py',
+            'tokamax/_src/ops/sparse_mla/base_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/sparse_mla/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=2,
+        compat_minutes=2,
+    ),
+    'experimental-fused-moe': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_moe/api_test.py',
+            'tokamax/_src/ops/experimental/fused_moe/base_test.py',
+            'tokamax/_src/ops/experimental/fused_moe/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_router.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_tables.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_tp_tokens.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_fused_ep_moe_v2_weight_slots.py',
+            'tokamax/_src/ops/experimental/fused_moe/test_tp_token_layout.py',
         ),
         minutes=1,
+        compat_minutes=1,
+    ),
+    # The fused MoE decode op, out of the catch-all: 0.5m on tpu7x, less
+    # elsewhere. Its own shard rather than folded into `experimental-fused-moe`
+    # so that selection can tell the two ops apart.
+    'experimental-fused-moe-decode': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_moe_decode/api_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/base_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/experimental/fused_moe_decode/test_fused_moe_decode_kernel.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
     ),
     # The topk tests that are not the kernel. Separate from
     # `experimental-topk-kernel` because that one is TPU-pinned and these two
     # run everywhere; merging them would drop the CUDA coverage.
     'experimental-topk': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/topk/api_test.py',
-            'tokamax/_src/ops/experimental/tpu/topk/base_test.py',
+            'tokamax/_src/ops/topk/api_test.py',
+            'tokamax/_src/ops/topk/base_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     'experimental-topk-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/tpu/topk/pallas_mosaic_tpu_test.py',
+            'tokamax/_src/ops/topk/pallas_mosaic_tpu_kernel_test.py',
+            'tokamax/_src/ops/topk/pallas_mosaic_tpu_test.py',
         ),
         minutes=1,
+        compat_minutes=1,
     ),
     # -- core --------------------------------------------------------------
-    # Public-API smoke test: the canary for an import or packaging break.
-    'core-api': Spec(
-        paths=('tokamax/tokamax_test.py',),
-        minutes=3,
-    ),
     'core-autotuning': Spec(
         paths=(
             'tokamax/_src/autotuning/api_test.py',
             'tokamax/_src/autotuning/cache_test.py',
         ),
-        minutes=3,
-    ),
-    'core-op': Spec(
-        paths=('tokamax/_src/ops/op_test.py',),
         minutes=2,
+        compat_minutes=1,
     ),
-    'core-pallas-block': Spec(
-        paths=('tokamax/_src/pallas/block_test.py',),
+    # Public-API smoke test: the canary for an import or packaging break.
+    'core-api': Spec(
+        paths=('tokamax/tokamax_test.py',),
         minutes=1,
+        compat_minutes=1,
     ),
     # The library internals under `tokamax/_src/`, none of which is slow enough
     # to deserve a shard. Enumerated file by file rather than given as the
     # directory `tokamax/_src/`, which would swallow every op subdirectory, and
     # rather than left to the catch-all shard, which is reserved for files
     # nobody has scheduled yet. `benchmarking_test.py` is absent on purpose;
-    # see EXCLUDED_TESTS.
+    # see EXCLUDED_TESTS. `op_test.py` and `pallas/block_test.py` were shards of
+    # their own; see `attention-misc` for why they are folded in here.
     'core-utils': Spec(
         paths=(
             'tokamax/_src/ad_test.py',
@@ -638,13 +910,17 @@ SHARDS: ShardMap = {
             'tokamax/_src/hlo_utils_test.py',
             'tokamax/_src/jaxtyping_test.py',
             'tokamax/_src/mosaic_gpu_test.py',
+            'tokamax/_src/mosaic_tpu_test.py',
             'tokamax/_src/numerics_test.py',
+            'tokamax/_src/ops/op_test.py',
+            'tokamax/_src/pallas/block_test.py',
             'tokamax/_src/precision_test.py',
             'tokamax/_src/pydantic_test.py',
             'tokamax/_src/shape_test.py',
             'tokamax/_src/test_utils_test.py',
         ),
-        minutes=2,
+        minutes=1,
+        compat_minutes=1,
     ),
     # -- catch-all ---------------------------------------------------------
     # Temporary shard that ideally should be empty. It's filled in by
@@ -891,6 +1167,7 @@ def _matches(test_files: Iterable[str], globs: Iterable[str]) -> set[str]:
 
 def resolve_shards(
     test_files: Collection[str] | None = None,
+    shard_map: Mapping[str, Spec] | None = None,
 ) -> tuple[ShardMap, list[str], set[str], set[str]]:
   """Fills in the catch-all shard and partitions the tree it sharded against.
 
@@ -902,6 +1179,7 @@ def resolve_shards(
     test_files: The tree to shard, as from `all_test_files`. Defaults to walking
       the real one, and is a parameter so the checks can run against a tree that
       does not exist on disk.
+    shard_map: Shard table to resolve, defaulting to `SHARDS`.
 
   Returns:
     `(shards, catch_all, excluded, ignored)`. `shards` is a deep-enough copy of
@@ -909,9 +1187,24 @@ def resolve_shards(
     shard picked up, empty in the ordinary case. `excluded` and `ignored` are
     the files left out by design and the ones pytest never collects, returned
     so `check_consistency` can be handed the same partitions.
+
+  Raises:
+    ValueError: If the table has no catch-all shard, gives it `paths` other
+      than `None`, or gives any other shard `paths=None`.
   """
   test_files = all_test_files() if test_files is None else test_files
-  shards = {n: dict(s) for n, s in SHARDS.items()}
+  source = SHARDS if shard_map is None else shard_map
+  if (
+      _CATCH_ALL_SHARD not in source
+      or source[_CATCH_ALL_SHARD].get('paths') is not None
+  ):
+    raise ValueError(
+        f'{_CATCH_ALL_SHARD!r} shard must be present with paths=None'
+    )
+  for name, spec in source.items():
+    if name != _CATCH_ALL_SHARD and spec.get('paths') is None:
+      raise ValueError(f'shard {name!r} must not have paths=None')
+  shards = {n: dict(s) for n, s in source.items()}
 
   claimed = set()
   for spec in shards.values():
@@ -1005,14 +1298,17 @@ def check_consistency(
         claims[file].append((name, selector))
     # `minutes` is sorted on and printed, so a string or a zero would quietly
     # misplace the shard rather than fail. Absent says there is no number yet.
-    minutes = spec.get('minutes')
-    if minutes is not None and (
-        not isinstance(minutes, (int, float)) or minutes <= 0
-    ):
-      errors.append(
-          f'shard {name!r} has minutes={minutes!r}: expected a positive'
-          ' number, or the key omitted if unmeasured'
-      )
+    # `compat_minutes` is packed on, where a zero would let a bin grow without
+    # limit.
+    for key in ('minutes', 'compat_minutes'):
+      value = spec.get(key)
+      if value is not None and (
+          not isinstance(value, (int, float)) or value <= 0
+      ):
+        errors.append(
+            f'shard {name!r} has {key}={value!r}: expected a positive'
+            ' number, or the key omitted if unmeasured'
+        )
     # Every shard runs on every runner, so `Spec` has no key for restricting
     # one and nothing here reads such a key. An entry carrying a `devices` key
     # would be silently ignored, and would read to anyone editing the table as
@@ -1100,8 +1396,7 @@ def check_consistency(
     if runner not in RUNNERS:
       errors.append(f'COMPAT_RUNNERS {runner!r} is not in RUNNERS.')
 
-  # TODO: Revert to 2 supported versions after jax upgrade to 0.11.2
-  if len(JAX_VERSIONS) < 3:
+  if len(JAX_VERSIONS) != 2:
     errors.append(
         f'JAX_VERSIONS is {JAX_VERSIONS}: tokamax supports 2 latest JAX'
         ' versions for backward compatibility.'
@@ -1242,11 +1537,11 @@ def build_matrix(
   """Builds `strategy.matrix.include`, one entry per (shard, runner) job.
 
   Every shard runs on every runner, so this is the full cross product unless
-  `only` narrows it. Every
-  shard then runs once more per version in `older_jaxs()`, on each of
-  `COMPAT_RUNNERS`, for the backward compatibility check.
+  `only` narrows it. The backward compatibility check on `older_jaxs()` is not
+  here: it is a separate job, from `build_compat_matrix`.
 
-  The only place a shard's `paths` becomes a command line: the workflow reads
+  One of the two places a shard's `paths` becomes a command line, with
+  `build_compat_matrix`: the workflow reads
   `test_paths` as one string and splits it back into arguments with `xargs`,
   so `shlex.join` quotes it here rather than trusting every path to be free of
   whitespace and quoting characters.
@@ -1258,8 +1553,7 @@ def build_matrix(
       that reaches no test and correctly runs nothing.
 
   Returns:
-    A job per shard per runner, in `shard_order` within each runner, then the
-    backward compatible jobs.
+    A job per shard per runner, in `shard_order` within each runner.
   """
   ordered = sorted(shards.items(), key=shard_order)
   jobs = []
@@ -1280,20 +1574,100 @@ def build_matrix(
           'test_paths': shlex.join(spec['paths']),
           'jax_pin': latest_jax(),
       })
+  return jobs
 
+
+def compat_size(spec: Spec) -> float:
+  """Minutes a shard is expected to take in a compat bin.
+
+  Both `compat_minutes` and `minutes` are set by hand in `SHARDS` from real CI
+  runs; nothing in CI writes them (see the table's comment for how to read
+  them off a run).
+
+  Args:
+    spec: One shard's spec.
+
+  Returns:
+    `compat_minutes` if measured, else `minutes`: smoke mode runs a subset of
+    the same tests on the same runners, so the full-run time is an upper bound
+    on it, and packing by it can only cost an extra bin, never an overfull one.
+    An unmeasured shard counts as a whole bin, so it is packed alone: absent
+    is an unknown, not a zero, and an unknown sharing a bin could make it the
+    slowest job of the run.
+  """
+  return spec.get('compat_minutes') or spec.get('minutes') or COMPAT_BIN_MINUTES
+
+
+def compat_bins(
+    shards: ShardMap, only: Collection[str] | None = None
+) -> list[list[str]]:
+  """Packs the shards to rerun on older JAX into bins of `COMPAT_BIN_MINUTES`.
+
+  First-fit decreasing: largest shard first, each into the first bin it fits.
+  A shard bigger than a bin gets a bin of its own rather than being split,
+  because the shard is already the smallest unit `paths` can address.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    only: As in `build_matrix`. `None` packs every shard; empty packs none.
+
+  Returns:
+    Shard names per bin, fullest bin first. Every packed shard is in exactly
+    one bin.
+  """
+  sizes = {
+      name: compat_size(spec)
+      for name, spec in shards.items()
+      if spec['paths'] and (only is None or name in only)
+  }
+  bins: list[list[str]] = []
+  loads: list[float] = []
+  for name in sorted(sizes, key=lambda n: (-sizes[n], n)):
+    for i, load in enumerate(loads):
+      if load + sizes[name] <= COMPAT_BIN_MINUTES:
+        loads[i] += sizes[name]
+        bins[i].append(name)
+        break
+    else:
+      bins.append([name])
+      loads.append(sizes[name])
+  return [bins[i] for i in sorted(range(len(bins)), key=lambda i: -loads[i])]
+
+
+def build_compat_matrix(
+    shards: ShardMap, only: Collection[str] | None = None
+) -> list[MatrixEntry]:
+  """Builds the `compat-tests` job's `strategy.matrix.include`.
+
+  One entry per (bin, older JAX, compat runner), each running its bin's shards
+  in one pytest session in smoke mode. A separate job from `shard-tests` so
+  that its `fail-fast` only cancels other compat bins: a compat failure stops
+  the compat check early without taking the primary results with it.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    only: As in `build_matrix`; selection narrows the compat check the same way.
+
+  Returns:
+    The compat jobs, fullest bin first, every version of a bin together, so
+    that the jobs that set the compat wall clock are the first to get runners.
+  """
+  bins = compat_bins(shards, only)
+  jobs = []
   for runner in COMPAT_RUNNERS:
-    for name, spec in ordered:
+    device, short = RUNNERS[runner]
+    for index, names in enumerate(bins, start=1):
+      paths = [p for name in names for p in shards[name]['paths']]
       for version in older_jaxs():
-        if only is not None and name not in only:
-          continue
-        if not spec['paths']:
-          continue
         jobs.append({
             'runner': runner,
-            'runner_short': f'{RUNNERS[runner][1]}-jax{version}',
-            'device': RUNNERS[runner][0],
-            'shard_name': name,
-            'test_paths': shlex.join(spec['paths']),
+            'runner_short': f'{short}-jax{version}',
+            'device': device,
+            'shard_name': f'compat-{index}',
+            # Which shards the bin holds, for the job log: the job title only
+            # has room for the bin's number.
+            'shards': ' '.join(names),
+            'test_paths': shlex.join(paths),
             'jax_pin': version,
         })
   return jobs
@@ -1314,6 +1688,269 @@ def read_changed(path: str) -> list[str]:
     return [p for p in f.read().split('\0') if p]
 
 
+def _assigns_shards(node: ast.stmt) -> bool:
+  """Returns whether `node` is a statement that assigns to `SHARDS`."""
+  if isinstance(node, ast.AnnAssign):
+    return isinstance(node.target, ast.Name) and node.target.id == 'SHARDS'
+  if isinstance(node, ast.Assign):
+    return any(
+        isinstance(t, ast.Name) and t.id == 'SHARDS' for t in node.targets
+    )
+  return False
+
+
+def _literal_spec(node: ast.expr) -> Spec:
+  """Reads one `SHARDS` value without executing it.
+
+  Args:
+    node: The value side of one table entry.
+
+  Returns:
+    The spec it spells.
+
+  Raises:
+    ValueError: If the value is anything but `Spec(...)`, `dict(...)` or a dict
+      display whose values are all literals, or has no well-formed `paths`.
+  """
+  try:
+    if isinstance(node, ast.Dict):
+      spec = ast.literal_eval(node)
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ('Spec', 'dict')
+        and not node.args
+        and all(k.arg is not None for k in node.keywords)
+    ):
+      spec = {k.arg: ast.literal_eval(k.value) for k in node.keywords}
+      if len(spec) != len(node.keywords):
+        raise ValueError('a shard spec repeats a keyword')
+    else:
+      raise ValueError(f'not a literal shard spec: {ast.unparse(node)}')
+  except TypeError as exc:
+    raise ValueError(f'not a literal shard spec: {ast.unparse(node)}') from exc
+  if not isinstance(spec, dict) or 'paths' not in spec:
+    raise ValueError(f'shard spec has no paths: {ast.unparse(node)}')
+  paths = spec['paths']
+  if paths is not None and not (
+      isinstance(paths, tuple) and all(isinstance(p, str) for p in paths)
+  ):
+    raise ValueError(f'shard paths is not a tuple of strings: {paths!r}')
+  return spec
+
+
+def _split_shards_table(source: str) -> tuple[str, ShardMap]:
+  """Separates a version of this file into its `SHARDS` table and the rest.
+
+  The table is read as literals, never executed: the base version comes out of
+  git, and nothing about deciding which shards to run should depend on running
+  it.
+
+  Args:
+    source: The text of some version of `shards.py`.
+
+  Returns:
+    `(rest, table)`. `rest` is the module's AST dump with the table's value
+    replaced by `None`, so two versions whose `rest` agree differ only in the
+    table. It is a dump of the syntax tree rather than of the text, so comments
+    and formatting -- which are most of what this file is -- do not count as a
+    change anywhere.
+
+  Raises:
+    SyntaxError: If `source` does not parse.
+    ValueError: If there is not exactly one module-level `SHARDS` assignment, or
+      its value is not a dict display of literal specs with distinct names.
+  """
+  tree = ast.parse(source)
+  assignments = [node for node in tree.body if _assigns_shards(node)]
+  if len(assignments) != 1:
+    raise ValueError(f'{len(assignments)} assignments to SHARDS, expected 1')
+  (statement,) = assignments
+  if not isinstance(statement.value, ast.Dict):
+    raise ValueError('SHARDS is not a dict display')
+
+  table = {}
+  for key, value in zip(
+      statement.value.keys, statement.value.values, strict=True
+  ):
+    # A `None` key is `**other` unpacking, which would make the table depend
+    # on something outside it.
+    if key is None:
+      raise ValueError('SHARDS unpacks another mapping')
+    try:
+      name = ast.literal_eval(key)
+    except TypeError as exc:
+      raise ValueError(
+          f'shard name is not a string: {ast.unparse(key)}'
+      ) from exc
+    if not isinstance(name, str):
+      raise ValueError(f'shard name is not a string: {name!r}')
+    # Python keeps the last of two equal keys without a word, so a duplicate
+    # would hide a shard from every check that reads the resolved table.
+    if name in table:
+      raise ValueError(f'shard {name!r} is declared twice')
+    spec = _literal_spec(value)
+    if name != _CATCH_ALL_SHARD and spec['paths'] is None:
+      raise ValueError(f'shard {name!r} must not have paths=None')
+    table[name] = spec
+
+  statement.value = ast.Constant(value=None)
+  return ast.dump(tree), table
+
+
+def read_base_shards() -> str:
+  """Reads this file as it is on the branch the change is diffed against.
+
+  The same base `ci-build.yml` diffs against to write the changed-file list:
+  the merge base of `origin/<base>` and `HEAD`, so a change that landed on the
+  base branch after this one forked is not read as part of this one.
+
+  Returns:
+    The base version's text.
+
+  Raises:
+    OSError: If git cannot be run.
+    subprocess.SubprocessError: If git fails, e.g. because the base ref was
+      not fetched or the file did not exist there.
+  """
+  base = os.environ.get('BASE_REF') or os.environ.get('GITHUB_BASE_REF')
+  ref = f'origin/{base or "main"}'
+  fork = subprocess.run(
+      ['git', 'merge-base', ref, 'HEAD'],
+      capture_output=True,
+      text=True,
+      check=True,
+  ).stdout.strip()
+  return subprocess.run(
+      ['git', 'show', f'{fork}:{SHARDS_PATH}'],
+      capture_output=True,
+      text=True,
+      check=True,
+  ).stdout
+
+
+def read_head_shards() -> str:
+  """Reads this file as it is being run, which is the change's version."""
+  with open(__file__, encoding='utf-8') as f:
+    return f.read()
+
+
+def shards_from_table_diff(
+    test_files: Collection[str],
+    base_source: str | None = None,
+    head_source: str | None = None,
+    class_reader: Callable[[str], list[str]] = declared_test_classes,
+) -> tuple[set[str] | None, str]:
+  """Decides which shards an edit to this file has to run.
+
+  Most edits here only move test files between shards -- adding one, moving
+  one, splitting one by `::Class`, renaming a shard or retiming one -- and run
+  nothing that was not already passing except the shards whose test paths
+  changed. Anything else in this file decides what every job runs, so an edit
+  outside the table, or one too broad to call small, runs every shard.
+
+  Args:
+    test_files: The tree to resolve both tables against, as from
+      `all_test_files`: the change's tree, since that is what will run.
+    base_source: The base version's text, or None to read it from git.
+    head_source: The change's version, or None to read this file.
+    class_reader: As in `check_consistency`.
+
+  Returns:
+    `(names, reason)`. `names` is the change's shards whose resolved test paths
+    are in no shard of the base table, or None meaning every shard. A shard
+    whose paths match a base shard of any name -- a retimed or renamed one --
+    is not among them. `reason` is one line for the log.
+  """
+  try:
+    base_source = read_base_shards() if base_source is None else base_source
+  except (OSError, subprocess.SubprocessError):
+    return None, 'shards.py: could not load the base version'
+  try:
+    head_source = read_head_shards() if head_source is None else head_source
+  except OSError:
+    return None, 'shards.py: could not load the head version'
+
+  try:
+    base_rest, base_table = _split_shards_table(base_source)
+    head_rest, head_table = _split_shards_table(head_source)
+  except (SyntaxError, TypeError, ValueError) as exc:
+    return None, f'shards.py: could not read the SHARDS table ({exc})'
+  if base_rest != head_rest:
+    return None, 'shards.py: changes outside the SHARDS table'
+
+  try:
+    base, *_ = resolve_shards(test_files, base_table)
+    head, _, excluded, ignored = resolve_shards(test_files, head_table)
+  except (KeyError, TypeError, ValueError) as exc:
+    return None, f'shards.py: could not resolve the SHARDS table ({exc})'
+  # The JAX floor is not part of the table, and `rest` agreeing already says
+  # it did not change.
+  if errors := check_consistency(
+      head, test_files, excluded, ignored, class_reader, pyproject=None
+  ):
+    return None, f'shards.py: head table fails check_consistency: {errors[0]}'
+
+  # Compared as sets of `paths` entries, `::Class` suffixes included, so a
+  # re-split selects both sides of it. The catch-all is compared only with
+  # itself: its paths are whatever no one else claims, and a file moving out
+  # of it into a new shard must select that shard, not match it away.
+  before = {
+      frozenset(s['paths']) for n, s in base.items() if n != _CATCH_ALL_SHARD
+  }
+  base_catch_all = frozenset(base.get(_CATCH_ALL_SHARD, {}).get('paths', ()))
+  names = set()
+  for name, spec in head.items():
+    paths = frozenset(spec['paths'])
+    if name == _CATCH_ALL_SHARD:
+      if paths != base_catch_all:
+        names.add(name)
+    elif paths not in before:
+      names.add(name)
+
+  if len(names) > MAX_DIFF_SHARDS or len(names) > MAX_DIFF_FRACTION * len(head):
+    return None, (
+        f'shards.py: table diff touches {len(names)} of {len(head)} shards,'
+        ' over the diff-aware bound'
+    )
+  return names, (
+      f"shards.py: table-only change; {len(names)} of {len(head)} shards'"
+      ' test paths changed'
+  )
+
+
+def _table_diff(
+    shards: ShardMap, test_files: Collection[str], changed: Sequence[str]
+) -> tuple[list[str], set[str] | None, str | None]:
+  """Takes an edit to this file out of a change list and selects for it.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    changed: The changed paths.
+
+  Returns:
+    `(others, names, reason)`. `others` is `changed` without this file, for
+    `deps` to trace as usual. `names` is the shards the table edit selects,
+    empty if the file did not change and None meaning every shard. `reason`
+    describes the table edit, None if there was none.
+  """
+  if SHARDS_PATH not in changed:
+    return list(changed), set(), None
+  others = [p for p in changed if p != SHARDS_PATH]
+  names, why = shards_from_table_diff(test_files)
+  # The head table is this module's own `SHARDS`, which `shards` was resolved
+  # from, so this cannot happen in CI. If it ever does, a name the matrix does
+  # not have would select nothing rather than the shard that changed.
+  if names is not None and (unknown := sorted(names - set(shards))):
+    return (
+        others,
+        None,
+        f'shards.py: table diff names unknown shard {unknown[0]}',
+    )
+  return others, names, why
+
+
 def select(
     shards: ShardMap, test_files: Collection[str], changed_from: str | None
 ) -> tuple[set[str] | None, str]:
@@ -1323,6 +1960,10 @@ def select(
   a rule in `deps.full_run_reason`, or an affected test no shard claims. The
   asymmetry is deliberate -- running too much costs runner minutes, running
   too little reports a change green that was never tested.
+
+  An edit to this file is the one path outside the package `deps` does not
+  get to rule on: `shards_from_table_diff` decides it, and what it selects is
+  added to whatever the rest of the change reaches.
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
@@ -1342,9 +1983,17 @@ def select(
   if not changed:
     return None, 'changed-file list is empty: every shard runs'
 
-  affected, why = deps.affected_tests(changed)
-  if affected is None:
-    return None, f'every shard runs: {why}'
+  others, table_names, table_why = _table_diff(shards, test_files, changed)
+  if table_names is None:
+    return None, f'every shard runs: {table_why}'
+
+  # Only the table changed: nothing for `deps` to trace, and asking it would
+  # walk the whole package for an empty answer.
+  affected = set()
+  if others:
+    affected, why = deps.affected_tests(others)
+    if affected is None:
+      return None, f'every shard runs: {why}'
 
   # Defensive check: if any affected test is not covered by the shard map,
   # fall back to running all shards.
@@ -1354,11 +2003,12 @@ def select(
         f' shard, first {sorted(orphans)[0]}'
     )
 
-  names = shards_for_tests(shards, test_files, affected)
-  return names, (
+  names = shards_for_tests(shards, test_files, affected) | table_names
+  reason = (
       f'{len(changed)} changed file(s) reach {len(affected)} test file(s)'
       f' in {len(names)} of {len(shards)} shards'
   )
+  return names, f'{reason} ({table_why})' if table_why else reason
 
 
 def explain(
@@ -1368,7 +2018,8 @@ def explain(
 
   Lists the changed files, the affected test files, and which shards collect
   those tests. Tests are tagged as `edited` (directly modified) or `import`
-  (reached via dependency graph).
+  (reached via dependency graph), and a shard an edit to the `SHARDS` table
+  selected is tagged `table`.
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
@@ -1382,9 +2033,15 @@ def explain(
   if not changed:
     return ['changed-file list is empty: every shard runs']
 
-  affected, why = deps.affected_tests(changed)
-  if affected is None:
-    return [f'every shard runs: {why}']
+  others, table_names, table_why = _table_diff(shards, test_files, changed)
+  if table_names is None:
+    return [f'every shard runs: {table_why}']
+
+  affected = set()
+  if others:
+    affected, why = deps.affected_tests(others)
+    if affected is None:
+      return [f'every shard runs: {why}']
 
   # The change itself, before any graph, so the log says what was edited as
   # well as what that dragged in. The `Decide which files changed` step logs
@@ -1393,7 +2050,7 @@ def explain(
   edited = set(changed)
   tests_edited = {f for f in edited if deps.is_test_file(f)}
   affected = set(affected)
-  names = shards_for_tests(shards, test_files, affected)
+  names = shards_for_tests(shards, test_files, affected) | table_names
   noun = 'a test file' if len(tests_edited) == 1 else 'test files'
   out = [f'{len(changed)} changed file(s), {len(tests_edited)} of them {noun}:']
   out += [f'      {f}' for f in sorted(changed)]
@@ -1403,6 +2060,10 @@ def explain(
           f'reaching {len(affected)} test file(s) in {len(names)} of'
           f' {len(shards)} shards.'
       ),
+  ]
+  if table_why:
+    out.append(f'  {table_why}; those shards are marked `table`.')
+  out += [
       '  `edited` was changed directly, `import` reaches one that was.',
       (
           '  the clock is measured wall time: what shards are sized on, not'
@@ -1416,7 +2077,8 @@ def explain(
       continue
     files = collected_by(spec['paths'], test_files)
     claimed |= files
-    if not (reached := sorted(files & affected)):
+    reached = sorted(files & affected)
+    if not reached and name not in table_names:
       continue
     # Which classes of a file this shard runs, for the shards that split one
     # by node ID. Empty for every other shard, which names whole files.
@@ -1430,6 +2092,8 @@ def explain(
         f'  {name:32s} {f"{minutes}m" if minutes else "-":>4}'
         f'  {len(reached)} of {len(files)} file(s) reached'
     )
+    if name in table_names:
+      out.append(f'      table   test paths changed in {SHARDS_PATH}')
     for file in reached:
       tag = 'edited' if file in edited else 'import'
       # The file is the unit the graph works in -- it cannot see classes, so a
@@ -1520,6 +2184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Under `--dry-run` the selection is computed and reported but not acted
     # on, so the matrix is every shard whatever `select` decided.
     combos = build_matrix(shards, None if args.dry_run else only)
+    compat = build_compat_matrix(shards, None if args.dry_run else only)
     flags = shlex.join(PYTEST_SELECT_FLAGS)
     # Diagnostics on stderr, so they land in the job log rather than in
     # $GITHUB_OUTPUT, which stdout is redirected to.
@@ -1531,12 +2196,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'selection: {reason}', file=sys.stderr)
     # What actually runs, always. The block below is what selection thought,
     # which is the same thing unless this is a dry run.
-    print(f'{len(shards)} shards, {len(combos)} jobs', file=sys.stderr)
+    print(
+        f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs',
+        file=sys.stderr,
+    )
     if only is not None:
       verb = 'would select' if args.dry_run else 'selected'
       print(f'{verb} {len(only)} of {len(shards)} shards:', file=sys.stderr)
       for name in sorted(only):
         print(f'  {name}', file=sys.stderr)
+    for index, names in enumerate(
+        compat_bins(shards, None if args.dry_run else only), start=1
+    ):
+      print(f'compat-{index}: {" ".join(names)}', file=sys.stderr)
     print(f'not run by design: {sorted(excluded)}', file=sys.stderr)
     print(f'pytest select flags: {flags}', file=sys.stderr)
     # Only the values something reads. The reason goes to stderr above and
@@ -1545,6 +2217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # newline would break -- and `-z` exists precisely because such a path can
     # come out of a pull request.
     print(f'include={json.dumps(combos)}')
+    print(f'compat_include={json.dumps(compat)}')
     print(f'pytest_flags={flags}')
     # The catch-all is empty in the ordinary case, and the workflow turns a
     # non-empty one into a `::warning::` annotation. On stdout as an output
@@ -1554,8 +2227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
   combos = build_matrix(shards)
+  compat = build_compat_matrix(shards)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
-  print(f'{len(shards)} shards, {len(combos)} jobs')
+  print(f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs')
   # Longest first, shards without a number last. An absent `minutes` is an
   # unknown, so it sorts to the bottom rather than being read as a zero.
   order = sorted(shards.items(), key=shard_order)
@@ -1581,6 +2255,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f'      excluded         {path}')
   for path in sorted(ignored):
     print(f'      never collected  {path}')
+
+  print()
+  print(
+      f'  compat bins, each run once per {", ".join(older_jaxs())} on'
+      f' {", ".join(RUNNERS[r][1] for r in COMPAT_RUNNERS)}:'
+  )
+  for index, names in enumerate(compat_bins(shards), start=1):
+    load = sum(compat_size(shards[n]) for n in names)
+    print(f'  compat-{index:<3d} {load:5.1f}m  {" ".join(names)}')
   return 0
 
 

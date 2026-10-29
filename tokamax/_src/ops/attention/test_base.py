@@ -107,14 +107,16 @@ def _run_test(
     ref_kwargs = {}
   ref_kwargs.setdefault("precision", jax.lax.Precision.HIGHEST)
 
-  if isinstance(mask := (impl_kwargs | kwargs).get("mask"), base.Mask):
+  if isinstance(mask := (impl_kwargs | kwargs).get("mask"), base.CausalMask):
+    mask = base.Mask(causal_mask=mask)
+  if isinstance(mask, base.Mask):
     q_indices = impl_kwargs.get("q_indices", None)
     k_indices = impl_kwargs.get("k_indices", None)
     q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
     k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
     mask = mask.as_array(q_len_or_indices, k_len_or_indices)
 
-  if mask is not None:
+  if isinstance(mask, jax.Array):
     is_fully_masked = jnp.all(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
     output_mask = jnp.where(is_fully_masked, 0.0, 1.0)[..., None]
 
@@ -519,12 +521,11 @@ class AttentionTestBase(parameterized.TestCase):
 
   def test_local_attention_mask(self):
     window_size = 128
-    k_start = jnp.maximum(0, jnp.arange(1024) + 1 - window_size)
     ref_mask = jnp.tri(1024, dtype=bool)
     ref_mask &= ~jnp.tri(1024, k=-window_size, dtype=bool)
     self._run_test(
         (2, 1024, 4, 64),
-        impl_kwargs=dict(mask=base.Mask(k_start=k_start, is_causal=True)),
+        impl_kwargs=dict(mask=base.CausalMask(window_size=window_size)),
         ref_kwargs=dict(mask=ref_mask),
         expect_supported=self._supports_mask,
     )

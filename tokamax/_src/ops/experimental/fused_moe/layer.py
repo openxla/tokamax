@@ -414,6 +414,7 @@ def fused_ep_moe_v2(
         hidden=hidden,
         inter=inter,
         ep=ep,
+        ep_axis_name=ax,
         ragged_rows_alloc=ragged_stride,
         weight_format=weight_format,
         rhs_qb=rhs_qb,

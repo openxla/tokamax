@@ -31,6 +31,7 @@ import ast
 import collections
 from collections.abc import Collection, Mapping, Sequence
 import os
+import re
 import sys
 from typing import Final
 
@@ -46,10 +47,9 @@ PACKAGE_ROOT: Final[str] = 'tokamax'
 #   conftest.py    a session-scoped autouse fixture that sets JAX and XLA
 #                  flags for the whole suite. pytest loads it by location, so
 #                  nothing imports it and it has no dependents to find.
-#   data/**.json   the autotuning cache, read at runtime through
-#                  `resources.files("tokamax")` in `_src/autotuning/cache.py`.
-#                  It decides which kernel configuration a test actually runs,
-#                  so it is a behavioural input with no import edge at all.
+#   data           any non-Python file in the package, read at runtime by
+#                  path, so a behavioural input with no import edge at all.
+#                  The autotuning tables are the exception; see below.
 #   __init__.py    executed by every import that passes through the package,
 #                  but never named by one. `from a.b import c` records edges to
 #                  `a.b` and `a.b.c`, so the package being imported *from* is
@@ -69,7 +69,16 @@ TEST_FILE_PREFIX: Final[str] = 'test_'
 
 # Non-Python files that cannot change what a test does, and so do not force a
 # full run.
-INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf')
+INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
+
+# `_src/autotuning/cache.py` reads `<device_kind>/<op_name>.json` for the op
+# whose snake-cased class name is `<op_name>`. Narrowed by op only, not runner.
+AUTOTUNING_DATA: Final[str] = f'{PACKAGE_ROOT}/data/autotuning'
+AUTOTUNING_CACHE_TEST: Final[str] = (
+    f'{PACKAGE_ROOT}/_src/autotuning/cache_test.py'
+)
+_OPS_ROOT: Final[str] = f'{PACKAGE_ROOT}/_src/ops/'
+_CAMEL_TO_SNAKE: Final[re.Pattern[str]] = re.compile(r'(?!^)([A-Z])')
 
 
 def python_files(root: str = PACKAGE_ROOT) -> list[str]:
@@ -131,6 +140,15 @@ def module_name(path: str) -> str:
   return mod.removesuffix('.__init__') if mod.endswith('.__init__') else mod
 
 
+def _parse(path: str) -> ast.Module | None:
+  """`path` parsed by `ast`, or `None` if it does not parse."""
+  try:
+    with open(path, encoding='utf-8') as f:
+      return ast.parse(f.read(), filename=path)
+  except (SyntaxError, ValueError, UnicodeDecodeError):
+    return None
+
+
 def imported_modules(path: str) -> set[str] | None:
   """Absolute module names `path` imports, or `None` if it does not parse.
 
@@ -146,10 +164,7 @@ def imported_modules(path: str) -> set[str] | None:
     `import_graph` is what discards those. `None` if the file did not parse,
     which is distinct from an empty set: empty means it imports nothing.
   """
-  try:
-    with open(path, encoding='utf-8') as f:
-      tree = ast.parse(f.read(), filename=path)
-  except (SyntaxError, ValueError, UnicodeDecodeError):
+  if (tree := _parse(path)) is None:
     return None
 
   own = module_name(path)
@@ -169,6 +184,19 @@ def imported_modules(path: str) -> set[str] | None:
       # `from a.b import c` reaches `a.b`, and `a.b.c` if that is a module.
       modules.add(target)
       modules.update(f'{target}.{alias.name}' for alias in node.names)
+    elif (
+        path.endswith('__init__.py')
+        and isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == '__all__' for t in node.targets
+        )
+        and isinstance(node.value, (ast.Tuple, ast.List))
+    ):
+      modules.update(
+          f'{package}.{elt.value}'
+          for elt in node.value.elts
+          if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+      )
   return modules
 
 
@@ -232,6 +260,39 @@ def module_referrers(
   return index
 
 
+def autotuning_op_name(path: str) -> str | None:
+  """`tokamax/data/autotuning/tpu7x/ragged_dot.json` -> `ragged_dot`."""
+  rest = path.removeprefix(f'{AUTOTUNING_DATA}/')
+  if rest == path:
+    return None
+  device, _, name = rest.partition('/')
+  if not device or '/' in name or not name.endswith('.json'):
+    return None
+  return name.removesuffix('.json') or None
+
+
+def op_name(class_name: str) -> str:
+  """`PallasMosaicTpuRaggedDot` -> `pallas_mosaic_tpu_ragged_dot`."""
+  return _CAMEL_TO_SNAKE.sub(r'_\1', class_name).lower()
+
+
+def op_modules(files: Sequence[str] | None = None) -> dict[str, set[str]]:
+  """Snake-cased class name -> the `_src/ops/` files that define it."""
+  files = python_files() if files is None else files
+  index = collections.defaultdict(set)
+  for path in files:
+    if (
+        not path.startswith(_OPS_ROOT)
+        or is_test_file(path)
+        or (tree := _parse(path)) is None
+    ):
+      continue
+    for node in ast.walk(tree):
+      if isinstance(node, ast.ClassDef) and node.bases:
+        index[op_name(node.name)].add(path)
+  return index
+
+
 def _reachable(start: str, edges: ImportEdges) -> set[str]:
   """Every file `start` imports, transitively.
 
@@ -279,6 +340,7 @@ def full_run_reason(
     changed: Collection[str],
     unparsed: Collection[str] = (),
     known: Collection[str] | None = None,
+    ops: Mapping[str, Collection[str]] | None = None,
 ) -> str | None:
   """Why `changed` requires every shard, or `None` if it does not.
 
@@ -303,6 +365,7 @@ def full_run_reason(
     known: The file set the graph was built from. `None` reports a changed
       `__init__.py` as edited rather than deleted, which is only safe when the
       caller already knows every changed path still exists.
+    ops: Op name to defining files, from `op_modules`.
 
   Returns:
     A human-readable reason to run every shard, or `None` if the changeset can
@@ -327,6 +390,13 @@ def full_run_reason(
       return f'{path} is outside {PACKAGE_ROOT}/'
     if os.path.basename(path) == 'conftest.py':
       return f'{path} configures every test in the package'
+    if ops is not None and (name := autotuning_op_name(path)):
+      if not ops.get(name):
+        return (
+            f'{path} is the autotuning table for {name!r}, which no class'
+            f' under {_OPS_ROOT} is named after, so no op is known to read it'
+        )
+      continue
     if not path.endswith('.py'):
       return f'{path} is package data, which no import edge covers'
     # An `__init__.py` is depended on by tree position, never by name, so the
@@ -375,7 +445,11 @@ def affected_tests(
     built_edges, built_unparsed = import_graph(files)
     edges = built_edges if edges is None else edges
     unparsed = built_unparsed if unparsed is None else unparsed
-  if reason := full_run_reason(changed, unparsed, files):
+  tables = {p: n for p in sorted(changed) if (n := autotuning_op_name(p))}
+  ops = op_modules(files) if tables else {}
+  if reason := full_run_reason(
+      changed, unparsed, files, ops if tables else None
+  ):
     return None, reason
 
   index = dependents(edges, files)
@@ -386,6 +460,17 @@ def affected_tests(
   deleted = [p for p in changed if p not in known and p.endswith('.py')]
   for path in changed:
     tests |= index.get(path, set())
+  for path, name in tables.items():
+    op_tests = set().union(*(index.get(m, set()) for m in ops[name]))
+    if not op_tests:
+      return (
+          None,
+          f'{path} is the autotuning table for {name!r}, which reaches no'
+          ' test',
+      )
+    tests |= op_tests
+  if tables:
+    tests |= index.get(AUTOTUNING_CACHE_TEST, set())
 
   if deleted:
     # A deleted file has no node in `edges`. Find surviving files that still
