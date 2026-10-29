@@ -31,6 +31,25 @@ from tokamax._src.ops.experimental.mla.v3 import configs
 from tokamax._src.ops.experimental.mla.v3 import utils
 
 
+def _carry(
+    x: jax.Array, is_last_k_b: jax.Array, cfgs: configs.MlaConfigs
+) -> jax.Array:
+  """The `l` / `acc` value carried into the next lane or step.
+
+  Zeroed where a q block just finished, so the next one starts clean. Relying on
+  the next block's `alpha == 0` to discard it instead is `0 * x`, which is NaN
+  when `x` is non-finite: a partial q block's padding rows (past `q_sz`) hold
+  whatever VMEM did, and nothing masks them, so they can leave NaN behind.
+
+  Decode skips it: with `bq_sz == 1` a real lane has `q_sz == 1` and so no
+  padding rows, and padding lanes (`q_sz == 0`) only follow every real lane of
+  the schedule's last step, so nothing they leave is ever consumed.
+  """
+  if cfgs.one_new_token:
+    return x
+  return jnp.where(is_last_k_b, 0.0, x)
+
+
 # TODO: Generalize flash attention helpers between BatchedRPA and
 # MLAv3/create a shared utility.
 def flash_attention_qk_softmax(
@@ -186,7 +205,10 @@ def flash_attention_qk_softmax(
     l_next_b = alpha_list[b_idx] * l_prev_b + p_rowsum[b_idx]
 
     l_next_list.append(l_next_b)
-    l_prev = l_next_b
+    if is_last_k is not None:
+      l_prev = _carry(l_next_b, is_last_k[b_idx], cfgs)
+    else:
+      l_prev = l_next_b
 
   l_next = jnp.stack(l_next_list, axis=0)
 
@@ -201,6 +223,7 @@ def flash_attention_pv(
     alpha_list: Sequence[jax.Array],  # B * [bq_sz * H_q, 128]
     o_prev: jax.Array,  # [bq_sz * H_q, d_nope]
     cfgs: configs.MlaConfigs,
+    is_last_k: jax.Array | Sequence[jax.Array] | None = None,  # [B]
 ) -> jax.Array:
   """Accumulates P @ V where V is strictly latent C_kv (excluding RoPE key K_pe).
 
@@ -211,6 +234,9 @@ def flash_attention_pv(
       * H_q, 128].
     o_prev: Previous unnormalized accumulator [bq_sz * H_q, d_nope].
     cfgs: MLA configuration parameters.
+    is_last_k: Optional per-lane flags. When given, the accumulator carried from
+      lane b to lane b+1 is reset where `is_last_k[b]` is set (see `_carry`).
+      The returned per-lane accumulators are unaffected.
 
   Returns:
     Updated unnormalized output accumulator [B, bq_sz * H_q, d_nope].
@@ -234,7 +260,10 @@ def flash_attention_pv(
     alpha_b = utils.broadcast_minor(alpha_list[b_idx], o_prev.shape)
     o_next_b = alpha_b * o_prev + pv[b_idx]
     o_next_list.append(o_next_b)
-    o_prev = o_next_b
+    if is_last_k is not None:
+      o_prev = _carry(o_next_b, is_last_k[b_idx], cfgs)
+    else:
+      o_prev = o_next_b
 
   return jnp.stack(o_next_list, axis=0)
 
@@ -286,7 +315,7 @@ def _flash_attention_decode(
       cfgs=cfgs,
   )
   batched_output = flash_attention_pv(
-      p, k_nope_arr, alpha, acc_scratch_ref[...], cfgs=cfgs
+      p, k_nope_arr, alpha, acc_scratch_ref[...], cfgs=cfgs, is_last_k=is_last_k
   )
   m_scratch_ref[...] = m_carry
   l_scratch_ref[...] = l_next[-1]
@@ -369,6 +398,10 @@ def _flash_attention_prefill(
     o_vref[...] = _normalize(
         acc_scratch_ref[...], l_scratch_ref[...], cfgs=cfgs
     ).reshape(o_vref.shape)
+    # Reset the carry for the next q block (see `_carry`). Here it can only
+    # happen after the normalize above, which reads it from scratch.
+    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
 
 
 def _run_pv_fallback_chunk(
@@ -381,13 +414,19 @@ def _run_pv_fallback_chunk(
     acc_scratch_ref: Any,
     o_vref: Any,
     *,
+    is_last_k: jax.Array | Sequence[jax.Array],
     cfgs: configs.MlaConfigs,
 ) -> None:
   """Runs PV for one query chunk and stores per-lane slices to o_vref."""
   batched_output = flash_attention_pv(
-      p, k_nope_arr, alpha, acc_scratch_ref[r_slice], cfgs=cfgs
+      p,
+      k_nope_arr,
+      alpha,
+      acc_scratch_ref[r_slice],
+      cfgs=cfgs,
+      is_last_k=is_last_k,
   )
-  acc_scratch_ref[r_slice] = batched_output[-1]
+  acc_scratch_ref[r_slice] = _carry(batched_output[-1], is_last_k[-1], cfgs)
   bq_sz_chunk = cfgs.bq_c_sz
   out = _normalize(batched_output, l_next, cfgs=cfgs).reshape(
       cfgs.batch_size,
@@ -438,7 +477,7 @@ def _flash_attention_fallback(
         bq_start=q_idx * bq_sz_chunk,
     )
     m_scratch_ref[r_slice] = cur_m_carry
-    l_scratch_ref[r_slice] = cur_l_next[-1]
+    l_scratch_ref[r_slice] = _carry(cur_l_next[-1], is_last_k[-1], cfgs)
 
     if prev_pv_args is not None:
       _run_pv_fallback_chunk(
@@ -446,6 +485,7 @@ def _flash_attention_fallback(
           k_nope_arr,
           acc_scratch_ref,
           o_vref,
+          is_last_k=is_last_k,
           cfgs=cfgs,
       )
     prev_pv_args = (q_idx, r_slice, cur_p, cur_alpha, cur_l_next)
@@ -456,6 +496,7 @@ def _flash_attention_fallback(
         k_nope_arr,
         acc_scratch_ref,
         o_vref,
+        is_last_k=is_last_k,
         cfgs=cfgs,
     )
 

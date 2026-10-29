@@ -389,6 +389,112 @@ class FlashAttentionMathTest(parameterized.TestCase):
       ("q_split_1", 1),
       ("q_split_2", 2),
   )
+  def test_prefill_nan_padding_rows_do_not_leak(self, q_split: int):
+    """A finished q block's non-finite padding rows must not reach the next.
+
+    Step 0 is a partial q block whose padding rows (the second half) hold NaN,
+    as uninitialized VMEM past `q_sz` can. Step 1 is a full, clean q block. The
+    carry used to be reset only through `alpha == 0`, and `0 * NaN` is NaN, so
+    step 1's rows in those positions came out NaN.
+    """
+    b, bq_sz, s = 1, 8, 64
+    cfgs = self._make_cfg(
+        batch_size=b,
+        bq_sz=bq_sz,
+        q_split=q_split,
+        bkv_sz=s,
+        mode=configs.MlaCase.PREFILL,
+    )
+    n_q = bq_sz * self.num_q_heads
+
+    keys = jax.random.split(jax.random.PRNGKey(5), 4)
+    q_nope = jax.random.normal(keys[0], (b, n_q, self.lkv_dim), jnp.float32)
+    q_pe = jax.random.normal(keys[1], (b, n_q, self.r_dim), jnp.float32)
+    k_nope = jax.random.normal(keys[2], (b, self.lkv_dim, s), jnp.float32)
+    k_pe = jax.random.normal(keys[3], (b, self.r_dim, s), jnp.float32)
+
+    q = jnp.concatenate([q_nope, q_pe], axis=-1)
+    k = jnp.concatenate([k_nope, k_pe], axis=1)
+    q_poisoned = q.at[:, n_q // 2 :, :].set(jnp.nan)
+
+    o_vref = self._run_kernel_steps(
+        [
+            (q_poisoned, k, jnp.array([True])),  # Partial block, NaN padding.
+            (q, k, jnp.array([True])),  # Next block, clean.
+        ],
+        cfgs,
+    )
+
+    expected = _ref_mla_attention(
+        q_nope[0], q_pe[0], k_nope[0], k_pe[0], self.sm_scale
+    )
+    np.testing.assert_allclose(
+        o_vref[0].reshape(n_q, self.lkv_dim), expected, rtol=1e-4, atol=1e-4
+    )
+
+  def test_fallback_nan_padding_rows_do_not_leak(self):
+    """Fallback path: the same reset, both lane-to-lane and step-to-step.
+
+    First run: one step where lane 0 finishes a q block with NaN padding rows
+    and lane 1 runs a clean one, so lane 1 checks the in-step lane chain is
+    reset. Second run: both lanes poisoned in step 0, clean in step 1; lane 0
+    of step 1 starts from the scratch carry, so it checks the step-to-step
+    reset.
+    """
+    b, bq_sz, q_split, s = 2, 4, 2, 64
+    cfgs = self._make_cfg(
+        batch_size=b,
+        bq_sz=bq_sz,
+        q_split=q_split,
+        bkv_sz=s,
+        mode=configs.MlaCase.PREFILL,
+    )
+    n_q = bq_sz * self.num_q_heads
+
+    keys = jax.random.split(jax.random.PRNGKey(6), 4)
+    q_nope = jax.random.normal(keys[0], (b, n_q, self.lkv_dim), jnp.float32)
+    q_pe = jax.random.normal(keys[1], (b, n_q, self.r_dim), jnp.float32)
+    k_nope = jax.random.normal(keys[2], (b, self.lkv_dim, s), jnp.float32)
+    k_pe = jax.random.normal(keys[3], (b, self.r_dim, s), jnp.float32)
+
+    q = jnp.concatenate([q_nope, q_pe], axis=-1)
+    k = jnp.concatenate([k_nope, k_pe], axis=1)
+    q_poisoned = q.at[:, n_q // 2 :, :].set(jnp.nan)
+
+    # Step 0, lane 1: poisoned rows from lane 0 must not leak through the chain.
+    o_step0 = self._run_kernel_steps(
+        [(q_poisoned.at[1].set(q[1]), k, jnp.array([True, True]))], cfgs
+    )
+    expected_1 = _ref_mla_attention(
+        q_nope[1], q_pe[1], k_nope[1], k_pe[1], self.sm_scale
+    )
+    np.testing.assert_allclose(
+        o_step0[1].reshape(n_q, self.lkv_dim), expected_1, rtol=1e-4, atol=1e-4
+    )
+
+    # Step 1: lane 0 starts from scratch left by step 0's poisoned lane 1.
+    o_step1 = self._run_kernel_steps(
+        [
+            (q_poisoned, k, jnp.array([True, True])),
+            (q, k, jnp.array([True, True])),
+        ],
+        cfgs,
+    )
+    for lane in range(b):
+      expected = _ref_mla_attention(
+          q_nope[lane], q_pe[lane], k_nope[lane], k_pe[lane], self.sm_scale
+      )
+      np.testing.assert_allclose(
+          o_step1[lane].reshape(n_q, self.lkv_dim),
+          expected,
+          rtol=1e-4,
+          atol=1e-4,
+      )
+
+  @parameterized.named_parameters(
+      ("q_split_1", 1),
+      ("q_split_2", 2),
+  )
   def test_prefill_causal_mask_with_scales(self, q_split: int):
     """General mask path (`n_tokens > 1`) with `historical_kv_len > 0`.
 
