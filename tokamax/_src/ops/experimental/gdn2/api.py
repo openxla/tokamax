@@ -31,7 +31,7 @@ from jaxtyping import (  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.gdn2 import base
 
-Implementation: TypeAlias = Literal["xla", "mosaic_tpu", "mosaic"]
+Implementation: TypeAlias = Literal["xla", "mosaic"]
 
 IMPLEMENTATIONS = {
     "xla": base.GatedDeltaNet2(),
@@ -42,14 +42,14 @@ try:
       pallas_mosaic_tpu,  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
   )
 
-  IMPLEMENTATIONS["mosaic_tpu"] = (
-      pallas_mosaic_tpu.PallasTpuGatedDeltaNet2()
+  IMPLEMENTATIONS["mosaic"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2()
   )
 except ImportError:
   pass
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
-    ("mosaic_tpu", "xla") if "mosaic_tpu" in IMPLEMENTATIONS else ("xla",)
+    ("mosaic", "xla") if "mosaic" in IMPLEMENTATIONS else ("xla",)
 )
 
 
@@ -86,10 +86,10 @@ def gated_delta_net_2(
     output_final_state: Whether to return the final recurrent state.
     implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
-      `"xla"` evaluates the recurrent reference implementation. `"mosaic"` or
-      `"mosaic_tpu"` uses the experimental Pallas/Mosaic TPU kernel. A sequence
-      tries implementations in order, falling back when an implementation
-      raises `NotImplementedError`.
+      `"xla"` evaluates the recurrent reference implementation. `"mosaic"` uses
+      the experimental Pallas/Mosaic TPU kernel. A sequence tries
+      implementations in order, falling back when an implementation raises
+      `NotImplementedError`.
 
   Returns:
     A pair `(output, final_state)`. The output has shape `[B, T, H, V]`.
@@ -106,8 +106,6 @@ def gated_delta_net_2(
 
   errors = []
   for impl in implementations:
-    if impl == "mosaic":
-      impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
       raise ValueError(f"Unknown implementation: {impl}")
 

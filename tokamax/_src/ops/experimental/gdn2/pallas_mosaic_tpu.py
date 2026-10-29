@@ -29,6 +29,7 @@ import dataclasses
 from typing import Any, ClassVar
 
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import (  # pylint: disable=g-multiple-import,g-importing-member
     Array,
     Float,
@@ -58,13 +59,10 @@ class Config:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuGatedDeltaNet2Vjp(
-    op.Op[Any, dict[str, jax.Array], None, Config, Any]
-):
-  """Tokamax Op VJP wrapper for GDN-2 Pallas TPU backward path."""
+class PallasMosaicTpuGatedDeltaNet2Vjp(base.GatedDeltaNet2Vjp[Config]):
+  """Tokamax Op VJP wrapper for GDN-2 Pallas Mosaic TPU backward path."""
 
   config_cls: ClassVar[type[Config]] = Config
-  supports_symbolic_shapes: ClassVar[bool] = False
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
@@ -152,15 +150,20 @@ class PallasTpuGatedDeltaNet2Vjp(
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
-  """Tokamax operator wrapper for GDN-2 Pallas TPU kernel."""
+class PallasMosaicTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
+  """Tokamax operator wrapper for GDN-2 Pallas Mosaic TPU kernel."""
 
   config_cls: ClassVar[type[Config]] = Config
-  vjp: op.Op | None = PallasTpuGatedDeltaNet2Vjp()
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self, "vjp", PallasMosaicTpuGatedDeltaNet2Vjp(config=self.config)
+      )
 
   @jaxtyping.jaxtyped
   @override
@@ -198,20 +201,7 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
             return_residuals=True,
         )
     )
-    residuals = (
-        q,
-        k,
-        v,
-        g,
-        b,
-        w,
-        initial_state,
-        a_mat_c,
-        merged_out_c,
-        s_in_c,
-        resolved_chunk_size,
-        scale,
-    )
+    residuals = (a_mat_c, merged_out_c, s_in_c)
     return out, (residuals if return_residuals else None)
 
   @override
@@ -221,4 +211,4 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

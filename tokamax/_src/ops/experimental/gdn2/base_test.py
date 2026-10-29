@@ -78,6 +78,15 @@ class GatedDeltaNet2BaseTest(absltest.TestCase):
     np.testing.assert_allclose(api_out, ref_out, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(api_s, ref_s, rtol=1e-5, atol=1e-5)
 
+    def loss_fn(q_, k_, v_, g_, b_, w_):
+      out, _ = op_instance(q_, k_, v_, g_, b_, w_, scale=1.0)
+      return jnp.sum(out)
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, g, b, w)
+    self.assertLen(grads, 6)
+    for grad_arr, src_arr in zip(grads, (q, k, v, g, b, w), strict=True):
+      self.assertEqual(grad_arr.shape, src_arr.shape)
+
 
 if __name__ == "__main__":
   absltest.main()

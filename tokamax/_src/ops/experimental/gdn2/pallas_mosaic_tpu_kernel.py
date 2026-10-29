@@ -288,10 +288,6 @@ def gdn2_pallas_fwd(
   """Computes GDN-2 forward pass using fused `tb`-batched Pallas kernel."""
   B, T, H, K = q.shape
   _, _, _, V = v.shape
-  if chunk_size <= 0 or T % chunk_size != 0:
-    raise ValueError(
-        f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
-    )
   if chunk_size > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
@@ -301,7 +297,7 @@ def gdn2_pallas_fwd(
   tt = chunk_size
   nt = T // tt
   if scale is None:
-    scale = K**-0.5
+    scale = float(K**-0.5)
 
   q_c = _chunkify(q.astype(jnp.float32) * scale, B, nt, tt).astype(q.dtype)
   k_c = _chunkify(k, B, nt, tt)

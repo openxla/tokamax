@@ -430,10 +430,6 @@ def gdn2_pallas_bwd(
   """Analytical closed-form backward pass for GDN-2 operator using Pallas TPU."""
   B, T, H, K = q.shape
   _, _, _, V = v.shape
-  if chunk_size <= 0 or T % chunk_size != 0:
-    raise ValueError(
-        f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
-    )
   if chunk_size > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
@@ -443,7 +439,7 @@ def gdn2_pallas_bwd(
   tt = chunk_size
   nt = T // tt
   if scale is None:
-    scale = K**-0.5
+    scale = float(K**-0.5)
 
   if a_mat_c is None or merged_out_c is None or s_in_c is None:
     _, (a_mat_c, merged_out_c, s_in_c) = (

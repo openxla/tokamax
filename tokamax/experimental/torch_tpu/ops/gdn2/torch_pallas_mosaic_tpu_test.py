@@ -23,7 +23,7 @@ import torch
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_pallas_mosaic_tpu
 
-gdn2_pallas = torch_pallas_mosaic_tpu.gdn2
+gdn2_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2
 
 
 class GDN2PallasKernelTest(unittest.TestCase):
@@ -105,7 +105,7 @@ class GDN2PallasKernelTest(unittest.TestCase):
       )
 
       actual = gdn2_pallas(q, k, v, g, b_mat, w_mat, chunk_size=chunk_size)
-      expected = torch_base.gated_delta_net_2(
+      expected = torch_base.GatedDeltaNet2(
           q, k, v, g, b_mat, w_mat, chunk_size=chunk_size
       )
 
@@ -172,7 +172,7 @@ class GDN2PallasKernelTest(unittest.TestCase):
     b_ref = b0.clone().detach().requires_grad_(True)
     w_ref = w0.clone().detach().requires_grad_(True)
 
-    out_ref = torch_base.gated_delta_net_2(
+    out_ref = torch_base.GatedDeltaNet2(
         q_ref, k_ref, v_ref, g_ref, b_ref, w_ref, chunk_size=chunk_size
     )
     (out_ref * do).sum().backward()

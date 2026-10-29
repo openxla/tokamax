@@ -22,7 +22,7 @@ import numpy as np
 from tokamax._src.ops.experimental.gdn2 import base, pallas_mosaic_tpu
 
 
-class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
+class PallasMosaicTpuGatedDeltaNet2Test(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -60,7 +60,7 @@ class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
         )
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuGatedDeltaNet2()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2()
     (actual_out, actual_s), _ = op_instance._fwd(
         q,
         k,
@@ -128,7 +128,7 @@ class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
         k8, (batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuGatedDeltaNet2()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2()
     (actual_out, _), residuals = op_instance._fwd(
         q,
         k,
@@ -143,7 +143,7 @@ class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
         return_residuals=True,
     )
 
-    vjp_op = pallas_mosaic_tpu.PallasTpuGatedDeltaNet2Vjp()
+    vjp_op = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2Vjp()
     actual_grads, _ = vjp_op._fwd(
         residuals,
         actual_out,
@@ -213,9 +213,9 @@ class PallasTpuGatedDeltaNet2Test(absltest.TestCase):
 
   def test_invalid_chunk_size_raises(self):
     q = jnp.ones((1, 100, 2, 16), dtype=jnp.float32)
-    op_instance = pallas_mosaic_tpu.PallasTpuGatedDeltaNet2()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2()
     with self.assertRaises(ValueError):
-      op_instance._fwd(q, q, q, q, q, q, chunk_size=64)
+      op_instance.bind(q, q, q, q, q, q, chunk_size=64)
     with self.assertRaises(NotImplementedError):
       q128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
       op_instance._fwd(q128, q128, q128, q128, q128, q128, chunk_size=128)
