@@ -20,8 +20,10 @@ import unittest
 from absl import logging
 from absl.testing import absltest
 import torch
-from tokamax.experimental.torch_tpu.ops.gdn2 import gdn2 as gdn2_pallas
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
+from tokamax.experimental.torch_tpu.ops.gdn2 import torch_pallas_mosaic_tpu
+
+gdn2_pallas = torch_pallas_mosaic_tpu.gdn2
 
 
 class GDN2PallasKernelTest(unittest.TestCase):
