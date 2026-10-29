@@ -286,6 +286,9 @@ def raven_pallas_stage1_bwd(
   tb = _select_tb(BH)
   nb = BH // tb
 
+  if scale is None:
+    scale = float(K**-0.5)
+
   if s1_in_c is None:
     _, s1_in_c = pallas_mosaic_tpu_kernel.raven_pallas_stage1_fwd(
         q,
@@ -300,10 +303,7 @@ def raven_pallas_stage1_bwd(
     )
   assert s1_in_c is not None
 
-  if scale is not None:
-    q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
-  else:
-    q_scaled = q
+  q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
 
   q_c = _chunkify(q_scaled, B, nt, tt).reshape(BH, nt, tt, K)
   k_c = _chunkify(k, B, nt, tt).reshape(BH, nt, tt, K)

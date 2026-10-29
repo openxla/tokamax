@@ -33,6 +33,7 @@ from tokamax.experimental.torch_tpu.ops.proj_and_save_state.torch_pallas_mosaic_
 from tokamax.experimental.torch_tpu.ops.ragged_dot.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedDot as ragged_dot
 from tokamax.experimental.torch_tpu.ops.ragged_gather.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedGather as ragged_gather
 from tokamax.experimental.torch_tpu.ops.ragged_gather_reduce.torch_pallas_mosaic_tpu import PallasMosaicTpuRaggedGatherReduce as ragged_gather_reduce
+from tokamax.experimental.torch_tpu.ops.raven.torch_pallas_mosaic_tpu import PallasMosaicTpuRavenGsa as raven_gsa
 from tokamax.experimental.torch_tpu.ops.router_topk.torch_pallas_mosaic_tpu import PallasMosaicTpuRouterTopK as router_topk
 from tokamax.experimental.torch_tpu.ops.sparse_mla.torch_pallas_mosaic_tpu import PallasMosaicTpuSparseMla as sparse_mla
 from tokamax.experimental.torch_tpu.ops.splash_attention.torch_pallas_mosaic_tpu import PallasMosaicTpuSplashAttention as splash_attention

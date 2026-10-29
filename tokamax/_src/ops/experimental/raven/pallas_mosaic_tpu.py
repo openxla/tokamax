@@ -27,6 +27,7 @@
 import dataclasses
 from typing import Any, ClassVar
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
@@ -39,7 +40,7 @@ from tokamax._src.ops.experimental.raven import (
 from typing_extensions import override
 
 
-@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+@pydantic.dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Autotuning and execution configuration for Pallas TPU Raven."""
 
@@ -47,7 +48,7 @@ class Config:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
+class PallasMosaicTpuRavenGsaVjp(base.RavenGsaVjp[Config]):
   """Tokamax Op VJP wrapper for Raven GSA Pallas TPU backward path."""
 
   config_cls: ClassVar[type[Config]] = Config
@@ -59,7 +60,7 @@ class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
 
   @override
   def _fwd(
@@ -80,22 +81,31 @@ class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[dict[str, Any], None]:
-    del out, q, k, s, g, v, chunk_size, scale
-    del initial_state, output_final_state, return_residuals, config
-    (
-        res_q,
-        res_k,
-        res_s,
-        res_g,
-        res_v,
-        res_s0,
-        res_s1_in_c,
-        res_qv,
-        res_s2_in_c,
-        res_chunk_size,
-        res_scale,
-    ) = residuals
-    grad_out, grad_final_state = dout
+    del out, output_final_state, return_residuals
+    if residuals:
+      (
+          res_q,
+          res_k,
+          res_s,
+          res_g,
+          res_v,
+          res_s0,
+          res_s1_in_c,
+          res_qv,
+          res_s2_in_c,
+          res_chunk_size,
+          res_scale,
+      ) = residuals
+    else:
+      res_q, res_k, res_s, res_g, res_v = q, k, s, g, v
+      res_s0 = initial_state
+      res_s1_in_c, res_qv, res_s2_in_c = None, None, None
+      res_chunk_size = config.chunk_size if config is not None else chunk_size
+      res_scale = scale
+
+    grad_out, grad_final_state = (
+        dout if isinstance(dout, tuple) else (dout, None)
+    )
 
     dq, dk, ds, dg, dv, ds0 = pallas_mosaic_tpu_bwd_kernel.raven_pallas_bwd(
         res_q,
@@ -121,11 +131,14 @@ class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PallasTpuRavenGSA(base.RavenGSA[Config]):
+class PallasMosaicTpuRavenGsa(base.RavenGsa[Config]):
   """Tokamax operator wrapper for Raven GSA Pallas TPU kernel."""
 
   config_cls: ClassVar[type[Config]] = Config
-  vjp: op.Op | None = PallasTpuRavenGSAVjp()
+
+  def __post_init__(self) -> None:
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", PallasMosaicTpuRavenGsaVjp())
 
   @jaxtyping.jaxtyped
   @override
@@ -196,4 +209,4 @@ class PallasTpuRavenGSA(base.RavenGSA[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu"
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5

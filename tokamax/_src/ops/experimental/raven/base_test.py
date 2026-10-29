@@ -33,6 +33,7 @@ def _recurrent_two_stage_ref(
     s2_0: jax.Array,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
   """Step-by-step recurrent reference for two-stage Raven GSA."""
+  q = q * float(q.shape[-1] ** -0.5)
 
   def step(carry, inputs):
     s1, s2 = carry
@@ -84,7 +85,7 @@ class RavenGSABaseTest(absltest.TestCase):
         )
     )
 
-    op_instance = base.RavenGSA()
+    op_instance = base.RavenGsa()
     (actual_out, _), _ = op_instance._fwd(q, k, s, g, chunk_size=chunk_size)
     expected_out, _ = base.raven_stage1_reference(
         q, k, s, g, chunk_size=chunk_size
@@ -163,7 +164,7 @@ class RavenGSABaseTest(absltest.TestCase):
     s = jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
     g = -0.1 * jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
     with self.assertRaises(ValueError):
-      base.raven_gsa_reference(q, k, s, g, chunk_size=64)
+      base.RavenGsa().bind(q, k, s, g, chunk_size=64)
 
 
 if __name__ == "__main__":

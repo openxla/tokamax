@@ -27,7 +27,7 @@ from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu_bwd_kernel
 from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu_kernel
 
 
-class PallasTpuRavenGSATest(absltest.TestCase):
+class PallasMosaicTpuRavenGsaTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -57,7 +57,7 @@ class PallasTpuRavenGSATest(absltest.TestCase):
         )
     )
 
-    op_instance = pallas_mosaic_tpu.PallasTpuRavenGSA()
+    op_instance = pallas_mosaic_tpu.PallasMosaicTpuRavenGsa()
     (actual_out, _), residuals = op_instance._fwd(
         q, k, s, g, chunk_size=chunk_size, return_residuals=False
     )
@@ -268,7 +268,9 @@ class PallasTpuRavenGSATest(absltest.TestCase):
         keys[9], (batch_size, num_heads, num_slots, val_dim), dtype=jnp.float32
     )
 
-    op_pallas = pallas_mosaic_tpu.PallasTpuRavenGSA(bypass_device_check=True)
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuRavenGsa(
+        bypass_device_check=True
+    )
     (actual_out, (actual_s1, actual_s2)), residuals = op_pallas._fwd(
         q,
         k,
@@ -296,7 +298,7 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     np.testing.assert_allclose(actual_s1, expected_s1, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(actual_s2, expected_s2, rtol=1e-4, atol=1e-4)
 
-    vjp_op = pallas_mosaic_tpu.PallasTpuRavenGSAVjp()
+    vjp_op = pallas_mosaic_tpu.PallasMosaicTpuRavenGsaVjp()
     grads, _ = vjp_op._fwd(
         residuals,
         (actual_out, (actual_s1, actual_s2)),
@@ -347,7 +349,7 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     )
 
   def test_heuristics_config_and_validation(self):
-    op_pallas = pallas_mosaic_tpu.PallasTpuRavenGSA()
+    op_pallas = pallas_mosaic_tpu.PallasMosaicTpuRavenGsa()
     q = jnp.ones((1, 64, 2, 16), dtype=jnp.float32)
     k = jnp.ones((1, 64, 2, 16), dtype=jnp.float32)
     s = jnp.ones((1, 64, 2, 8), dtype=jnp.float32)
@@ -355,6 +357,7 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     ba = op_pallas.bind(q, k, s, g, chunk_size=32)
     cfg = op_pallas._get_heuristics_config(ba)
     self.assertEqual(cfg.chunk_size, 32)
+    self.assertEqual(ba.arguments["scale"], float(16**-0.5))
 
     cpu_dev = jax.devices("cpu")[0]
     self.assertFalse(op_pallas.supported_on(cpu_dev))
@@ -364,7 +367,7 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     s_bad = jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
     g_bad = -0.1 * jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
     with self.assertRaises(ValueError):
-      op_pallas._fwd(q_bad, k_bad, s_bad, g_bad, chunk_size=64)
+      op_pallas.bind(q_bad, k_bad, s_bad, g_bad, chunk_size=64)
 
     q_128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
     k_128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)

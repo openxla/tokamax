@@ -29,18 +29,18 @@ from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-import
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.raven import base
 
-Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
+Implementation: TypeAlias = Literal["xla", "mosaic"]
 
 IMPLEMENTATIONS: dict[str, Callable[..., Any]] = {
-    "xla": base.RavenGSA(),
+    "xla": base.RavenGsa(),
 }
 _DEFAULT_IMPLEMENTATION: tuple[str, ...] = ("xla",)
 
 try:
   from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top
 
-  IMPLEMENTATIONS["mosaic_tpu"] = pallas_mosaic_tpu.PallasTpuRavenGSA()
-  _DEFAULT_IMPLEMENTATION = ("mosaic_tpu",) + _DEFAULT_IMPLEMENTATION
+  IMPLEMENTATIONS["mosaic"] = pallas_mosaic_tpu.PallasMosaicTpuRavenGsa()
+  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
 except ImportError:
   pass
 
@@ -80,7 +80,7 @@ def raven_gsa(
     initial_state: Optional initial recurrent state ``[B, H, K, M]`` (for
       Stage 1) or ``(s1_0, s2_0)`` (for full two-stage GSA).
     output_final_state: Whether to return the final recurrent state.
-    implementation: Backend implementation name (``"mosaic_tpu"`` or ``"xla"``)
+    implementation: Backend implementation name (``"mosaic"`` or ``"xla"``)
       or sequence of fallback implementations.
 
   Returns:

@@ -53,11 +53,8 @@ def _resolve_interpret(interpret: bool | None = None) -> bool:
 
 
 def _validate_chunk_size(T: int, tt: int) -> None:
-  """Validates that ``chunk_size`` is positive, divides ``seq_len``, and fits VMEM."""
-  if tt <= 0:
-    raise ValueError(f"chunk_size must be positive, got {tt}.")
-  if T % tt != 0:
-    raise ValueError(f"seq_len ({T}) must be divisible by chunk_size ({tt}).")
+  """Validates that ``chunk_size`` fits TPU VMEM layout."""
+  del T
   if tt > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {tt}."
@@ -226,10 +223,9 @@ def raven_pallas_stage1_fwd(
   tb = _select_tb(BH)
   nb = BH // tb
 
-  if scale is not None:
-    q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
-  else:
-    q_scaled = q
+  if scale is None:
+    scale = float(K**-0.5)
+  q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
 
   q_c = _chunkify(q_scaled, B, nt, tt).reshape(BH, nt, tt, K)
   k_c = _chunkify(k, B, nt, tt).reshape(BH, nt, tt, K)

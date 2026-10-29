@@ -45,18 +45,10 @@ State: TypeAlias = (
     | None
 )
 Output: TypeAlias = tuple[
-    Float[Array, "B T H M"] | Float[Array, "B T H V"],
+    Float[Array, "B T H D"],
     State,
 ]
 Residuals: TypeAlias = Any
-
-
-def _validate_chunk_size(T: int, tt: int) -> None:
-  """Validates that ``chunk_size`` is positive and divides ``seq_len``."""
-  if tt <= 0:
-    raise ValueError(f"chunk_size must be positive, got {tt}.")
-  if T % tt != 0:
-    raise ValueError(f"seq_len ({T}) must be divisible by chunk_size ({tt}).")
 
 
 def _chunkify(x: jax.Array, B: int, nt: int, tt: int) -> jax.Array:
@@ -134,13 +126,11 @@ def raven_stage1_reference(
   B, T, H, K = q.shape
   _, _, _, M = s.shape
   tt = chunk_size
-  _validate_chunk_size(T, tt)
   nt = T // tt
 
-  if scale is not None:
-    q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
-  else:
-    q_scaled = q
+  if scale is None:
+    scale = float(K**-0.5)
+  q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
 
   q_c = _chunkify(q_scaled.astype(jnp.float32), B, nt, tt)
   k_c = _chunkify(k.astype(jnp.float32), B, nt, tt)
@@ -242,7 +232,6 @@ def raven_stage2_reference(
   B, T, H, M = qv.shape
   _, _, _, V = v.shape
   tt = chunk_size
-  _validate_chunk_size(T, tt)
   nt = T // tt
 
   qv_c = _chunkify(qv.astype(jnp.float32), B, nt, tt)
@@ -339,7 +328,68 @@ def raven_gsa_reference(
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class RavenGSA[C](op.Op[Any, Output, Residuals, C, None]):
+class RavenGsaVjp[C](op.Op[Any, dict[str, Any], None, C, None]):
+  """Tokamax base VJP operator for Raven Gated Slot Attention (GSA)."""
+
+  supports_symbolic_shapes = False
+
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Output,
+      dout: Output,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      s: Float[Array, "B T H M"],
+      g: Float[Array, "B T H M"],
+      v: Float[Array, "B T H V"] | None = None,
+      *,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: float | None = None,
+      initial_state: State = None,
+      output_final_state: bool = False,
+      return_residuals: bool = False,
+      config: C | None = None,
+  ) -> tuple[dict[str, Any], None]:
+    del residuals, out, return_residuals, config
+
+    def _ref_fn(q_, k_, s_, g_, v_, init_state_):
+      return raven_gsa_reference(
+          q_,
+          k_,
+          s_,
+          g_,
+          v_,
+          chunk_size=chunk_size,
+          scale=scale,
+          initial_state=init_state_,
+          output_final_state=output_final_state,
+      )
+
+    primals_out, vjp_fn = jax.vjp(_ref_fn, q, k, s, g, v, initial_state)
+    grad_out, grad_final_state = (
+        dout if isinstance(dout, tuple) else (dout, None)
+    )
+    if not output_final_state:
+      cotangent_state = None
+    elif grad_final_state is None:
+      cotangent_state = jax.tree.map(jnp.zeros_like, primals_out[1])
+    else:
+      cotangent_state = grad_final_state
+
+    dq, dk, ds, dg, dv, ds0 = vjp_fn((grad_out, cotangent_state))
+    grads: dict[str, Any] = {"q": dq, "k": dk, "s": ds, "g": dg}
+    if v is not None:
+      grads["v"] = dv
+    if initial_state is not None:
+      grads["initial_state"] = ds0
+    return grads, None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RavenGsa[C](op.Op[Any, Output, Residuals, C, None]):
   """Tokamax base operator for Raven Gated Slot Attention (GSA).
 
   Supports both standalone Stage 1 slot-logit computation (when ``v is None``)
@@ -348,6 +398,93 @@ class RavenGSA[C](op.Op[Any, Output, Residuals, C, None]):
   """
 
   supports_symbolic_shapes = False
+
+  def __post_init__(self) -> None:
+    if self.vjp is None:
+      object.__setattr__(self, "vjp", RavenGsaVjp())
+
+  @override
+  def bind(
+      self,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      s: Float[Array, "B T H M"],
+      g: Float[Array, "B T H M"],
+      v: Float[Array, "B T H V"] | None = None,
+      *,
+      chunk_size: int = _CHUNK_SIZE,
+      scale: float | None = None,
+      initial_state: State = None,
+      output_final_state: bool = False,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    if q.ndim != 4:
+      raise ValueError(
+          f"Expected 4D q (batch, seq_len, heads, dim), got {q.shape}."
+      )
+    B, T, H, K = q.shape
+    if k.shape != (B, T, H, K):
+      raise ValueError(f"Expected k shape {(B, T, H, K)}, got {k.shape}.")
+    if s.ndim != 4 or s.shape[:3] != (B, T, H):
+      raise ValueError(
+          f"Expected 4D s with leading shape {(B, T, H)}, got {s.shape}."
+      )
+    M = s.shape[3]
+    if g.shape != (B, T, H, M):
+      raise ValueError(f"Expected g shape {(B, T, H, M)}, got {g.shape}.")
+    if v is not None and (v.ndim != 4 or v.shape[:3] != (B, T, H)):
+      raise ValueError(
+          f"Expected 4D v with leading shape {(B, T, H)}, got {v.shape}."
+      )
+    if isinstance(initial_state, tuple):
+      if len(initial_state) != 2:
+        raise ValueError(
+            f"Expected 2-tuple initial_state, got length {len(initial_state)}."
+        )
+      s1_init, s2_init = initial_state
+      if s1_init is not None and s1_init.shape != (B, H, K, M):
+        raise ValueError(
+            f"Expected initial_state[0] shape {(B, H, K, M)}, got"
+            f" {s1_init.shape}."
+        )
+      if (
+          s2_init is not None
+          and v is not None
+          and s2_init.shape != (B, H, M, v.shape[3])
+      ):
+        raise ValueError(
+            f"Expected initial_state[1] shape {(B, H, M, v.shape[3])}, got"
+            f" {s2_init.shape}."
+        )
+    elif initial_state is not None:
+      if initial_state.shape != (B, H, K, M):
+        raise ValueError(
+            f"Expected initial_state shape {(B, H, K, M)}, got"
+            f" {initial_state.shape}."
+        )
+
+    if chunk_size <= 0:
+      raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    if T % chunk_size != 0:
+      raise ValueError(
+          f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
+      )
+
+    if scale is None:
+      scale = float(K**-0.5)
+
+    return super().bind(
+        q,
+        k,
+        s,
+        g,
+        v,
+        chunk_size=chunk_size,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        return_residuals=return_residuals,
+    )
 
   @jaxtyping.jaxtyped
   @override
