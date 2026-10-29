@@ -28,8 +28,10 @@ class GDN2PallasKernelTest(unittest.TestCase):
   """Tests for GDN-2 Pallas kernel against base reference."""
 
   def _get_device(self) -> str:
-    if hasattr(torch, "tpu") and torch.tpu.is_available():
-      return "tpu"
+    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
+      accel = torch.accelerator.current_accelerator()
+      if accel is not None and accel.type in ("tpu", "xla"):
+        return accel.type
     return "cpu"
 
   def test_forward_shape_and_parity_multi_chunk(self):

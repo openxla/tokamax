@@ -15,6 +15,18 @@
 
 """Pallas TPU compute kernel for Gated Delta Net 2 (GDN-2)."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length (nt * tt)
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+#   BH  flattened batch-head count (B * H)
+#   tb  tile extent of BH (micro-batch size dividing BH)
+#   tt  tile extent of T (chunk_size)
+#   nb  grid extent along BH (BH // tb)
+#   nt  grid extent along T (T // tt, number of chunks)
+
 import functools
 import math
 from typing import Any
@@ -24,92 +36,84 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-# Dimensions:
-#   B: batch size
-#   T: sequence length (NT * BT)
-#   H: number of attention heads
-#   BH: flattened batch-head count (B * H)
-#   MB: stream micro-batch size dividing BH
-#   NT: number of chunks (T // BT)
-#   BT: chunk size (chunk_size)
-#   K: key head dimension (key_dim)
-#   V: value head dimension (val_dim)
-
 _CHUNK_SIZE = 64
-_MAX_MB = 16
+_MAX_TB = 16
 
 
-def _select_mb(bh: int, max_mb: int = _MAX_MB) -> int:
-  """Selects largest divisor of `bh` up to `max_mb` for stream batching."""
-  for mb in range(min(bh, max_mb), 0, -1):
-    if bh % mb == 0:
-      return mb
+def _select_tb(BH: int, max_tb: int = _MAX_TB) -> int:
+  """Selects largest divisor of `BH` up to `max_tb` for stream batching."""
+  for tb in range(min(BH, max_tb), 0, -1):
+    if BH % tb == 0:
+      return tb
   return 1
 
 
-def _chunkify(
-    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
-) -> jax.Array:
-  # [B, T, H, ...] -> [BH, NT, BT, ...]
-  num_heads = x.shape[2]
-  rest = x.shape[3:]
-  x = x.reshape((batch_size, num_chunks, chunk_size, num_heads) + rest)
+def _chunkify(x: jax.Array, B: int, nt: int, tt: int) -> jax.Array:
+  # [B, T, H, ...] -> [BH, nt, tt, ...]
+  _, _, H, *rest = x.shape
+  rest_shape = tuple(rest)
+  x = x.reshape((B, nt, tt, H) + rest_shape)
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   x_t = jnp.transpose(x, perm)
-  return x_t.reshape((batch_size * num_heads, num_chunks, chunk_size) + rest)
+  return x_t.reshape((B * H, nt, tt) + rest_shape)
 
 
 def _unchunk(
     x_c: jax.Array,
-    rest_dim: int,
-    batch_size: int,
-    num_chunks: int,
-    chunk_size: int,
-    num_heads: int,
+    D: int,
+    B: int,
+    nt: int,
+    tt: int,
+    H: int,
 ) -> jax.Array:
-  x_ = x_c.reshape((batch_size, num_heads, num_chunks, chunk_size, rest_dim))
+  x_ = x_c.reshape((B, H, nt, tt, D))
   x_ = jnp.transpose(x_, (0, 2, 3, 1, 4))
-  return x_.reshape(batch_size, num_chunks * chunk_size, num_heads, rest_dim)
+  return x_.reshape(B, nt * tt, H, D)
 
 
 def _decayed_gram(
-    a: jax.Array,
-    b: jax.Array,
-    g_a: jax.Array,
-    g_b: jax.Array,
+    lhs_in: jax.Array,
+    rhs_in: jax.Array,
+    g_lhs: jax.Array,
+    g_rhs: jax.Array,
 ) -> jax.Array:
-  """Computes decayed Gram matrix `(a @ b^T) * exp(g_a - g_b)` over (..., BT, K)."""
-  g0 = g_b[..., :1, :]
-  lhs = (a * jnp.exp(jnp.minimum(g_a - g0, 80.0))).astype(jnp.float32)
-  rhs = (b * jnp.exp(jnp.minimum(g0 - g_b, 80.0))).astype(jnp.float32)
+  """Computes decayed Gram matrix `(lhs_in @ rhs_in^T) * exp(g_lhs - g_rhs)`."""
+  # Shift log-decays by the chunk's first token `g0` and clamp at 80.0 so the
+  # factored `exp(g_lhs - g0)` and `exp(g0 - g_rhs)` terms never overflow f32
+  # before contracting on the MXU.
+  g0 = g_rhs[..., :1, :]
+  lhs = (lhs_in * jnp.exp(jnp.minimum(g_lhs - g0, 80.0))).astype(jnp.float32)
+  rhs = (rhs_in * jnp.exp(jnp.minimum(g0 - g_rhs, 80.0))).astype(jnp.float32)
   out = jnp.matmul(
       lhs,
       jnp.swapaxes(rhs, -1, -2),
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   )
-  return out.astype(a.dtype)
+  return out.astype(lhs_in.dtype)
 
 
 def _unit_lower_inverse(a0: jax.Array) -> jax.Array:
   """Computes `(I - a0)^{-1}` for strictly lower-triangular `a0` via Schulz doubling."""
-  bt = a0.shape[-1]
-  p = a0.astype(jnp.float32)
-  row = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
-  col = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
-  eye = (row == col).astype(jnp.float32)
-  inv = eye + p
-  num_doubling_steps = max(0, math.ceil(math.log2(bt)) - 1)
+  *_, tt, _ = a0.shape
+  power = a0.astype(jnp.float32)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
+  eye = (row_idx == col_idx).astype(jnp.float32)
+  inv = eye + power
+  # Because `a0` is strictly lower-triangular of size `tt`, `a0^tt == 0`, so
+  # `ceil(log2(tt)) - 1` squaring steps compute the exact inverse on the MXU.
+  num_doubling_steps = max(0, math.ceil(math.log2(tt)) - 1)
   for _ in range(num_doubling_steps):
-    p = jnp.matmul(
-        p,
-        p,
+    power = jnp.matmul(
+        power,
+        power,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
     inv = inv + jnp.matmul(
         inv,
-        p,
+        power,
         preferred_element_type=jnp.float32,
         precision=jax.lax.Precision.HIGHEST,
     )
@@ -118,55 +122,58 @@ def _unit_lower_inverse(a0: jax.Array) -> jax.Array:
 
 def _gdn2_fwd_kernel(
     # Inputs.
-    q_vmem_ref,  # [MB, 1, BT, K] dtype
-    k_vmem_ref,  # [MB, 1, BT, K] dtype
-    v_vmem_ref,  # [MB, 1, BT, V] dtype
-    g_vmem_ref,  # [MB, 1, BT, K] float32
-    b_vmem_ref,  # [MB, 1, BT, K] dtype
-    w_vmem_ref,  # [MB, 1, BT, V] dtype
-    s0_vmem_ref,  # [MB, K, V] float32
+    q_ref,  # [tb, 1, tt, K]
+    k_ref,  # [tb, 1, tt, K]
+    v_ref,  # [tb, 1, tt, V]
+    g_ref,  # [tb, 1, tt, K] f32
+    b_ref,  # [tb, 1, tt, K]
+    w_ref,  # [tb, 1, tt, V]
+    s0_ref,  # [tb, K, V] f32
     # Outputs.
-    o_vmem_ref,  # [MB, 1, BT, V] dtype
-    s_final_vmem_ref,  # [MB, K, V] float32
-    a_mat_vmem_ref,  # [MB, 1, BT, BT] dtype
-    merged_out_vmem_ref,  # [MB, 1, BT, K + V] float32
-    s_in_vmem_ref,  # [MB, 1, K, V] float32
+    out_ref,  # [tb, 1, tt, V]
+    s_final_ref,  # [tb, K, V] f32
+    a_mat_ref,  # [tb, 1, tt, tt]
+    merged_out_ref,  # [tb, 1, tt, K + V] f32
+    s_in_ref,  # [tb, 1, K, V] f32
     # Scratch.
-    scratch_vmem_ref,  # [MB, K, V] float32
+    s_scratch_ref,  # [tb, K, V] f32   persists across the nt chunk grid axis
     *,
-    num_chunks: int,
+    nt: int,
 ) -> None:
-  """Single-pass MB-batched intra-chunk WY + in-VMEM state recurrence kernel."""
-  c = pl.program_id(1)
-  bt = q_vmem_ref.shape[2]
-  k_dim = q_vmem_ref.shape[3]
+  """Single-pass `tb`-batched intra-chunk WY + in-VMEM state recurrence kernel."""
+  t_i = pl.program_id(1)
+  _, _, tt, K = q_ref.shape
 
-  @pl.when(c == 0)
+  # Seed the persistent VMEM state buffer from `s0_ref` on the first chunk;
+  # subsequent chunks along axis 1 reuse `s_scratch_ref` in place without HBM round-trips.
+  @pl.when(t_i == 0)
   def _():
-    scratch_vmem_ref[...] = s0_vmem_ref[...].astype(jnp.float32)
+    s_scratch_ref[...] = s0_ref[...].astype(jnp.float32)
 
-  s_prev = scratch_vmem_ref[...]
-  s_in_vmem_ref[:, 0] = s_prev.astype(s_in_vmem_ref.dtype)
+  s_prev = s_scratch_ref[...]
+  s_in_ref[:, 0] = s_prev.astype(s_in_ref.dtype)
 
-  q_i = q_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  k_i = k_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  v_i = v_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
-  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  b_i = b_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  w_i = w_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  q_tile = q_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  k_tile = k_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  v_tile = v_ref[:, 0].astype(jnp.float32)  # [tb, tt, V]
+  g_tile = g_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  b_tile = b_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  w_tile = w_ref[:, 0].astype(jnp.float32)  # [tb, tt, V]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (bt, bt), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
   strictly_lower = (col_idx < row_idx).astype(jnp.float32)
   causal_keep = (col_idx <= row_idx).astype(jnp.float32)
 
-  bk = b_i * k_i
-  t_lower = -_decayed_gram(bk, k_i, g_i, g_i) * strictly_lower
+  bk = b_tile * k_tile
+  t_lower = -_decayed_gram(bk, k_tile, g_tile, g_tile) * strictly_lower
   a_mat = _unit_lower_inverse(t_lower)
 
-  exp_g = jnp.exp(g_i)
+  exp_g = jnp.exp(g_tile)
   k_g_b = exp_g * bk
-  wv = w_i * v_i
+  wv = w_tile * v_tile
+  # Concatenate `k_g_b` and `wv` along the feature axis so `(I + T)^{-1}` is
+  # applied to both WY factors in a single `[tb, tt, tt] x [tb, tt, K + V]` MXU matmul.
   merged_rhs = jnp.concatenate([k_g_b, wv], axis=-1)
   merged_out = jnp.matmul(
       a_mat,
@@ -174,34 +181,34 @@ def _gdn2_fwd_kernel(
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   )
-  aqk_i = _decayed_gram(q_i, k_i, g_i, g_i) * causal_keep
+  aqk_tile = _decayed_gram(q_tile, k_tile, g_tile, g_tile) * causal_keep
 
-  a_mat_vmem_ref[:, 0] = a_mat.astype(a_mat_vmem_ref.dtype)
-  merged_out_vmem_ref[:, 0] = merged_out.astype(merged_out_vmem_ref.dtype)
+  a_mat_ref[:, 0] = a_mat.astype(a_mat_ref.dtype)
+  merged_out_ref[:, 0] = merged_out.astype(merged_out_ref.dtype)
 
-  wwy_i = merged_out[:, :, :k_dim]
-  u_i = merged_out[:, :, k_dim:]
+  wwy_tile = merged_out[:, :, :K]
+  u_tile = merged_out[:, :, K:]
 
-  v_new = u_i - jnp.matmul(
-      wwy_i,
+  v_new = u_tile - jnp.matmul(
+      wwy_tile,
       s_prev,
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   )
-  o_i = jnp.matmul(
-      q_i * exp_g,
+  out_tile = jnp.matmul(
+      q_tile * exp_g,
       s_prev,
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   ) + jnp.matmul(
-      aqk_i,
+      aqk_tile,
       v_new,
       preferred_element_type=jnp.float32,
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  g_last = g_i[:, -1, :]  # [MB, K]
-  decayed_k = jnp.exp(g_last[:, None, :] - g_i) * k_i
+  g_last = g_tile[:, -1, :]  # [tb, K]
+  decayed_k = jnp.exp(g_last[:, None, :] - g_tile) * k_tile
   s_update = jnp.matmul(
       jnp.swapaxes(decayed_k, -1, -2),
       v_new,
@@ -210,12 +217,12 @@ def _gdn2_fwd_kernel(
   )
   s_new = s_prev * jnp.exp(g_last)[:, :, None] + s_update
 
-  scratch_vmem_ref[...] = s_new
-  o_vmem_ref[:, 0] = o_i.astype(o_vmem_ref.dtype)
+  s_scratch_ref[...] = s_new
+  out_ref[:, 0] = out_tile.astype(out_ref.dtype)
 
-  @pl.when(c == num_chunks - 1)
+  @pl.when(t_i == nt - 1)
   def _():
-    s_final_vmem_ref[...] = s_new.astype(s_final_vmem_ref.dtype)
+    s_final_ref[...] = s_new.astype(s_final_ref.dtype)
 
 
 def _gdn2_fwd_pallas(
@@ -228,42 +235,37 @@ def _gdn2_fwd_pallas(
     s0: jax.Array,
     out_dtype: Any,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-  """Runs fused single-pass MB-batched intra-chunk WY + state recurrence."""
-  bh, num_chunks, chunk_size, key_dim = q_c.shape
-  val_dim = v_c.shape[-1]
-  mb = _select_mb(bh)
-  grid = (bh // mb, num_chunks)
-  idx = lambda i, n: (i, n, 0, 0)  # noqa: E731
-  bspec_k = pl.BlockSpec((mb, 1, chunk_size, key_dim), idx)
-  bspec_v = pl.BlockSpec((mb, 1, chunk_size, val_dim), idx)
-  bspec_bt = pl.BlockSpec((mb, 1, chunk_size, chunk_size), idx)
-  bspec_merged = pl.BlockSpec((mb, 1, chunk_size, key_dim + val_dim), idx)
-  bspec_s = pl.BlockSpec((mb, key_dim, val_dim), lambda i, n: (i, 0, 0))
-  bspec_s_in = pl.BlockSpec((mb, 1, key_dim, val_dim), idx)
+  """Runs fused single-pass `tb`-batched intra-chunk WY + state recurrence."""
+  BH, nt, tt, K = q_c.shape
+  _, _, _, V = v_c.shape
+  tb = _select_tb(BH)
+  nb = BH // tb
+  grid = (nb, nt)
+  idx = lambda b_i, t_i: (b_i, t_i, 0, 0)  # noqa: E731
+  bspec_k = pl.BlockSpec((tb, 1, tt, K), idx)
+  bspec_v = pl.BlockSpec((tb, 1, tt, V), idx)
+  bspec_tt = pl.BlockSpec((tb, 1, tt, tt), idx)
+  bspec_merged = pl.BlockSpec((tb, 1, tt, K + V), idx)
+  bspec_s = pl.BlockSpec((tb, K, V), lambda b_i, t_i: (b_i, 0, 0))
+  bspec_s_in = pl.BlockSpec((tb, 1, K, V), idx)
 
   interpret = jax.default_backend() != "tpu"
   return pl.pallas_call(
-      functools.partial(_gdn2_fwd_kernel, num_chunks=num_chunks),
+      functools.partial(_gdn2_fwd_kernel, nt=nt),
       grid=grid,
       in_specs=[bspec_k, bspec_k, bspec_v, bspec_k, bspec_k, bspec_v, bspec_s],
-      out_specs=[bspec_v, bspec_s, bspec_bt, bspec_merged, bspec_s_in],
-      scratch_shapes=[pltpu.VMEM((mb, key_dim, val_dim), jnp.float32)],
+      out_specs=[bspec_v, bspec_s, bspec_tt, bspec_merged, bspec_s_in],
+      scratch_shapes=[pltpu.VMEM((tb, K, V), jnp.float32)],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary"),
           disable_bounds_checks=True,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct((bh, num_chunks, chunk_size, val_dim), out_dtype),
-          jax.ShapeDtypeStruct((bh, key_dim, val_dim), jnp.float32),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, chunk_size), q_c.dtype
-          ),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, key_dim + val_dim), jnp.float32
-          ),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, key_dim, val_dim), jnp.float32
-          ),
+          jax.ShapeDtypeStruct((BH, nt, tt, V), out_dtype),
+          jax.ShapeDtypeStruct((BH, K, V), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, tt), q_c.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, K + V), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, K, V), jnp.float32),
       ],
       interpret=interpret,
   )(q_c, k_c, v_c, g_c, b_c, w_c, s0)
@@ -282,57 +284,50 @@ def gdn2_pallas_fwd(
     initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     return_residuals: bool = False,
-) -> (
-    tuple[jax.Array, jax.Array | None]
-    | tuple[
-        tuple[jax.Array, jax.Array | None],
-        tuple[jax.Array, jax.Array, jax.Array],
-    ]
-):
-  """Computes GDN-2 forward pass using fused MB-batched Pallas kernel."""
-  batch_size, seq_len, num_heads, key_dim = q.shape
-  if chunk_size <= 0 or seq_len % chunk_size != 0:
+) -> tuple[Any, ...]:
+  """Computes GDN-2 forward pass using fused `tb`-batched Pallas kernel."""
+  B, T, H, K = q.shape
+  _, _, _, V = v.shape
+  if chunk_size <= 0 or T % chunk_size != 0:
     raise ValueError(
-        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+        f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
     )
   if chunk_size > 64:
     raise NotImplementedError(
         f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
     )
 
-  val_dim = v.shape[-1]
-  bh = batch_size * num_heads
-  num_chunks = seq_len // chunk_size
+  BH = B * H
+  tt = chunk_size
+  nt = T // tt
   if scale is None:
-    scale = key_dim**-0.5
+    scale = K**-0.5
 
-  q_c = _chunkify(
-      q.astype(jnp.float32) * scale, batch_size, num_chunks, chunk_size
-  ).astype(q.dtype)
-  k_c = _chunkify(k, batch_size, num_chunks, chunk_size)
-  v_c = _chunkify(v, batch_size, num_chunks, chunk_size)
+  q_c = _chunkify(q.astype(jnp.float32) * scale, B, nt, tt).astype(q.dtype)
+  k_c = _chunkify(k, B, nt, tt)
+  v_c = _chunkify(v, B, nt, tt)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
   )
-  b_c = _chunkify(b, batch_size, num_chunks, chunk_size)
-  w_c = _chunkify(w, batch_size, num_chunks, chunk_size)
+  b_c = _chunkify(b, B, nt, tt)
+  w_c = _chunkify(w, B, nt, tt)
 
   if initial_state is None:
-    s0 = jnp.zeros((bh, key_dim, val_dim), dtype=jnp.float32)
+    s0 = jnp.zeros((BH, K, V), dtype=jnp.float32)
   else:
-    s0 = initial_state.reshape((bh, key_dim, val_dim)).astype(jnp.float32)
+    s0 = initial_state.reshape((BH, K, V)).astype(jnp.float32)
 
-  o_c, s_final, a_mat_c, merged_out_c, s_in_c = _gdn2_fwd_pallas(
+  out_c, s_final, a_mat_c, merged_out_c, s_in_c = _gdn2_fwd_pallas(
       q_c, k_c, v_c, g_c, b_c, w_c, s0, v_c.dtype
   )
 
-  o = _unchunk(o_c, val_dim, batch_size, num_chunks, chunk_size, num_heads)
+  out = _unchunk(out_c, V, B, nt, tt, H)
   final_state = (
-      s_final.reshape((batch_size, num_heads, key_dim, val_dim)).astype(q.dtype)
+      s_final.reshape((B, H, K, V)).astype(q.dtype)
       if output_final_state
       else None
   )
   if return_residuals:
-    return (o, final_state), (a_mat_c, merged_out_c, s_in_c)
-  return o, final_state
+    return (out, final_state), (a_mat_c, merged_out_c, s_in_c)
+  return out, final_state

@@ -14,6 +14,13 @@
 # ==============================================================================
 """Experimental Gated Delta Net 2 (GDN-2) API."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+
 from collections.abc import Sequence
 from typing import Final, Literal, TypeAlias
 
@@ -89,14 +96,16 @@ def gated_delta_net_2(
     The final state has shape `[B, H, K, V]` when requested, otherwise `None`.
   """
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATIONS
+    implementations: Sequence[Implementation] = _DEFAULT_IMPLEMENTATIONS
   elif isinstance(implementation, str):
-    implementation = (implementation,)
+    implementations = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
+  else:
+    implementations = tuple(implementation)
 
   errors = []
-  for impl in implementation:
+  for impl in implementations:
     if impl == "mosaic":
       impl = "mosaic_tpu"
     if impl not in IMPLEMENTATIONS:
@@ -116,7 +125,7 @@ def gated_delta_net_2(
           output_final_state=output_final_state,
       )
     except NotImplementedError as e:
-      if len(implementation) == 1:
+      if len(implementations) == 1:
         raise
       errors.append(e)
 

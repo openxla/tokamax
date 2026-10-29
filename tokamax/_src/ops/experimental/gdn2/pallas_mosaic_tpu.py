@@ -15,11 +15,26 @@
 
 """Tokamax operator wrapper for GDN-2 Pallas TPU kernel."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length (nt * tt)
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+#   BH  flattened batch-head count (B * H)
+#   tt  tile extent of T (chunk_size)
+#   nt  grid extent along T (T // tt)
+
 import dataclasses
-from typing import Annotated, Any, ClassVar
+from typing import Any, ClassVar
 
 import jax
+from jaxtyping import (  # pylint: disable=g-multiple-import,g-importing-member
+    Array,
+    Float,
+)
 import pydantic
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.gdn2 import (
     base,
@@ -33,7 +48,13 @@ from typing_extensions import override
 class Config:
   """Autotuning and execution configuration for Pallas TPU GDN-2."""
 
-  chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
+  chunk_size: pydantic.PositiveInt = 64
+
+  def __post_init__(self) -> None:
+    if self.chunk_size & (self.chunk_size - 1) != 0:
+      raise ValueError(
+          f"chunk_size must be a power of 2, got {self.chunk_size}."
+      )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -56,16 +77,16 @@ class PallasTpuGatedDeltaNet2Vjp(
       residuals: base.Residuals,
       out: base.Output,
       dout: base.Output,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g: jax.Array,
-      b: jax.Array,
-      w: jax.Array,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      g: Float[Array, "B T H K"],
+      b: Float[Array, "B T H K"],
+      w: Float[Array, "B T H V"],
       *,
       chunk_size: int = 64,
       scale: float | None = None,
-      initial_state: jax.Array | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
@@ -117,7 +138,7 @@ class PallasTpuGatedDeltaNet2Vjp(
         s_in_c=s_in_c,
     )
 
-    grads = {
+    grads: dict[str, Any] = {
         "q": dq,
         "k": dk,
         "v": dv,
@@ -125,7 +146,7 @@ class PallasTpuGatedDeltaNet2Vjp(
         "b": db,
         "w": dw,
     }
-    if initial_state is not None:
+    if initial_state is not None and ds0 is not None:
       grads["initial_state"] = ds0
     return grads, None
 
@@ -141,19 +162,20 @@ class PallasTpuGatedDeltaNet2(base.GatedDeltaNet2[Config]):
   config_cls: ClassVar[type[Config]] = Config
   vjp: op.Op | None = PallasTpuGatedDeltaNet2Vjp()
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g: jax.Array,
-      b: jax.Array,
-      w: jax.Array,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      g: Float[Array, "B T H K"],
+      b: Float[Array, "B T H K"],
+      w: Float[Array, "B T H V"],
       *,
       chunk_size: int = 64,
       scale: float | None = None,
-      initial_state: jax.Array | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,

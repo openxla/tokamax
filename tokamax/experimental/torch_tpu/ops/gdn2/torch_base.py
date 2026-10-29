@@ -15,6 +15,15 @@
 
 """PyTorch interface for Gated Delta Net 2 (GDN-2) operator."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length (nt * tt)
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+#   tt  tile extent of T (chunk_size)
+#   nt  grid extent along T (T // tt)
+
 import math
 from typing import Any
 
@@ -51,6 +60,89 @@ class _FallbackTorchOp[Config]:
 _TorchOpBase = torch_op.TorchOp if torch_op is not None else _FallbackTorchOp
 
 
+def _gdn2_cpu_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    chunk_size: int = 64,
+    scale: float | None = None,
+) -> torch.Tensor:
+  """Pure PyTorch reference implementation for GDN-2."""
+  B, T, H, K = q.shape
+  _, _, _, V = v.shape
+  tt = chunk_size
+  nt = T // tt
+  resolved_scale = (K**-0.5) if scale is None else scale
+  outs = []
+
+  state = torch.zeros(
+      B,
+      H,
+      K,
+      V,
+      device=q.device,
+      dtype=torch.float32,
+  )
+  strictly_lower = torch.tril(
+      torch.ones(tt, tt, device=q.device), diagonal=-1
+  )
+  causal_mask = torch.tril(
+      torch.ones(tt, tt, device=q.device), diagonal=0
+  )
+  eye = torch.eye(tt, device=q.device)
+
+  for chunk_idx in range(nt):
+    start_idx = chunk_idx * tt
+    end_idx = (chunk_idx + 1) * tt
+    q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float() * resolved_scale
+    k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    g_c = g[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    b_c = b[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+    w_c = w[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
+
+    g_cs = torch.cumsum(g_c, dim=2)
+    bk = b_c * k_c
+    diff = torch.clamp(g_cs.unsqueeze(3) - g_cs.unsqueeze(2), max=80.0)
+    decay = torch.exp(diff)
+    t_mat = torch.sum(bk.unsqueeze(3) * k_c.unsqueeze(2) * decay, dim=-1)
+    t_mat = -t_mat * strictly_lower
+
+    p_mat = eye + t_mat
+    curr = t_mat
+    num_doubling_steps = max(0, math.ceil(math.log2(tt)) - 1)
+    for _ in range(num_doubling_steps):
+      curr = torch.matmul(curr, curr)
+      p_mat = torch.matmul(p_mat, eye + curr)
+    a_mat = p_mat
+
+    k_g_b = torch.exp(g_cs) * k_c * b_c
+    wv = w_c * v_c
+    merged_rhs = torch.cat([k_g_b, wv], dim=-1)
+    merged_out = torch.matmul(a_mat, merged_rhs)
+    wwy_chunk = merged_out[:, :, :, :K]
+    u_chunk = merged_out[:, :, :, K:]
+
+    qg = q_c.unsqueeze(3) * decay
+    aqk = torch.sum(qg * k_c.unsqueeze(2), dim=-1) * causal_mask
+
+    v_chunk = u_chunk - torch.matmul(wwy_chunk, state.to(u_chunk.dtype))
+    out_chunk = torch.matmul(
+        q_c * torch.exp(g_cs), state.to(q_c.dtype)
+    ) + torch.matmul(aqk, v_chunk)
+    outs.append(out_chunk.permute(0, 2, 1, 3).to(q.dtype))
+
+    g_last = g_cs[:, :, -1:, :]
+    decayed_k = torch.exp(g_last - g_cs) * k_c
+    s_update = torch.matmul(decayed_k.transpose(-1, -2), v_chunk)
+    state = state * torch.exp(g_last).transpose(-1, -2) + s_update
+
+  return torch.cat(outs, dim=1)
+
+
 class _GatedDeltaNet2[Config](_TorchOpBase[Config]):
   """PyTorch wrapper for base GDN-2 operator."""
 
@@ -83,9 +175,7 @@ class _GatedDeltaNet2[Config](_TorchOpBase[Config]):
       w: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> jax.Array:
-    del config
     assert self.op_impl_jax is not None, "Forward class not set."
     (out, _), _ = self.op_impl_jax._fwd(
         q, k, v, g, b, w, chunk_size=chunk_size, scale=scale
@@ -104,10 +194,10 @@ class _GatedDeltaNet2[Config](_TorchOpBase[Config]):
       chunk_size: int = 64,
       scale: float | None = None,
   ) -> torch.Tensor:
-    seq_len = q.shape[1]
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
+    _, T, _, _ = q.shape
+    if chunk_size <= 0 or T % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f"Sequence length ({T}) must be divisible by chunk_size"
           f" ({chunk_size})"
       )
 
@@ -115,94 +205,13 @@ class _GatedDeltaNet2[Config](_TorchOpBase[Config]):
       return self._torch_tokamax_op(
           q, k, v, g, b, w, chunk_size=chunk_size, scale=scale
       )
-    return self._cpu_fallback(
+    return _gdn2_cpu_fallback(
         q, k, v, g, b, w, chunk_size=chunk_size, scale=scale
     )
-
-  gdn2_pallas_delta_rule = __call__
-
-  def _cpu_fallback(
-      self,
-      q: torch.Tensor,
-      k: torch.Tensor,
-      v: torch.Tensor,
-      g: torch.Tensor,
-      b: torch.Tensor,
-      w: torch.Tensor,
-      chunk_size: int = 64,
-      scale: float | None = None,
-  ) -> torch.Tensor:
-    """Pure PyTorch reference implementation for GDN-2."""
-    batch_size, seq_len, num_heads, key_dim = q.shape
-    val_dim = v.shape[-1]
-    num_chunks = seq_len // chunk_size
-    resolved_scale = (key_dim**-0.5) if scale is None else scale
-    outs = []
-
-    state = torch.zeros(
-        batch_size,
-        num_heads,
-        key_dim,
-        val_dim,
-        device=q.device,
-        dtype=torch.float32,
-    )
-    strictly_lower = torch.tril(
-        torch.ones(chunk_size, chunk_size, device=q.device), diagonal=-1
-    )
-    causal_mask = torch.tril(
-        torch.ones(chunk_size, chunk_size, device=q.device), diagonal=0
-    )
-    eye = torch.eye(chunk_size, device=q.device)
-
-    for chunk_idx in range(num_chunks):
-      start_idx = chunk_idx * chunk_size
-      end_idx = (chunk_idx + 1) * chunk_size
-      q_c = q[:, start_idx:end_idx].permute(0, 2, 1, 3).float() * resolved_scale
-      k_c = k[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      v_c = v[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      g_c = g[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      b_c = b[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-      w_c = w[:, start_idx:end_idx].permute(0, 2, 1, 3).float()
-
-      g_cs = torch.cumsum(g_c, dim=2)
-      bk = b_c * k_c
-      diff = torch.clamp(g_cs.unsqueeze(3) - g_cs.unsqueeze(2), max=80.0)
-      decay = torch.exp(diff)
-      t_mat = torch.sum(bk.unsqueeze(3) * k_c.unsqueeze(2) * decay, dim=-1)
-      t_mat = -t_mat * strictly_lower
-
-      p_mat = eye + t_mat
-      curr = t_mat
-      num_doubling_steps = max(0, math.ceil(math.log2(chunk_size)) - 1)
-      for _ in range(num_doubling_steps):
-        curr = torch.matmul(curr, curr)
-        p_mat = torch.matmul(p_mat, eye + curr)
-      a_mat = p_mat
-
-      k_g_b = torch.exp(g_cs) * k_c * b_c
-      wv = w_c * v_c
-      merged_rhs = torch.cat([k_g_b, wv], dim=-1)
-      merged_out = torch.matmul(a_mat, merged_rhs)
-      wwy = merged_out[:, :, :, :key_dim]
-      u = merged_out[:, :, :, key_dim:]
-
-      qg = q_c.unsqueeze(3) * decay
-      aqk = torch.sum(qg * k_c.unsqueeze(2), dim=-1) * causal_mask
-
-      vi = u - torch.matmul(wwy, state.to(u.dtype))
-      oi = torch.matmul(
-          q_c * torch.exp(g_cs), state.to(q_c.dtype)
-      ) + torch.matmul(aqk, vi)
-      outs.append(oi.permute(0, 2, 1, 3).to(q.dtype))
-
-      g_last = g_cs[:, :, -1:, :]
-      decayed_k = torch.exp(g_last - g_cs) * k_c
-      s_update = torch.matmul(decayed_k.transpose(-1, -2), vi)
-      state = state * torch.exp(g_last).transpose(-1, -2) + s_update
-
-    return torch.cat(outs, dim=1)
 
 
 # Singleton instance for the base GDN-2 operator.
 gated_delta_net_2 = _GatedDeltaNet2[Any]()
+object.__setattr__(
+    gated_delta_net_2, "gdn2_pallas_delta_rule", gated_delta_net_2
+)

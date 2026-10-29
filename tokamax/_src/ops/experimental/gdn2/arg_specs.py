@@ -14,7 +14,7 @@
 # ==============================================================================
 """Gated Delta Net 2 (GDN-2) argument specifications."""
 
-from typing import Final
+from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +32,7 @@ def _gdn2_workload_spec(
     num_heads: int = 32,
     key_dim: int = 128,
     val_dim: int = 128,
-    dtype: jnp.dtype = jnp.bfloat16,
+    dtype: Any = jnp.bfloat16,
 ) -> arg_spec.ArgSpec:
   """Builds a representative GDN-2 workload."""
   qk_shape = (batch_size, seq_len, num_heads, key_dim)

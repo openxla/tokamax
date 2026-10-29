@@ -15,15 +15,29 @@
 
 """Base operator class for Gated Delta Net 2 (GDN-2)."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+
 import dataclasses
 from typing import Any, TypeAlias
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import (  # pylint: disable=g-multiple-import,g-importing-member
+    Array,
+    Float,
+)
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from typing_extensions import override
 
-Output: TypeAlias = tuple[jax.Array, jax.Array | None]
+Output: TypeAlias = tuple[
+    Float[Array, "B T H V"], Float[Array, "B H K V"] | None
+]
 Residuals: TypeAlias = Any
 
 
@@ -37,6 +51,7 @@ def _step_token(
   q_t, k_t, v_t, g_t, b_t, w_t = inputs
   state_decay = state * jnp.exp(g_t)[:, None]
   beta = b_t * k_t
+  # Pin HIGHEST precision so TPU does not lower f32 reference matmuls to bf16.
   v_pred = jnp.matmul(
       beta,
       state_decay,
@@ -55,34 +70,35 @@ def _step_token(
 
 
 def _scan_head(
-    q_i: jax.Array,
-    k_i: jax.Array,
-    v_i: jax.Array,
-    g_i: jax.Array,
-    b_i: jax.Array,
-    w_i: jax.Array,
+    q_h: jax.Array,
+    k_h: jax.Array,
+    v_h: jax.Array,
+    g_h: jax.Array,
+    b_h: jax.Array,
+    w_h: jax.Array,
     s0: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
   """Scans GDN-2 token-by-token recurrence across one head."""
   s_final, out_seq = jax.lax.scan(
-      _step_token, s0, (q_i, k_i, v_i, g_i, b_i, w_i)
+      _step_token, s0, (q_h, k_h, v_h, g_h, b_h, w_h)
   )
   return out_seq, s_final
 
 
+@jaxtyping.jaxtyped
 def gdn2_reference(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
-    b: jax.Array,
-    w: jax.Array,
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    v: Float[Array, "B T H V"],
+    g: Float[Array, "B T H K"],
+    b: Float[Array, "B T H K"],
+    w: Float[Array, "B T H V"],
     *,
     chunk_size: int = 64,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "B H K V"] | None = None,
     output_final_state: bool = False,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> Output:
   """Token-by-token recurrence reference implementation of GDN-2."""
   (out, final_state), _ = GatedDeltaNet2()._fwd(
       q,
@@ -109,32 +125,33 @@ class GatedDeltaNet2[C](op.Op[Any, Output, Residuals, C, None]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      v: jax.Array,
-      g: jax.Array,
-      b: jax.Array,
-      w: jax.Array,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      v: Float[Array, "B T H V"],
+      g: Float[Array, "B T H K"],
+      b: Float[Array, "B T H K"],
+      w: Float[Array, "B T H V"],
       *,
       chunk_size: int = 64,
       scale: float | None = None,
-      initial_state: jax.Array | None = None,
+      initial_state: Float[Array, "B H K V"] | None = None,
       output_final_state: bool = False,
       return_residuals: bool = False,
       config: C | None = None,
   ) -> tuple[Output, None]:
     del return_residuals, config
-    batch_size, seq_len, num_heads, key_dim = q.shape
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
+    B, T, H, K = q.shape
+    _, _, _, V = v.shape
+    if chunk_size <= 0 or T % chunk_size != 0:
       raise ValueError(
-          f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
+          f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})."
       )
-    val_dim = v.shape[-1]
     if scale is None:
-      scale = key_dim**-0.5
+      scale = K**-0.5
 
     q_bh = jnp.transpose(q, (0, 2, 1, 3)) * scale
     k_bh = jnp.transpose(k, (0, 2, 1, 3))
@@ -144,9 +161,7 @@ class GatedDeltaNet2[C](op.Op[Any, Output, Residuals, C, None]):
     w_bh = jnp.transpose(w, (0, 2, 1, 3))
 
     if initial_state is None:
-      s0 = jnp.zeros(
-          (batch_size, num_heads, key_dim, val_dim), dtype=jnp.float32
-      )
+      s0 = jnp.zeros((B, H, K, V), dtype=jnp.float32)
     else:
       s0 = initial_state.astype(jnp.float32)
 

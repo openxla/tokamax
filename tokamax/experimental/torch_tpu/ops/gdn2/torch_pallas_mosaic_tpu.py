@@ -15,6 +15,16 @@
 
 """PyTorch interface for Pallas TPU GDN-2 operator."""
 
+# Dimensions.
+#   B   batch size
+#   T   sequence length (nt * tt)
+#   H   number of attention heads
+#   K   key head dimension
+#   V   value head dimension
+#   BH  flattened batch-head count (B * H)
+#   tt  tile extent of T (chunk_size)
+#   nt  grid extent along T (T // tt)
+
 from collections.abc import Sequence
 from typing import Any
 
@@ -30,11 +40,11 @@ from typing_extensions import override
 Config = jax_pallas.Config
 
 
-def _torch_to_jax(t: torch.Tensor) -> jax.Array:
-  t_cpu = t.detach().cpu()
-  if t_cpu.dtype == torch.bfloat16:
-    return jnp.asarray(t_cpu.float().numpy()).astype(jnp.bfloat16)
-  return jnp.asarray(t_cpu.numpy())
+def _torch_to_jax(tensor: torch.Tensor) -> jax.Array:
+  tensor_cpu = tensor.detach().cpu()
+  if tensor_cpu.dtype == torch.bfloat16:
+    return jnp.asarray(tensor_cpu.float().numpy()).astype(jnp.bfloat16)
+  return jnp.asarray(tensor_cpu.numpy())
 
 
 def _jax_to_torch(
@@ -65,16 +75,16 @@ class _PallasTpuGatedDeltaNet2Vjp(torch_base._TorchOpBase[Config]):  # pylint: d
       return {"residuals": (empty, empty, empty), "out": empty, "dout": empty}
     q_meta = abstract_argument_dict["q"]
     v_meta = abstract_argument_dict["v"]
-    b_sz, seq_len, h_sz, k_dim = q_meta.shape
-    v_dim = v_meta.shape[-1]
-    bt = abstract_argument_dict.get("chunk_size", 64)
-    nt = seq_len // bt
-    bh = b_sz * h_sz
+    B, T, H, K = q_meta.shape
+    _, _, _, V = v_meta.shape
+    tt = abstract_argument_dict.get("chunk_size", 64)
+    nt = T // tt
+    BH = B * H
     return {
         "residuals": (
-            jax.ShapeDtypeStruct((bh, nt, bt, bt), q_meta.dtype),
-            jax.ShapeDtypeStruct((bh, nt, bt, k_dim + v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bh, nt, k_dim, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((BH, nt, tt, tt), q_meta.dtype),
+            jax.ShapeDtypeStruct((BH, nt, tt, K + V), jnp.float32),
+            jax.ShapeDtypeStruct((BH, nt, K, V), jnp.float32),
         ),
         "out": (v_meta, None),
         "dout": (v_meta, None),
@@ -95,11 +105,9 @@ class _PallasTpuGatedDeltaNet2Vjp(torch_base._TorchOpBase[Config]):  # pylint: d
       do: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> tuple[
       jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
   ]:
-    del config
     assert self.op_impl_jax is not None, "Backward class not set."
     dq, dk, dv, dg, db, dw, _ = pallas_mosaic_tpu_bwd_kernel.gdn2_pallas_bwd(
         q,
@@ -255,9 +263,7 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2[Config]):  # pylint: d
       w: jax.Array,
       chunk_size: int = 64,
       scale: float | None = None,
-      config: Any = None,
   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    del config
     assert self.op_impl_jax is not None, "Forward class not set."
     (out, _), residuals = self.op_impl_jax._fwd(
         q,
@@ -285,10 +291,10 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2[Config]):  # pylint: d
       chunk_size: int = 64,
       scale: float | None = None,
   ) -> torch.Tensor:
-    seq_len = q.shape[1]
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
+    _, T, _, _ = q.shape
+    if chunk_size <= 0 or T % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by chunk_size"
+          f"Sequence length ({T}) must be divisible by chunk_size"
           f" ({chunk_size})"
       )
 
@@ -300,8 +306,6 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2[Config]):  # pylint: d
     return _CpuPallasAutogradFn.apply(
         self, q, k, v, g, b, w, chunk_size, scale
     )
-
-  gdn2_pallas_delta_rule = __call__
 
   def setup_context(
       self, ctx: Any, inputs: Sequence[Any], output: Any
@@ -341,3 +345,4 @@ class _PallasTpuGatedDeltaNet2(torch_base._GatedDeltaNet2[Config]):  # pylint: d
 
 # Singleton instance
 gdn2 = _PallasTpuGatedDeltaNet2()
+object.__setattr__(gdn2, "gdn2_pallas_delta_rule", gdn2)
