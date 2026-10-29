@@ -19,8 +19,10 @@ import unittest
 from absl import logging
 from absl.testing import absltest
 import torch
-from tokamax.experimental.torch_tpu.ops.moba import moba as moba_pallas
 from tokamax.experimental.torch_tpu.ops.moba import torch_base
+from tokamax.experimental.torch_tpu.ops.moba import torch_pallas_mosaic_tpu
+
+moba_pallas = torch_pallas_mosaic_tpu.moba
 
 
 class MoBAPallasKernelTest(unittest.TestCase):
