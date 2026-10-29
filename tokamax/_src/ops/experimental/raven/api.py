@@ -15,9 +15,18 @@
 
 """Raven Gated Slot Attention (GSA) public API."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+
 from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal, TypeAlias
-import jax
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.raven import base
 
 Implementation: TypeAlias = Literal["mosaic_tpu", "xla"]
@@ -38,12 +47,13 @@ except ImportError:
 IMPLEMENTATIONS: Final[dict[str, Callable[..., Any]]] = IMPLEMENTATIONS  # type: ignore[misc]
 
 
+@jaxtyping.jaxtyped
 def raven_gsa(
-    q: jax.Array,
-    k: jax.Array,
-    s: jax.Array,
-    g: jax.Array,
-    v: jax.Array | None = None,
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    s: Float[Array, "B T H M"],
+    g: Float[Array, "B T H M"],
+    v: Float[Array, "B T H V"] | None = None,
     *,
     chunk_size: int = 64,
     scale: float | None = None,
@@ -65,7 +75,7 @@ def raven_gsa(
     v: Optional value tensor of shape ``[B, T, H, V]``. When omitted, only
       Stage 1 slot logits ``[B, T, H, M]`` are computed. When provided, runs
       the full two-stage GSA recurrence (Stage 1 -> slot softmax -> Stage 2).
-    chunk_size: Intra-chunk block size ``BT`` dividing ``T``.
+    chunk_size: Intra-chunk tile size ``tt`` dividing ``T``.
     scale: Optional multiplicative scaling factor applied to ``q``.
     initial_state: Optional initial recurrent state ``[B, H, K, M]`` (for
       Stage 1) or ``(s1_0, s2_0)`` (for full two-stage GSA).
@@ -77,14 +87,18 @@ def raven_gsa(
     A tuple ``(output, final_state)``.
   """
   if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATION
-  elif not isinstance(implementation, (tuple, list)):
-    implementation = (implementation,)
+    implementations: Sequence[str | Callable[..., Any]] = (
+        _DEFAULT_IMPLEMENTATION
+    )
+  elif isinstance(implementation, str) or callable(implementation):
+    implementations = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
+  else:
+    implementations = tuple(implementation)
 
   errors: list[Exception] = []
-  for impl in implementation:
+  for impl in implementations:
     if isinstance(impl, str):
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f"Unknown implementation: {impl}")
@@ -105,7 +119,7 @@ def raven_gsa(
           output_final_state=output_final_state,
       )
     except NotImplementedError as e:
-      if len(implementation) == 1:
+      if len(implementations) == 1:
         raise
       errors.append(e)
 

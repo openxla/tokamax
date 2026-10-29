@@ -15,14 +15,23 @@
 
 """PyTorch interface for Pallas TPU Raven GSA operator."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+#   tt     tile extent of T (chunk_size)
+
 from collections.abc import Sequence
 from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
 from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu as jax_pallas
 from tokamax.experimental.torch_tpu.ops.raven import torch_base
+import torch
 from typing_extensions import override
 
 Config = jax_pallas.Config
@@ -70,23 +79,21 @@ class _PallasTpuRavenGSAVjp(torch_base._TorchOpBase[Config]):  # pylint: disable
       v: jax.Array | None = None,
       chunk_size: int = 64,
       scale: float | None = None,
-      residuals: tuple[Any, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
     assert self.op_impl_jax is not None, "Backward JAX op not set."
-    if residuals is None:
-      residuals = (
-          q,
-          k,
-          s,
-          g,
-          v,
-          None,
-          None,
-          None,
-          None,
-          chunk_size,
-          scale,
-      )
+    residuals = (
+        q,
+        k,
+        s,
+        g,
+        v,
+        None,
+        None,
+        None,
+        None,
+        chunk_size,
+        scale,
+    )
     grads, _ = self.op_impl_jax._fwd(
         residuals,
         (grad_out, None),
@@ -232,22 +239,28 @@ class _RavenPallasInterpretAutograd(torch.autograd.Function):
   ]:
     owner: _PallasTpuRavenGSA = ctx.owner
     assert owner.backward_op_torch is not None
+    assert owner.backward_op_torch.op_impl_jax is not None
     res_q, res_k, res_s, res_g, res_v = ctx.residuals[:5]
     grad_out_jax = _torch_to_jax(grad_out)
     assert grad_out_jax is not None
-    dq_jax, dk_jax, ds_jax, dg_jax, dv_jax = (
-        owner.backward_op_torch.op_impl_call(
-            res_q,
-            res_k,
-            res_s,
-            res_g,
-            grad_out_jax,
-            v=res_v,
-            chunk_size=ctx.chunk_size,
-            scale=ctx.scale,
-            residuals=ctx.residuals,
-        )
+    grads, _ = owner.backward_op_torch.op_impl_jax._fwd(
+        ctx.residuals,
+        (grad_out_jax, None),
+        (grad_out_jax, None),
+        res_q,
+        res_k,
+        res_s,
+        res_g,
+        res_v,
+        chunk_size=ctx.chunk_size,
+        scale=ctx.scale,
+        config=Config(chunk_size=ctx.chunk_size),
     )
+    dq_jax = grads["q"]
+    dk_jax = grads["k"]
+    ds_jax = grads["s"]
+    dg_jax = grads["g"]
+    dv_jax = grads.get("v")
     dq = _jax_to_torch(dq_jax, *ctx.q_meta)
     dk = _jax_to_torch(dk_jax, *ctx.k_meta)
     ds = _jax_to_torch(ds_jax, *ctx.s_meta)
@@ -257,7 +270,9 @@ class _RavenPallasInterpretAutograd(torch.autograd.Function):
         if ctx.has_v and ctx.v_meta is not None
         else None
     )
-    assert dq is not None and dk is not None and ds is not None and dg is not None
+    assert (
+        dq is not None and dk is not None and ds is not None and dg is not None
+    )
     return None, dq, dk, ds, dg, dv, None, None
 
 
@@ -357,10 +372,10 @@ class _PallasTpuRavenGSA(torch_base._RavenGSA[Config]):
       raise ValueError(
           f"Expected 4D input (batch, seq_len, heads, dim), got {q.shape}."
       )
-    seq_len = q.shape[1]
-    if chunk_size <= 0 or seq_len % chunk_size != 0:
+    _, T, _, _ = q.shape
+    if chunk_size <= 0 or T % chunk_size != 0:
       raise ValueError(
-          f"Sequence length ({seq_len}) must be divisible by positive"
+          f"Sequence length ({T}) must be divisible by positive"
           f" chunk_size ({chunk_size})."
       )
 
@@ -374,8 +389,7 @@ class _PallasTpuRavenGSA(torch_base._RavenGSA[Config]):
         self, q, k, s, g, v, chunk_size, scale
     )
 
-  raven_pallas_gsa = __call__
-
 
 # Singleton instance
 raven_gsa = _PallasTpuRavenGSA()
+object.__setattr__(raven_gsa, "raven_pallas_gsa", raven_gsa)

@@ -15,10 +15,21 @@
 
 """Tokamax operator wrapper for Raven GSA Pallas TPU kernel."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+#   tt     tile extent of T (chunk_size)
+
 import dataclasses
-from typing import Annotated, Any, ClassVar
+from typing import Any, ClassVar
 import jax
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.experimental.raven import (
     base,
@@ -32,7 +43,7 @@ from typing_extensions import override
 class Config:
   """Autotuning and execution configuration for Pallas TPU Raven."""
 
-  chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
+  chunk_size: pydantic.PositiveInt = 64
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -56,11 +67,11 @@ class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
       residuals: tuple[Any, ...],
       out: base.Output,
       dout: base.Output,
-      q: jax.Array,
-      k: jax.Array,
-      s: jax.Array,
-      g: jax.Array,
-      v: jax.Array | None = None,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      s: Float[Array, "B T H M"],
+      g: Float[Array, "B T H M"],
+      v: Float[Array, "B T H V"] | None = None,
       *,
       chunk_size: int = 64,
       scale: float | None = None,
@@ -69,20 +80,8 @@ class PallasTpuRavenGSAVjp(op.Op[Any, dict[str, Any], None, Config, Any]):
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[dict[str, Any], None]:
-    del (
-        out,
-        q,
-        k,
-        s,
-        g,
-        v,
-        chunk_size,
-        scale,
-        initial_state,
-        output_final_state,
-        return_residuals,
-        config,
-    )
+    del out, q, k, s, g, v, chunk_size, scale
+    del initial_state, output_final_state, return_residuals, config
     (
         res_q,
         res_k,
@@ -128,14 +127,15 @@ class PallasTpuRavenGSA(base.RavenGSA[Config]):
   config_cls: ClassVar[type[Config]] = Config
   vjp: op.Op | None = PallasTpuRavenGSAVjp()
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      s: jax.Array,
-      g: jax.Array,
-      v: jax.Array | None = None,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      s: Float[Array, "B T H M"],
+      g: Float[Array, "B T H M"],
+      v: Float[Array, "B T H V"] | None = None,
       *,
       chunk_size: int = 64,
       scale: float | None = None,

@@ -15,37 +15,54 @@
 
 """Base operator and JAX reference for Raven Gated Slot Attention (GSA)."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+#   tt     tile extent of T (chunk_size)
+#   nt     grid extent along T: nt = T // tt
+
 import dataclasses
 from typing import Any, TypeAlias, TypeVar
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from typing_extensions import override
 
 _CHUNK_SIZE = 64
 _Config = TypeVar("_Config")
-State: TypeAlias = jax.Array | tuple[jax.Array | None, jax.Array | None] | None
-Output: TypeAlias = tuple[jax.Array, State]
+State: TypeAlias = (
+    Float[Array, "B H K M"]
+    | tuple[
+        Float[Array, "B H K M"] | None,
+        Float[Array, "B H M V"] | None,
+    ]
+    | None
+)
+Output: TypeAlias = tuple[
+    Float[Array, "B T H M"] | Float[Array, "B T H V"],
+    State,
+]
 Residuals: TypeAlias = Any
 
 
-def _validate_chunk_size(seq_len: int, chunk_size: int) -> None:
+def _validate_chunk_size(T: int, tt: int) -> None:
   """Validates that ``chunk_size`` is positive and divides ``seq_len``."""
-  if chunk_size <= 0:
-    raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-  if seq_len % chunk_size != 0:
-    raise ValueError(
-        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
-    )
+  if tt <= 0:
+    raise ValueError(f"chunk_size must be positive, got {tt}.")
+  if T % tt != 0:
+    raise ValueError(f"seq_len ({T}) must be divisible by chunk_size ({tt}).")
 
 
-def _chunkify(
-    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
-) -> jax.Array:
-  # (batch_size, seq_len, num_heads, ...) ->
-  # (batch_size, num_heads, num_chunks, chunk_size, ...)
-  rest = x.shape[3:]
-  x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
+def _chunkify(x: jax.Array, B: int, nt: int, tt: int) -> jax.Array:
+  # [B, T, H, ...] -> [B, H, nt, tt, ...]
+  _, _, H, *rest = x.shape
+  x = x.reshape((B, nt, tt, H, *rest))
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   return jnp.transpose(x, perm)
 
@@ -73,8 +90,8 @@ def _stage1_scan_step(
 def _stage1_intra_one_plain(
     q_i: jax.Array, k_i: jax.Array, s_i: jax.Array, g_i: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-  chunk_size = q_i.shape[0]
-  mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
+  tt, _ = q_i.shape
+  mask_upper = jnp.triu(jnp.ones((tt, tt), dtype=bool), k=1)
   qk = jnp.where(
       mask_upper,
       0.0,
@@ -91,7 +108,7 @@ def _stage1_intra_one_plain(
   decay = jnp.exp(diff)
   y_diag = jnp.sum(qk[:, :, None] * decay * s_i[None, :, :], axis=1)
   g_last = g_i[-1]
-  mask_last = (jnp.arange(chunk_size) == (chunk_size - 1))[:, None]
+  mask_last = (jnp.arange(tt) == (tt - 1))[:, None]
   decay_tail = jnp.exp(jnp.where(mask_last, 0.0, g_last[None, :] - g_i))
   state_contrib = jnp.matmul(
       k_i.T,
@@ -103,34 +120,33 @@ def _stage1_intra_one_plain(
 
 
 def raven_stage1_reference(
-    q: jax.Array,
-    k: jax.Array,
-    s: jax.Array,
-    g: jax.Array,
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    s: Float[Array, "B T H M"],
+    g: Float[Array, "B T H M"],
     *,
     chunk_size: int = _CHUNK_SIZE,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "B H K M"] | None = None,
     output_final_state: bool = False,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> tuple[Float[Array, "B T H M"], Float[Array, "B H K M"] | None]:
   """Stage 1 reference: decay on slot output (M) axis."""
-  batch_size, seq_len, num_heads, key_dim = q.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  num_slots = s.shape[-1]
-  num_chunks = seq_len // chunk_size
+  B, T, H, K = q.shape
+  _, _, _, M = s.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
 
   if scale is not None:
     q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
   else:
     q_scaled = q
 
-  q_c = _chunkify(
-      q_scaled.astype(jnp.float32), batch_size, num_chunks, chunk_size
-  )
-  k_c = _chunkify(k.astype(jnp.float32), batch_size, num_chunks, chunk_size)
-  s_c = _chunkify(s.astype(jnp.float32), batch_size, num_chunks, chunk_size)
+  q_c = _chunkify(q_scaled.astype(jnp.float32), B, nt, tt)
+  k_c = _chunkify(k.astype(jnp.float32), B, nt, tt)
+  s_c = _chunkify(s.astype(jnp.float32), B, nt, tt)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
   )
 
@@ -145,9 +161,7 @@ def raven_stage1_reference(
   scan_body_batched = jax.vmap(jax.vmap(_stage1_scan_step))
 
   if initial_state is None:
-    initial_recurrent_state = jnp.zeros(
-        (batch_size, num_heads, key_dim, num_slots), dtype=jnp.float32
-    )
+    initial_recurrent_state = jnp.zeros((B, H, K, M), dtype=jnp.float32)
   else:
     initial_recurrent_state = initial_state.astype(jnp.float32)
 
@@ -157,11 +171,7 @@ def raven_stage1_reference(
       (q_s, g_s, y_diag_s, state_contrib_s, g_last_s),
   )
   o = jnp.moveaxis(o_stacked, 0, 2)
-  o = (
-      jnp.transpose(o, (0, 2, 3, 1, 4))
-      .reshape(batch_size, seq_len, num_heads, num_slots)
-      .astype(s.dtype)
-  )
+  o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(B, T, H, M).astype(s.dtype)
   final_state = s_final.astype(q.dtype) if output_final_state else None
   return o, final_state
 
@@ -185,8 +195,8 @@ def _stage2_scan_step(
 def _stage2_intra_one_plain(
     qv_i: jax.Array, s_i: jax.Array, v_i: jax.Array, g_i: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-  chunk_size = qv_i.shape[0]
-  mask_upper = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
+  tt, _ = qv_i.shape
+  mask_upper = jnp.triu(jnp.ones((tt, tt), dtype=bool), k=1)
   diff = jnp.where(
       mask_upper[:, :, None], 0.0, g_i[:, None, :] - g_i[None, :, :]
   )
@@ -207,7 +217,7 @@ def _stage2_intra_one_plain(
       precision=jax.lax.Precision.HIGHEST,
   )
   g_last = g_i[-1]
-  mask_last = (jnp.arange(chunk_size) == (chunk_size - 1))[:, None]
+  mask_last = (jnp.arange(tt) == (tt - 1))[:, None]
   decay_tail = jnp.exp(jnp.where(mask_last, 0.0, g_last[None, :] - g_i))
   state_contrib = jnp.matmul(
       (s_i * decay_tail).T,
@@ -219,26 +229,27 @@ def _stage2_intra_one_plain(
 
 
 def raven_stage2_reference(
-    qv: jax.Array,
-    s: jax.Array,
-    v: jax.Array,
-    g: jax.Array,
+    qv: Float[Array, "B T H M"],
+    s: Float[Array, "B T H M"],
+    v: Float[Array, "B T H V"],
+    g: Float[Array, "B T H M"],
     *,
     chunk_size: int = _CHUNK_SIZE,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "B H M V"] | None = None,
     output_final_state: bool = False,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> tuple[Float[Array, "B T H V"], Float[Array, "B H M V"] | None]:
   """Stage 2 reference: decay on slot input (M) axis, output on value (V) axis."""
-  batch_size, seq_len, num_heads, num_slots = qv.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  val_dim = v.shape[-1]
-  num_chunks = seq_len // chunk_size
+  B, T, H, M = qv.shape
+  _, _, _, V = v.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
 
-  qv_c = _chunkify(qv.astype(jnp.float32), batch_size, num_chunks, chunk_size)
-  s_c = _chunkify(s.astype(jnp.float32), batch_size, num_chunks, chunk_size)
-  v_c = _chunkify(v.astype(jnp.float32), batch_size, num_chunks, chunk_size)
+  qv_c = _chunkify(qv.astype(jnp.float32), B, nt, tt)
+  s_c = _chunkify(s.astype(jnp.float32), B, nt, tt)
+  v_c = _chunkify(v.astype(jnp.float32), B, nt, tt)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
   )
 
@@ -253,9 +264,7 @@ def raven_stage2_reference(
   scan_body_batched = jax.vmap(jax.vmap(_stage2_scan_step))
 
   if initial_state is None:
-    initial_recurrent_state = jnp.zeros(
-        (batch_size, num_heads, num_slots, val_dim), dtype=jnp.float32
-    )
+    initial_recurrent_state = jnp.zeros((B, H, M, V), dtype=jnp.float32)
   else:
     initial_recurrent_state = initial_state.astype(jnp.float32)
 
@@ -265,21 +274,18 @@ def raven_stage2_reference(
       (qv_s, g_s, y_diag_s, state_contrib_s, g_last_s),
   )
   o = jnp.moveaxis(o_stacked, 0, 2)
-  o = (
-      jnp.transpose(o, (0, 2, 3, 1, 4))
-      .reshape(batch_size, seq_len, num_heads, val_dim)
-      .astype(v.dtype)
-  )
+  o = jnp.transpose(o, (0, 2, 3, 1, 4)).reshape(B, T, H, V).astype(v.dtype)
   final_state = s_final.astype(v.dtype) if output_final_state else None
   return o, final_state
 
 
+@jaxtyping.jaxtyped
 def raven_gsa_reference(
-    q: jax.Array,
-    k: jax.Array,
-    s: jax.Array,
-    g: jax.Array,
-    v: jax.Array | None = None,
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    s: Float[Array, "B T H M"],
+    g: Float[Array, "B T H M"],
+    v: Float[Array, "B T H V"] | None = None,
     *,
     chunk_size: int = _CHUNK_SIZE,
     scale: float | None = None,
@@ -343,14 +349,15 @@ class RavenGSA[C](op.Op[Any, Output, Residuals, C, None]):
 
   supports_symbolic_shapes = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
-      q: jax.Array,
-      k: jax.Array,
-      s: jax.Array,
-      g: jax.Array,
-      v: jax.Array | None = None,
+      q: Float[Array, "B T H K"],
+      k: Float[Array, "B T H K"],
+      s: Float[Array, "B T H M"],
+      g: Float[Array, "B T H M"],
+      v: Float[Array, "B T H V"] | None = None,
       *,
       chunk_size: int = _CHUNK_SIZE,
       scale: float | None = None,

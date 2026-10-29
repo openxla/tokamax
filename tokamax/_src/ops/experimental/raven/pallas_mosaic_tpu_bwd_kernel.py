@@ -15,6 +15,19 @@
 
 """Analytical backward pass kernels for Raven Gated Slot Attention (GSA)."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   BH     flattened batch * heads (B * H)
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+#   tb     tile extent of BH (stream-batching factor per Pallas program)
+#   tt     tile extent of T (chunk_size)
+#   nb     grid extent along BH: nb = BH // tb
+#   nt     grid extent along T: nt = T // tt
+
 import functools
 
 import jax
@@ -24,22 +37,10 @@ import jax.numpy as jnp
 
 from tokamax._src.ops.experimental.raven import pallas_mosaic_tpu_kernel
 
-# Dimensions:
-#   B: batch size
-#   T: sequence length (seq_len)
-#   H: number of attention heads (num_heads)
-#   BH: flattened batch * heads (B * H)
-#   MB: stream-batching factor per Pallas program instance
-#   NT: number of chunks along sequence length (T // BT)
-#   BT: chunk size (chunk_size)
-#   K: key/query head dimension (key_dim)
-#   M: number of memory slots (num_slots)
-#   V: value head dimension (val_dim)
-
 _CHUNK_SIZE = 64
 _validate_chunk_size = pallas_mosaic_tpu_kernel._validate_chunk_size
 _resolve_interpret = pallas_mosaic_tpu_kernel._resolve_interpret
-_select_mb = pallas_mosaic_tpu_kernel._select_mb
+_select_tb = pallas_mosaic_tpu_kernel._select_tb
 _chunkify = pallas_mosaic_tpu_kernel._chunkify
 _unchunk = pallas_mosaic_tpu_kernel._unchunk
 _decayed_gram = pallas_mosaic_tpu_kernel._decayed_gram
@@ -118,44 +119,43 @@ def _decayed_apply_bwd(
 
 def _stage1_bwd_kernel(
     # Inputs.
-    q_vmem_ref,  # [MB, 1, BT, K]
-    k_vmem_ref,  # [MB, 1, BT, K]
-    s_vmem_ref,  # [MB, 1, BT, M]
-    g_vmem_ref,  # [MB, 1, BT, M]
-    do_vmem_ref,  # [MB, 1, BT, M]
-    s1_in_vmem_ref,  # [MB, 1, K, M] f32
-    d_s1_final_vmem_ref,  # [MB, K, M] f32
+    q_ref,  # [tb, 1, tt, K] bf16/f32  reverse chunk order via index_map
+    k_ref,  # [tb, 1, tt, K] bf16/f32  reverse chunk order via index_map
+    s_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    g_ref,  # [tb, 1, tt, M] f32       reverse chunk order via index_map
+    do_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    s1_in_ref,  # [tb, 1, K, M] f32        reverse chunk order via index_map
+    ds1_final_ref,  # [tb, K, M] f32
     # Outputs.
-    dq_vmem_ref,  # [MB, 1, BT, K] f32
-    dk_vmem_ref,  # [MB, 1, BT, K]
-    ds_vmem_ref,  # [MB, 1, BT, M]
-    dg_vmem_ref,  # [MB, 1, BT, M]
-    ds0_vmem_ref,  # [MB, K, M] f32
+    dq_ref,  # [tb, 1, tt, K] f32       reverse chunk order via index_map
+    dk_ref,  # [tb, 1, tt, K] bf16/f32  reverse chunk order via index_map
+    ds_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    dg_ref,  # [tb, 1, tt, M] f32       reverse chunk order via index_map
+    ds0_ref,  # [tb, K, M] f32
     # Scratch.
-    scratch_vmem_ref,  # [MB, K, M] f32
+    ds1_scratch_ref,  # [tb, K, M] f32   persists across the reverse nt grid axis
     *,
-    num_chunks: int,
+    nt: int,
 ) -> None:
-  """Fused single-pass MB-batched reverse recurrence backward kernel for Raven Stage 1."""
-  # Dimensions.
-  chunk_size = q_vmem_ref.shape[2]
-  rev_chunk_idx = pl.program_id(1)
+  """Fused single-pass tb-batched reverse recurrence backward kernel for Raven Stage 1."""
+  rev_t_i = pl.program_id(1)
+  _, _, tt, _ = q_ref.shape
 
-  @pl.when(rev_chunk_idx == 0)
-  def _() -> None:
-    scratch_vmem_ref[...] = d_s1_final_vmem_ref[...].astype(jnp.float32)
+  @pl.when(rev_t_i == 0)
+  def _():
+    ds1_scratch_ref[...] = ds1_final_ref[...].astype(jnp.float32)
 
-  ds1_out = scratch_vmem_ref[...]  # [MB, K, M]
-  s1_in = s1_in_vmem_ref[:, 0].astype(jnp.float32)  # [MB, K, M]
+  ds1_out = ds1_scratch_ref[...]  # [tb, K, M]
+  s1_in = s1_in_ref[:, 0].astype(jnp.float32)  # [tb, K, M]
 
-  q_i = q_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  k_i = k_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  do_i = do_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  q_i = q_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  k_i = k_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  s_i = s_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  g_i = g_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  do_i = do_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
   upper_tri = (row_idx <= col_idx).astype(jnp.float32)
 
@@ -181,15 +181,10 @@ def _stage1_bwd_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  g_last = g_i[:, -1, :]  # [MB, M]
+  g_last = g_i[:, -1, :]  # [tb, M]
   exp_glast = jnp.exp(g_last)
   ds_next_last = jnp.sum(ds1_out * s1_in * exp_glast[:, None, :], axis=1)
   ds1_prev = ds1_out * exp_glast[:, None, :] + ds1_from_off
-  scratch_vmem_ref[...] = ds1_prev
-
-  @pl.when(rev_chunk_idx == num_chunks - 1)
-  def _() -> None:
-    ds0_vmem_ref[...] = ds1_prev.astype(ds0_vmem_ref.dtype)
 
   qk = (
       jnp.matmul(
@@ -232,14 +227,12 @@ def _stage1_bwd_kernel(
   d_tail_exp = du * u
 
   mask_strictly_prior = (
-      jax.lax.broadcasted_iota(jnp.int32, (1, chunk_size, 1), 1)
-      < (chunk_size - 1)
+      jax.lax.broadcasted_iota(jnp.int32, (1, tt, 1), 1) < (tt - 1)
   ).astype(jnp.float32)
   dg_tail = -d_tail_exp * mask_strictly_prior
   dg_last_tail = jnp.sum(d_tail_exp * mask_strictly_prior, axis=1)
   mask_last = (
-      jax.lax.broadcasted_iota(jnp.int32, (1, chunk_size, 1), 1)
-      == (chunk_size - 1)
+      jax.lax.broadcasted_iota(jnp.int32, (1, tt, 1), 1) == (tt - 1)
   ).astype(jnp.float32)
 
   dq_i = dq_diag + dq_off
@@ -251,6 +244,7 @@ def _stage1_bwd_kernel(
       + dg_off
       + mask_last * (dg_last_tail + ds_next_last)[:, None, :]
   )
+  # Reverse cumulative sum within the chunk via upper-triangular MXU matmul.
   dg_raw_i = jnp.matmul(
       upper_tri,
       dg_i,
@@ -258,10 +252,15 @@ def _stage1_bwd_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  dq_vmem_ref[:, 0] = dq_i.astype(dq_vmem_ref.dtype)
-  dk_vmem_ref[:, 0] = dk_i.astype(dk_vmem_ref.dtype)
-  ds_vmem_ref[:, 0] = ds_i.astype(ds_vmem_ref.dtype)
-  dg_vmem_ref[:, 0] = dg_raw_i.astype(dg_vmem_ref.dtype)
+  ds1_scratch_ref[...] = ds1_prev
+  dq_ref[:, 0] = dq_i.astype(dq_ref.dtype)
+  dk_ref[:, 0] = dk_i.astype(dk_ref.dtype)
+  ds_ref[:, 0] = ds_i.astype(ds_ref.dtype)
+  dg_ref[:, 0] = dg_raw_i.astype(dg_ref.dtype)
+
+  @pl.when(rev_t_i == nt - 1)
+  def _():
+    ds0_ref[...] = ds1_prev.astype(ds0_ref.dtype)
 
 
 def raven_pallas_stage1_bwd(
@@ -278,12 +277,14 @@ def raven_pallas_stage1_bwd(
     s1_in_c: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
   """Analytical closed-form backward pass for Raven Stage 1 using Pallas TPU."""
-  batch_size, seq_len, num_heads, key_dim = q.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  num_slots = s.shape[-1]
-  num_chunks = seq_len // chunk_size
-  bh = batch_size * num_heads
-  mb = _select_mb(bh)
+  B, T, H, K = q.shape
+  _, _, _, M = s.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
+  BH = B * H
+  tb = _select_tb(BH)
+  nb = BH // tb
 
   if s1_in_c is None:
     _, s1_in_c = pallas_mosaic_tpu_kernel.raven_pallas_stage1_fwd(
@@ -291,53 +292,44 @@ def raven_pallas_stage1_bwd(
         k,
         s,
         g,
-        chunk_size=chunk_size,
+        chunk_size=tt,
         scale=scale,
         initial_state=initial_state,
         output_final_state=False,
         return_residuals=True,
     )
+  assert s1_in_c is not None
 
   if scale is not None:
     q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
   else:
     q_scaled = q
 
-  q_c = _chunkify(q_scaled, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, key_dim
-  )
-  k_c = _chunkify(k, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, key_dim
-  )
-  s_c = _chunkify(s, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
+  q_c = _chunkify(q_scaled, B, nt, tt).reshape(BH, nt, tt, K)
+  k_c = _chunkify(k, B, nt, tt).reshape(BH, nt, tt, K)
+  s_c = _chunkify(s, B, nt, tt).reshape(BH, nt, tt, M)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
-  ).reshape(bh, num_chunks, chunk_size, num_slots)
-  do_c = _chunkify(grad_out, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
-  s1_in_bh = s1_in_c.reshape(bh, num_chunks, key_dim, num_slots)
+  ).reshape(BH, nt, tt, M)
+  do_c = _chunkify(grad_out, B, nt, tt).reshape(BH, nt, tt, M)
+  s1_in_bh = s1_in_c.reshape(BH, nt, K, M)
 
   if grad_final_state is None:
-    ds1_final = jnp.zeros((bh, key_dim, num_slots), dtype=jnp.float32)
+    ds1_final = jnp.zeros((BH, K, M), dtype=jnp.float32)
   else:
-    ds1_final = grad_final_state.astype(jnp.float32).reshape(
-        bh, key_dim, num_slots
-    )
+    ds1_final = grad_final_state.astype(jnp.float32).reshape(BH, K, M)
 
-  grid = (bh // mb, num_chunks)
-  rev_idx = lambda i, n: (i, num_chunks - 1 - n, 0, 0)  # noqa: E731
-  bspec_k = pl.BlockSpec((mb, 1, chunk_size, key_dim), rev_idx)
-  bspec_m = pl.BlockSpec((mb, 1, chunk_size, num_slots), rev_idx)
-  bspec_s_in = pl.BlockSpec((mb, 1, key_dim, num_slots), rev_idx)
-  bspec_s = pl.BlockSpec((mb, key_dim, num_slots), lambda i, n: (i, 0, 0))
+  grid = (nb, nt)
+  rev_idx = lambda b_i, rev_t_i: (b_i, nt - 1 - rev_t_i, 0, 0)  # noqa: E731
+  bspec_k = pl.BlockSpec((tb, 1, tt, K), rev_idx)
+  bspec_m = pl.BlockSpec((tb, 1, tt, M), rev_idx)
+  bspec_s_in = pl.BlockSpec((tb, 1, K, M), rev_idx)
+  bspec_s = pl.BlockSpec((tb, K, M), lambda b_i, rev_t_i: (b_i, 0, 0))
 
   interpret = _resolve_interpret()
   dq_c, dk_c, ds_c, dg_raw_c, ds0 = pl.pallas_call(
-      functools.partial(_stage1_bwd_kernel, num_chunks=num_chunks),
+      functools.partial(_stage1_bwd_kernel, nt=nt),
       grid=grid,
       in_specs=[
           bspec_k,
@@ -349,64 +341,28 @@ def raven_pallas_stage1_bwd(
           bspec_s,
       ],
       out_specs=[bspec_k, bspec_k, bspec_m, bspec_m, bspec_s],
-      scratch_shapes=[pltpu.VMEM((mb, key_dim, num_slots), jnp.float32)],
+      scratch_shapes=[pltpu.VMEM((tb, K, M), jnp.float32)],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary"),
           disable_bounds_checks=True,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, key_dim), jnp.float32
-          ),
-          jax.ShapeDtypeStruct((bh, num_chunks, chunk_size, key_dim), k.dtype),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, num_slots), s.dtype
-          ),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, num_slots), g.dtype
-          ),
-          jax.ShapeDtypeStruct((bh, key_dim, num_slots), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, K), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, K), k.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), s.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), g.dtype),
+          jax.ShapeDtypeStruct((BH, K, M), jnp.float32),
       ],
       interpret=interpret,
   )(q_c, k_c, s_c, g_c, do_c, s1_in_bh, ds1_final)
 
-  dq = _unchunk(
-      dq_c.reshape(batch_size, num_heads, num_chunks, chunk_size, key_dim),
-      key_dim,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
+  dq = _unchunk(dq_c.reshape(B, H, nt, tt, K), K, B, nt, tt, H)
   if scale is not None:
     dq = dq * scale
-  dk = _unchunk(
-      dk_c.reshape(batch_size, num_heads, num_chunks, chunk_size, key_dim),
-      key_dim,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  ds = _unchunk(
-      ds_c.reshape(batch_size, num_heads, num_chunks, chunk_size, num_slots),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  dg = _unchunk(
-      dg_raw_c.reshape(
-          batch_size, num_heads, num_chunks, chunk_size, num_slots
-      ),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  ds0_4d = ds0.reshape(batch_size, num_heads, key_dim, num_slots)
+  dk = _unchunk(dk_c.reshape(B, H, nt, tt, K), K, B, nt, tt, H)
+  ds = _unchunk(ds_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  dg = _unchunk(dg_raw_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  ds0_4d = ds0.reshape(B, H, K, M)
   ds0_out = (
       ds0_4d.astype(initial_state.dtype) if initial_state is not None else None
   )
@@ -421,44 +377,43 @@ def raven_pallas_stage1_bwd(
 
 def _stage2_bwd_kernel(
     # Inputs.
-    qv_vmem_ref,  # [MB, 1, BT, M]
-    s_vmem_ref,  # [MB, 1, BT, M]
-    v_vmem_ref,  # [MB, 1, BT, V]
-    g_vmem_ref,  # [MB, 1, BT, M]
-    do_vmem_ref,  # [MB, 1, BT, V]
-    s2_in_vmem_ref,  # [MB, 1, M, V] f32
-    d_s2_final_vmem_ref,  # [MB, M, V] f32
+    qv_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    s_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    v_ref,  # [tb, 1, tt, V] bf16/f32  reverse chunk order via index_map
+    g_ref,  # [tb, 1, tt, M] f32       reverse chunk order via index_map
+    do_ref,  # [tb, 1, tt, V] bf16/f32  reverse chunk order via index_map
+    s2_in_ref,  # [tb, 1, M, V] f32        reverse chunk order via index_map
+    ds2_final_ref,  # [tb, M, V] f32
     # Outputs.
-    dqv_vmem_ref,  # [MB, 1, BT, M]
-    ds_vmem_ref,  # [MB, 1, BT, M]
-    dv_vmem_ref,  # [MB, 1, BT, V]
-    dg_vmem_ref,  # [MB, 1, BT, M]
-    ds0_vmem_ref,  # [MB, M, V] f32
+    dqv_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    ds_ref,  # [tb, 1, tt, M] bf16/f32  reverse chunk order via index_map
+    dv_ref,  # [tb, 1, tt, V] bf16/f32  reverse chunk order via index_map
+    dg_ref,  # [tb, 1, tt, M] f32       reverse chunk order via index_map
+    ds0_ref,  # [tb, M, V] f32
     # Scratch.
-    scratch_vmem_ref,  # [MB, M, V] f32
+    ds2_scratch_ref,  # [tb, M, V] f32   persists across the reverse nt grid axis
     *,
-    num_chunks: int,
+    nt: int,
 ) -> None:
-  """Fused single-pass MB-batched reverse recurrence backward kernel for Raven Stage 2."""
-  # Dimensions.
-  chunk_size = qv_vmem_ref.shape[2]
-  rev_chunk_idx = pl.program_id(1)
+  """Fused single-pass tb-batched reverse recurrence backward kernel for Raven Stage 2."""
+  rev_t_i = pl.program_id(1)
+  _, _, tt, _ = qv_ref.shape
 
-  @pl.when(rev_chunk_idx == 0)
-  def _() -> None:
-    scratch_vmem_ref[...] = d_s2_final_vmem_ref[...].astype(jnp.float32)
+  @pl.when(rev_t_i == 0)
+  def _():
+    ds2_scratch_ref[...] = ds2_final_ref[...].astype(jnp.float32)
 
-  ds2_out = scratch_vmem_ref[...]  # [MB, M, V]
-  s2_in = s2_in_vmem_ref[:, 0].astype(jnp.float32)  # [MB, M, V]
+  ds2_out = ds2_scratch_ref[...]  # [tb, M, V]
+  s2_in = s2_in_ref[:, 0].astype(jnp.float32)  # [tb, M, V]
 
-  qv_i = qv_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  v_i = v_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
-  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  do_i = do_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
+  qv_i = qv_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  s_i = s_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  v_i = v_ref[:, 0].astype(jnp.float32)  # [tb, tt, V]
+  g_i = g_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  do_i = do_ref[:, 0].astype(jnp.float32)  # [tb, tt, V]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
   upper_tri = (row_idx <= col_idx).astype(jnp.float32)
 
@@ -479,15 +434,10 @@ def _stage2_bwd_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  g_last = g_i[:, -1, :]  # [MB, M]
+  g_last = g_i[:, -1, :]  # [tb, M]
   exp_glast = jnp.exp(g_last)
   ds_next_last = jnp.sum(ds2_out * s2_in * exp_glast[:, :, None], axis=2)
   ds2_prev = ds2_out * exp_glast[:, :, None] + ds2_from_off
-  scratch_vmem_ref[...] = ds2_prev
-
-  @pl.when(rev_chunk_idx == num_chunks - 1)
-  def _() -> None:
-    ds0_vmem_ref[...] = ds2_prev.astype(ds0_vmem_ref.dtype)
 
   aqk = _decayed_gram(qv_i, s_i, g_i, g_i) * causal
   dv_diag = jnp.matmul(
@@ -525,14 +475,12 @@ def _stage2_bwd_kernel(
   d_tail_exp = du * u
 
   mask_strictly_prior = (
-      jax.lax.broadcasted_iota(jnp.int32, (1, chunk_size, 1), 1)
-      < (chunk_size - 1)
+      jax.lax.broadcasted_iota(jnp.int32, (1, tt, 1), 1) < (tt - 1)
   ).astype(jnp.float32)
   dg_tail = -d_tail_exp * mask_strictly_prior
   dg_last_tail = jnp.sum(d_tail_exp * mask_strictly_prior, axis=1)
   mask_last = (
-      jax.lax.broadcasted_iota(jnp.int32, (1, chunk_size, 1), 1)
-      == (chunk_size - 1)
+      jax.lax.broadcasted_iota(jnp.int32, (1, tt, 1), 1) == (tt - 1)
   ).astype(jnp.float32)
 
   dqv_i = dqv_diag + dqv_off
@@ -551,10 +499,15 @@ def _stage2_bwd_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
-  dqv_vmem_ref[:, 0] = dqv_i.astype(dqv_vmem_ref.dtype)
-  ds_vmem_ref[:, 0] = ds_i.astype(ds_vmem_ref.dtype)
-  dv_vmem_ref[:, 0] = dv_i.astype(dv_vmem_ref.dtype)
-  dg_vmem_ref[:, 0] = dg_raw_i.astype(dg_vmem_ref.dtype)
+  ds2_scratch_ref[...] = ds2_prev
+  dqv_ref[:, 0] = dqv_i.astype(dqv_ref.dtype)
+  ds_ref[:, 0] = ds_i.astype(ds_ref.dtype)
+  dv_ref[:, 0] = dv_i.astype(dv_ref.dtype)
+  dg_ref[:, 0] = dg_raw_i.astype(dg_ref.dtype)
+
+  @pl.when(rev_t_i == nt - 1)
+  def _():
+    ds0_ref[...] = ds2_prev.astype(ds0_ref.dtype)
 
 
 def raven_pallas_stage2_bwd(
@@ -570,12 +523,14 @@ def raven_pallas_stage2_bwd(
     s2_in_c: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
   """Analytical closed-form backward pass for Raven Stage 2 using Pallas TPU."""
-  batch_size, seq_len, num_heads, num_slots = qv.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  val_dim = v.shape[-1]
-  num_chunks = seq_len // chunk_size
-  bh = batch_size * num_heads
-  mb = _select_mb(bh)
+  B, T, H, M = qv.shape
+  _, _, _, V = v.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
+  BH = B * H
+  tb = _select_tb(BH)
+  nb = BH // tb
 
   if s2_in_c is None:
     _, s2_in_c = pallas_mosaic_tpu_kernel.raven_pallas_stage2_fwd(
@@ -583,47 +538,38 @@ def raven_pallas_stage2_bwd(
         s,
         v,
         g,
-        chunk_size=chunk_size,
+        chunk_size=tt,
         initial_state=initial_state,
         output_final_state=False,
         return_residuals=True,
     )
+  assert s2_in_c is not None
 
-  qv_c = _chunkify(qv, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
-  s_c = _chunkify(s, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
-  v_c = _chunkify(v, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, val_dim
-  )
+  qv_c = _chunkify(qv, B, nt, tt).reshape(BH, nt, tt, M)
+  s_c = _chunkify(s, B, nt, tt).reshape(BH, nt, tt, M)
+  v_c = _chunkify(v, B, nt, tt).reshape(BH, nt, tt, V)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
-  ).reshape(bh, num_chunks, chunk_size, num_slots)
-  do_c = _chunkify(grad_out, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, val_dim
-  )
-  s2_in_bh = s2_in_c.reshape(bh, num_chunks, num_slots, val_dim)
+  ).reshape(BH, nt, tt, M)
+  do_c = _chunkify(grad_out, B, nt, tt).reshape(BH, nt, tt, V)
+  s2_in_bh = s2_in_c.reshape(BH, nt, M, V)
 
   if grad_final_state is None:
-    ds2_final = jnp.zeros((bh, num_slots, val_dim), dtype=jnp.float32)
+    ds2_final = jnp.zeros((BH, M, V), dtype=jnp.float32)
   else:
-    ds2_final = grad_final_state.astype(jnp.float32).reshape(
-        bh, num_slots, val_dim
-    )
+    ds2_final = grad_final_state.astype(jnp.float32).reshape(BH, M, V)
 
-  grid = (bh // mb, num_chunks)
-  rev_idx = lambda i, n: (i, num_chunks - 1 - n, 0, 0)  # noqa: E731
-  bspec_m = pl.BlockSpec((mb, 1, chunk_size, num_slots), rev_idx)
-  bspec_v = pl.BlockSpec((mb, 1, chunk_size, val_dim), rev_idx)
-  bspec_s_in = pl.BlockSpec((mb, 1, num_slots, val_dim), rev_idx)
-  bspec_s = pl.BlockSpec((mb, num_slots, val_dim), lambda i, n: (i, 0, 0))
+  grid = (nb, nt)
+  rev_idx = lambda b_i, rev_t_i: (b_i, nt - 1 - rev_t_i, 0, 0)  # noqa: E731
+  bspec_m = pl.BlockSpec((tb, 1, tt, M), rev_idx)
+  bspec_v = pl.BlockSpec((tb, 1, tt, V), rev_idx)
+  bspec_s_in = pl.BlockSpec((tb, 1, M, V), rev_idx)
+  bspec_s = pl.BlockSpec((tb, M, V), lambda b_i, rev_t_i: (b_i, 0, 0))
 
   interpret = _resolve_interpret()
   dqv_c, ds_c, dv_c, dg_raw_c, ds0 = pl.pallas_call(
-      functools.partial(_stage2_bwd_kernel, num_chunks=num_chunks),
+      functools.partial(_stage2_bwd_kernel, nt=nt),
       grid=grid,
       in_specs=[
           bspec_m,
@@ -635,62 +581,26 @@ def raven_pallas_stage2_bwd(
           bspec_s,
       ],
       out_specs=[bspec_m, bspec_m, bspec_v, bspec_m, bspec_s],
-      scratch_shapes=[pltpu.VMEM((mb, num_slots, val_dim), jnp.float32)],
+      scratch_shapes=[pltpu.VMEM((tb, M, V), jnp.float32)],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary"),
           disable_bounds_checks=True,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, num_slots), qv.dtype
-          ),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, num_slots), s.dtype
-          ),
-          jax.ShapeDtypeStruct((bh, num_chunks, chunk_size, val_dim), v.dtype),
-          jax.ShapeDtypeStruct(
-              (bh, num_chunks, chunk_size, num_slots), g.dtype
-          ),
-          jax.ShapeDtypeStruct((bh, num_slots, val_dim), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), qv.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), s.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, V), v.dtype),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), g.dtype),
+          jax.ShapeDtypeStruct((BH, M, V), jnp.float32),
       ],
       interpret=interpret,
   )(qv_c, s_c, v_c, g_c, do_c, s2_in_bh, ds2_final)
 
-  dqv = _unchunk(
-      dqv_c.reshape(batch_size, num_heads, num_chunks, chunk_size, num_slots),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  ds = _unchunk(
-      ds_c.reshape(batch_size, num_heads, num_chunks, chunk_size, num_slots),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  dv = _unchunk(
-      dv_c.reshape(batch_size, num_heads, num_chunks, chunk_size, val_dim),
-      val_dim,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  dg = _unchunk(
-      dg_raw_c.reshape(
-          batch_size, num_heads, num_chunks, chunk_size, num_slots
-      ),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  ds0_4d = ds0.reshape(batch_size, num_heads, num_slots, val_dim)
+  dqv = _unchunk(dqv_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  ds = _unchunk(ds_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  dv = _unchunk(dv_c.reshape(B, H, nt, tt, V), V, B, nt, tt, H)
+  dg = _unchunk(dg_raw_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  ds0_4d = ds0.reshape(B, H, M, V)
   ds0_out = (
       ds0_4d.astype(initial_state.dtype) if initial_state is not None else None
   )

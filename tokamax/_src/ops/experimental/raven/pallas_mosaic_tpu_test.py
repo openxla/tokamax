@@ -360,8 +360,18 @@ class PallasTpuRavenGSATest(absltest.TestCase):
     self.assertFalse(op_pallas.supported_on(cpu_dev))
 
     q_bad = jnp.ones((1, 100, 2, 16), dtype=jnp.float32)
+    k_bad = jnp.ones((1, 100, 2, 16), dtype=jnp.float32)
+    s_bad = jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
+    g_bad = -0.1 * jnp.ones((1, 100, 2, 8), dtype=jnp.float32)
     with self.assertRaises(ValueError):
-      op_pallas._fwd(q_bad, k, s, g, chunk_size=64)
+      op_pallas._fwd(q_bad, k_bad, s_bad, g_bad, chunk_size=64)
+
+    q_128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
+    k_128 = jnp.ones((1, 128, 2, 16), dtype=jnp.float32)
+    s_128 = jnp.ones((1, 128, 2, 8), dtype=jnp.float32)
+    g_128 = -0.1 * jnp.ones((1, 128, 2, 8), dtype=jnp.float32)
+    with self.assertRaises(NotImplementedError):
+      op_pallas._fwd(q_128, k_128, s_128, g_128, chunk_size=128)
 
   def test_tpu_export_fwd_and_bwd(self):
     batch_size, seq_len, num_heads, key_dim, num_slots, val_dim = (

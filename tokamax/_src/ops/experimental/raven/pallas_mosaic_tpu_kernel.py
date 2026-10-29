@@ -15,6 +15,19 @@
 
 """Pallas TPU compute kernel for Raven Gated Slot Attention (GSA)."""
 
+# Dimensions.
+#   B      batch size
+#   T      sequence length
+#   H      number of attention heads
+#   BH     flattened batch * heads (B * H)
+#   K      key/query head dimension
+#   M      number of memory slots
+#   V      value head dimension
+#   tb     tile extent of BH (stream-batching factor per Pallas program)
+#   tt     tile extent of T (chunk_size)
+#   nb     grid extent along BH: nb = BH // tb
+#   nt     grid extent along T: nt = T // tt
+
 import functools
 import os
 from typing import Any
@@ -23,18 +36,6 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-
-# Dimensions:
-#   B: batch size
-#   T: sequence length (seq_len)
-#   H: number of attention heads (num_heads)
-#   BH: flattened batch * heads (B * H)
-#   MB: stream-batching factor per Pallas program instance
-#   NT: number of chunks along sequence length (T // BT)
-#   BT: chunk size (chunk_size)
-#   K: key/query head dimension (key_dim)
-#   M: number of memory slots (num_slots)
-#   V: value head dimension (val_dim)
 
 _CHUNK_SIZE = 64
 
@@ -51,35 +52,30 @@ def _resolve_interpret(interpret: bool | None = None) -> bool:
   return jax.default_backend() != "tpu"
 
 
-def _validate_chunk_size(seq_len: int, chunk_size: int) -> None:
+def _validate_chunk_size(T: int, tt: int) -> None:
   """Validates that ``chunk_size`` is positive, divides ``seq_len``, and fits VMEM."""
-  if chunk_size <= 0:
-    raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-  if seq_len % chunk_size != 0:
-    raise ValueError(
-        f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})."
-    )
-  if chunk_size > 64:
+  if tt <= 0:
+    raise ValueError(f"chunk_size must be positive, got {tt}.")
+  if T % tt != 0:
+    raise ValueError(f"seq_len ({T}) must be divisible by chunk_size ({tt}).")
+  if tt > 64:
     raise NotImplementedError(
-        f"chunk_size must be <= 64 for TPU VMEM layout, got {chunk_size}."
+        f"chunk_size must be <= 64 for TPU VMEM layout, got {tt}."
     )
 
 
-def _select_mb(bh: int) -> int:
-  """Selects the largest stream-batching factor ``MB <= 16`` dividing ``bh``."""
+def _select_tb(BH: int) -> int:
+  """Selects the largest stream-batching factor ``tb <= 16`` dividing ``BH``."""
   for d in (16, 8, 4, 2):
-    if bh % d == 0:
+    if BH % d == 0:
       return d
   return 1
 
 
-def _chunkify(
-    x: jax.Array, batch_size: int, num_chunks: int, chunk_size: int
-) -> jax.Array:
-  # (batch_size, seq_len, num_heads, ...) ->
-  # (batch_size, num_heads, num_chunks, chunk_size, ...)
-  rest = x.shape[3:]
-  x = x.reshape((batch_size, num_chunks, chunk_size, x.shape[2]) + rest)
+def _chunkify(x: jax.Array, B: int, nt: int, tt: int) -> jax.Array:
+  # [B, T, H, ...] -> [B, H, nt, tt, ...]
+  _, _, H, *rest = x.shape
+  x = x.reshape((B, nt, tt, H, *rest))
   perm = (0, 3, 1, 2) + tuple(range(4, x.ndim))
   return jnp.transpose(x, perm)
 
@@ -87,19 +83,22 @@ def _chunkify(
 def _unchunk(
     x_c: jax.Array,
     rest_dim: int,
-    batch_size: int,
-    num_chunks: int,
-    chunk_size: int,
-    num_heads: int,
+    B: int,
+    nt: int,
+    tt: int,
+    H: int,
 ) -> jax.Array:
   x_ = jnp.transpose(x_c, (0, 2, 3, 1, 4))
-  return x_.reshape(batch_size, num_chunks * chunk_size, num_heads, rest_dim)
+  return x_.reshape(B, nt * tt, H, rest_dim)
 
 
 def _decayed_gram(
     a: jax.Array, b: jax.Array, g_a: jax.Array, g_b: jax.Array
 ) -> jax.Array:
   """Computes decayed Gram matrix ``(a @ b^T) * exp(g_a[:, None] - g_b[None, :])``."""
+  # Factor exp(g_a - g_b) through the chunk-initial baseline g0 so that both
+  # factors can be absorbed into the operands before a single MXU matmul, while
+  # clamping exponents to avoid f32 overflow.
   g0 = g_b[..., :1, :]
   lhs = (a * jnp.exp(jnp.minimum(g_a - g0, 80.0))).astype(jnp.float32)
   rhs = (b * jnp.exp(jnp.minimum(g0 - g_b, 80.0))).astype(jnp.float32)
@@ -114,6 +113,9 @@ def _decayed_gram(
 
 def _decayed_apply(qk: jax.Array, s: jax.Array, g: jax.Array) -> jax.Array:
   """Computes ``out[r, m] = sum_c qk[r, c] * exp(g[r, m] - g[c, m]) * s[c, m]``."""
+  # Factor the slot-dependent decay exp(g[r, m] - g[c, m]) around g0 = g[0, m]
+  # so the c-dependent term scales s before the MXU contraction and the
+  # r-dependent term scales the output afterward.
   g0 = g[..., :1, :]
   rhs = (s * jnp.exp(jnp.minimum(g0 - g, 80.0))).astype(jnp.float32)
   out = jnp.matmul(
@@ -127,39 +129,40 @@ def _decayed_apply(qk: jax.Array, s: jax.Array, g: jax.Array) -> jax.Array:
 
 def _stage1_fwd_kernel(
     # Inputs.
-    q_vmem_ref,  # [MB, 1, BT, K]
-    k_vmem_ref,  # [MB, 1, BT, K]
-    s_vmem_ref,  # [MB, 1, BT, M]
-    g_vmem_ref,  # [MB, 1, BT, M]
-    s0_vmem_ref,  # [MB, K, M] f32
+    q_ref,  # [tb, 1, tt, K] bf16/f32
+    k_ref,  # [tb, 1, tt, K] bf16/f32
+    s_ref,  # [tb, 1, tt, M] bf16/f32
+    g_ref,  # [tb, 1, tt, M] f32
+    s0_ref,  # [tb, K, M] f32
     # Outputs.
-    ok_vmem_ref,  # [MB, 1, BT, M]
-    s1_final_vmem_ref,  # [MB, K, M] f32
-    s1_in_vmem_ref,  # [MB, 1, K, M] f32
+    ok_ref,  # [tb, 1, tt, M] bf16/f32
+    s1_final_ref,  # [tb, K, M] f32
+    s1_in_ref,  # [tb, 1, K, M] f32
     # Scratch.
-    scratch_vmem_ref,  # [MB, K, M] f32
+    s1_scratch_ref,  # [tb, K, M] f32   persists across the nt grid axis
     *,
-    num_chunks: int,
+    nt: int,
 ) -> None:
-  """Fused single-pass MB-batched compute kernel for Raven Stage 1."""
-  # Dimensions.
-  chunk_size = q_vmem_ref.shape[2]
-  chunk_idx = pl.program_id(1)
+  """Fused single-pass tb-batched compute kernel for Raven Stage 1."""
+  t_i = pl.program_id(1)
+  _, _, tt, _ = q_ref.shape
 
-  @pl.when(chunk_idx == 0)
-  def _() -> None:
-    scratch_vmem_ref[...] = s0_vmem_ref[...].astype(jnp.float32)
+  @pl.when(t_i == 0)
+  def _():
+    s1_scratch_ref[...] = s0_ref[...].astype(jnp.float32)
 
-  s1 = scratch_vmem_ref[...]  # [MB, K, M]
-  s1_in_vmem_ref[:, 0] = s1.astype(s1_in_vmem_ref.dtype)
+  # Keep the recurrent state in f32 in VMEM across all nt chunks to prevent
+  # precision drift over long sequences.
+  s1 = s1_scratch_ref[...]  # [tb, K, M]
+  s1_in_ref[:, 0] = s1.astype(s1_in_ref.dtype)
 
-  q_i = q_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  k_i = k_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, K]
-  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  q_i = q_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  k_i = k_ref[:, 0].astype(jnp.float32)  # [tb, tt, K]
+  s_i = s_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  g_i = g_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
 
   qk = (
@@ -180,7 +183,7 @@ def _stage1_fwd_kernel(
   ) * jnp.exp(g_i)
   ok_i = y_diag + y_off
 
-  g_last = g_i[:, -1, :]  # [MB, M]
+  g_last = g_i[:, -1, :]  # [tb, M]
   decay_tail = jnp.exp(jnp.minimum(g_last[:, None, :] - g_i, 0.0))
   state_contrib = jnp.matmul(
       jnp.swapaxes(k_i, -1, -2),
@@ -190,12 +193,12 @@ def _stage1_fwd_kernel(
   )
   s1_new = s1 * jnp.exp(g_last)[:, None, :] + state_contrib
 
-  scratch_vmem_ref[...] = s1_new
-  ok_vmem_ref[:, 0] = ok_i.astype(ok_vmem_ref.dtype)
+  s1_scratch_ref[...] = s1_new
+  ok_ref[:, 0] = ok_i.astype(ok_ref.dtype)
 
-  @pl.when(chunk_idx == num_chunks - 1)
-  def _() -> None:
-    s1_final_vmem_ref[...] = s1_new.astype(s1_final_vmem_ref.dtype)
+  @pl.when(t_i == nt - 1)
+  def _():
+    s1_final_ref[...] = s1_new.astype(s1_final_ref.dtype)
 
 
 def raven_pallas_stage1_fwd(
@@ -213,81 +216,62 @@ def raven_pallas_stage1_fwd(
     tuple[jax.Array, jax.Array | None]
     | tuple[tuple[jax.Array, jax.Array | None], jax.Array]
 ):
-  """Computes Raven Stage 1 forward pass using a single-pass MB-batched Pallas kernel."""
-  batch_size, seq_len, num_heads, key_dim = q.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  num_slots = s.shape[-1]
-  num_chunks = seq_len // chunk_size
-  bh = batch_size * num_heads
-  mb = _select_mb(bh)
+  """Computes Raven Stage 1 forward pass using a single-pass tb-batched Pallas kernel."""
+  B, T, H, K = q.shape
+  _, _, _, M = s.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
+  BH = B * H
+  tb = _select_tb(BH)
+  nb = BH // tb
 
   if scale is not None:
     q_scaled = (q.astype(jnp.float32) * scale).astype(q.dtype)
   else:
     q_scaled = q
 
-  q_c = _chunkify(q_scaled, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, key_dim
-  )
-  k_c = _chunkify(k, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, key_dim
-  )
-  s_c = _chunkify(s, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
+  q_c = _chunkify(q_scaled, B, nt, tt).reshape(BH, nt, tt, K)
+  k_c = _chunkify(k, B, nt, tt).reshape(BH, nt, tt, K)
+  s_c = _chunkify(s, B, nt, tt).reshape(BH, nt, tt, M)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
-  ).reshape(bh, num_chunks, chunk_size, num_slots)
+  ).reshape(BH, nt, tt, M)
 
   if initial_state is None:
-    s0 = jnp.zeros((bh, key_dim, num_slots), dtype=jnp.float32)
+    s0 = jnp.zeros((BH, K, M), dtype=jnp.float32)
   else:
-    s0 = initial_state.astype(jnp.float32).reshape(bh, key_dim, num_slots)
+    s0 = initial_state.astype(jnp.float32).reshape(BH, K, M)
 
-  grid = (bh // mb, num_chunks)
-  bspec_k = pl.BlockSpec(
-      (mb, 1, chunk_size, key_dim), lambda i, n: (i, n, 0, 0)
-  )
-  bspec_m = pl.BlockSpec(
-      (mb, 1, chunk_size, num_slots), lambda i, n: (i, n, 0, 0)
-  )
-  bspec_s = pl.BlockSpec((mb, key_dim, num_slots), lambda i, n: (i, 0, 0))
-  bspec_s_in = pl.BlockSpec(
-      (mb, 1, key_dim, num_slots), lambda i, n: (i, n, 0, 0)
-  )
+  grid = (nb, nt)
+  bspec_k = pl.BlockSpec((tb, 1, tt, K), lambda b_i, t_i: (b_i, t_i, 0, 0))
+  bspec_m = pl.BlockSpec((tb, 1, tt, M), lambda b_i, t_i: (b_i, t_i, 0, 0))
+  bspec_s = pl.BlockSpec((tb, K, M), lambda b_i, t_i: (b_i, 0, 0))
+  bspec_s_in = pl.BlockSpec((tb, 1, K, M), lambda b_i, t_i: (b_i, t_i, 0, 0))
 
   interpret = _resolve_interpret()
   ok_c, s1_final, s1_in_c = pl.pallas_call(
-      functools.partial(_stage1_fwd_kernel, num_chunks=num_chunks),
+      functools.partial(_stage1_fwd_kernel, nt=nt),
       grid=grid,
       in_specs=[bspec_k, bspec_k, bspec_m, bspec_m, bspec_s],
       out_specs=[bspec_m, bspec_s, bspec_s_in],
-      scratch_shapes=[pltpu.VMEM((mb, key_dim, num_slots), jnp.float32)],
+      scratch_shapes=[pltpu.VMEM((tb, K, M), jnp.float32)],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary"),
           disable_bounds_checks=True,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct((bh, num_chunks, chunk_size, num_slots), s.dtype),
-          jax.ShapeDtypeStruct((bh, key_dim, num_slots), jnp.float32),
-          jax.ShapeDtypeStruct((bh, num_chunks, key_dim, num_slots), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, M), s.dtype),
+          jax.ShapeDtypeStruct((BH, K, M), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, K, M), jnp.float32),
       ],
       interpret=interpret,
   )(q_c, k_c, s_c, g_c, s0)
 
-  ok = _unchunk(
-      ok_c.reshape(batch_size, num_heads, num_chunks, chunk_size, num_slots),
-      num_slots,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  s1_final_4d = s1_final.reshape(batch_size, num_heads, key_dim, num_slots)
-  s1_in_5d = s1_in_c.reshape(
-      batch_size, num_heads, num_chunks, key_dim, num_slots
-  )
+  ok = _unchunk(ok_c.reshape(B, H, nt, tt, M), M, B, nt, tt, H)
+  s1_final_4d = s1_final.reshape(B, H, K, M)
+  s1_in_5d = s1_in_c.reshape(B, H, nt, K, M)
   final_state = s1_final_4d.astype(q.dtype) if output_final_state else None
   if return_residuals:
     return (ok, final_state), s1_in_5d
@@ -296,39 +280,38 @@ def raven_pallas_stage1_fwd(
 
 def _stage2_fwd_kernel(
     # Inputs.
-    qv_vmem_ref,  # [MB, 1, BT, M]
-    s_vmem_ref,  # [MB, 1, BT, M]
-    v_vmem_ref,  # [MB, 1, BT, V]
-    g_vmem_ref,  # [MB, 1, BT, M]
-    s0_vmem_ref,  # [MB, M, V] f32
+    qv_ref,  # [tb, 1, tt, M] bf16/f32
+    s_ref,  # [tb, 1, tt, M] bf16/f32
+    v_ref,  # [tb, 1, tt, V] bf16/f32
+    g_ref,  # [tb, 1, tt, M] f32
+    s0_ref,  # [tb, M, V] f32
     # Outputs.
-    out_vmem_ref,  # [MB, 1, BT, V]
-    s2_final_vmem_ref,  # [MB, M, V] f32
-    s2_in_vmem_ref,  # [MB, 1, M, V] f32
+    out_ref,  # [tb, 1, tt, V] bf16/f32
+    s2_final_ref,  # [tb, M, V] f32
+    s2_in_ref,  # [tb, 1, M, V] f32
     # Scratch.
-    scratch_vmem_ref,  # [MB, M, V] f32
+    s2_scratch_ref,  # [tb, M, V] f32   persists across the nt grid axis
     *,
-    num_chunks: int,
+    nt: int,
 ) -> None:
-  """Fused single-pass MB-batched compute kernel for Raven Stage 2."""
-  # Dimensions.
-  chunk_size = qv_vmem_ref.shape[2]
-  chunk_idx = pl.program_id(1)
+  """Fused single-pass tb-batched compute kernel for Raven Stage 2."""
+  t_i = pl.program_id(1)
+  _, _, tt, _ = qv_ref.shape
 
-  @pl.when(chunk_idx == 0)
-  def _() -> None:
-    scratch_vmem_ref[...] = s0_vmem_ref[...].astype(jnp.float32)
+  @pl.when(t_i == 0)
+  def _():
+    s2_scratch_ref[...] = s0_ref[...].astype(jnp.float32)
 
-  s2 = scratch_vmem_ref[...]  # [MB, M, V]
-  s2_in_vmem_ref[:, 0] = s2.astype(s2_in_vmem_ref.dtype)
+  s2 = s2_scratch_ref[...]  # [tb, M, V]
+  s2_in_ref[:, 0] = s2.astype(s2_in_ref.dtype)
 
-  qv_i = qv_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  s_i = s_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
-  v_i = v_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, V]
-  g_i = g_vmem_ref[:, 0].astype(jnp.float32)  # [MB, BT, M]
+  qv_i = qv_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  s_i = s_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
+  v_i = v_ref[:, 0].astype(jnp.float32)  # [tb, tt, V]
+  g_i = g_ref[:, 0].astype(jnp.float32)  # [tb, tt, M]
 
-  row_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 0)
-  col_idx = jax.lax.broadcasted_iota(jnp.int32, (chunk_size, chunk_size), 1)
+  row_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 0)
+  col_idx = jax.lax.broadcasted_iota(jnp.int32, (tt, tt), 1)
   causal = (col_idx <= row_idx).astype(jnp.float32)
 
   aqk = _decayed_gram(qv_i, s_i, g_i, g_i) * causal
@@ -346,7 +329,7 @@ def _stage2_fwd_kernel(
   )
   out_i = y_diag + y_off
 
-  g_last = g_i[:, -1, :]  # [MB, M]
+  g_last = g_i[:, -1, :]  # [tb, M]
   decay_tail = jnp.exp(jnp.minimum(g_last[:, None, :] - g_i, 0.0))
   state_contrib = jnp.matmul(
       jnp.swapaxes(s_i * decay_tail, -1, -2),
@@ -356,12 +339,12 @@ def _stage2_fwd_kernel(
   )
   s2_new = s2 * jnp.exp(g_last)[:, :, None] + state_contrib
 
-  scratch_vmem_ref[...] = s2_new
-  out_vmem_ref[:, 0] = out_i.astype(out_vmem_ref.dtype)
+  s2_scratch_ref[...] = s2_new
+  out_ref[:, 0] = out_i.astype(out_ref.dtype)
 
-  @pl.when(chunk_idx == num_chunks - 1)
-  def _() -> None:
-    s2_final_vmem_ref[...] = s2_new.astype(s2_final_vmem_ref.dtype)
+  @pl.when(t_i == nt - 1)
+  def _():
+    s2_final_ref[...] = s2_new.astype(s2_final_ref.dtype)
 
 
 def raven_pallas_stage2_fwd(
@@ -378,76 +361,57 @@ def raven_pallas_stage2_fwd(
     tuple[jax.Array, jax.Array | None]
     | tuple[tuple[jax.Array, jax.Array | None], jax.Array]
 ):
-  """Computes Raven Stage 2 forward pass using a single-pass MB-batched Pallas kernel."""
-  batch_size, seq_len, num_heads, num_slots = qv.shape
-  _validate_chunk_size(seq_len, chunk_size)
-  val_dim = v.shape[-1]
-  num_chunks = seq_len // chunk_size
-  bh = batch_size * num_heads
-  mb = _select_mb(bh)
+  """Computes Raven Stage 2 forward pass using a single-pass tb-batched Pallas kernel."""
+  B, T, H, M = qv.shape
+  _, _, _, V = v.shape
+  tt = chunk_size
+  _validate_chunk_size(T, tt)
+  nt = T // tt
+  BH = B * H
+  tb = _select_tb(BH)
+  nb = BH // tb
 
-  qv_c = _chunkify(qv, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
-  s_c = _chunkify(s, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, num_slots
-  )
-  v_c = _chunkify(v, batch_size, num_chunks, chunk_size).reshape(
-      bh, num_chunks, chunk_size, val_dim
-  )
+  qv_c = _chunkify(qv, B, nt, tt).reshape(BH, nt, tt, M)
+  s_c = _chunkify(s, B, nt, tt).reshape(BH, nt, tt, M)
+  v_c = _chunkify(v, B, nt, tt).reshape(BH, nt, tt, V)
   g_c = jnp.cumsum(
-      _chunkify(g.astype(jnp.float32), batch_size, num_chunks, chunk_size),
+      _chunkify(g.astype(jnp.float32), B, nt, tt),
       axis=-2,
-  ).reshape(bh, num_chunks, chunk_size, num_slots)
+  ).reshape(BH, nt, tt, M)
 
   if initial_state is None:
-    s0 = jnp.zeros((bh, num_slots, val_dim), dtype=jnp.float32)
+    s0 = jnp.zeros((BH, M, V), dtype=jnp.float32)
   else:
-    s0 = initial_state.astype(jnp.float32).reshape(bh, num_slots, val_dim)
+    s0 = initial_state.astype(jnp.float32).reshape(BH, M, V)
 
-  grid = (bh // mb, num_chunks)
-  bspec_m = pl.BlockSpec(
-      (mb, 1, chunk_size, num_slots), lambda i, n: (i, n, 0, 0)
-  )
-  bspec_v = pl.BlockSpec(
-      (mb, 1, chunk_size, val_dim), lambda i, n: (i, n, 0, 0)
-  )
-  bspec_s = pl.BlockSpec((mb, num_slots, val_dim), lambda i, n: (i, 0, 0))
-  bspec_s_in = pl.BlockSpec(
-      (mb, 1, num_slots, val_dim), lambda i, n: (i, n, 0, 0)
-  )
+  grid = (nb, nt)
+  bspec_m = pl.BlockSpec((tb, 1, tt, M), lambda b_i, t_i: (b_i, t_i, 0, 0))
+  bspec_v = pl.BlockSpec((tb, 1, tt, V), lambda b_i, t_i: (b_i, t_i, 0, 0))
+  bspec_s = pl.BlockSpec((tb, M, V), lambda b_i, t_i: (b_i, 0, 0))
+  bspec_s_in = pl.BlockSpec((tb, 1, M, V), lambda b_i, t_i: (b_i, t_i, 0, 0))
 
   interpret = _resolve_interpret()
   out_c, s2_final, s2_in_c = pl.pallas_call(
-      functools.partial(_stage2_fwd_kernel, num_chunks=num_chunks),
+      functools.partial(_stage2_fwd_kernel, nt=nt),
       grid=grid,
       in_specs=[bspec_m, bspec_m, bspec_v, bspec_m, bspec_s],
       out_specs=[bspec_v, bspec_s, bspec_s_in],
-      scratch_shapes=[pltpu.VMEM((mb, num_slots, val_dim), jnp.float32)],
+      scratch_shapes=[pltpu.VMEM((tb, M, V), jnp.float32)],
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "arbitrary"),
           disable_bounds_checks=True,
       ),
       out_shape=[
-          jax.ShapeDtypeStruct((bh, num_chunks, chunk_size, val_dim), v.dtype),
-          jax.ShapeDtypeStruct((bh, num_slots, val_dim), jnp.float32),
-          jax.ShapeDtypeStruct((bh, num_chunks, num_slots, val_dim), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, tt, V), v.dtype),
+          jax.ShapeDtypeStruct((BH, M, V), jnp.float32),
+          jax.ShapeDtypeStruct((BH, nt, M, V), jnp.float32),
       ],
       interpret=interpret,
   )(qv_c, s_c, v_c, g_c, s0)
 
-  out = _unchunk(
-      out_c.reshape(batch_size, num_heads, num_chunks, chunk_size, val_dim),
-      val_dim,
-      batch_size,
-      num_chunks,
-      chunk_size,
-      num_heads,
-  )
-  s2_final_4d = s2_final.reshape(batch_size, num_heads, num_slots, val_dim)
-  s2_in_5d = s2_in_c.reshape(
-      batch_size, num_heads, num_chunks, num_slots, val_dim
-  )
+  out = _unchunk(out_c.reshape(B, H, nt, tt, V), V, B, nt, tt, H)
+  s2_final_4d = s2_final.reshape(B, H, M, V)
+  s2_in_5d = s2_in_c.reshape(B, H, nt, M, V)
   final_state = s2_final_4d.astype(v.dtype) if output_final_state else None
   if return_residuals:
     return (out, final_state), s2_in_5d
