@@ -73,6 +73,7 @@ def _make_spec(
     group_sizes=None,
     project='',
     tags=(),
+    excluded_platforms=(),
 ) -> arg_spec.ArgSpec:
   """Make an argument spec for a ragged dot operation."""
   lhs = jax.ShapeDtypeStruct((m, k), lhs_dtype)
@@ -88,7 +89,13 @@ def _make_spec(
     )
 
   args = dict(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
-  return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
+  return arg_spec.ArgSpec(
+      name=name,
+      args=args,
+      project=project,
+      tags=tags,
+      excluded_platforms=excluded_platforms,
+  )
 
 
 def _make_maxtext_spec(
@@ -104,6 +111,8 @@ def _make_maxtext_spec(
       rhs_dtype=jnp.bfloat16,
       project='maxtext',
       tags=tags,
+      # MaxText ragged dot shapes are TPU workloads; skip them on GPU.
+      excluded_platforms=('gpu',),
   )
 
 
@@ -133,6 +142,7 @@ def _make_maxtext_gmm_v2_spec(
         group_sizes=base.GroupSizes(
             jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
         ),
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
   else:
@@ -143,6 +153,7 @@ def _make_maxtext_gmm_v2_spec(
         group_sizes=base.GroupSizes(
             jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
         ),
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
   return arg_spec.ArgSpec(
@@ -150,7 +161,63 @@ def _make_maxtext_gmm_v2_spec(
       args=args,
       project=project,
       tags=tags,
+      # MaxText ragged dot shapes are TPU workloads; skip them on GPU.
+      excluded_platforms=('gpu',),
   )
+
+
+def _make_fp8_gmm_v2_spec(
+    name: str,
+    *,
+    num_groups: int,
+    m: int,
+    k: int,
+    n: int,
+    quantize_lhs: bool,
+    equal_groups: bool,
+    block_size: int = 256,
+    fuse_act: str | None = None,
+    project: str,
+    tags: tuple[arg_spec.Tag, ...] = ('forward_only',),
+) -> arg_spec.ArgSpec:
+  """Makes a GMM v2 spec with fp8 weights.
+
+  Args:
+    name: Spec name.
+    num_groups: Number of local experts.
+    m: Number of routed rows.
+    k: Contracting dimension.
+    n: Output dimension, including both halves of a fused activation.
+    quantize_lhs: Whether the kernel quantizes the activations to fp8 (W8A8).
+      Otherwise the activations stay bf16 (W8A16).
+    equal_groups: Whether all groups have `m // num_groups` rows. Otherwise the
+      group sizes are random, as in the other specs (`generate_group_sizes`).
+    block_size: Sub-channel block size of the weight scales along `k`.
+    fuse_act: Optional fused gate-up activation.
+    project: Project name.
+    tags: Spec tags.
+
+  Returns:
+    The arg spec.
+  """
+  lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
+  args = dict(
+      lhs=AsQArray(lhs, jnp.float8_e4m3fn) if quantize_lhs else lhs,  # pyrefly: ignore[bad-argument-type]
+      rhs=QArray(
+          qvalue=jax.ShapeDtypeStruct((num_groups, k, n), jnp.float8_e4m3fn),  # pyrefly: ignore[bad-argument-type]
+          scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
+              (num_groups, k // block_size, n), jnp.bfloat16
+          ),
+      ),
+      group_sizes=base.GroupSizes(
+          jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
+          tuple([m // num_groups] * num_groups) if equal_groups else m,
+      ),
+      zero_initialize=True,
+      fuse_gateup_activation=fuse_act,
+      preferred_element_type=jnp.bfloat16,
+  )
+  return arg_spec.ArgSpec(name=name, args=args, project=project, tags=tags)
 
 
 def _make_ullm_gmm_v2_spec(
@@ -196,136 +263,337 @@ def _make_ullm_gmm_v2_spec(
 
 
 ARG_SPECS = (
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=131072, n=1024, k=7168, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=131072, n=7168, k=1024, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=131072, n=512, k=7168, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=131072, n=7168, k=512, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=262144, n=512, k=7168, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=262144, n=7168, k=256, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=262144, n=7168, k=1024, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=262144, n=1024, k=7168, tags=('primary',)
-    ),
-    _make_maxtext_spec(
-        'deepseek-v3', 256, m=262144, n=2048, k=7168, tags=('primary',)
-    ),
-    _make_maxtext_spec('gpt-oss', 128, m=327680, n=2880, k=2880),
-    _make_maxtext_spec('gpt-oss', 128, m=393216, n=768, k=2048),
-    _make_maxtext_spec('gpt-oss', 128, m=393216, n=2048, k=768),
-    _make_maxtext_spec('gpt-oss', 128, m=524288, n=1536, k=4096),
-    _make_maxtext_spec('gpt-oss', 128, m=524288, n=4096, k=1536),
-    _make_maxtext_spec('gpt-oss', 256, m=524288, n=2048, k=7168),
-    _make_maxtext_spec('gpt-oss', 128, m=262144, n=1536, k=4096),
-    _make_maxtext_spec('gpt-oss', 128, m=262144, n=4096, k=1536),
-    _make_maxtext_spec('gpt-oss', 128, m=131072, n=2048, k=7168),
-    _make_maxtext_spec('gpt-oss', 128, m=131072, n=768, k=2048),
-    _make_maxtext_spec('gpt-oss', 128, m=131072, n=1536, k=4096),
-    _make_maxtext_spec('gpt-oss', 128, m=131072, n=4096, k=1536),
-    _make_maxtext_spec('gpt-oss', 256, m=131072, n=2048, k=7168),
-    _make_maxtext_spec('gpt-oss', 256, m=65536, n=2048, k=7168),
-    _make_maxtext_spec('gpt-oss', 256, m=131072, n=512, k=7168),
-    _make_maxtext_spec('gpt-oss', 256, m=131072, n=7168, k=512),
-    _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=512),
-    _make_maxtext_spec('gpt-oss', 256, m=262144, n=512, k=7168),
-    _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=256),
-    _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=1024),
-    _make_maxtext_spec('gpt-oss', 256, m=262144, n=1024, k=7168),
-) + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items()) + (
-    # Use smaller input shapes to avoid XLA implementation from OOMing.
-    _make_maxtext_gmm_v2_spec(
-        'gmm_v2_maxtext_8192x7168_64x7168x1024',
-        num_groups=64,
-        m=8192,
-        n=1024,
-        k=7168,
-        block_size=256,
-        quantized=True,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp8_prefill_gate_up',
-        m=81920,
-        k=4096,
-        n=2 * 1024,
-        fuse_act='silu',
-        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=4096,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp8_prefill_down',
-        m=81920,
-        k=1024,
-        n=4096,
-        fuse_act=None,
-        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=1024,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp8_decode_gate_up',
-        m=1280,
-        k=4096,
-        n=2 * 1024,
-        fuse_act='silu',
-        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=4096,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp8_decode_down',
-        m=1280,
-        k=1024,
-        n=4096,
-        fuse_act=None,
-        weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=1024,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp4_prefill_gate_up',
-        m=81920,
-        k=4096,
-        n=2 * 1024,
-        fuse_act='silu',
-        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=64,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp4_prefill_down',
-        m=81920,
-        k=1024,
-        n=4096,
-        fuse_act=None,
-        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=64,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp4_decode_gate_up',
-        m=1280,
-        k=4096,
-        n=2 * 1024,
-        fuse_act='silu',
-        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=64,
-    ),
-    _make_ullm_gmm_v2_spec(
-        'gmm_v2_ullm_fp4_decode_down',
-        m=1280,
-        k=1024,
-        n=4096,
-        fuse_act=None,
-        weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
-        block_size=64,
-    ),
+    (
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=131072, n=1024, k=7168, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=131072, n=7168, k=1024, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=131072, n=512, k=7168, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=131072, n=7168, k=512, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=262144, n=512, k=7168, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=262144, n=7168, k=256, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=262144, n=7168, k=1024, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=262144, n=1024, k=7168, tags=('primary',)
+        ),
+        _make_maxtext_spec(
+            'deepseek-v3', 256, m=262144, n=2048, k=7168, tags=('primary',)
+        ),
+        _make_maxtext_spec('gpt-oss', 128, m=327680, n=2880, k=2880),
+        _make_maxtext_spec('gpt-oss', 128, m=393216, n=768, k=2048),
+        _make_maxtext_spec('gpt-oss', 128, m=393216, n=2048, k=768),
+        _make_maxtext_spec('gpt-oss', 128, m=524288, n=1536, k=4096),
+        _make_maxtext_spec('gpt-oss', 128, m=524288, n=4096, k=1536),
+        _make_maxtext_spec('gpt-oss', 256, m=524288, n=2048, k=7168),
+        _make_maxtext_spec('gpt-oss', 128, m=262144, n=1536, k=4096),
+        _make_maxtext_spec('gpt-oss', 128, m=262144, n=4096, k=1536),
+        _make_maxtext_spec('gpt-oss', 128, m=131072, n=2048, k=7168),
+        _make_maxtext_spec('gpt-oss', 128, m=131072, n=768, k=2048),
+        _make_maxtext_spec('gpt-oss', 128, m=131072, n=1536, k=4096),
+        _make_maxtext_spec('gpt-oss', 128, m=131072, n=4096, k=1536),
+        _make_maxtext_spec('gpt-oss', 256, m=131072, n=2048, k=7168),
+        _make_maxtext_spec('gpt-oss', 256, m=65536, n=2048, k=7168),
+        _make_maxtext_spec('gpt-oss', 256, m=131072, n=512, k=7168),
+        _make_maxtext_spec('gpt-oss', 256, m=131072, n=7168, k=512),
+        _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=512),
+        _make_maxtext_spec('gpt-oss', 256, m=262144, n=512, k=7168),
+        _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=256),
+        _make_maxtext_spec('gpt-oss', 256, m=262144, n=7168, k=1024),
+        _make_maxtext_spec('gpt-oss', 256, m=262144, n=1024, k=7168),
+    )
+    + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
+    + (
+        # Use smaller input shapes to avoid XLA implementation from OOMing.
+        _make_maxtext_gmm_v2_spec(
+            'gmm_v2_maxtext_8192x7168_64x7168x1024',
+            num_groups=64,
+            m=8192,
+            n=1024,
+            k=7168,
+            block_size=256,
+            quantized=True,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp8_prefill_gate_up',
+            m=81920,
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp8_prefill_down',
+            m=81920,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp8_decode_gate_up',
+            m=1280,
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp8_decode_down',
+            m=1280,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp4_prefill_gate_up',
+            m=81920,
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=64,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp4_prefill_down',
+            m=81920,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=64,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp4_decode_gate_up',
+            m=1280,
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=64,
+        ),
+        _make_ullm_gmm_v2_spec(
+            'gmm_v2_ullm_fp4_decode_down',
+            m=1280,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=64,
+        ),
+        # Qwen 3.5 MoE GMM v2 benchmark shapes:
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc4_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=320,  # 32 tokens * topk 10
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc4_down',
+            num_groups=64,  # 512 / EP=8
+            m=320,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc8_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=640,  # 64 tokens * topk 10
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc8_down',
+            num_groups=64,  # 512 / EP=8
+            m=640,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc16_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=1280,  # 128 tokens * topk 10
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc16_down',
+            num_groups=64,  # 512 / EP=8
+            m=1280,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc32_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=2560,  # 256 tokens * topk 10 (conc 32, conc 256)
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc32_down',
+            num_groups=64,  # 512 / EP=8
+            m=2560,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc64_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=5120,  # 512 tokens * topk 10
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc64_down',
+            num_groups=64,  # 512 / EP=8
+            m=5120,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc128_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=10240,  # 1024 tokens * topk 10
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_decode_conc128_down',
+            num_groups=64,  # 512 / EP=8
+            m=10240,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_prefill_gate_up',  # 8192 tokens * topk 10 (conc 4, 16, 32, 64, 128, 256)
+            num_groups=64,  # 512 / EP=8
+            m=81920,
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_prefill_down',
+            num_groups=64,  # 512 / EP=8
+            m=81920,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_prefill_conc8_gate_up',
+            num_groups=64,  # 512 / EP=8
+            m=163840,  # 16384 tokens * topk 10 (conc 8)
+            k=4096,
+            n=2 * 1024,
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=4096,
+            project='qwen3_5',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_5_prefill_conc8_down',
+            num_groups=64,  # 512 / EP=8
+            m=163840,
+            k=1024,
+            n=4096,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=1024,
+            project='qwen3_5',
+        ),
+    )
+    # DeepSeek-V3 (256 experts, top-8, 65,536 tokens) with fp8 weights and
+    # equal group sizes. Each group's row count is a multiple of the bucket
+    # size, so these cover bucket selection for full groups.
+    + tuple(
+        _make_fp8_gmm_v2_spec(
+            f'dsv3_{proj}_m524288_{"w8a8" if quantize_lhs else "w8a16"}_equal',
+            num_groups=256,
+            m=524288,
+            k=k,
+            n=n,
+            quantize_lhs=quantize_lhs,
+            equal_groups=True,
+            fuse_act=fuse_act,
+            project='deepseek3',
+        )
+        for proj, k, n, fuse_act in (
+            ('gate_up', 7168, 2 * 2048, 'silu'),
+            ('down', 2048, 7168, None),
+        )
+        for quantize_lhs in (False, True)
+    )
 )
-

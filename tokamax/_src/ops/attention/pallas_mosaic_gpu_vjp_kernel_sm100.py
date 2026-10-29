@@ -106,11 +106,14 @@ def _get_dq_scratch_shapes(
 
   if mask is not None and mask.shape[-1] != 1:
     if mask.shape[-2] == 1:
-      shapes["mask_smem"] = plgpu.SMEM((block_kv,), jnp.int8)
+      if block_kv >= 128:  # Minimum transfer size is 128 bytes.
+        shapes["mask_smem"] = plgpu.SMEM((block_kv,), jnp.int8)
+        shapes["mask_produced"] = plgpu.Barrier()
+        shapes["mask_consumed"] = plgpu.Barrier()
     else:
       shapes["mask_smem"] = _tiled_smem((block_q, block_kv), jnp.int8)
-    shapes["mask_produced"] = plgpu.Barrier()
-    shapes["mask_consumed"] = plgpu.Barrier()
+      shapes["mask_produced"] = plgpu.Barrier()
+      shapes["mask_consumed"] = plgpu.Barrier()
 
   return shapes
 
@@ -125,6 +128,9 @@ def _get_dkv_scratch_shapes(
     v_dtype,
     bias,
     mask,
+    *,
+    compute_dk: bool = True,
+    compute_dv: bool = True,
 ):
   block_q = config.block_q_dkv
   block_kv = config.block_kv_dkv
@@ -143,8 +149,6 @@ def _get_dkv_scratch_shapes(
           plgpu.TMEM((block_kv, block_q), jnp.float32),
           plgpu.TMEM((block_kv, block_q), q_dtype, packed=True),
       ),
-      dk_tmem=plgpu.TMEM((block_kv, head_dim), jnp.float32),
-      dv_tmem=plgpu.TMEM((block_kv, head_dim_out), jnp.float32),
       kv_produced=plgpu.Barrier(num_arrivals=2),
       q_do_produced=plgpu.Barrier(num_barriers=num_stages, num_arrivals=2),
       q_consumed=plgpu.Barrier(
@@ -164,6 +168,10 @@ def _get_dkv_scratch_shapes(
       ),
       residual_consumed=plgpu.Barrier(num_barriers=residual_stages),
   )
+  if compute_dk:
+    shapes["dk_tmem"] = plgpu.TMEM((block_kv, head_dim), jnp.float32)
+  if compute_dv:
+    shapes["dv_tmem"] = plgpu.TMEM((block_kv, head_dim_out), jnp.float32)
   if bias is not None and bias.shape[-2] != 1 and bias.shape[-1] != 1:
     shapes["bias_smem"] = _tiled_smem((block_kv, block_q), bias.dtype, "bias")
     shapes["bias_produced"] = plgpu.Barrier()
@@ -222,55 +230,64 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   q_dtype = _downcast_if_needed(q.dtype, q_k_prec)
   k_dtype = _downcast_if_needed(k.dtype, q_k_prec)
   v_dtype = _downcast_if_needed(v.dtype, v_prec)
-  dout_dtype = _downcast_if_needed(dout.dtype, v_prec)
+  dout_dtype = (
+      v_dtype
+      if dout.dtype == jnp.float32
+      else _downcast_if_needed(dout.dtype, v_prec)
+  )
 
-  for q_kv_block_size in (128, 64):
-    for residual_stages in (1, 2):
-      for num_stages in (2, 3, 4):
-        config = Config(
-            block_kv_dkv=128,
-            block_q_dkv=q_kv_block_size,
-            block_kv_dq=q_kv_block_size,
-            block_q_dq=128,
-            residual_stages=residual_stages,
-            num_stages=num_stages,
-        )
-        dq_shapes = _get_dq_scratch_shapes(
-            config=config,
-            head_dim=head_dim,
-            head_dim_out=head_dim_out,
-            q_dtype=q_dtype,
-            dout_dtype=dout_dtype,
-            k_dtype=k_dtype,
-            v_dtype=v_dtype,
-            ds_dtype=ds_dtype,
-            bias=bias,
-            mask=mask,
-        )
-        dkv_shapes = _get_dkv_scratch_shapes(
-            config=config,
-            head_dim=head_dim,
-            head_dim_out=head_dim_out,
-            q_dtype=q_dtype,
-            dout_dtype=dout_dtype,
-            k_dtype=k_dtype,
-            v_dtype=v_dtype,
-            bias=bias,
-            mask=mask,
-        )
-        dq_smem = _estimate_smem_bytes(dq_shapes)
-        dkv_smem = _estimate_smem_bytes(dkv_shapes)
-        if dq_smem + dkv_smem < min_total_smem:
-          min_total_smem = dq_smem + dkv_smem
-          fallback_dq_smem = dq_smem
-          fallback_dkv_smem = dkv_smem
-        min_dq_smem = min(min_dq_smem, dq_smem)
-        min_dkv_smem = min(min_dkv_smem, dkv_smem)
-        if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
-          configs.add(config)
-    # If we found a good config for q_kv_block_size 128 there is no point
-    # looking into 64 which is strictly worse for use of TC and
-    # SMEM/TMEM.
+  for num_stages_candidates in ((2, 3, 4), (1,)):
+    for q_kv_block_size in (128, 64):
+      if 2 * q_kv_block_size + head_dim > 512:
+        continue
+      for residual_stages in (1, 2):
+        for num_stages in num_stages_candidates:
+          config = Config(
+              block_kv_dkv=128,
+              block_q_dkv=q_kv_block_size,
+              block_kv_dq=q_kv_block_size,
+              block_q_dq=128,
+              residual_stages=residual_stages,
+              num_stages=num_stages,
+          )
+          dq_shapes = _get_dq_scratch_shapes(
+              config=config,
+              head_dim=head_dim,
+              head_dim_out=head_dim_out,
+              q_dtype=q_dtype,
+              dout_dtype=dout_dtype,
+              k_dtype=k_dtype,
+              v_dtype=v_dtype,
+              ds_dtype=ds_dtype,
+              bias=bias,
+              mask=mask,
+          )
+          dkv_shapes = _get_dkv_scratch_shapes(
+              config=config,
+              head_dim=head_dim,
+              head_dim_out=head_dim_out,
+              q_dtype=q_dtype,
+              dout_dtype=dout_dtype,
+              k_dtype=k_dtype,
+              v_dtype=v_dtype,
+              bias=bias,
+              mask=mask,
+          )
+          dq_smem = _estimate_smem_bytes(dq_shapes)
+          dkv_smem = _estimate_smem_bytes(dkv_shapes)
+          if dq_smem + dkv_smem < min_total_smem:
+            min_total_smem = dq_smem + dkv_smem
+            fallback_dq_smem = dq_smem
+            fallback_dkv_smem = dkv_smem
+          min_dq_smem = min(min_dq_smem, dq_smem)
+          min_dkv_smem = min(min_dkv_smem, dkv_smem)
+          if dq_smem <= _SMEM_SIZE_LIMIT and dkv_smem <= _SMEM_SIZE_LIMIT:
+            configs.add(config)
+      # If we found a good config for q_kv_block_size 128 there is no point
+      # looking into 64 which is strictly worse for use of TC and
+      # SMEM/TMEM.
+      if configs:
+        break
     if configs:
       break
   if not configs:
@@ -366,7 +383,7 @@ def _kernel_dq(
   qs = cast(pl.Slice, pl.ds(q_base, block_q))
 
   lb = 0
-  ub = k_gmem.shape[-3] // block_kv
+  ub = num_kv_tiles = k_gmem.shape[-3] // block_kv
   if is_causal:
     ub = lax.min(ub, pl.cdiv(q_base + block_q, block_kv))
 
@@ -437,6 +454,8 @@ def _kernel_dq(
           plgpu.barrier_wait(kv_produced.at[si])
           if wait_s_consumed:
             plgpu.barrier_wait(s_consumed)
+          else:
+            mgpu_lib.tcgen05_fence_after_thread_sync()
           plgpu.tcgen05_mma(s_tmem, q_smem, k_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(s_produced)
 
@@ -453,22 +472,39 @@ def _kernel_dq(
           plgpu.tcgen05_commit_arrive(k_consumed.at[si])
 
         plgpu.barrier_wait(q_do_produced)
-        q_k_mma(lb, wait_s_consumed=False)
-        do_v_mma(lb)
+        if num_stages == 1:
 
-        @pl.loop(lb, ub - 1)
-        def mma_loop(ki):
-          q_k_mma(ki + 1)
-          ds_k_mma(ki)
-          do_v_mma(ki + 1)
+          @pl.loop(lb, ub)
+          def mma_loop_single_stage(ki):
+            q_k_mma(ki, wait_s_consumed=False)
+            do_v_mma(ki)
+            ds_k_mma(ki)
+            plgpu.barrier_wait(s_consumed)
 
-        ds_k_mma(ub - 1)
+        else:
+          q_k_mma(lb, wait_s_consumed=False)
+          do_v_mma(lb)
+
+          @pl.loop(lb, ub - 1)
+          def mma_loop(ki):
+            q_k_mma(ki + 1)
+            ds_k_mma(ki)
+            do_v_mma(ki + 1)
+
+          ds_k_mma(ub - 1)
         plgpu.tcgen05_commit_arrive(dq_mma_finished)
 
     plgpu.barrier_wait(dq_mma_finished)
     dq = plgpu.async_load_tmem(dq_tmem, layout=_TCGEN05)
     plgpu.wait_load_tmem()
     q_smem[...] = (dq * logits_scale).astype(q_smem.dtype)
+    plgpu.commit_smem()
+    plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[qs, hi])
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+  @pl.when((wg == 0) & (ub <= lb))
+  def zero_dq_wg():
+    q_smem[...] = jnp.zeros_like(q_smem)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(q_smem, dq_gmem.at[qs, hi])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -512,6 +548,7 @@ def _kernel_dq(
         else:
           plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
           bias = plgpu.load(bias_smem, layout=layout)
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s, scale = s * scale + bias.astype(s.dtype), 1.0
 
@@ -550,6 +587,7 @@ def _kernel_dq(
             mask = lax.broadcast_in_dim(mask, s.shape, [1])
           else:
             mask = plgpu.load(mask_smem, layout=layout)
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         p = jnp.where(mask, p, 0.0)
@@ -561,6 +599,7 @@ def _kernel_dq(
       if logits_soft_cap is not None:
         ds *= 1.0 - logits * logits
 
+      mgpu_lib.tcgen05_wait_ld()
       plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
       if ds_gmem is not None:
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -574,6 +613,24 @@ def _kernel_dq(
         plgpu.copy_smem_to_gmem(ds_smem, ds_gmem.at[hi, qs, ks])
 
     if ds_gmem is not None:
+      plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+  @pl.when((wg == 1) & (ub < num_kv_tiles))
+  def zero_ds_wg():
+    if ds_gmem is not None:
+      assert ds_smem is not None
+      ds_smem[...] = jnp.zeros_like(ds_smem)
+      plgpu.commit_smem()
+
+      @pl.loop(lax.max(ub, lb), num_kv_tiles)
+      def zero_ds_loop(ki):
+        assert ds_smem is not None
+        ks = pl.ds(ki * block_kv, block_kv)
+        plgpu.copy_smem_to_gmem(
+            ds_smem, ds_gmem.at[hi, qs, ks], commit_group=False
+        )
+
+      plgpu.commit_smem_to_gmem_group()
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
@@ -599,8 +656,8 @@ def _kernel_dkv(
     residuals_smem,
     s_p_tmems,
     dp_ds_tmems,
-    dk_tmem,
-    dv_tmem,
+    dk_tmem=None,
+    dv_tmem=None,
     kv_produced,
     q_do_produced,
     q_consumed,
@@ -736,6 +793,7 @@ def _kernel_dkv(
         def q_loop(step):
           si = lax.rem(step, num_stages)
           plgpu.barrier_wait(q_do_produced.at[si])
+          mgpu_lib.tcgen05_fence_after_thread_sync()
           plgpu.tcgen05_mma(s_tmem, k_smem, q_smem.at[si].T, accumulate=False)
           plgpu.tcgen05_commit_arrive(s_produced)
 
@@ -743,34 +801,59 @@ def _kernel_dkv(
           plgpu.tcgen05_commit_arrive(dp_produced)
 
           plgpu.barrier_wait(p_produced)
-          plgpu.tcgen05_mma(
-              dv_tmem, p_tmem, do_smem.at[si], accumulate=(step > 0)
-          )
+          if dv_tmem is not None:
+            plgpu.tcgen05_mma(
+                dv_tmem, p_tmem, do_smem.at[si], accumulate=(step > 0)
+            )
           plgpu.tcgen05_commit_arrive(do_consumed.at[si])
 
           plgpu.barrier_wait(ds_produced)
-          plgpu.tcgen05_mma(
-              dk_tmem, ds_tmem, q_smem.at[si], accumulate=(step > 0)
-          )
+          if dk_tmem is not None:
+            plgpu.tcgen05_mma(
+                dk_tmem, ds_tmem, q_smem.at[si], accumulate=(step > 0)
+            )
           plgpu.tcgen05_commit_arrive(q_consumed.at[si])
 
         plgpu.tcgen05_commit_arrive(kv_mma_finished)
 
     plgpu.barrier_wait(kv_mma_finished)
-    dk = plgpu.async_load_tmem(dk_tmem, layout=_TCGEN05)
-    dv = plgpu.async_load_tmem(dv_tmem, layout=_TCGEN05)
-    k_smem[...] = (dk * logits_scale).astype(k_smem.dtype)
-    v_smem[...] = dv.astype(v_smem.dtype)
+    if dk_tmem is not None:
+      dk = plgpu.async_load_tmem(dk_tmem, layout=_TCGEN05)
+      plgpu.wait_load_tmem()
+      k_smem[...] = (dk * logits_scale).astype(k_smem.dtype)
+    if dv_tmem is not None:
+      dv = plgpu.async_load_tmem(dv_tmem, layout=_TCGEN05)
+      plgpu.wait_load_tmem()
+      v_smem[...] = dv.astype(v_smem.dtype)
     plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[ks, hi_kv])
-    plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[ks, hi_kv])
+    if dk_gmem is not None:
+      plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[ks, hi_kv])
+    if dv_gmem is not None:
+      plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[ks, hi_kv])
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+  @pl.when((wg == 0) & (total_steps <= 0))
+  def zero_dkv_wg():
+    if dk_gmem is not None:
+      k_smem[...] = jnp.zeros_like(k_smem)
+    if dv_gmem is not None:
+      v_smem[...] = jnp.zeros_like(v_smem)
+    plgpu.commit_smem()
+    if dk_gmem is not None:
+      plgpu.copy_smem_to_gmem(k_smem, dk_gmem.at[ks, hi_kv])
+    if dv_gmem is not None:
+      plgpu.copy_smem_to_gmem(v_smem, dv_gmem.at[ks, hi_kv])
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
   @pl.when((wg == 1) & (total_steps > 0))
   def softmax_wg():
     if mask_gmem is None:
       loop_invariant_mask = None
-    elif mask_gmem.shape[-3] != 1 or mask_gmem.shape[-1] != 1:
+    elif (
+        mask_gmem.shape[-3] != 1
+        or mask_gmem.shape[-2] == 1
+        or mask_gmem.shape[-1] != 1
+    ):
       loop_invariant_mask = None
     else:
       loop_invariant_mask = plgpu.load(
@@ -789,18 +872,18 @@ def _kernel_dkv(
       if bias_gmem is None:
         bias = None
       elif bias_smem is None:
-        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
+        bias = _load_bcast(bias_gmem, (hi, ks, qs), layout=_TCGEN05)
       else:
         plgpu.barrier_wait(bias_produced)  # pyrefly: ignore[bad-argument-type]
         bias = plgpu.load(bias_smem, layout=_TCGEN05)
+        mgpu_lib.fence_async_shared_cta()
+        plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
 
       plgpu.barrier_wait(s_produced)
       s = plgpu.async_load_tmem(s_tmem, layout=_TCGEN05)
       scale = logits_scale
 
       if bias is not None:
-        if bias_smem is not None:
-          plgpu.barrier_arrive(bias_consumed)  # pyrefly: ignore[bad-argument-type]
         s, scale = s * scale + bias.astype(s.dtype), 1.0
 
       if logits_soft_cap is not None:
@@ -838,21 +921,24 @@ def _kernel_dkv(
       if mask_gmem is not None:
         if mask_smem is None:
           if loop_invariant_mask is None:
-            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)  # pyrefly: ignore[bad-argument-type]
+            mask = _load_bcast(mask_gmem, (hi, ks, qs), layout=_TCGEN05)
           else:
             mask = lax.broadcast_in_dim(loop_invariant_mask, s.shape, [0])
         else:
           plgpu.barrier_wait(mask_produced)  # pyrefly: ignore[bad-argument-type]
           mask = plgpu.load(mask_smem, layout=_TCGEN05)
+          mgpu_lib.fence_async_shared_cta()
           plgpu.barrier_arrive(mask_consumed)  # pyrefly: ignore[bad-argument-type]
 
         p = jnp.where(mask, p, 0.0)
 
+      mgpu_lib.tcgen05_wait_ld()
       plgpu.async_store_tmem(p_tmem, p.astype(p_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
       plgpu.barrier_arrive(p_produced)
 
       delta = plgpu.load(delta_smem.at[si_res], layout=_TCGEN05_COL)
+      mgpu_lib.fence_async_shared_cta()
       plgpu.barrier_arrive(residual_consumed.at[si_res])
 
       plgpu.barrier_wait(dp_produced)
@@ -862,6 +948,7 @@ def _kernel_dkv(
       if logits_soft_cap is not None:
         ds *= 1.0 - logits * logits
 
+      mgpu_lib.tcgen05_wait_ld()
       plgpu.async_store_tmem(ds_tmem, ds.astype(ds_tmem.dtype))
       mgpu_lib.tcgen05_wait_st()
       plgpu.barrier_arrive(ds_produced)
@@ -903,14 +990,17 @@ def flash_attention_vjp_kernel(
 
   block_q_dq = config.block_q_dq
   block_kv_dq = config.block_kv_dq
+  block_q_dkv = config.block_q_dkv
   block_kv_dkv = config.block_kv_dkv
+  pad_q = math.lcm(block_q_dq, block_q_dkv)
+  pad_kv = math.lcm(block_kv_dq, block_kv_dkv)
 
   # TODO: Remove explicit padding in favor of TMA out-of-bounds zero-filling and in-kernel -inf masking.
-  q = shape_lib.pad_to_next_multiple_of(q, block_q_dq, -3)
-  out = shape_lib.pad_to_next_multiple_of(out, block_q_dq, -3)
-  dout = shape_lib.pad_to_next_multiple_of(dout, block_q_dq, -3)
-  k = shape_lib.pad_to_next_multiple_of(k, block_kv_dkv, -3)
-  v = shape_lib.pad_to_next_multiple_of(v, block_kv_dkv, -3)
+  q = shape_lib.pad_to_next_multiple_of(q, pad_q, -3)
+  out = shape_lib.pad_to_next_multiple_of(out, pad_q, -3)
+  dout = shape_lib.pad_to_next_multiple_of(dout, pad_q, -3)
+  k = shape_lib.pad_to_next_multiple_of(k, pad_kv, -3)
+  v = shape_lib.pad_to_next_multiple_of(v, pad_kv, -3)
 
   # TODO: Avoid broadcast.
   bcast = lambda x: jnp.broadcast_to(x, (q.shape[-2], orig_q_seq_len))
@@ -921,29 +1011,35 @@ def flash_attention_vjp_kernel(
     mask = mask.astype(jnp.int8)
 
   if mask is not None:
-    mask = _pad_maybe_bcast(mask, block_q_dq, -2)
-    mask = _pad_maybe_bcast(mask, block_kv_dkv, -1)
+    mask = _pad_maybe_bcast(mask, pad_q, -2)
+    mask = _pad_maybe_bcast(mask, pad_kv, -1)
   if bias is not None:
-    bias = _pad_maybe_bcast(bias, block_q_dq, -2)
-    bias = _pad_maybe_bcast(bias, block_kv_dkv, -1)
+    bias = _pad_maybe_bcast(bias, pad_q, -2)
+    bias = _pad_maybe_bcast(bias, pad_kv, -1)
   if k_start is not None:
-    k_start = shape_lib.pad_to_next_multiple_of(k_start, block_q_dq, -1)
+    k_start = shape_lib.pad_to_next_multiple_of(k_start, pad_q, -1)
   if k_end is not None:
-    k_end = shape_lib.pad_to_next_multiple_of(k_end, block_q_dq, -1)
+    k_end = shape_lib.pad_to_next_multiple_of(k_end, pad_q, -1)
 
   pad_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v, out, dout = map(pad_dim, (q, k, v, out, dout))
   head_dim, head_dim_out = _get_input_metadata(q, v)
 
   m, l = residuals
-  m = shape_lib.pad_to_next_multiple_of(m, block_q_dq, -1, pad_value=1e9)
-  l = shape_lib.pad_to_next_multiple_of(l, block_q_dq, -1, pad_value=1)
-  l_rcp = jnp.reciprocal(l + jnp.finfo(jnp.float32).tiny)
+  m = jnp.where((m == -jnp.inf) | (l == 0.0), jnp.inf, m)
+  m = shape_lib.pad_to_next_multiple_of(m, pad_q, -1, pad_value=jnp.inf)
+  l = shape_lib.pad_to_next_multiple_of(l, pad_q, -1, pad_value=0.0)
+  l_rcp = jnp.where(
+      l == 0.0, 0.0, jnp.reciprocal(l + jnp.finfo(jnp.float32).tiny)
+  )
 
   delta = jnp.einsum(
-      "...qhd,...qhd->...hq", out.astype(jnp.float32), dout.astype(jnp.float32)
+      "...qhd,...qhd->...hq",
+      out.astype(jnp.float32),
+      dout.astype(jnp.float32),
+      precision=jax.lax.Precision.HIGHEST,
   )
-  delta = shape_lib.pad_to_next_multiple_of(delta, block_q_dq, -1)
+  delta = shape_lib.pad_to_next_multiple_of(delta, pad_q, -1)
 
   compiler_params = plgpu.CompilerParams(
       approx_math=True,
@@ -992,23 +1088,6 @@ def flash_attention_vjp_kernel(
       scratch_types=dq_scratch_shapes,
   )(q, k, v, dout, m, l_rcp, delta, bias, k_start, k_end, mask)
 
-  dkv_shape = (
-      jax.ShapeDtypeStruct(k.shape, k.dtype),
-      jax.ShapeDtypeStruct(v.shape, v.dtype),
-  )
-
-  dkv_scratch_shapes = _get_dkv_scratch_shapes(
-      config=config,
-      head_dim=head_dim,
-      head_dim_out=head_dim_out,
-      q_dtype=q.dtype,
-      dout_dtype=dout.dtype,
-      k_dtype=k.dtype,
-      v_dtype=v.dtype,
-      bias=bias,
-      mask=mask,
-  )
-
   bias_dkv = None if bias is None else bias.mT
   mask_dkv = None if mask is None else mask.mT
 
@@ -1020,17 +1099,41 @@ def flash_attention_vjp_kernel(
       logits_soft_cap=logits_soft_cap,
   )
 
-  dk, dv = plgpu.kernel(
-      kernel_dkv,
-      out_type=dkv_shape,
-      kernel_name="sm100_dkv_kernel",
-      grid=(k.shape[-2], k.shape[-3] // block_kv_dkv),
-      grid_names=("heads", "kv_tiles"),
-      num_threads=2,
-      thread_name="wg",
-      compiler_params=compiler_params,
-      scratch_types=dkv_scratch_shapes,
-  )(q, k, v, dout, m, l_rcp, delta, bias_dkv, k_start, k_end, mask_dkv)
+  def run_dkv(compute_dk: bool, compute_dv: bool):
+    dkv_shape = (
+        jax.ShapeDtypeStruct(k.shape, k.dtype) if compute_dk else None,
+        jax.ShapeDtypeStruct(v.shape, v.dtype) if compute_dv else None,
+    )
+    dkv_scratch_shapes = _get_dkv_scratch_shapes(
+        config=config,
+        head_dim=head_dim,
+        head_dim_out=head_dim_out,
+        q_dtype=q.dtype,
+        dout_dtype=dout.dtype,
+        k_dtype=k.dtype,
+        v_dtype=v.dtype,
+        bias=bias,
+        mask=mask,
+        compute_dk=compute_dk,
+        compute_dv=compute_dv,
+    )
+    return plgpu.kernel(
+        kernel_dkv,
+        out_type=dkv_shape,
+        kernel_name="sm100_dkv_kernel",
+        grid=(k.shape[-2], k.shape[-3] // block_kv_dkv),
+        grid_names=("heads", "kv_tiles"),
+        num_threads=2,
+        thread_name="wg",
+        compiler_params=compiler_params,
+        scratch_types=dkv_scratch_shapes,
+    )(q, k, v, dout, m, l_rcp, delta, bias_dkv, k_start, k_end, mask_dkv)
+
+  if 2 * block_q_dkv + head_dim + head_dim_out <= 512:
+    dk, dv = run_dkv(compute_dk=True, compute_dv=True)
+  else:
+    dk, _ = run_dkv(compute_dk=True, compute_dv=False)
+    _, dv = run_dkv(compute_dk=False, compute_dv=True)
 
   dq = dq[:orig_q_seq_len, :, :orig_head_dim]
   dk = dk[:orig_kv_seq_len, :, :orig_head_dim]

@@ -113,42 +113,70 @@ def fence_async_shared_cta(_):
 
 
 def _bar_operation(
-    operation: str, barrier_id: int | jax.Array, num_threads: int
+    operation: str,
+    barrier_id: int | jax.Array,
+    num_threads: int,
+    predicate: bool | jax.Array | None = None,
 ):
   """Performs a PTX CTA barrier operation."""
+  if isinstance(predicate, (bool, np.bool_)):
+    if not predicate:
+      return
+    predicate = None
+
   if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
-
-    bar_op()
+    args, bar_id = [], barrier_id
   else:
+    args, bar_id = [barrier_id], "$0"
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-    def bar_op(_, barrier_id):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [barrier_id.registers[()]],
-          f"bar.{operation} $0, {num_threads};",
-          "r",
-          has_side_effects=True,
-      )
+  if predicate is not None:
+    args.append(predicate)
 
-    bar_op(barrier_id)
+  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,) * len(args))
+  def bar_op(_, *args):
+    args = [a.registers[()] for a in args]
+    pred = None if predicate is None else args.pop()
+    mgpu.utils.inline_ptx(
+        f"bar.{operation} {bar_id}, {num_threads};", *args, predicate=pred
+    )
+
+  bar_op(*args)
 
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
 bar_sync = functools.partial(_bar_operation, "sync")
 
 
-def int4_as_biased_f8e4m3fn(x, layout):
+def apply_int4_to_fp8_offline_permute(x: jax.Array, axis: int) -> jax.Array:
+  """Permutes an int4 array offline for the permute-free int4 -> fp8 upcast.
+
+  This is the layout `int4_as_biased_f8e4m3fn(offline_permuted=True)` expects:
+  within every aligned group of 8 elements along `axis`, storage slot `p` holds
+  original element `(0, 4, 1, 5, 2, 6, 3, 7)[p]` (the two halves of the group
+  interleaved), so each packed byte `i` becomes `(e[i + 4] << 4) | e[i]` and the
+  upcast needs no byte permutes. Uses reshape + transpose rather than a gather
+  so that it also works under symbolic checkpoint evaluation.
+
+  Args:
+    x: The int4 array.
+    axis: The contraction axis to permute along.
+
+  Returns:
+    The permuted array, with the same shape and dtype as `x`.
+  """
+  axis = axis % x.ndim
+  k = x.shape[axis]
+  if k % 8:
+    raise ValueError(f"Contraction dim must be a multiple of 8, got {k}.")
+  x8 = x.astype(jnp.int8)
+  x8 = x8.reshape(*x.shape[:axis], k // 8, 2, 4, *x.shape[axis + 1 :])
+  x8 = jnp.swapaxes(x8, axis + 1, axis + 2)
+  return x8.reshape(x.shape).astype(x.dtype)
+
+
+def int4_as_biased_f8e4m3fn(
+    x: jax.Array, layout: Any, *, offline_permuted: bool = False
+) -> jax.Array:
   """Encodes a packed `int4` array as an `f8e4m3fn` array with an implicit +8 bias.
 
   Mathematically, for any int4 value `x` in the range [-8, 7], this encoding
@@ -208,11 +236,38 @@ def int4_as_biased_f8e4m3fn(x, layout):
   Args:
     x: A `jax.Array` containing packed int4 values.
     layout: The `plgpu.Layout` of the fragmented array `x`.
+    offline_permuted: Whether `x` was permuted offline with
+      `apply_int4_to_fp8_offline_permute` along the contraction dim. Saves two
+      `prmt` per 8 elements.
 
   Returns:
-    A `mgpu.FragmentedArray` containing the encoded values in biased `f8e4m3fn`
-    format with the specified layout.
+    A `jax.Array` containing the encoded values in biased `f8e4m3fn` format
+    with the specified layout.
   """
+  if offline_permuted:
+    # byte i = (e[i + 4] << 4) | e[i]: lo/hi nibbles already are [e0..e3] and
+    # [e4..e7], so only the mask and the +8 bias (xor) remain.
+    asm = """
+        {{
+        .reg .b32 hi_raw, c_mask;
+        mov.b32 c_mask, 0x0F0F0F0F;
+        shr.u32 hi_raw, $2, 4;
+        lop3.b32 $0, $2, 0x08080808, c_mask, 0x6c;
+        lop3.b32 $1, hi_raw, 0x08080808, c_mask, 0x6c;
+        }}
+        """
+  else:
+    asm = """
+        {{
+        .reg .b32 odds_raw, c_mask;
+        mov.b32 c_mask, 0x0F0F0F0F;
+        shr.u32 odds_raw, $2, 4;
+        prmt.b32 $0, $2, odds_raw, 0x5140;
+        prmt.b32 $1, $2, odds_raw, 0x7362;
+        lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
+        lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
+        }}
+        """
 
   @plgpu.inline_mgpu(
       arg_types=(layout,),
@@ -235,17 +290,7 @@ def int4_as_biased_f8e4m3fn(x, layout):
           llvm.inline_asm(
               llvm.StructType.get_literal((i32, i32)),
               [reg],
-              """
-              {{
-              .reg .b32 odds_raw, c_mask;
-              mov.b32 c_mask, 0x0F0F0F0F;
-              shr.u32 odds_raw, $2, 4;
-              prmt.b32 $0, $2, odds_raw, 0x5140;
-              prmt.b32 $1, $2, odds_raw, 0x7362;
-              lop3.b32 $0, $0, 0x08080808, c_mask, 0x6c;
-              lop3.b32 $1, $1, 0x08080808, c_mask, 0x6c;
-              }}
-              """,
+              asm,
               "=r,=r,r",
           ),
       )

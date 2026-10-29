@@ -369,7 +369,7 @@ def vjp(
     fuse_gateup_activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
-  del out, preferred_element_type  # Unused.
+  del out  # Unused.
 
   if (
       group_offset is not None
@@ -428,7 +428,7 @@ def vjp(
           rhs_group_dimensions=[],
       ),
       precision=precision,
-      preferred_element_type=rhs.dtype,
+      preferred_element_type=preferred_element_type,
       manual_axis_type=jax.typeof(rhs).manual_axis_type.to_ct_mat(),
   )
   return dlhs, drhs

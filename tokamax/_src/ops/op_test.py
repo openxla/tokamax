@@ -38,9 +38,9 @@ from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_ragged_dot = None
 
 ragged_dot = api.ragged_dot
 
@@ -319,7 +319,7 @@ class BoundArgumentsTest(parameterized.TestCase):
     # Use a real op so that we have a real autotuning cache.
     # Read in the autotuning cache and then with the overlay it should be None.
     ba = norm_base.Normalization().bind(
-        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        x=jax.ShapeDtypeStruct((2, 2), jnp.bfloat16),
         scale=None,
         offset=None,
         axis=-1,

@@ -87,15 +87,25 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_end = None
 
   if k_indices is None:
-    mask, is_causal, k_start, k_end = mask.take("is_causal", "k_start", "k_end")
+    is_causal = mask.is_causal
+    mask, causal_mask, k_start, k_end = mask.take(
+        "causal_mask", "k_start", "k_end"
+    )
 
-    # Fold `is_causal` into `k_end`. If `q_indices` is not `None`, then this is
-    # necessary for correctness. Otherwise, it is a performance optimization.
-    if is_causal and (q_indices is not None or k_end is not None):
+    # Fold `causal_mask` into `k_end`. If `q_indices` is not `None`, then this
+    # is necessary for correctness. Otherwise, it is a performance optimization.
+    if causal_mask is not None and (
+        not is_causal or q_indices is not None or k_end is not None
+    ):
       if q_indices is None:
         q_indices = jnp.arange(q.shape[-3])
-      k_end_ = q_indices + 1
+      k_end_ = q_indices + (causal_mask.offset + 1)
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
+      if causal_mask.window_size is not None:
+        k_start_ = k_end_ - causal_mask.window_size
+        k_start = (
+            k_start_ if k_start is None else jnp.maximum(k_start, k_start_)
+        )
       is_causal = False
 
     if k_start is not None:
@@ -107,6 +117,24 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
   k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
   mask = mask.as_array(q_len_or_indices, k_len_or_indices)
   return mask, is_causal, k_start, k_end
+
+
+def k_range_block_minmax(
+    k_range: jax.Array | None, kv_seq_len: int, block_q: int
+) -> tuple[jax.Array, jax.Array] | None:
+  """Pre-reduces `k_start` or `k_end` to `(min, max)` per Q-block of `block_q`."""
+  if k_range is None:
+    return None
+  if k_range.shape[-1] == 1:
+    return k_range, k_range
+
+  def pad_reduce(pad_value: int):
+    k_range_ = shape_lib.pad_to_next_multiple_of(
+        k_range, block_q, -1, pad_value
+    )
+    return shape_lib.einshape("...(bq)->...bq", q=block_q)(k_range_)
+
+  return jnp.min(pad_reduce(kv_seq_len), -1), jnp.max(pad_reduce(0), -1)
 
 
 def cast_qkv[
@@ -240,6 +268,17 @@ def load_bcast(
     value = ref[new_idx]
   value = jax.lax.broadcast_in_dim(value, shape, bcast_dims)
   return value if layout is None else plgpu.layout_cast(value, layout)
+
+
+MASK_PACK_DTYPE = jnp.int8
+MASK_PACKED_BITS = mgpu_lib.num_bits(MASK_PACK_DTYPE)
+MIN_MASK_COLS = 128 // MASK_PACKED_BITS
+
+
+def pack_mask(mask: jax.Array) -> jax.Array:
+  """Packs a boolean mask into bits."""
+  mask = jnp.packbits(mask, axis=-1, bitorder="little").view(MASK_PACK_DTYPE)
+  return shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
 
 
 def unpack_bool_bits_tmem_native(a):

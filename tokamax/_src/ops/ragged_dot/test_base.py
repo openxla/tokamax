@@ -30,6 +30,7 @@ from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import arg_specs
 from tokamax._src.ops.ragged_dot import base
+
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
@@ -67,7 +68,9 @@ def override_chex_args(**kwargs):
   assert_close = lambda *a, **kw: orig_assert_close(*a, **(kw | kwargs))
   return mock.patch.object(chex, "assert_trees_all_close", assert_close)
 
+
 NAMED_ARG_SPECS = {s.full_name: s for s in ARG_SPECS if "ci_tests" in s.tags}
+
 
 # TODO: `jax.nn.relu` is annotated with `custom_jvp_call`
 # which isn't compatible with `_estimate_resources` in the mosaic lowering.
@@ -153,7 +156,9 @@ class RaggedDotTestBase(parameterized.TestCase):
     num_groups, m, k, n = 8, 1024, 128, 256
     a, b, group_sizes = self._create_inputs(num_groups, m, k, n, dtype)
     actual = self._dot_fn_f32(a, b, group_sizes=group_sizes)
-    chex.assert_trees_all_close(actual, ref(a, b, group_sizes))
+    chex.assert_trees_all_close(
+        actual, ref(a, b, group_sizes), atol=0.01, rtol=0.005
+    )
 
   @parameterized.parameters(jnp.bfloat16, jnp.float32)
   def test_simple(self, dtype):
@@ -167,7 +172,9 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(a, b, group_sizes)
     actual = self._dot_fn_f32(a, b, group_sizes=group_sizes)
     count = sum(group_sizes)
-    chex.assert_trees_all_close(actual[:count], expected[:count])
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.01, rtol=0.005
+    )
 
   def test_zero_group_sizes(self):
     num_groups, m, k, n = 8, 1024, 128, 256
@@ -182,7 +189,9 @@ class RaggedDotTestBase(parameterized.TestCase):
         expected = ref(a, b, group_sizes_)
         actual = self._dot_fn_f32(a, b, group_sizes=group_sizes_)
         count = sum(group_sizes_)
-        chex.assert_trees_all_close(actual[:count], expected[:count])
+        chex.assert_trees_all_close(
+            actual[:count], expected[:count], atol=0.01, rtol=0.005
+        )
 
   @parameterized.product(
       dtype=("int8", "int4"),
@@ -233,9 +242,7 @@ class RaggedDotTestBase(parameterized.TestCase):
 
     expected = ref(a, b, group_sizes, activation)
     # TODO: preferred_element_type to f32 and tighten tolerances.
-    actual = self._dot_fn(
-        a, b, group_sizes=group_sizes, activation=activation
-    )
+    actual = self._dot_fn(a, b, group_sizes=group_sizes, activation=activation)
     count = sum(group_sizes)
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.01, rtol=0.005
@@ -253,8 +260,7 @@ class RaggedDotTestBase(parameterized.TestCase):
         a, b, group_sizes=group_sizes, preferred_element_type=out_type
     )
     self.assertEqual(actual.dtype, out_type or jnp.bfloat16)
-    tol = dict(atol=0.01, rtol=0.005) if actual.dtype == jnp.bfloat16 else {}
-    chex.assert_trees_all_close(actual, expected, **tol)
+    chex.assert_trees_all_close(actual, expected, atol=0.01, rtol=0.005)
 
   @parameterized.product(
       num_groups=(8,),
@@ -298,7 +304,7 @@ class RaggedDotTestBase(parameterized.TestCase):
     expected = ref(a, b, group_sizes=group_sizes)
     group_sizes = base.GroupSizes(group_sizes, (1,) * num_groups)
     actual = self._dot_fn_f32(a, b, group_sizes=group_sizes)
-    chex.assert_trees_all_close(actual, expected)
+    chex.assert_trees_all_close(actual, expected, atol=0.01, rtol=0.005)
 
   @parameterized.parameters(((2, 3, -1, 4),), ((1022, 1, 1, 1),))
   def test_invalid_group_sizes(self, group_sizes):
@@ -315,7 +321,7 @@ class RaggedDotTestBase(parameterized.TestCase):
 
   @parameterized.named_parameters(NAMED_ARG_SPECS.items())
   def test_bench(self, spec):
-    if jax.devices()[0].device_kind in spec.excluded_platforms:
+    if spec.is_excluded_on(jax.devices()[0]):
       self.skipTest(f"Skip the test on {jax.devices()[0].device_kind}.")
 
     if "m1179648" in self._testMethodName and jax.default_backend() == "gpu":

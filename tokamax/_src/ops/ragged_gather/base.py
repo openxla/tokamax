@@ -27,8 +27,29 @@ AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 def ragged_gather(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
 ) -> jax.Array:
-  del start, end  # Integer scalar arrays can be converted to a scalar index.
-  return x[indices]
+  """Gathers `x[indices]` for output rows in `[start, end)`."""
+  # Mask indices for output rows outside [start, end) to -1.
+  row_ids = jax.lax.iota(jax.numpy.int32, indices.shape[0])
+  start_idx = jax.lax.reshape(start, ())
+  end_idx = jax.lax.reshape(end, ())
+  in_range = jax.lax.bitwise_and(
+      jax.lax.ge(row_ids, start_idx), jax.lax.lt(row_ids, end_idx)
+  )
+  masked_indices = jax.lax.select(
+      in_range, indices, jax.lax.full_like(indices, -1)
+  )
+  # Gather slices of x along axis 0 using the masked 1D indices.
+  dnums = jax.lax.GatherDimensionNumbers(
+      offset_dims=tuple(range(1, x.ndim)),
+      collapsed_slice_dims=(0,),
+      start_index_map=(0,),
+  )
+  return jax.lax.gather(
+      x,
+      jax.lax.expand_dims(masked_indices, (-1,)),
+      dimension_numbers=dnums,
+      slice_sizes=(1, *x.shape[1:]),
+  )
 
 
 class RaggedGather[C](op.Op[Any, jax.Array, None, C, Any]):

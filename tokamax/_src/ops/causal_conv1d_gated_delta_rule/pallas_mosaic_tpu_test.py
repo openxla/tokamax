@@ -98,10 +98,17 @@ class GDNAutotuningTest(parameterized.TestCase):
   )
   def test_autotuning_configs(self, n_kq, n_v):
     kwargs = self._kwargs(n_kq, n_v)
-    configs = self.op.bind(**kwargs).autotuning_configs
+    ba = self.op.bind(**kwargs)
+    configs = ba.autotuning_configs
 
+    # The heuristic resolves to concrete tile sizes, so it never shows up as
+    # null tile sizes in the autotuning cache.
+    heuristics_config = ba.heuristics_config
+    self.assertIsNotNone(heuristics_config.decode_tile_size)
+    self.assertIsNotNone(heuristics_config.mixed_tile_size)
     # The heuristic is always a candidate, so tuning can never lose to it.
-    self.assertIn(pallas_mosaic_tpu.Config(), configs)
+    self.assertIn(heuristics_config, configs)
+    self.assertNotIn(pallas_mosaic_tpu.Config(), configs)
 
     states_ref, out_ref = base.CausalConv1dGatedDeltaRule()(**kwargs)
     lowerings = set()

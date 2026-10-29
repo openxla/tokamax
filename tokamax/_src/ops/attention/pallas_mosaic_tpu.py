@@ -30,7 +30,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
 
 
 QArray = base.QArray

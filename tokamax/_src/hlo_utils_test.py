@@ -24,7 +24,6 @@ import jax
 from jax import export
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
-from jax.experimental.pallas import triton as plgpu
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -36,18 +35,21 @@ from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import base as norm_base
-from tokamax._src.ops.normalization import pallas_triton as pl_norm
-from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 
 try:
-  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_glu = None  # pyrefly: ignore[assignment]
+  triton_glu = None
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_norm = None
+
+try:
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
+except ImportError:
+  triton_ragged_dot = None
 
 RepresentationTypes = Literal['lowered', 'mlir']
 
@@ -64,39 +66,13 @@ def _computation_from_lowered(
       return hlo_utils_common.ir_module_from_lowered(x)
 
 
-def add_vectors_kernel(x_ref, y_ref, o_ref):
-  x, y = x_ref[...], y_ref[...]
-  o_ref[...] = x + y
-
-
-def add_vector_two(x_ref, o_ref):
-  o_ref[...] = x_ref[...] + 2
-
-
-@jax.jit
-def add_vectors_pallas_triton(x: jax.Array, y: jax.Array) -> jax.Array:
-  call_1 = pl.pallas_call(
-      add_vectors_kernel,
-      out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      name='add_vectors_kernel_1',
-      compiler_params=plgpu.CompilerParams(num_warps=2, num_stages=1),
-  )
-  call_2 = pl.pallas_call(
-      add_vector_two,
-      grid=(8, 1, 1),
-      out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-      name='add_vector_two',
-      compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3),
-  )
-  out = call_1(x, y)
-  out *= call_2(out)
-  return jnp.sin(out) + jnp.cos(out)
-
-
 class DumpHloLibTest(parameterized.TestCase):
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_pallas_gpu_tpu(self, representation):
+  def test_pallas_tpu(self, representation):
+    if jax.default_backend() != 'tpu':
+      self.skipTest('This test only runs on TPU.')
+
     # Example taken from https://docs.jax.dev/en/latest/pallas/quickstart.html.
     def add_vectors_kernel(x_ref, y_ref, o_ref):
       x, y = x_ref[...], y_ref[...]
@@ -107,9 +83,6 @@ class DumpHloLibTest(parameterized.TestCase):
       return pl.pallas_call(
           add_vectors_kernel,
           out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-          compiler_params=(
-              plgpu.CompilerParams() if jax.default_backend() == 'gpu' else None
-          ),
       )(x, y)
 
     x = jnp.arange(8)
@@ -125,76 +98,25 @@ class DumpHloLibTest(parameterized.TestCase):
         computation, include_xla_kernels=False
     )
 
-    expected_class = (
-        hlo_utils_common.TritonKernelInfo
-        if jax.default_backend() == 'gpu'
-        else hlo_utils_common.MosaicTpuKernelInfo
-    )
-    self.assertIsInstance(kernel_info, expected_class)
+    self.assertIsInstance(kernel_info, hlo_utils_common.MosaicTpuKernelInfo)
     self.assertEqual(
         kernel_info.outputs,
         (jax.ShapeDtypeStruct(shape=(8,), dtype=jnp.int32),),
     )
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_simple_pallas_triton(self, representation):
-
+  def test_triton_norm(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
-    dtype = jnp.int32
-    x = jnp.arange(8, dtype=dtype)
-    computation = _computation_from_lowered(
-        add_vectors_pallas_triton.lower(x=x, y=x), representation
-    )
-    kernel_info = hlo_utils.get_kernel_info(
-        computation, include_xla_kernels=False
-    )
-    self.assertLen(kernel_info, 2)
-    kernel_1, kernel_2 = kernel_info
-
-    self.assertIsInstance(kernel_1, hlo_utils_common.TritonKernelInfo)
-    self.assertIsInstance(kernel_2, hlo_utils_common.TritonKernelInfo)
-
-    # TODO: Re-enable checks after bug is fixed.
-    _ = """
-    self.assertEqual(kernel_1.num_stages, 1)
-    self.assertEqual(kernel_2.num_stages, 3)
-    """
-
-    shape = jax.ShapeDtypeStruct(shape=(8,), dtype=dtype)
-    self.assertEqual(kernel_1.inputs, (shape, shape))
-    self.assertEqual(kernel_2.inputs, (shape,))
-
-    # Note that Pallas Triton kernels are considered unstable for the purposes
-    # of JAX StableHLO export. Test that DISABLE_JAX_EXPORT_CHECKS works as
-    # expected.
-    with self.subTest('serialization'):
-      shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-      with self.assertRaises(ValueError):
-        export.export(add_vectors_pallas_triton)(shape, shape)
-
-      exported_fn = export.export(
-          add_vectors_pallas_triton,
-          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
-      )(shape, shape)
-      serialized = exported_fn.serialize()
-      f_roundtrip = export.deserialize(serialized)
-      out_roundtrip = jax.jit(f_roundtrip.call)(x, x)
-      out = add_vectors_pallas_triton(x, x)
-      chex.assert_trees_all_equal(out, out_roundtrip)
-
-  @parameterized.parameters(*REPRESENTATION_TYPES)
-  def test_pallas_norm(self, representation):
-    if jax.default_backend() != 'gpu':
-      self.skipTest('This test only runs on GPU.')
+    assert triton_norm is not None
 
     axis = -1
     dtype = jnp.bfloat16
     x_shape = (16, 64, 128)
     param_shape = (x_shape[axis],)
 
-    f = functools.partial(pl_norm.PallasTritonNormalization(), axis=axis)
+    f = functools.partial(triton_norm.TritonNormalization(), axis=axis)
 
     x = jax.ShapeDtypeStruct(shape=x_shape, dtype=dtype)
     scale = jax.ShapeDtypeStruct(shape=param_shape, dtype=jnp.float32)
@@ -223,21 +145,38 @@ class DumpHloLibTest(parameterized.TestCase):
     x_canonical_shape = (math.prod(x_shape[:-1]), x_shape[-1], 1)
     inputs_ref = (
         jax.ShapeDtypeStruct(shape=x_canonical_shape, dtype=x.dtype),
-        jax.ShapeDtypeStruct(shape=(*param_shape, 1), dtype=scale.dtype),
-        jax.ShapeDtypeStruct(shape=(*param_shape, 1), dtype=offset.dtype),
+        jax.ShapeDtypeStruct(shape=param_shape, dtype=scale.dtype),
+        jax.ShapeDtypeStruct(shape=param_shape, dtype=offset.dtype),
     )
     self.assertEqual(forward.inputs, inputs_ref)
 
     # TODO: add tests for axis once this is in the Pallas HLO.
+
+    # Test that DISABLE_JAX_EXPORT_CHECKS works as expected for Triton kernels.
+    with self.subTest('serialization'):
+      fn = jax.jit(f)
+      with self.assertRaises(ValueError):
+        export.export(fn)(x, scale, offset)
+
+      exported_fn = export.export(
+          fn,
+          disabled_checks=hlo_utils.DISABLE_JAX_EXPORT_CHECKS,
+      )(x, scale, offset)
+      serialized = exported_fn.serialize()
+      f_roundtrip = export.deserialize(serialized)
+      out_roundtrip = jax.jit(f_roundtrip.call)(x, scale, offset)
+      out = fn(x, scale, offset)
+      chex.assert_trees_all_equal(out, out_roundtrip)
 
   @parameterized.parameters(*REPRESENTATION_TYPES)
   def test_get_opspecs_from_lowered_jax(self, representation):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
+    assert triton_norm is not None
     assert triton_glu is not None
 
-    norm_op = pl_norm.PallasTritonNormalization()
+    norm_op = triton_norm.TritonNormalization()
     glu_op = triton_glu.TritonGatedLinearUnit()
 
     # Create a string of Tokamax ops in Jax, lower it to HLO, and extract the
@@ -261,13 +200,13 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
     )
     glu_spec = glu_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(weights.shape, jnp.bfloat16),
         activation=jax.nn.swish,
     )
 
@@ -286,14 +225,12 @@ class DumpHloLibTest(parameterized.TestCase):
     op_specs = hlo_utils.get_opspecs(computation, include_xla_kernels=False)
 
     norm_spec = norm_op.bind(
-        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct(x_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
+        jax.ShapeDtypeStruct(param_shape, jnp.bfloat16),
         return_residuals=True,
     )
-    norm_vjp_op = typing.cast(
-        pl_norm_vjp.PallasTritonNormalizationVjp, norm_op.vjp
-    )
+    norm_vjp_op = typing.cast(triton_norm.TritonNormalizationVjp, norm_op.vjp)
     norm_vjp_spec = norm_vjp_op.bind(**norm_spec.vjp_arg_spec)
     self.assertEqual(op_specs[0].op.config, norm_spec.default_config)
     self.assertEqual(op_specs[1].op.config, norm_vjp_spec.default_config)
@@ -316,12 +253,14 @@ class DumpHloLibTest(parameterized.TestCase):
     if jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
 
+    assert triton_norm is not None
+
     # TODO: Add a test for vmap.
-    op = pl_norm.PallasTritonNormalization()
+    op = triton_norm.TritonNormalization()
     ba = op.bind(
-        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
-        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),  # pyrefly: ignore[bad-argument-type]
+        batching.BatchedShapeDtype((128, 256), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
+        batching.BatchedShapeDtype((256,), jnp.bfloat16, vmap_axes=()),
     )
 
     fn, x = benchmarking.standardize_function(op, kwargs=ba.arguments)
@@ -346,8 +285,8 @@ class DumpHloLibTest(parameterized.TestCase):
 
     op = triton_ragged_dot.TritonRaggedDot()
     ba = op.bind(
-        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
-        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),  # pyrefly: ignore[bad-argument-type]
+        jax.ShapeDtypeStruct((1024, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16),
         group_sizes=[128] * 8,
     )
 
@@ -376,7 +315,7 @@ class DumpHloLibTest(parameterized.TestCase):
     self.assertGreater(diff_summary.percent_close * 100, 99.99)
 
   @parameterized.product(
-      implementation=['mosaic', 'triton', 'xla', 'xla_chunked', 'cudnn', None],
+      implementation=['mosaic', 'xla', 'xla_chunked', 'cudnn', None],
       representation=REPRESENTATION_TYPES,
   )
   def test_opspec_attention_all_implementations(
@@ -384,7 +323,7 @@ class DumpHloLibTest(parameterized.TestCase):
   ):
     """Tests that attention opspecs are returned for all implementations."""
 
-    if implementation in ('triton', 'cudnn') and jax.default_backend() != 'gpu':
+    if implementation == 'cudnn' and jax.default_backend() != 'gpu':
       self.skipTest('This test only runs on GPU.')
     if implementation == 'mosaic' and not gpu_utils.has_mosaic_gpu_support():
       self.skipTest('mosaic is not supported on this GPU version.')

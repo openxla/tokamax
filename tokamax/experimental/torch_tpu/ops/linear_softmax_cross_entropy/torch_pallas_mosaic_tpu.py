@@ -28,8 +28,91 @@ import torch
 Config = jax_pallas_mosaic_tpu.Config
 
 
+def _deconstruct_config(
+    config: Config | tuple[Any, ...] | list[Any] | None,
+) -> tuple[int, ...] | None:
+  """Deconstructs a Config object or tuple into a flat tuple of ints."""
+  if config is None:
+    return None
+  if isinstance(config, (tuple, list)):
+    flat: list[int] = []
+    for item in config:
+      if isinstance(item, (tuple, list)):
+        flat.extend(int(x) for x in item)
+      else:
+        flat.append(int(item))
+    return tuple(flat)
+  b = config.b_block_size
+  h = config.h_block_size
+  v = config.v_block_size
+  bc = config.buffer_count
+  if isinstance(bc, (tuple, list)):
+    return (b, h, v, *[int(x) for x in bc])
+  return (b, h, v, int(bc))
+
+
+def _reconstruct_config(
+    *config_parts: Any,
+) -> Config:
+  """Reconstructs a Config object from a deconstructed tuple or Config."""
+  if not config_parts:
+    raise ValueError("Config parts cannot be empty.")
+  raw: Any = config_parts[0]
+  if isinstance(raw, Config):
+    return raw
+  if raw is None:
+    raise ValueError("Config cannot be None.")
+
+  def _flatten(items: Sequence[Any] | tuple[Any, ...] | list[Any]) -> list[int]:
+    flat: list[int] = []
+    for item in items:
+      if isinstance(item, (tuple, list)):
+        flat.extend(_flatten(item))
+      elif item is None:
+        raise ValueError("Config elements cannot be None.")
+      else:
+        flat.append(int(item))
+    return flat
+
+  elements: Sequence[int]
+  if len(config_parts) == 1:
+    if not isinstance(raw, (tuple, list)):
+      raise ValueError(
+          f"Expected tuple or list for config, got {type(raw).__name__}"
+      )
+    elements = _flatten(raw)
+  else:
+    elements = _flatten(config_parts)
+
+  if len(elements) == 3:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+    )
+  elif len(elements) == 4:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+        buffer_count=elements[3],
+    )
+  elif len(elements) == 5:
+    return Config(
+        b_block_size=elements[0],
+        h_block_size=elements[1],
+        v_block_size=elements[2],
+        buffer_count=(elements[3], elements[4]),
+    )
+  else:
+    raise ValueError(
+        f"Invalid config tuple length: {len(elements)}. Expected 3, 4, or 5"
+        " elements."
+    )
+
+
 class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
-    torch_base._LinearSoftmaxCrossEntropyLossVjp
+    torch_base._LinearSoftmaxCrossEntropyLossVjp[Config]  # pylint: disable=protected-access
 ):
   """This is the Pallas Mosaic TPU Tokamax LSCE VJP Op wrapped for PyTorch."""
 
@@ -44,6 +127,16 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
     self.is_vjp = True
 
   @override
+  def deconstruct_config(
+      self, config: Config | tuple[Any, ...] | list[Any] | None
+  ) -> tuple[int, ...] | None:
+    return _deconstruct_config(config)
+
+  @override
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
+
+  @override
   def __call__(
       self,
       residuals: torch.Tensor,
@@ -53,9 +146,8 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      config: Config | None = None,
+      config: Config | tuple[int, ...] | list[int] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    self.configs = (None, config)
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. This means that self.op_impl_jax is not set"
@@ -69,6 +161,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
         w,
         reduction=reduction,
         return_residuals=False,
+        config=self.deconstruct_config(config),
     )
 
   @override
@@ -82,9 +175,12 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Backward config not set."
+    kernel_config = self.reconstruct_config(config)
     output, _ = self.op_impl_jax._fwd(
         (residuals,),
         out,
@@ -93,7 +189,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
         labels,
         w,
         reduction=reduction,
-        config=self.configs[1],
+        config=kernel_config,
         return_residuals=return_residuals,
     )
     x_grad, _, w_grad = output
@@ -116,24 +212,37 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
     self.backward_op_torch = _PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp()
 
   @override
+  def deconstruct_config(
+      self, config: Config | tuple[Any, ...] | list[Any] | None
+  ) -> tuple[int, ...] | None:
+    return _deconstruct_config(config)
+
+  @override
+  def reconstruct_config(self, *config_parts: Any) -> Config:
+    return _reconstruct_config(*config_parts)
+
+  @override
   def __call__(
       self,
       x: torch.Tensor,
       labels: torch.Tensor,
       w: torch.Tensor,
       reduction: str,
-      configs: tuple[Any, Any] | None = None,
+      configs: tuple[Config | None, Config | None] | None = None,
   ):
-    self.configs = (None, None) if configs is None else configs
+    fwd_config, bwd_config = (None, None) if configs is None else configs
     assert (
         self._torch_tokamax_op is not None
     ), "Forward op not registered. Call register_ops first."
+    assert self.backward_op_torch is not None, "Backward op not set."
     loss, lse = self._torch_tokamax_op(
         x,
         labels,
         w,
         reduction=reduction,
         return_residuals=not self.is_vjp,  # Only return residuals for forward pass.
+        config=self.deconstruct_config(fwd_config),
+        bwd_config=self.backward_op_torch.deconstruct_config(bwd_config),
     )
     return loss, lse
 
@@ -145,16 +254,21 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       w: jax.Array,
       reduction: str,
       return_residuals: bool,
+      config: tuple[int, ...] | None = None,
+      bwd_config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
+    del bwd_config
     reduction = cast(Literal["mean", "none", "sum"], reduction)
     assert self.op_impl_jax is not None, "Forward class not set."
+    assert config is not None, "Forward config not set."
+    kernel_config = self.reconstruct_config(config)
     loss, (lse,) = self.op_impl_jax._fwd(
         x,
         labels,
         w,
         reduction=reduction,
         return_residuals=return_residuals,
-        config=self.configs[0],
+        config=kernel_config,
     )
     return loss, lse
 
@@ -172,10 +286,13 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         w,
         reduction,
         _,
+        _,
+        bwd_config,
     ) = inputs
     loss, lse = output
     ctx.save_for_backward(x, labels, w, lse, loss)
     ctx.reduction = reduction
+    ctx.bwd_config = bwd_config
 
   @override
   def backward(
@@ -183,7 +300,7 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       ctx: Any,
       d_loss: torch.Tensor,
       d_lse: torch.Tensor,
-  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None]:
+  ) -> tuple[torch.Tensor, None, torch.Tensor, None, None, None, None]:
     """Callback for torch register_autograd."""
     del d_lse  # Unused
     x, labels, w, lse, loss = ctx.saved_tensors
@@ -196,9 +313,9 @@ class _PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         labels,
         w,
         reduction=ctx.reduction,
-        config=self.configs[1],
+        config=ctx.bwd_config,
     )
-    return grad_x, None, grad_w, None, None
+    return grad_x, None, grad_w, None, None, None, None
 
 
 # Singleton instance of the Pallas Mosaic TPU Linear Softmax Cross-Entropy Loss.

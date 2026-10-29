@@ -18,6 +18,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Any, ClassVar, cast, override
 
 import jax
@@ -112,9 +113,18 @@ class PallasMosaicGpuFlashAttentionVjp(
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
+    orig_seq_len_k = k.shape[-3]
     mask, is_causal, k_start, k_end = common.decompose_mask(
         mask, q, k, q_indices, k_indices
     )
+    block_kv_dkv = config.block_kv_dkv
+    if not isinstance(config, sm100.Config):
+      block_kv_dkv *= config.compute_wgs
+    if orig_seq_len_k % math.lcm(config.block_kv_dq, block_kv_dkv) != 0:
+      if k_end is None:
+        k_end = jnp.full([1] * (q.ndim - 1), orig_seq_len_k, jnp.int32)
+      else:
+        k_end = jnp.minimum(k_end, orig_seq_len_k)
 
     def cast(x, precision):
       msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
@@ -138,6 +148,7 @@ class PallasMosaicGpuFlashAttentionVjp(
         v.dtype, v.dtype, weights_v_dot_precision
     )
     # TODO: Avoid silently downcasting types.
+    orig_q_dtype, orig_k_dtype, orig_v_dtype = q.dtype, k.dtype, v.dtype
     q = cast(q, q_k_dot_precision)
     k = cast(k, q_k_dot_precision)
     v = cast(v, weights_v_dot_precision)
@@ -175,6 +186,9 @@ class PallasMosaicGpuFlashAttentionVjp(
       dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
       dbias = dbias.reshape(orig_bias_shape)
 
+    dq = dq.astype(orig_q_dtype)
+    dk = dk.astype(orig_k_dtype)
+    dv = dv.astype(orig_v_dtype)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   @override
@@ -191,7 +205,7 @@ class PallasMosaicGpuFlashAttentionVjp(
   ) -> set[sm90.Config | sm100.Config]:
     if gpu_utils.is_sm100():
       return sm100.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
-    return sm90.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
+    return sm90.get_autotuning_configs(ba)
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

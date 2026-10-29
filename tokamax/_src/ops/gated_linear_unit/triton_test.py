@@ -22,7 +22,7 @@ try:
 
   _JAX_TRITON_AVAILABLE = True
 except ImportError:
-  triton_glu = None  # pyrefly: ignore[assignment]
+  triton_glu = None
   _JAX_TRITON_AVAILABLE = False
 
 

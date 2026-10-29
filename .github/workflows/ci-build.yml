@@ -13,6 +13,10 @@ name: CI-Build
 #  whole suite in a single process, because some failures are properties of
 #  the collection rather than of any test.
 #
+#  `compat-tests` reruns the selected shards on the older JAX versions, one
+#  case per test function, packed into a few bins rather than a job per shard.
+#  See `COMPAT_BIN_MINUTES` in `shards.py`.
+#
 #  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
 #  whose names and number change whenever the SHARDS table is rebalanced.
 on:
@@ -49,6 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       include: ${{ steps.compute.outputs.include }}
+      compat_include: ${{ steps.compute.outputs.compat_include }}
       # The pytest flags that decide which tests are selected, as opposed to
       # how they are reported. Emitted by the same module that builds the
       # shard paths so the two cannot disagree about what the suite is.
@@ -102,15 +107,28 @@ jobs:
         # We compare tree SHA's of this PR's most recent passing run, not
         # the push just before to determine whether or not to skip the run.
         #
+        # After submit, Copybara also pushes the commit it landed on the base
+        # branch to the PR branch. That head is already on the base branch, so
+        # its diff is empty, which would otherwise run every shard.
+        #
         id: repeat
         env:
           GH_TOKEN: ${{ github.token }}
           # A run only counts if it came from this repository.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # `GITHUB_HEAD_REF` is the PR's branch; empty outside `pull_request`.
           if [[ -z "${GITHUB_HEAD_REF}" || -z "${HEAD_REPO}" ]]; then
             echo "Not a pull request: nothing to compare against."
+            exit 0
+          fi
+          # Exit 1 (not an ancestor) and any git error both fall through.
+          if git merge-base --is-ancestor "${HEAD_SHA}" "origin/${BASE_REF}"; then
+            echo "${HEAD_SHA} is already on origin/${BASE_REF}: skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_why=${HEAD_SHA} is already on origin/${BASE_REF}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! prev=$(gh api \
@@ -138,13 +156,13 @@ jobs:
           fi
           echo "Same files as ${prev} (tree ${tree}), which passed: skipping."
           echo "skip=true" >> "$GITHUB_OUTPUT"
-          echo "skip_from=${prev}" >> "$GITHUB_OUTPUT"
+          echo "skip_why=same files as ${prev}, which passed" >> "$GITHUB_OUTPUT"
 
       - name: Build test matrix
         id: compute
         env:
           SKIP: ${{ steps.repeat.outputs.skip }}
-          SKIP_FROM: ${{ steps.repeat.outputs.skip_from }}
+          SKIP_WHY: ${{ steps.repeat.outputs.skip_why }}
         run: |
           set -o pipefail
           # `--changed-from` narrows the matrix to the shards those files can
@@ -165,12 +183,14 @@ jobs:
             cat /tmp/summary.txt
             exit 1
           fi
-          # Empty the *output* so that no shards run.
+          # Empty the *outputs* so that no shards run, compat bins included.
           if [[ "${SKIP}" == "true" ]]; then
-            sed -i 's/^include=.*/include=[]/' /tmp/outputs.txt
+            sed -i -e 's/^include=.*/include=[]/' \
+              -e 's/^compat_include=.*/compat_include=[]/' /tmp/outputs.txt
             # Rewrite the one `selection:` line rather than adding a second,
-            # so the summary does not say both "every shard" and "none".
-            sed -i "s/^selection: \(.*\)/selection: same files as ${SKIP_FROM}, which passed -- no shard runs (selection would have been: \1)/" \
+            # so the summary does not say both "every shard" and "none". `|`
+            # rather than `/` as the delimiter: the reason can name a ref.
+            sed -i "s|^selection: \(.*\)|selection: ${SKIP_WHY} -- no shard runs (selection would have been: \1)|" \
               /tmp/summary.txt
           fi
           cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
@@ -302,11 +322,55 @@ jobs:
           printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
             | xargs -r pytest -s --durations=25
 
+  compat-tests:
+    # The backward compatibility check: each bin is several shards, rerun on
+    # an older JAX in smoke mode. Its own job, so `fail-fast` here cancels the
+    # other compat bins only -- once one older JAX has failed, the rest of the
+    # check has nothing to add -- and never the `shard-tests` jobs.
+    name: ${{ matrix.shard_name && format('compat-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'compat-tests (no shard selected)' }}
+    needs: shard-matrix
+    if: needs.shard-matrix.outputs.compat_include != '[]'
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.shard-matrix.outputs.compat_include) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        env:
+          DEVICE: ${{ matrix.device }}
+          JAX_PIN: ${{ matrix.jax_pin }}
+        run: |
+          bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
+
+      - name: Run compat bin
+        env:
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
+          SHARDS: ${{ matrix.shards }}
+          # One case per test function; see `tokamax/conftest.py`.
+          TOKAMAX_COMPAT_SMOKE: '1'
+        run: |
+          echo "Shards in this bin: ${SHARDS}"
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
+
   shard-all-tests-passed:
     # The idea here is that rather than checking for specific shard names to pass, we centralize
     # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
     name: shard-all-tests-passed
-    needs: [shard-matrix, collect-tests, shard-tests]
+    needs: [shard-matrix, collect-tests, shard-tests, compat-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -335,8 +399,10 @@ jobs:
           COLLECT: ${{ needs.collect-tests.result }}
           TESTS: ${{ needs.shard-tests.result }}
           INCLUDE: ${{ needs.shard-matrix.outputs.include }}
+          COMPAT: ${{ needs.compat-tests.result }}
+          COMPAT_INCLUDE: ${{ needs.shard-matrix.outputs.compat_include }}
         run: |
-          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS}"
+          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS} compat=${COMPAT}"
           # Only `success` counts. `cancelled` in particular is not a result,
           # and treating it as one is how a cancelled run reports green.
           if [[ "${MATRIX}" != "success" ]]; then
@@ -345,6 +411,18 @@ jobs:
           fi
           if [[ "${COLLECT}" != "success" ]]; then
             echo "::error::collect-tests reported ${COLLECT}"
+            exit 1
+          fi
+          # `compat-tests` is `skipped` in two cases: its `if:` was false
+          # because `shard-matrix` emitted no bins (`COMPAT_INCLUDE` is `[]`,
+          # e.g. a change that only edits `*.md`, or the landed-PR skip), or
+          # `shard-matrix` itself did not succeed. Only the first means there
+          # was nothing to check, so `skipped` passes only together with an
+          # empty `COMPAT_INCLUDE`; anything else fails. Same rule as
+          # `shard-tests` below.
+          if [[ "${COMPAT}" != "success" ]] &&
+             ! [[ "${COMPAT}" == "skipped" && "${COMPAT_INCLUDE}" == "[]" ]]; then
+            echo "::error::compat-tests reported ${COMPAT}"
             exit 1
           fi
           # `skipped` is expected when the change only touches non-test files

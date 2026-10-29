@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 import copy
 import dataclasses
 import json
@@ -31,13 +31,12 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attn_base
-from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
 
 try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
 except ImportError:
-  triton_ragged_dot = None  # pyrefly: ignore[assignment]
+  triton_ragged_dot = None
 
 A_SYMBOLIC, B_SYMBOLIC = export.symbolic_shape("a, b")
 
@@ -74,12 +73,8 @@ class _Foo:
   pass
 
 
-_PL_ATTN_CFG = pl_attn.Config(block_q=64, block_k=64, num_stages=2, num_warps=4)
 _OPS = (
     attn_base.DotProductAttention(),
-    pl_attn.PallasTritonFlashAttention(),
-    pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
-    pl_attn.PallasTritonFlashAttention(config=_PL_ATTN_CFG),
     ragged_dot_base.RaggedDot(),
 )
 if triton_ragged_dot is not None:
@@ -226,6 +221,13 @@ class PydanticTest(parameterized.TestCase):
     )
     self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
 
+  def test_collection_annotation_roundtrip(self):
+    data: Collection[int] = (1, 2, 3)
+    adapter = pydantic.TypeAdapter(pydantic_lib.annotate(Collection[int]))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(data)))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(list(data))))
+    self.assertEqual(data, adapter.validate_json(adapter.dump_json(set(data))))
+
   @parameterized.parameters(*_OPS)
   def test_op_roundtrip(self, op):
     adapter = pydantic.TypeAdapter(pydantic_lib.annotate(type(op)))
@@ -253,6 +255,37 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual(b'"bfloat16"', adapter.dump_json(ml_dtypes.bfloat16))
     self.assertEqual("bfloat16", adapter.dump_python(ml_dtypes.bfloat16))
     self.assertEqual(ml_dtypes.bfloat16, adapter.validate_json('"bfloat16"'))
+
+  def test_mesh_serialization(self):
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]),
+        ("d",),
+        axis_types=(jax.sharding.AxisType.Explicit,),
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.Mesh | None)
+    )
+    self.assertIs(mesh, adapter.validate_python(adapter.dump_python(mesh)))
+    expected = dict(axis_names=["d"], axis_sizes=[1], axis_types=["Explicit"])
+    self.assertEqual(expected, json.loads(adapter.dump_json(mesh)))
+    mesh_roundtrip = adapter.validate_json(adapter.dump_json(mesh))
+    self.assertIsInstance(mesh_roundtrip, jax.sharding.AbstractMesh)
+    self.assertEqual(
+        jax.sharding.AbstractMesh(
+            (1,), ("d",), axis_types=(jax.sharding.AxisType.Explicit,)
+        ),
+        mesh_roundtrip,
+    )
+    self.assertIsNone(adapter.validate_json(adapter.dump_json(None)))
+
+  def test_abstract_mesh_roundtrip(self):
+    mesh = jax.sharding.AbstractMesh(
+        (2, 4), ("x", "y"), axis_types=(jax.sharding.AxisType.Auto,) * 2
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.AbstractMesh)
+    )
+    self.assertEqual(mesh, adapter.validate_json(adapter.dump_json(mesh)))
 
 
 if __name__ == "__main__":

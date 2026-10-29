@@ -27,7 +27,7 @@ from tokamax._src.ops.ragged_dot import test_base
 try:
   import jax_triton as jt
 except ImportError:
-  triton = None  # pyrefly: ignore[assignment]
+  triton = None
   _JAX_TRITON_AVAILABLE = False
   _TestTritonRaggedDot: Any = object
 else:
