@@ -43,6 +43,53 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
 
 
+def _to_words(x: jax.Array) -> jax.Array:
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  packing = 4 // x.dtype.itemsize
+  x = x.reshape(x.shape[0], -1, packing, num_lanes)
+  return jax.lax.bitcast_convert_type(
+      jnp.moveaxis(x, -2, -1), jnp.uint32
+  ).reshape(x.shape[0], -1, 1, num_lanes)
+
+
+def _from_words(
+    words: jax.Array, shape: tuple[int, ...], dtype: jax.typing.DTypeLike
+) -> jax.Array:
+  dtype = jnp.dtype(dtype)
+  if dtype.itemsize < 4:
+    x = jax.lax.bitcast_convert_type(words.squeeze(-2), dtype)
+    x = jnp.moveaxis(x, -1, -2)
+  else:
+    x = jax.lax.bitcast_convert_type(words, dtype)
+  return x.reshape(shape)
+
+
+def _pack_state_pool(
+    conv_state: jax.Array, recurrent_state: jax.Array
+) -> jax.Array:
+  rec_words = _to_words(recurrent_state)
+  conv_words = _to_words(conv_state)
+  return jnp.concatenate([rec_words, conv_words], axis=1)
+
+
+def _unpack_state_pool(
+    pool: jax.Array,
+    conv_shape: tuple[int, ...],
+    conv_dtype: jax.typing.DTypeLike,
+    rec_shape: tuple[int, ...],
+    rec_dtype: jax.typing.DTypeLike,
+) -> tuple[jax.Array, jax.Array]:
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  rec_packing = 4 // jnp.dtype(rec_dtype).itemsize
+  rec_granules = int(np.prod(rec_shape[1:])) // (num_lanes * rec_packing)
+  rec_words = pool[:, :rec_granules]
+  conv_words = pool[:, rec_granules:]
+  return (
+      _from_words(conv_words, conv_shape, conv_dtype),
+      _from_words(rec_words, rec_shape, rec_dtype),
+  )
+
+
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
   """Mirror the kernel's `_l2_norm_f32`, which accumulates in float32."""
   x_f32 = x.astype(np.float32)
@@ -353,6 +400,20 @@ def _cases():
       yield case
 
 
+def _unified_pool_cases():
+  """Every shape and gate form under both float32 and bfloat16 recurrent state."""
+  for case in _cases():
+    for rec_name, rec_dtype in (
+        ("f32_rec", jnp.float32),
+        ("bf16_rec", jnp.bfloat16),
+    ):
+      yield dict(
+          case,
+          testcase_name=f"{case['testcase_name']}_{rec_name}",
+          recurrent_dtype=rec_dtype,
+      )
+
+
 class KdaAttentionTest(parameterized.TestCase):
 
   def setUp(self):
@@ -402,12 +463,10 @@ class KdaAttentionTest(parameterized.TestCase):
         q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
     )
 
-    common_kwargs = dict(
+    common_kwargs: dict[str, Any] = dict(
         qkv=qkv,
         b=b,
         a=a,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         a_log=a_log,
@@ -425,9 +484,15 @@ class KdaAttentionTest(parameterized.TestCase):
         gate_lower_bound=gate_lower_bound,
     )
 
-    (_, ref_state), ref_out = kda_attention_ref(**common_kwargs)
+    (_, ref_state), ref_out = kda_attention_ref(
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        **common_kwargs,
+    )
     (_, out_state), out = wrapper.fused_conv1d_gdn(
-        **common_kwargs, mixed_tile_size=mixed_tile_size
+        states=(conv_state, recurrent_state),
+        **common_kwargs,
+        mixed_tile_size=mixed_tile_size,
     )
 
     np.testing.assert_allclose(
@@ -491,7 +556,7 @@ class KdaAttentionTest(parameterized.TestCase):
     conv_state = jax.random.normal(
         next(rngs),
         (num_blocks, kernel_size - 1, dim_size),
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,
     )
     recurrent_state = jax.random.normal(next(rngs), (num_blocks, n_v, d_k, d_v))
     conv_weight = jax.random.normal(
@@ -500,12 +565,10 @@ class KdaAttentionTest(parameterized.TestCase):
     a_log = jax.random.normal(next(rngs), (n_v,))
     dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
 
-    common_kwargs = dict(
+    common_kwargs: dict[str, Any] = dict(
         qkv=qkv,
         b=b,
         a=a,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
         conv_weight=conv_weight,
         conv_bias=None,
         a_log=a_log,
@@ -523,11 +586,14 @@ class KdaAttentionTest(parameterized.TestCase):
     )
 
     (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
         **common_kwargs,
         read_offsets=read_offsets_arr,
         num_spec_seqs=num_seqs,
     )
     (new_conv, new_rec), out = wrapper.fused_conv1d_gdn(
+        states=(conv_state, recurrent_state),
         **common_kwargs,
         read_offsets=read_offsets_arr,
         num_spec_tokens=num_spec_tokens,
@@ -564,20 +630,28 @@ class KdaAttentionTest(parameterized.TestCase):
           overrides=dict(gate_lower_bound=0.0),
           error=ValueError,
       ),
+      dict(
+          testcase_name="bf16_conv_state",
+          overrides=dict(),
+          conv_dtype=jnp.bfloat16,
+          error=NotImplementedError,
+      ),
   )
-  def test_rejects(self, overrides, error):
+  def test_rejects(self, overrides, error, conv_dtype=jnp.float32):
     """The entry point's guards, which all fail silently if dropped."""
     n_kq = n_v = 4
     d_k = d_v = 128
     kernel_size = 4
     dim_size = 2 * n_kq * d_k + n_v * d_v
 
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         qkv=jnp.zeros((8, dim_size)),
         b=jnp.zeros((8, n_v)),
         a=jnp.zeros((8, n_v * d_k)),
-        conv_state=jnp.zeros((9, kernel_size - 1, dim_size)),
-        recurrent_state=jnp.zeros((9, n_v, d_k, d_v)),
+        states=(
+            jnp.zeros((9, kernel_size - 1, dim_size), dtype=conv_dtype),
+            jnp.zeros((9, n_v, d_k, d_v)),
+        ),
         conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
         conv_bias=None,
         a_log=jnp.zeros((n_v,)),
@@ -650,7 +724,7 @@ class KdaAttentionTest(parameterized.TestCase):
     conv_state = jax.random.normal(
         next(rngs),
         (num_blocks, kernel_size - 1, dim_size),
-        dtype=jnp.bfloat16,
+        dtype=jnp.float32,
     )
     recurrent_state = jax.random.normal(
         next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
@@ -661,12 +735,10 @@ class KdaAttentionTest(parameterized.TestCase):
     a_log = jax.random.normal(next(rngs), (n_v,))
     dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
 
-    common_kwargs = dict(
+    common_kwargs: dict[str, Any] = dict(
         qkv=qkv,
         b=b,
         a=a,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
         conv_weight=conv_weight,
         conv_bias=None,
         a_log=a_log,
@@ -684,19 +756,16 @@ class KdaAttentionTest(parameterized.TestCase):
     )
 
     (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
         **common_kwargs,
         read_offsets=read_offsets_arr,
         num_spec_seqs=num_seqs,
     )
     for _ in range(3):
       (new_conv, new_rec), out = wrapper.fused_conv1d_gdn(
-          **(
-              common_kwargs
-              | dict(
-                  conv_state=conv_state.copy(),
-                  recurrent_state=recurrent_state.copy(),
-              )
-          ),
+          states=(conv_state.copy(), recurrent_state.copy()),
+          **common_kwargs,
           read_offsets=read_offsets_arr,
           num_spec_tokens=num_spec_tokens,
           attention_mode=config.AttentionMode.KDA,
@@ -717,6 +786,136 @@ class KdaAttentionTest(parameterized.TestCase):
             atol=1e-2,
             err_msg=f"recurrent checkpoint mismatch at slot {slot}",
         )
+
+  @parameterized.named_parameters(*_unified_pool_cases())
+  def test_kda_unified_pool_matches_the_recurrence(
+      self,
+      max_reqs,
+      q_loc,
+      distribution,
+      gate_lower_bound,
+      recurrent_dtype,
+      n_v=4,
+      mixed_tile_size=None,
+  ):
+    """KDA unified granule pool (`is_shared=True`) matches the oracle."""
+    n_kq = n_v
+    d_k = d_v = 128
+    kernel_size = 4
+
+    q_loc = jnp.array(q_loc, dtype=jnp.int32)
+    distribution = jnp.array(distribution, dtype=jnp.int32)
+    num_tokens = int(q_loc[max_reqs])
+
+    state_indices = jnp.arange(1, max_reqs + 1)
+    num_blocks = max_reqs + 1
+    dim_size = 2 * n_kq * d_k + n_v * d_v
+
+    rngs = iter(jax.random.split(jax.random.key(3), 10))
+    qkv = jax.random.normal(
+        next(rngs), (num_tokens, dim_size), dtype=jnp.bfloat16
+    )
+    b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(
+        next(rngs), (num_tokens, n_v * d_k), dtype=jnp.bfloat16
+    )
+
+    conv_state = jax.random.normal(
+        next(rngs),
+        (num_blocks, kernel_size - 1, dim_size),
+        dtype=jnp.float32,
+    )
+    recurrent_state = jax.random.normal(
+        next(rngs),
+        (num_blocks, n_v, d_k, d_v),
+        dtype=recurrent_dtype,
+    )
+    conv_weight = jax.random.normal(
+        next(rngs), (dim_size, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    conv_bias = jax.random.normal(next(rngs), (dim_size,), dtype=jnp.bfloat16)
+    a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+    dt_bias = jax.random.normal(next(rngs), (n_v, d_k), dtype=jnp.float32)
+
+    # Give sequences non-zero history so initial conv_state and recurrent_state
+    # reads from the shared pool are exercised.
+    seq_lens = (
+        jnp.asarray(q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32)
+        + 10
+    )
+
+    ref_kwargs = dict(
+        qkv=qkv,
+        b=b,
+        a=a,
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        attention_mode=config.AttentionMode.KDA,
+        gate_lower_bound=gate_lower_bound,
+    )
+    (ref_conv, ref_rec), ref_out = kda_attention_ref(**ref_kwargs)
+
+    pool = _pack_state_pool(conv_state, recurrent_state)
+    new_pool, out = wrapper.fused_conv1d_gdn(
+        qkv=qkv,
+        b=b,
+        a=a,
+        states=pool,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        query_start_loc=q_loc,
+        state_indices=state_indices,
+        distribution=distribution,
+        seq_lens=seq_lens,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        attention_mode=config.AttentionMode.KDA,
+        gate_lower_bound=gate_lower_bound,
+        mixed_tile_size=mixed_tile_size,
+        conv_dtype=jnp.float32,
+        recurrent_dtype=recurrent_dtype,
+    )
+    new_conv, new_rec = _unpack_state_pool(
+        new_pool,
+        conv_state.shape,
+        conv_state.dtype,
+        recurrent_state.shape,
+        recurrent_dtype,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(out, np.float64), ref_out, rtol=3e-2, atol=3e-2
+    )
+    np.testing.assert_allclose(
+        np.asarray(new_conv, np.float64),
+        np.asarray(ref_conv, np.float64),
+        rtol=2e-2,
+        atol=5e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(new_rec, np.float64),
+        np.asarray(ref_rec, np.float64),
+        rtol=3e-2,
+        atol=3e-2,
+    )
 
 
 if __name__ == "__main__":

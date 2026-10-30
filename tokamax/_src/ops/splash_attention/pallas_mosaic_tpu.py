@@ -141,9 +141,12 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
         **dataclasses.asdict(config),
     )
 
+    q_seq_shards, q_shard_idx = (
+        mask.get_q_seq_shard_info() if isinstance(mask, base.Mask) else (1, 0)
+    )
     q_seq_len = q.shape[-2]
     kv_seq_len = k.shape[-2]
-    mask_shape = (q_seq_len, kv_seq_len)
+    mask_shape = (q_seq_len * q_seq_shards, kv_seq_len)
 
     if isinstance(mask, mask_lib.Mask):
       splash_mask = mask
@@ -154,7 +157,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
         splash_mask = mask.bool_mask
       elif mask.is_causal:
         splash_mask = mask_lib.CausalMask(
-            shape=mask_shape, offset=mask.offset, shard_count=1
+            shape=mask_shape, offset=mask.offset, shard_count=q_seq_shards
         )
       else:
         splash_mask = mask_lib.FullMask(mask_shape)
@@ -169,7 +172,9 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       v_in = v
 
     broadcast_to_rank = (
-        lambda x, rank: None if x is None else jax.lax.broadcast_to_rank(x, rank)
+        lambda x, rank: None
+        if x is None
+        else jax.lax.broadcast_to_rank(x, rank)
     )
 
     if segment_ids is not None:
@@ -212,16 +217,33 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       )
     else:
       splash_maker = (
-          splash_attention_kernel.make_splash_mqa_single_device
+          splash_attention_kernel.make_splash_mqa
           if is_mqa
-          else splash_attention_kernel.make_splash_mha_single_device
+          else splash_attention_kernel.make_splash_mha
       )
       attn_fn = splash_maker(
           splash_mask,
           config=splash_config,
           mask_value=mask_value,
           save_residuals=return_residuals,
+          q_seq_shards=q_seq_shards,
       )
+
+      if q_seq_shards > 1:
+        fwd_mask_info = pallas_mosaic_tpu_vjp.slice_mask_info(
+            attn_fn.fwd_mask_info, q_shard_idx, q_seq_shards
+        )
+        dkv_mask_info = None
+        if attn_fn.dkv_mask_info:
+          dkv_mask_info = pallas_mosaic_tpu_vjp.slice_mask_info(
+              attn_fn.dkv_mask_info, q_shard_idx, q_seq_shards
+          )
+
+        attn_fn = splash_attention_kernel.SplashAttentionKernel(
+            fwd_mask_info,
+            dkv_mask_info,
+            **attn_fn.kwargs,
+        )
 
       def single_fwd_static(q, k, v, segment_ids, sinks):
         return attn_fn(

@@ -247,7 +247,9 @@ def load_and_select_states(
           is_first_tile, prev_conv_state, prev_tile_conv
       )
 
-    hbm_recurrent_state = recurrent_in_slot_ref[idx, 0]
+    hbm_recurrent_state = pltpu.bitcast(
+        recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+    ).astype(jnp.float32)
     prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
     if carry_recurrent_scratch_ref is not None:
