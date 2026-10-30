@@ -29,6 +29,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as plan_lib
 
 
@@ -47,10 +48,21 @@ class RoutingMode(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True)
 class DynamicQuantConfig:
-  """Dynamic quantization of an activation as seen by compute."""
+  """Dynamic quantization parameters for an activation tensor.
+
+  Each scale covers `block_size` elements of a row spaced `stride` columns
+  apart (`stride=1` for contiguous blocks, `stride=num_lanes` for per-lane
+  scales).
+
+  Attributes:
+    dtype: Target quantized element dtype.
+    block_size: Number of elements along the row sharing a single scale.
+    stride: Column stride between elements sharing a scale.
+  """
 
   dtype: jnp.dtype
   block_size: int
+  stride: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,6 +181,64 @@ class Dimension:
 
 
 @dataclasses.dataclass(frozen=True)
+class OutputConfig(ActivationConfig):
+  """Resolved layout, routing, and quantization config for the output tensor.
+
+  When `dynamic_quant` is set, each scattered row in compact layout
+  `[m, n // (packing * lanes) + 1, packing, lanes]` stores its quantized
+  payload chunks followed by one trailing chunk of `f32` per-lane scales
+  (`absmax / dtype_max`, with lane `l` covering columns `l, l + lanes, ...`);
+  `spec.col_size` includes this scale chunk. Because the trailing chunk stores
+  `f32` bit patterns inside a narrow-dtype buffer, consumers must reinterpret
+  that chunk as raw bytes rather than narrow-float values.
+  """
+
+  @classmethod
+  def create(
+      cls,
+      *,
+      dim: Dimension,
+      x_dtype: jnp.dtype,
+      scatter: arg.RoutingSpec | None,
+      mode: RoutingMode,
+      out_dtype: jax.typing.DTypeLike | None,
+      tpu_info: pltpu.TpuInfo,
+  ) -> Self:
+    """Derives the output spec and quantization config from `out_dtype`."""
+    # A 1-byte out_dtype other than x's is quantized with per-lane scales.
+    out_dtype = x_dtype if out_dtype is None else jnp.dtype(out_dtype)
+    quant = None
+    cols = dim.size_out_n
+    if out_dtype != x_dtype and out_dtype.itemsize == 1:
+      if scatter is None:
+        raise NotImplementedError("Quantized output needs a scatter.")
+      lanes = tpu_info.num_lanes
+      packing = layout_util.get_packing(out_dtype)
+      if dim.size_out_n % (packing * lanes):
+        raise ValueError(
+            f"Output cols {dim.size_out_n} must fill whole {out_dtype} chunks."
+        )
+      quant = DynamicQuantConfig(
+          dtype=out_dtype, block_size=dim.size_out_n // lanes, stride=lanes
+      )
+      cols += packing * lanes
+
+    # A remote scatter leaves each device only the rows it owns.
+    spec = arg.ActivationSpec(
+        row_size=dim.size_out_m // dim.size_ep,
+        col_size=cols,
+        dtype=out_dtype,
+    )
+    return cls(spec=spec, mode=mode, dynamic_quant=quant)
+
+  @property
+  def num_payload_chunks(self) -> int:
+    """Returns the number of compact payload chunks per row (sans scales)."""
+    chunks = self.spec.compact_shape[1]
+    return chunks if self.dynamic_quant is None else chunks - 1
+
+
+@dataclasses.dataclass(frozen=True)
 class RoutingGmmConfig:
   """Compile-time static configuration of the routing GMM kernel."""
 
@@ -179,7 +249,7 @@ class RoutingGmmConfig:
   w2: arg.WeightSpec | None
   compute: ComputeConfig
   compute2: ComputeConfig | None
-  out: ActivationConfig
+  out: OutputConfig
   gather: arg.RoutingSpec | None
   scatter: arg.RoutingSpec | None
   fuse_act: str | None
@@ -214,13 +284,6 @@ class RoutingGmmConfig:
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
       )
 
-    # A remote scatter leaves each device only the rows it owns.
-    out_spec = arg.ActivationSpec(
-        row_size=dim.size_out_m // dim.size_ep,
-        col_size=dim.size_out_n,
-        dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
-    )
-
     def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
       if routing is None:
         return RoutingMode.DIRECT
@@ -229,11 +292,18 @@ class RoutingGmmConfig:
       return RoutingMode.REMOTE
 
     x_mode = _resolve_mode(gather)
-    out_mode = _resolve_mode(scatter)
     compute_cfg = ComputeConfig(
         acc_dtype=plan.acc_dtype,
         tpu_info=tpu_info,
         dynamic_quant=x_quant,
+    )
+    out = OutputConfig.create(
+        dim=dim,
+        x_dtype=x.dtype,
+        scatter=scatter,
+        mode=_resolve_mode(scatter),
+        out_dtype=out_dtype,
+        tpu_info=tpu_info,
     )
 
     cfg = cls(
@@ -244,7 +314,7 @@ class RoutingGmmConfig:
         w2=w2,
         compute=compute_cfg,
         compute2=None if w2 is None else compute_cfg,
-        out=ActivationConfig(spec=out_spec, mode=out_mode),
+        out=out,
         gather=gather,
         scatter=scatter,
         fuse_act=fuse_act,
@@ -309,6 +379,11 @@ class RoutingGmmConfig:
       raise ValueError(
           f"Total number of SMEM allocation must be less than {smem_threshold}"
           f" to avoid OOM. Got {smem_allocation}"
+      )
+    if cfg.out.dynamic_quant is not None and cfg.num_n != 1:
+      # The per-lane scale is taken over the whole output row.
+      raise NotImplementedError(
+          "A quantized output does not support N dim tiling yet."
       )
     return cfg
 

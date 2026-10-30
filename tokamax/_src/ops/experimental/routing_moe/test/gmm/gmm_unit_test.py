@@ -16,21 +16,35 @@
 
 import dataclasses
 
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental import pallas as pl
+import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
+from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
+from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
+from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
 from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.gmm import gmm_test_lib
+from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
 
 jax.config.parse_flags_with_absl()
+
+FP8 = gmm_test_lib.FP8
+
+
+def _rel_diff(a: np.ndarray, b: np.ndarray) -> float:
+  """Returns the maximum elementwise error normalized by `max(|b|)`."""
+  return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-6))
 
 
 class RoutingGmmUnitTest(parameterized.TestCase):
@@ -92,6 +106,125 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         rtol=2e-2,
         atol=1e-2,
     )
+
+  @parameterized.product(case_spec=test_cases.UNIT_CASES)
+  def test_gmm_scatter_fp8(self, case_spec: test_cases.Case):
+    case = gmm_test_lib.GmmCase.make_case(case_spec)
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_sorted_compact,
+        case.w1,
+        scatter=routing.scatter,
+        out_dtype=FP8,
+        **routing.kernel_kwargs,
+    ).data
+    self.assertEqual(actual.dtype, FP8)
+    expected = test_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+    )
+    rows = np.asarray(routing.scattered_rows)
+    deq = np.asarray(gmm_test_lib.dequantize_rows(actual))[rows]
+    expected = np.asarray(expected, np.float32)
+    self.assertLessEqual(_rel_diff(deq, expected), 2**-4)
+    # Each lane's largest value lands on the fp8 max.
+    payload, _ = gmm_test_lib.split_scaled_rows(actual)
+    payload = np.asarray(payload, np.float32)[rows]
+    lane_max = np.abs(payload.reshape(len(rows), -1, 128)).max(axis=1)
+    np.testing.assert_array_equal(lane_max, float(jnp.finfo(FP8).max))
+
+  def test_gmm_scatter_fp8_zero_row_has_unit_scale(self):
+    # A zero row has a zero absmax, so its scale should be 1 instead of 0.
+    case = gmm_test_lib.GmmCase.make_case(test_cases.TOP1_200)
+    routing = case.routing
+    zeros = 4
+    actual = kernel.routing_gmm(
+        input_pack.input_pack(case.x_sorted.at[:zeros].set(0)),
+        case.w1,
+        scatter=routing.scatter,
+        out_dtype=FP8,
+        **routing.kernel_kwargs,
+    ).data
+    rows = np.asarray(routing.scattered_rows[:zeros])
+    _, scales = gmm_test_lib.split_scaled_rows(actual)
+    np.testing.assert_array_equal(np.asarray(scales)[rows], 1.0)
+    np.testing.assert_array_equal(
+        np.asarray(gmm_test_lib.dequantize_rows(actual))[rows], 0
+    )
+
+  def test_gmm_scatter_fp8_large_values(self):
+    # Outputs far above the fp8 max need scales above 1, so `1 / scale` is
+    # below 1 and any error in it is a large relative error.
+    case = gmm_test_lib.GmmCase.make_case(test_cases.TOP1_200)
+    routing = case.routing
+    x = case.x_sorted * 2**13
+    actual = kernel.routing_gmm(
+        input_pack.input_pack(x),
+        case.w1,
+        scatter=routing.scatter,
+        out_dtype=FP8,
+        **routing.kernel_kwargs,
+    ).data
+    expected = test_reference.reference_gmm(
+        x[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+    )
+    expected = np.asarray(expected, np.float32)
+    rows = np.asarray(routing.scattered_rows)
+    _, scales = gmm_test_lib.split_scaled_rows(actual)
+    self.assertGreater(float(np.asarray(scales)[rows].min()), 1.0)
+    deq = np.asarray(gmm_test_lib.dequantize_rows(actual))[rows]
+    self.assertLessEqual(_rel_diff(deq, expected), 2**-4)
+
+  def test_gmm_scatter_fp8_topk_sum(self):
+    case_spec = test_cases.PREFILL_16E
+    case = gmm_test_lib.GmmCase.make_case(case_spec)
+    routing = case.routing
+    num_tokens, topk = case_spec.num_tokens, routing.topk
+    self.assertEqual(routing.row_end - routing.row_start, num_tokens * topk)
+    routed = test_reference.reference_gmm(
+        case.x_sorted, case.w1, routing.local_group_sizes
+    )
+    # Output row `t * topk + k` is token t's k-th expert.
+    want = np.empty(routed.shape, np.float32)
+    want[np.asarray(routing.scattered_rows)] = np.asarray(routed, np.float32)
+    actual = kernel.routing_gmm(
+        case.x_sorted_compact,
+        case.w1,
+        scatter=routing.scatter,
+        out_dtype=FP8,
+        **routing.kernel_kwargs,
+    ).data
+    got = np.asarray(gmm_test_lib.dequantize_rows(actual))
+    want = want.reshape(num_tokens, topk, -1).sum(axis=1)
+    got = got.reshape(num_tokens, topk, -1).sum(axis=1)
+    err = np.abs(got - want)
+    max_rel = float(err.max() / np.abs(want).max())
+    mean_rel = float(err.mean() / np.abs(want).mean())
+    logging.info("fp8 topk sum: max rel %.4f, mean rel %.4f", max_rel, mean_rel)
+    self.assertLessEqual(max_rel, 2**-4)
+
+  def test_quantized_buffered_ref_input_raises(self):
+    cfg = metadata_test_lib.make_gmm_config(
+        num_rows=128,
+        num_global_groups=8,
+        num_local_groups=8,
+        size_k=512,
+        size_n=512,
+    )
+    meta_ref = metadata.SortedMetadataRef.create_scratch_types(cfg)
+    bref = memory_ref.QuantizedBufferedRef.input(
+        spec=pl.BlockSpec((16, 4, 4, 128), lambda i, j, k: (0, 0, 0, 0)),
+        dtype_or_type=FP8,
+        cfg=cfg,
+        metadata_ref=meta_ref,
+    )
+    with self.assertRaisesRegex(AssertionError, "branchless_copy_in"):
+      bref.branchless_copy_in(meta_ref.gm_id_to_num_rows, (0, 0, 0))
+    with self.assertRaisesRegex(AssertionError, "read_vmem"):
+      bref.read_vmem(meta_ref.gm_id_to_num_rows, (0, 0, 0))
 
   @parameterized.product(
       case_spec=test_cases.PREFILL_CASES,
@@ -356,12 +489,14 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
       ],
       num_tokens_topk=[(256, 2), (1024, 4)],
       skip_last_shard=[False, True],
+      out_dtype=[None, FP8],
   )
   def test_remote_scatter_matches_single_device(
       self,
       sharding: test_cases.MoESharding,
       num_tokens_topk: tuple[int, int],
       skip_last_shard: bool,
+      out_dtype: jnp.dtype | None,
   ):
     num_tokens, topk = num_tokens_topk
     shape = test_shapes.MoEShape("remote", 16, topk, 1024, 256)
@@ -377,6 +512,7 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
         arg.make_weight_wrapper(w),
         case.routing.group_sizes,
         scatter=case.routing.scatter,
+        out_dtype=out_dtype,
     ).data
     actual = gmm_test_lib.sharded_gmm_unpermute(
         case.x_sorted_compact,
@@ -385,8 +521,13 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
         case.routing.sorted_to_flat,
         mesh=mesh,
         remote_scatter=True,
+        out_dtype=out_dtype,
     )
-    np.testing.assert_array_equal(actual, expected)
+    self.assertEqual(actual.dtype, expected.dtype)
+    # Bytes, not values: an fp8 scale chunk is f32 bits, some of them fp8 NaNs.
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint8), np.asarray(expected).view(np.uint8)
+    )
 
 
 if __name__ == "__main__":

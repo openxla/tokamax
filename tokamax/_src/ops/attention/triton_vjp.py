@@ -240,7 +240,9 @@ def _bwd_kernel(
         offs_n1, seq_len_k, offs_d, head_dim, check_n1, check_d
     )
     k1 = tl.load(
-        k_ptr + offs_n1[:, None].to(tl.int64) * k_stride_n + offs_d[None, :],
+        k_ptr
+        + triton_utils.row_offset(offs_n1, seq_len_k, k_stride_n)
+        + offs_d[None, :],
         mask=k_mask1,
         other=None if k_mask1 is None else 0.0,
     )
@@ -251,7 +253,7 @@ def _bwd_kernel(
     )
     v1 = tl.load(
         v_ptr
-        + offs_n1[:, None].to(tl.int64) * v_stride_n
+        + triton_utils.row_offset(offs_n1, seq_len_k, v_stride_n)
         + offs_d_out[None, :],
         mask=v_mask1,
         other=None if v_mask1 is None else 0.0,
@@ -293,7 +295,7 @@ def _bwd_kernel(
         )
         q1 = tl.load(
             q_ptr
-            + offs_m1[:, None].to(tl.int64) * q_stride_m
+            + triton_utils.row_offset(offs_m1, seq_len_q, q_stride_m)
             + offs_d[None, :],
             mask=q_mask1,
             other=None if q_mask1 is None else 0.0,
@@ -354,7 +356,7 @@ def _bwd_kernel(
         )
         do1 = tl.load(
             dout_ptr
-            + offs_m1[:, None].to(tl.int64) * do_stride_m
+            + triton_utils.row_offset(offs_m1, seq_len_q, do_stride_m)
             + offs_d_out[None, :],
             mask=do_mask1,
             other=None if do_mask1 is None else 0.0,
@@ -377,7 +379,7 @@ def _bwd_kernel(
           )
           tl.store(
               ds_ptr
-              + offs_m1[:, None].to(tl.int64) * seq_len_k
+              + triton_utils.row_offset(offs_m1, seq_len_q, seq_len_k)
               + offs_n1[None, :],
               tl.trans(dsT).to(ds_ptr.dtype.element_ty),
               mask=ds_mask,
@@ -395,7 +397,7 @@ def _bwd_kernel(
         )
         tl.store(
             ds_ptr
-            + offs_m_zero[:, None].to(tl.int64) * seq_len_k
+            + triton_utils.row_offset(offs_m_zero, seq_len_q, seq_len_k)
             + offs_n1[None, :],
             z,
             mask=mask_zero,
@@ -403,13 +405,15 @@ def _bwd_kernel(
 
     tl.store(
         dv_ptr
-        + offs_n1[:, None].to(tl.int64) * do_stride_m
+        + triton_utils.row_offset(offs_n1, seq_len_k, do_stride_m)
         + offs_d_out[None, :],
         dv.to(dv_ptr.dtype.element_ty),
         mask=v_mask1,
     )
     tl.store(
-        dk_ptr + offs_n1[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        dk_ptr
+        + triton_utils.row_offset(offs_n1, seq_len_k, q_stride_m)
+        + offs_d[None, :],
         (dk * sm_scale).to(dk_ptr.dtype.element_ty),
         mask=k_mask1,
     )
@@ -423,7 +427,9 @@ def _bwd_kernel(
         offs_m2, seq_len_q, offs_d, head_dim, check_m2, check_d
     )
     q2 = tl.load(
-        q_ptr + offs_m2[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        q_ptr
+        + triton_utils.row_offset(offs_m2, seq_len_q, q_stride_m)
+        + offs_d[None, :],
         mask=q_mask2,
         other=None if q_mask2 is None else 0.0,
     )
@@ -434,7 +440,7 @@ def _bwd_kernel(
     )
     do2 = tl.load(
         dout_ptr
-        + offs_m2[:, None].to(tl.int64) * do_stride_m
+        + triton_utils.row_offset(offs_m2, seq_len_q, do_stride_m)
         + offs_d_out[None, :],
         mask=do_mask2,
         other=None if do_mask2 is None else 0.0,
@@ -501,7 +507,7 @@ def _bwd_kernel(
         )
         k2 = tl.load(
             k_ptr
-            + offs_n2[:, None].to(tl.int64) * k_stride_n
+            + triton_utils.row_offset(offs_n2, seq_len_k, k_stride_n)
             + offs_d[None, :],
             mask=k_mask2,
             other=None if k_mask2 is None else 0.0,
@@ -511,7 +517,7 @@ def _bwd_kernel(
         )
         v2 = tl.load(
             v_ptr
-            + offs_n2[:, None].to(tl.int64) * v_stride_n
+            + triton_utils.row_offset(offs_n2, seq_len_k, v_stride_n)
             + offs_d_out[None, :],
             mask=v_mask2,
             other=None if v_mask2 is None else 0.0,
@@ -553,7 +559,9 @@ def _bwd_kernel(
         dq += _dot(ds, k2, qk_prec, qk_dtype).to(tl.float32)
 
     tl.store(
-        dq_ptr + offs_m2[:, None].to(tl.int64) * q_stride_m + offs_d[None, :],
+        dq_ptr
+        + triton_utils.row_offset(offs_m2, seq_len_q, q_stride_m)
+        + offs_d[None, :],
         (dq * sm_scale).to(dq_ptr.dtype.element_ty),
         mask=q_mask2,
     )
@@ -917,12 +925,18 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
     devices = op.infer_devices(ba) or {backend.get_default_device()}
     is_sm80 = any(map(gpu_utils.is_sm80, devices))
     head_dim_bytes = max_itemsize * triton.next_power_of_2(head_dim)
-    num_stages = 1 if head_dim_bytes >= (512 if is_sm80 else 1024) else 2
-    block_n1 = 32 if head_dim_bytes >= 1024 else 64
+    num_stages = (
+        1
+        if head_dim_bytes >= (512 if is_sm80 and max_itemsize >= 4 else 1024)
+        else 2
+    )
+    block_m1 = 64 if 512 <= head_dim_bytes < 1024 else 32
+    block_n1 = 32 if head_dim_bytes >= 512 else 64
+    block_m2 = 32 if head_dim_bytes >= 1024 else 64
     return Config(
-        block_m1=32,
+        block_m1=block_m1,
         block_n1=block_n1,
-        block_m2=block_n1,
+        block_m2=block_m2,
         block_n2=32,
         num_warps=4,
         num_stages=num_stages,
@@ -950,6 +964,21 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
                     num_stages=num_stages,
                 )
             )
+    # For large head_dim (e.g. 256), dK/dV holds four block_n1 x head_dim tiles
+    # in registers (k1, v1, dk, dv) while dQ holds three block_m2 x head_dim
+    # tiles (q2, do2, dq), so shrinking only block_n1 to 32 avoids spills.
+    for num_warps in [2, 4]:
+      for num_stages in [1, 2, 3, 4]:
+        configs.add(
+            Config(
+                block_m1=64,
+                block_n1=32,
+                block_m2=64,
+                block_n2=32,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+        )
     return configs
 
   @override

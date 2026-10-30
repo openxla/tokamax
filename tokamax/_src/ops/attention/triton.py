@@ -58,7 +58,9 @@ def _load_2d(ptr, offs_r, bound_r, stride_r, start_c, bound_c, block_c):
       bound_c % block_c != 0,
   )
   return tl.load(
-      ptr + offs_r[:, None].to(tl.int64) * stride_r + offs_c[None, :],
+      ptr
+      + triton_utils.row_offset(offs_r, bound_r, stride_r)
+      + offs_c[None, :],
       mask=mask,
       other=None if mask is None else 0.0,
   )
@@ -86,8 +88,8 @@ def _load_scales(ptr, offs_r, start_d, head_dim, block_d, shape):
   rows: tl.constexpr = shape[0]
   num_scales: tl.constexpr = shape[2]
   row_stride: tl.constexpr = shape[1] * num_scales
-  zero = tl.zeros((1, 1), dtype=tl.int64)
-  r = zero if rows == 1 else offs_r[:, None].to(tl.int64) * row_stride
+  zero = tl.zeros((1, 1), dtype=tl.int32)
+  r = zero if rows == 1 else triton_utils.row_offset(offs_r, rows, row_stride)
   check_r: tl.constexpr = rows > 1 and rows % offs_r.shape[0] != 0
   if num_scales == 1:
     mask = offs_r[:, None] < rows if check_r else None
@@ -215,7 +217,7 @@ def _fwd_kernel(
   """Triton MHA forward kernel."""
   grid_m: tl.constexpr = tl.cdiv(seq_len_q, block_m)
   pid_1d = tl.program_id(0)
-  pid_m = (pid_1d % grid_m).to(tl.int64)
+  pid_m = pid_1d % grid_m
   pid_h = (pid_1d // grid_m % num_heads_q).to(tl.int64)
   pid_b = (
       tl.full((), 0, tl.int64)
@@ -224,7 +226,7 @@ def _fwd_kernel(
   )
   pid_h_kv = pid_h // (num_heads_q // num_heads_k)
 
-  start_m = pid_m.to(tl.int32) * block_m
+  start_m = pid_m * block_m
   span_m = start_m + tl.arange(0, block_m)
   check_m: tl.constexpr = seq_len_q % block_m != 0
   check_d_out: tl.constexpr = head_dim_out % block_d_out != 0
@@ -558,7 +560,7 @@ def _fwd_kernel(
     )
     tl.store(
         out_ptr
-        + span_m[:, None].to(tl.int64) * out_stride_m
+        + triton_utils.row_offset(span_m, seq_len_q, out_stride_m)
         + offs_d_out[None, :],
         acc.to(out_ptr.dtype.element_ty),
         mask=out_mask,

@@ -67,11 +67,28 @@ def make_gdn_spec(
     num_decode_seqs: int | None = None,
     distribution: Sequence[int] | None = None,
     num_spec_tokens: int = 0,
-    dtype: jax.typing.DTypeLike = jnp.bfloat16,
-    state_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+    act_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+    recurrent_state_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+    conv_state_dtype: jax.typing.DTypeLike = jnp.float32,
+    conv_weight_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+    kernel_act_dtype: jax.typing.DTypeLike = jnp.float32,
+    compute_precision: jax.typing.DTypeLike | None = None,
     tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
-  """Constructs an ArgSpec for CausalConv1dGatedDeltaRule."""
+  """Constructs an ArgSpec for CausalConv1dGatedDeltaRule.
+
+  Storage and kernel dtypes:
+    act_dtype: activations (`qkv`, `b`, `a`, and the output `out`).
+    recurrent_state_dtype: `recurrent_state`.
+    conv_state_dtype: `conv_state`. The fused kernel only accepts a float32
+      conv state, so other values are roofline what-ifs.
+    conv_weight_dtype: `conv_weight` and `conv_bias`, also forwarded as
+      `kernel_conv_weight_dtype`.
+    kernel_act_dtype: `qkv`, `b`, and `a` inside the kernel. Defaults to
+      `jnp.float32` because `vmem_ldst.load_compact_to_large` requires 32-bit
+      elements for `b` and `a`.
+    compute_precision: matmul precision, added to the spec only when set.
+  """
   num_seqs = len(lengths)
   if max_reqs is None:
     max_reqs = num_seqs
@@ -135,18 +152,20 @@ def make_gdn_spec(
 
   state_indices = np.arange(1, 1 + max_reqs * window, window, dtype=np.int32)
 
-  args = {
-      "qkv": ShapeDtype((num_tokens, dim_size), dtype),
-      "b": ShapeDtype((num_tokens, n_v), dtype),
-      "a": ShapeDtype((num_tokens, n_v), dtype),
+  args: dict[str, Any] = {
+      "qkv": ShapeDtype((num_tokens, dim_size), act_dtype),
+      "b": ShapeDtype((num_tokens, n_v), act_dtype),
+      "a": ShapeDtype((num_tokens, n_v), act_dtype),
       "conv_state": ShapeDtype(
-          (num_blocks, kernel_size - 1, dim_size), jnp.float32
+          (num_blocks, kernel_size - 1, dim_size), conv_state_dtype
       ),
-      "recurrent_state": ShapeDtype((num_blocks, n_v, d_k, d_v), state_dtype),
-      "conv_weight": ShapeDtype((dim_size, 1, kernel_size), dtype),
-      "conv_bias": ShapeDtype((dim_size,), dtype),
+      "recurrent_state": ShapeDtype(
+          (num_blocks, n_v, d_k, d_v), recurrent_state_dtype
+      ),
+      "conv_weight": ShapeDtype((dim_size, 1, kernel_size), conv_weight_dtype),
+      "conv_bias": ShapeDtype((dim_size,), conv_weight_dtype),
       "a_log": ShapeDtype((n_v,), jnp.float32),
-      "dt_bias": ShapeDtype((n_v,), dtype),
+      "dt_bias": ShapeDtype((n_v,), jnp.bfloat16),
       "query_start_loc": _HashableNPArray(q_loc),
       "state_indices": _HashableNPArray(state_indices),
       "distribution": _HashableNPArray(dist_array),
@@ -156,6 +175,8 @@ def make_gdn_spec(
       "d_k": d_k,
       "d_v": d_v,
       "kernel_size": kernel_size,
+      "kernel_act_dtype": jnp.dtype(kernel_act_dtype),
+      "kernel_conv_weight_dtype": jnp.dtype(conv_weight_dtype),
   }
   if num_spec_tokens > 0:
     # Last-step acceptance offsets cycle through the window positions.
@@ -163,6 +184,8 @@ def make_gdn_spec(
     read_offsets[:num_seqs] = [i % window for i in range(num_seqs)]
     args["read_offsets"] = _HashableNPArray(read_offsets)
     args["num_spec_tokens"] = num_spec_tokens
+  if compute_precision is not None:
+    args["compute_precision"] = jnp.dtype(compute_precision)
 
   return arg_spec.ArgSpec(
       args=args,
