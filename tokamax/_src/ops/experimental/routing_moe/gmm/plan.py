@@ -169,7 +169,14 @@ class ResolvedGmmPlan(RoutingGmmPlan):
 
     live_group_walk = plan.live_group_walk
     if live_group_walk is None:
-      live_group_walk = size_out_m < w.group_size
+      # The walk pays off while most of this shard's groups are empty.
+      # size_out_m counts the routed rows of all shards, i.e. (token, pick)
+      # pairs, num_tokens * top-k. A shard gets size_out_m * group_size /
+      # size_global_groups of them on average, which is fewer than its
+      # group_size groups exactly when size_out_m < size_global_groups, under TP
+      # or EP alike. This also keeps row_group, one int32 per routed row in
+      # SMEM, small.
+      live_group_walk = size_out_m < size_global_groups
 
     if w2 is None:
       if plan.tile_k2 is not None:

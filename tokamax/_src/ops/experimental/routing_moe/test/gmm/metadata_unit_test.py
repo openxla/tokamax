@@ -71,6 +71,31 @@ class MetadataUnitTest(parameterized.TestCase):
     self.assertLess(len(actual), cfg.max_num_gm)
     np.testing.assert_array_equal(actual, expected)
 
+  @parameterized.named_parameters(
+      # 512 global groups and 10 routed rows per token; a shard gets on average
+      # rows * local / 512 of them, fewer than its groups iff rows < 512.
+      dict(testcase_name="tp_decode", num_tokens=1, num_local_experts=512),
+      dict(testcase_name="tp_last", num_tokens=51, num_local_experts=512),
+      dict(testcase_name="tp_full", num_tokens=52, num_local_experts=512),
+      dict(testcase_name="ep_decode", num_tokens=1, num_local_experts=64),
+      dict(testcase_name="ep_mid", num_tokens=16, num_local_experts=64),
+      dict(testcase_name="ep_last", num_tokens=51, num_local_experts=64),
+      dict(testcase_name="ep_full", num_tokens=52, num_local_experts=64),
+  )
+  def test_live_group_walk_default(self, num_tokens, num_local_experts):
+    # The live walk is chosen while most of the shard's groups are empty, which
+    # depends on the global group count, not the shard's.
+    num_experts, topk, size_k, size_n = 512, 10, 512, 1024
+    rows = num_tokens * topk
+    cfg = metadata_test_lib.make_gmm_config(
+        num_rows=rows,
+        num_global_groups=num_experts,
+        num_local_groups=num_local_experts,
+        size_k=size_k,
+        size_n=size_n,
+    )
+    self.assertEqual(cfg.plan.live_group_walk, rows < num_experts)
+
 
 if __name__ == "__main__":
   absltest.main()
