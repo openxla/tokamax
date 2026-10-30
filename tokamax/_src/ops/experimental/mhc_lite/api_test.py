@@ -307,6 +307,7 @@ class MhcLiteApiTest(parameterized.TestCase):
       ("1d_pre_1d_post", (4,), (4,)),
       ("1d_pre_2d_post", (4,), (4, 1)),
       ("2d_pre_2d_post", (4, 256), (4, 1)),
+      ("2d_pre_full_2d_post", (4, 256), (4, 256)),
   )
   def test_hc_value_and_grad_end_to_end(self, pre_shape, post_shape):
     x, _, w_branch, _, cotangent = _make_inputs(embedding=256)
@@ -366,6 +367,47 @@ class MhcLiteApiTest(parameterized.TestCase):
         rtol=1e-3,
         atol=1e-3,
     )
+
+  @parameterized.named_parameters(
+      ("bf16_x_f32_branch_and_weights", jnp.bfloat16, jnp.float32),
+      ("f16_x_f16_branch_and_weights", jnp.float16, jnp.float16),
+      ("f16_x_f32_branch_and_weights", jnp.float16, jnp.float32),
+  )
+  def test_hc_value_and_grad_mixed_and_float16_dtypes(
+      self, x_dtype, branch_and_weight_dtype
+  ):
+    keys = jax.random.split(jax.random.key(7), 6)
+    x = jax.random.normal(keys[0], (2, 16, 4, 64), dtype=x_dtype)
+    cotangent = jax.random.normal(keys[1], (2, 16, 4, 64), dtype=x_dtype) * 0.1
+    hc_weights = common.HcWeights(
+        w_pre=jax.random.normal(keys[2], (4,), dtype=branch_and_weight_dtype)
+        * 0.25,
+        w_post=jax.random.normal(keys[3], (4,), dtype=branch_and_weight_dtype)
+        * 0.25,
+        w_res=jnp.eye(4, dtype=branch_and_weight_dtype),
+    )
+    next_weights = common.HcWeights(
+        w_pre=jax.random.normal(keys[4], (4, 64), dtype=branch_and_weight_dtype)
+        * 0.25,
+        w_post=jax.random.normal(keys[5], (4, 1), dtype=branch_and_weight_dtype)
+        * 0.25,
+        w_res=jnp.eye(4, dtype=branch_and_weight_dtype),
+    )
+
+    def loss_fn(x_in, w_in, next_w_in):
+      li, ctx = api.hc_pre(x_in, w_in)
+      layer_out_mixed = jnp.tanh(li.astype(branch_and_weight_dtype))
+      next_li, next_ctx = api.hc_post_and_pre(layer_out_mixed, ctx, next_w_in)
+      out = api.hc_post(next_li.astype(branch_and_weight_dtype), next_ctx)
+      return jnp.sum(out.astype(jnp.float32) * cotangent.astype(jnp.float32))
+
+    loss, (dx, dw, dnext_w) = jax.jit(
+        jax.value_and_grad(loss_fn, argnums=(0, 1, 2))
+    )(x, hc_weights, next_weights)
+    self.assertTrue(np.isfinite(float(loss)))
+    self.assertEqual(dx.dtype, x_dtype)
+    self.assertEqual(dw.w_post.dtype, branch_and_weight_dtype)
+    self.assertEqual(dnext_w.w_post.dtype, branch_and_weight_dtype)
 
   @parameterized.named_parameters(
       ("emb128", 128),

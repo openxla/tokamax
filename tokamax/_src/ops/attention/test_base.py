@@ -17,6 +17,7 @@
 import contextlib
 import functools
 import itertools
+import re
 import sys
 from unittest import mock
 
@@ -37,6 +38,222 @@ from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import xla_chunked
 ARG_SPECS = arg_specs.ARG_SPECS
+
+
+_PARAM_DECL_RE = re.compile(
+    r"%?([A-Za-z0-9_.$-]+):\s*([a-z0-9]+)\[([0-9,]*)\]"
+)
+_SINGLE_INSTR_RE = re.compile(
+    r"^\s*(ROOT\s+)?%?([A-Za-z0-9_.$-]+)\s*=\s*([a-z0-9]+)\[([0-9,]*)\]"
+    r"(?:\{[^}]*\})?\s+([a-z][a-z0-9_-]*)\((.*)"
+)
+_TUPLE_INSTR_RE = re.compile(
+    r"^\s*(ROOT\s+)?%?([A-Za-z0-9_.$-]+)\s*=\s*\((.+)\)\s+"
+    r"([a-z][a-z0-9_-]*)\((.*)"
+)
+_ARRAY_TYPE_RE = re.compile(r"([a-z0-9]+)\[([0-9,]*)\](?:\{[^}]*\})?")
+_REDUCE_DIMS_RE = re.compile(r"dimensions=\{([0-9,]*)\}")
+_TO_APPLY_RE = re.compile(r"to_apply=%?([A-Za-z0-9_.$-]+)")
+
+
+def _parse_comp_header(
+    line: str,
+) -> tuple[str, dict[str, tuple[int, ...]], dict[str, str]] | None:
+  """Parses an HLO computation header line, supporting nested tuple params."""
+  stripped = line.strip()
+  if not stripped.endswith("{"):
+    return None
+  header = stripped[:-1].strip()
+  if header.startswith("ENTRY "):
+    header = header[len("ENTRY ") :].strip()
+  if "=" in header.split("(", 1)[0]:
+    return None
+  m = re.match(r"^%?([A-Za-z0-9_.$-]+)(.*)$", header)
+  if m is None:
+    return None
+  comp_name, rest = m.group(1), m.group(2).strip()
+  var_shapes: dict[str, tuple[int, ...]] = {}
+  var_dtypes: dict[str, str] = {}
+  if rest.startswith("("):
+    depth = 0
+    end_idx = len(rest)
+    for i, ch in enumerate(rest):
+      if ch == "(":
+        depth += 1
+      elif ch == ")":
+        depth -= 1
+        if depth == 0:
+          end_idx = i
+          break
+    params_str = rest[1:end_idx]
+    for pm in _PARAM_DECL_RE.finditer(params_str):
+      dims = tuple(int(d) for d in pm.group(3).split(",") if d)
+      var_shapes[pm.group(1)] = dims
+      var_dtypes[pm.group(1)] = pm.group(2)
+  return comp_name, var_shapes, var_dtypes
+
+
+def _split_top_level_args(args_str: str) -> list[str]:
+  """Splits comma-separated HLO operand strings respecting `{...}` and `(...)`."""
+  parts = []
+  depth = 0
+  start = 0
+  for i, ch in enumerate(args_str):
+    if ch in "({[":
+      depth += 1
+    elif ch in ")}]":
+      depth -= 1
+      if depth < 0:
+        parts.append(args_str[start:i].strip())
+        return parts
+    elif ch == "," and depth == 0:
+      parts.append(args_str[start:i].strip())
+      start = i + 1
+  parts.append(args_str[start:].strip())
+  return parts
+
+
+def _parse_operand(arg_str: str) -> tuple[str, tuple[int, ...] | None]:
+  """Extracts `(operand_name, inline_dims_or_None)` from an HLO operand."""
+  name = arg_str.split()[-1].lstrip("%")
+  type_m = _ARRAY_TYPE_RE.match(arg_str)
+  if type_m is not None:
+    dims = tuple(int(d) for d in type_m.group(2).split(",") if d)
+    return name, dims
+  return name, None
+
+
+def find_low_precision_reductions(hlo_text: str) -> list[str]:
+  """Finds non-trivial bf16/f16 non-min/max `reduce` ops in HLO text."""
+  comp_root_ops: dict[str, tuple[tuple[str, str], ...]] = {}
+  comp_var_shapes: dict[str, dict[str, tuple[int, ...]]] = {}
+  comp_var_ops: dict[str, dict[str, str]] = {}
+  comp_var_dtypes: dict[str, dict[str, str]] = {}
+  reduces: list[
+      tuple[
+          str, str, str, tuple[int, ...] | None, tuple[int, ...], str, int, str
+      ]
+  ] = []
+
+  curr_comp: str | None = None
+  for line in hlo_text.splitlines():
+    if header := _parse_comp_header(line):
+      curr_comp, var_shapes, var_dtypes = header
+      comp_var_shapes[curr_comp] = var_shapes
+      comp_var_ops[curr_comp] = {}
+      comp_var_dtypes[curr_comp] = var_dtypes
+      continue
+
+    if curr_comp is None:
+      continue
+
+    if m := _SINGLE_INSTR_RE.match(line):
+      is_root, name, dtype, dims_str, opcode, rest = m.groups()
+      dims = tuple(int(d) for d in dims_str.split(",") if d)
+      comp_var_shapes[curr_comp][name] = dims
+      comp_var_ops[curr_comp][name] = opcode
+      comp_var_dtypes[curr_comp][name] = dtype
+      if is_root:
+        comp_root_ops[curr_comp] = ((opcode, dtype),)
+      if opcode == "reduce":
+        args = _split_top_level_args(rest)
+        operand_name, inline_dims = _parse_operand(args[0])
+        dims_m = _REDUCE_DIMS_RE.search(line)
+        apply_m = _TO_APPLY_RE.search(line)
+        if dims_m is not None and apply_m is not None:
+          red_dims = tuple(int(d) for d in dims_m.group(1).split(",") if d)
+          reduces.append((
+              curr_comp,
+              line.strip(),
+              operand_name,
+              inline_dims,
+              red_dims,
+              apply_m.group(1),
+              0,
+              dtype,
+          ))
+    elif m := _TUPLE_INSTR_RE.match(line):
+      is_root, name, tuple_types_str, opcode, rest = m.groups()
+      comp_var_ops[curr_comp][name] = opcode
+      args = _split_top_level_args(rest)
+      out_types = _split_top_level_args(tuple_types_str)
+      if is_root:
+        if opcode == "tuple":
+          roots = []
+          for idx, a in enumerate(args):
+            arg_name = _parse_operand(a)[0]
+            type_m = (
+                _ARRAY_TYPE_RE.match(out_types[idx])
+                if idx < len(out_types)
+                else None
+            )
+            elem_dtype = (
+                type_m.group(1)
+                if type_m is not None
+                else comp_var_dtypes[curr_comp].get(arg_name, "")
+            )
+            roots.append(
+                (comp_var_ops[curr_comp].get(arg_name, ""), elem_dtype)
+            )
+          comp_root_ops[curr_comp] = tuple(roots)
+        else:
+          comp_root_ops[curr_comp] = tuple(
+              (
+                  opcode,
+                  type_m.group(1)
+                  if (type_m := _ARRAY_TYPE_RE.match(t)) is not None
+                  else "",
+              )
+              for t in out_types
+          )
+      if opcode == "reduce":
+        dims_m = _REDUCE_DIMS_RE.search(line)
+        apply_m = _TO_APPLY_RE.search(line)
+        if dims_m is not None and apply_m is not None:
+          red_dims = tuple(int(d) for d in dims_m.group(1).split(",") if d)
+          for idx, out_type in enumerate(out_types):
+            type_m = _ARRAY_TYPE_RE.match(out_type)
+            if type_m is not None and idx < len(args):
+              operand_name, inline_dims = _parse_operand(args[idx])
+              reduces.append((
+                  curr_comp,
+                  line.strip(),
+                  operand_name,
+                  inline_dims,
+                  red_dims,
+                  apply_m.group(1),
+                  idx,
+                  type_m.group(1),
+              ))
+
+  unstable = []
+  for (
+      comp,
+      line,
+      operand_name,
+      inline_dims,
+      red_dims,
+      to_apply,
+      out_idx,
+      out_dtype,
+  ) in reduces:
+    root_ops = comp_root_ops.get(to_apply, ())
+    if out_idx < len(root_ops):
+      root_op, accum_dtype = root_ops[out_idx]
+    else:
+      root_op, accum_dtype = "", out_dtype
+    if accum_dtype not in ("bf16", "f16"):
+      continue
+    if root_op in ("maximum", "minimum"):
+      continue
+    operand_dims = (
+        inline_dims
+        if inline_dims is not None
+        else comp_var_shapes.get(comp, {}).get(operand_name)
+    )
+    if operand_dims is None or any(operand_dims[d] != 1 for d in red_dims):
+      unstable.append(line)
+  return unstable
 
 
 def _create_inputs(
@@ -110,11 +327,10 @@ def _run_test(
   if isinstance(mask := (impl_kwargs | kwargs).get("mask"), base.CausalMask):
     mask = base.Mask(causal_mask=mask)
   if isinstance(mask, base.Mask):
-    q_indices = impl_kwargs.get("q_indices", None)
-    k_indices = impl_kwargs.get("k_indices", None)
-    q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
-    k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
-    mask = mask.as_array(q_len_or_indices, k_len_or_indices)
+    q_indices = (impl_kwargs | kwargs).get("q_indices", None)
+    k_indices = (impl_kwargs | kwargs).get("k_indices", None)
+    mask = base.mask_as_array(mask, q, k, q_indices, k_indices)
+    mask = base.repeat_kv_heads(mask, -3, q.shape[-2], k.shape[-2])
 
   if isinstance(mask, jax.Array):
     is_fully_masked = jnp.all(jnp.swapaxes(mask, -2, -3) == 0, axis=-1)
@@ -337,17 +553,26 @@ class AttentionTestBase(parameterized.TestCase):
         expect_supported=(seq_q == seq_kv or self._supports_cross_attention),
     )
 
-  def test_multi_query_attention(self):
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_multi_query_attention(self, dtype):
     def ref_impl(q, k, v, **kwargs):
       k = jnp.broadcast_to(k, (*k.shape[:-2], q.shape[-2], k.shape[-1]))
       v = jnp.broadcast_to(v, (*v.shape[:-2], q.shape[-2], v.shape[-1]))
       return nn.dot_product_attention(q, k, v, **kwargs)
 
+    atol = {jnp.float32: 1e-6, jnp.bfloat16: 1e-2}[dtype]
+    atol_grads = {jnp.float32: None, jnp.bfloat16: 3e-2}[dtype]
     self._run_test(
-        q_shape=(2, 1024, 4, 64), kv_shape=(2, 1024, 1, 64), ref_impl=ref_impl
+        q_shape=(2, 1024, 4, 64),
+        kv_shape=(2, 1024, 1, 64),
+        dtype=dtype,
+        atol=atol,
+        atol_grads=atol_grads,
+        ref_impl=ref_impl,
     )
 
-  def test_grouped_query_attention(self):
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_grouped_query_attention(self, dtype):
 
     def ref(q, k, v, **kwargs):
       repeats = q.shape[-2] // k.shape[-2]
@@ -355,7 +580,16 @@ class AttentionTestBase(parameterized.TestCase):
       v = jnp.repeat(v, repeats, axis=-2)
       return nn.dot_product_attention(q, k, v, **kwargs)
 
-    self._run_test((2, 1024, 16, 64), kv_shape=(2, 1024, 4, 64), ref_impl=ref)
+    atol = {jnp.float32: 1e-6, jnp.bfloat16: 1e-2}[dtype]
+    atol_grads = {jnp.float32: None, jnp.bfloat16: 3e-2}[dtype]
+    self._run_test(
+        (2, 1024, 16, 64),
+        kv_shape=(2, 1024, 4, 64),
+        dtype=dtype,
+        atol=atol,
+        atol_grads=atol_grads,
+        ref_impl=ref,
+    )
 
   def test_no_batch_dim(self):
     self._run_test((1024, 4, 64))
