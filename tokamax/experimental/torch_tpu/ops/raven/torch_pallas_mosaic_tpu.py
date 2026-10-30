@@ -147,4 +147,3 @@ class _PallasMosaicTpuRavenGsa(torch_base._RavenGsa[Config]):  # pylint: disable
 
 # Singleton instance
 PallasMosaicTpuRavenGsa = _PallasMosaicTpuRavenGsa()
-torch_base.register_cpu_support(PallasMosaicTpuRavenGsa)

@@ -29,62 +29,12 @@ from collections.abc import Sequence
 from typing import Any, TypeVar
 import jax
 import jax.numpy as jnp
-import numpy as np
 from tokamax._src.ops.experimental.raven import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 from typing_extensions import override
 
 _Config = TypeVar("_Config")
-
-
-def _torch_to_jax(val: Any) -> Any:
-  """Converts a CPU/CUDA ``torch.Tensor`` (or primitive) into a ``jax.Array``."""
-  if isinstance(val, torch.Tensor):
-    if val.dtype == torch.bfloat16:
-      arr = val.detach().cpu().to(torch.float32).numpy()
-      return jnp.asarray(arr, dtype=jnp.bfloat16)
-    return jnp.asarray(val.detach().cpu().numpy())
-  if isinstance(val, list):
-    return tuple(val)
-  return val
-
-
-def _jax_to_torch(val: Any, device: torch.device) -> Any:
-  """Converts a ``jax.Array`` (or tuple of arrays) into ``torch.Tensor``(s)."""
-  if isinstance(val, tuple):
-    return tuple(_jax_to_torch(x, device) for x in val)
-  if isinstance(val, jax.Array):
-    if val.dtype == jnp.bfloat16:
-      np_arr = np.array(val, dtype=np.float32, copy=True)
-      return torch.as_tensor(np_arr, device=device).to(dtype=torch.bfloat16)
-    np_arr = np.array(val, copy=True)
-    return torch.as_tensor(np_arr, device=device)
-  return val
-
-
-def register_cpu_support(op_instance: torch_op.TorchOp[Any]) -> None:
-  """Registers CPU/CUDA dispatch kernels on ``op_instance._torch_tokamax_op``."""
-  custom_op = op_instance._torch_tokamax_op  # pylint: disable=protected-access
-  if custom_op is None:
-    return
-
-  def _host_kernel(*args: Any, **kwargs: Any) -> Any:
-    device = torch.device("cpu")
-    for arg in args:
-      if isinstance(arg, torch.Tensor):
-        device = arg.device
-        break
-    jax_args = tuple(_torch_to_jax(a) for a in args)
-    jax_kwargs = {k: _torch_to_jax(v) for k, v in kwargs.items()}
-    out = op_instance.op_impl_call(*jax_args, **jax_kwargs)
-    return _jax_to_torch(out, device)
-
-  custom_op.register_kernel("cpu")(_host_kernel)
-  if torch.cuda.is_available():
-    custom_op.register_kernel("cuda")(_host_kernel)
-  if op_instance.backward_op_torch is not None:
-    register_cpu_support(op_instance.backward_op_torch)
 
 
 class _RavenGsaVjp[_Config](torch_op.TorchOp[_Config]):
@@ -368,4 +318,3 @@ class _RavenGsa[_Config](torch_op.TorchOp[_Config]):
 
 # Singleton instance for the reference PyTorch op.
 RavenGsa = _RavenGsa[Any]()
-register_cpu_support(RavenGsa)

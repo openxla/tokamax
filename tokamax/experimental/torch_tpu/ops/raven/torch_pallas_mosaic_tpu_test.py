@@ -15,18 +15,23 @@
 
 """Unit tests for Raven Gated Slot Attention (GSA) PyTorch operator."""
 
-import unittest
 from absl import logging
 from absl.testing import absltest
 import jax
-import torch
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.raven import torch_base
 from tokamax.experimental.torch_tpu.ops.raven import torch_pallas_mosaic_tpu
+import torch
+import torch_tpu  # pylint: disable=unused-import
 
 
-class RavenPallasKernelTest(unittest.TestCase):
+class RavenPallasKernelTest(absltest.TestCase):
   """Tests for Raven Pallas kernel against the PyTorch reference op."""
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
 
   def test_no_disallowed_self_attributes(self):
     torch_utils.inspect_for_no_self_attributes(type(torch_base.RavenGsa))
@@ -41,9 +46,9 @@ class RavenPallasKernelTest(unittest.TestCase):
     )
 
   def test_forward_stage1_and_two_stage_parity(self):
-    device = "tpu" if jax.default_backend() == "tpu" else "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
-    num_slots, val_dim, chunk_size = 8, 16, 64
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 128
+    num_slots, val_dim, chunk_size = 64, 128, 64
 
     torch.manual_seed(42)
     q = torch.randn(
@@ -113,9 +118,9 @@ class RavenPallasKernelTest(unittest.TestCase):
     logging.info("Raven forward Stage 1 and 2-stage parity test passed.")
 
   def test_chunk_size_validation(self):
-    device = "tpu" if jax.default_backend() == "tpu" else "cpu"
-    batch_size, unaligned_seq_len, num_heads, head_dim = 2, 100, 4, 16
-    num_slots = 8
+    device = "tpu"
+    batch_size, unaligned_seq_len, num_heads, head_dim = 2, 100, 4, 128
+    num_slots = 64
     q = torch.randn(
         batch_size, unaligned_seq_len, num_heads, head_dim, device=device
     )
@@ -135,9 +140,9 @@ class RavenPallasKernelTest(unittest.TestCase):
       )
 
   def test_backward_autograd_matches_reference(self):
-    device = "tpu" if jax.default_backend() == "tpu" else "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
-    num_slots, val_dim, chunk_size = 8, 16, 64
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 128
+    num_slots, val_dim, chunk_size = 64, 128, 64
 
     torch.manual_seed(42)
     q_init = torch.randn(
