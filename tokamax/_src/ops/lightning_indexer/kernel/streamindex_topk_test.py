@@ -25,6 +25,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.lightning_indexer.kernel import metadata
+from tokamax._src.ops.lightning_indexer.kernel import tc_streamindex_topk
+from tokamax._src.ops.lightning_indexer.kernel import tc_topk
 from tokamax._src.ops.lightning_indexer.kernel.config import KVLayout
 from tokamax._src.ops.lightning_indexer.kernel.streamindex_topk import (
     convert_cache_to_seq_along_lane,
@@ -122,6 +124,117 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
   return q, scale
 
 
+def _pack_fp8_cache(keys):
+  """fp8-quantize ``[num_pages, page_size, D]`` keys into the uint8 cache.
+
+  Same record layout the tests above build row by row -- ``[fp8 x D | one
+  e8m0 scale byte | pad]`` rounded up to a 128-lane group, addressed as
+  ``[page, slot // 4, slot % 4, width]`` -- just quantized in one shot.
+
+  Args:
+    keys: ``[num_pages, page_size, D]`` float keys.
+
+  Returns:
+    The packed ``uint8`` cache, ``[num_pages, page_size // 4, 4, width]``.
+  """
+  num_pages, page_size, head_dim = keys.shape
+  fp8, scale = quantize_fp8_ue8m0(jnp.asarray(keys), head_dim)
+  record = jnp.concatenate([_to_byte_lane(fp8), _to_byte_lane(scale)], axis=-1)
+  width = -(-record.shape[-1] // 128) * 128
+  record = jnp.pad(record, ((0, 0), (0, 0), (0, width - record.shape[-1])))
+  return np.asarray(record).reshape(num_pages, page_size // 4, 4, width)
+
+
+# (B, T_list, S_list, page_size, H_I, H_KV, D, k, comp_ratio, bq_sz, bkv_p,
+#  block_table_list)
+_NUMERICAL_CORRECTNESS_CASES = (
+    # 0. Single sequence, single page (page_indices shape (1,))
+    (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 16, [[0]]),
+    # 1. Single sequence, highly fragmented block table
+    (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 16, [[2, 0]]),
+    # 2. Batched Decode (T=1, B=2)
+    (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[1, 3], [0, 2]]),
+    # 3. High GQA (8 Query Heads, 2 KV Heads)
+    (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 32, [[4, 1, 3, 0, 2]]),
+    # 4. Multi-Batch Prefill with variable query/sequence lengths
+    (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[3, 1], [2, 4]]),
+    # 5. Dummy sequences / Padding (B=3, but sequence 1 has 0 tokens)
+    (
+        3,
+        [2, 0, 3],
+        [16, 0, 8],
+        8,
+        4,
+        1,
+        16,
+        1024,
+        1,
+        8,
+        16,
+        [[1, 2], [0, 0], [4, 3]],
+    ),
+    # 6. Mixed batch: sequence 0 has 1 token, sequence 1 has 5 tokens
+    (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 16, [[1, 3], [2, 0]]),
+    (
+        1,
+        [4],
+        [384],
+        16,
+        4,
+        1,
+        16,
+        1024,
+        1,
+        8,
+        8,
+        [[
+            13,
+            2,
+            21,
+            7,
+            0,
+            18,
+            5,
+            11,
+            23,
+            1,
+            9,
+            16,
+            3,
+            20,
+            6,
+            14,
+            22,
+            4,
+            10,
+            17,
+            8,
+            15,
+            19,
+            12,
+        ]],
+    ),
+    # 8. Mixed batch with max_num_seqs == max_num_tokens (B=4, T=4):
+    # 2 decode sequences (T=1), 1 chunked-prefill sequence (T=2), and
+    # 1 padded inactive sequence (T=0). S_list // comp_ratio > k so
+    # _common_path is exercised even with enable_early_exit=True.
+    (
+        4,
+        [1, 1, 2, 0],
+        [64, 80, 96, 0],
+        128,
+        4,
+        1,
+        128,
+        16,
+        2,
+        8,
+        2,
+        [[1, 3], [0, 2], [4, 5], [0, 0]],
+    ),
+)
+
+
 class StreamIndexTopKTest(parameterized.TestCase):
 
   def setUp(self):
@@ -134,20 +247,7 @@ class StreamIndexTopKTest(parameterized.TestCase):
       )
 
   def _ee_pack_cache(self, keys):
-    """fp8-quantize ``[num_pages, page_size, D]`` keys into the uint8 cache.
-
-    Same record layout the tests above build row by row -- ``[fp8 x D | one
-    e8m0 scale byte | pad]`` rounded up to a 128-lane group, addressed as
-    ``[page, slot // 4, slot % 4, width]`` -- just quantized in one shot.
-    """
-    num_pages, page_size, head_dim = keys.shape
-    fp8, scale = quantize_fp8_ue8m0(jnp.asarray(keys), head_dim)
-    record = jnp.concatenate(
-        [_to_byte_lane(fp8), _to_byte_lane(scale)], axis=-1
-    )
-    width = -(-record.shape[-1] // 128) * 128
-    record = jnp.pad(record, ((0, 0), (0, 0), (0, width - record.shape[-1])))
-    return np.asarray(record).reshape(num_pages, page_size // 4, 4, width)
+    return _pack_fp8_cache(keys)
 
   def _ee_inputs(self, q_lens, seq_lens, seed):
     """One kernel invocation at ``compression_ratio=1``.
@@ -393,95 +493,25 @@ class StreamIndexTopKTest(parameterized.TestCase):
     assert out_shape_idxs.dtype == jnp.int32
     print("Result: PASS")
 
-  @parameterized.parameters(
-      [
-          # 0. Single sequence, single page (page_indices shape (1,))
-          (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 16, [[0]]),
-          # 1. Single sequence, highly fragmented block table
-          (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 16, [[2, 0]]),
-          # 2. Batched Decode (T=1, B=2)
-          (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[1, 3], [0, 2]]),
-          # 3. High GQA (8 Query Heads, 2 KV Heads)
-          (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 32, [[4, 1, 3, 0, 2]]),
-          # 4. Multi-Batch Prefill with variable query/sequence lengths
-          (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[3, 1], [2, 4]]),
-          # 5. Dummy sequences / Padding (B=3, but sequence 1 has 0 tokens)
-          (
-              3,
-              [2, 0, 3],
-              [16, 0, 8],
-              8,
-              4,
-              1,
-              16,
-              1024,
-              1,
-              8,
-              16,
-              [[1, 2], [0, 0], [4, 3]],
-          ),
-          # 6. Mixed batch: sequence 0 has 1 token, sequence 1 has 5 tokens
-          (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 16, [[1, 3], [2, 0]]),
-          (
-              1,
-              [4],
-              [384],
-              16,
-              4,
-              1,
-              16,
-              1024,
-              1,
-              8,
-              8,
-              [[
-                  13,
-                  2,
-                  21,
-                  7,
-                  0,
-                  18,
-                  5,
-                  11,
-                  23,
-                  1,
-                  9,
-                  16,
-                  3,
-                  20,
-                  6,
-                  14,
-                  22,
-                  4,
-                  10,
-                  17,
-                  8,
-                  15,
-                  19,
-                  12,
-              ]],
-          ),
-          # 8. Mixed batch with max_num_seqs == max_num_tokens (B=4, T=4):
-          # 2 decode sequences (T=1), 1 chunked-prefill sequence (T=2), and
-          # 1 padded inactive sequence (T=0). S_list // comp_ratio > k so
-          # _common_path is exercised even with enable_early_exit=True.
-          (
-              4,
-              [1, 1, 2, 0],
-              [64, 80, 96, 0],
-              128,
-              4,
-              1,
-              128,
-              16,
-              2,
-              8,
-              2,
-              [[1, 3], [0, 2], [4, 5], [0, 0]],
-          ),
-      ],
-  )
-  def test_streamindex_topk_numerical_correctness(
+  @parameterized.parameters(*_NUMERICAL_CORRECTNESS_CASES)
+  def test_streamindex_topk_numerical_correctness(self, *case):
+    self._check_numerical_correctness(*case)
+
+  @parameterized.parameters(*_NUMERICAL_CORRECTNESS_CASES)
+  def test_tensorcore_topk_numerical_correctness(self, *case):
+    """Runs the numerical test with the SparseCore-free kernels forced.
+
+    TPUs with >= 32 SparseCore subcores would otherwise never exercise the
+    fused TensorCore scoring + top-k kernel.
+    """
+    jax.clear_caches()
+    self.addCleanup(jax.clear_caches)
+    with mock.patch.object(
+        tc_topk, "has_full_sparsecore_topk", return_value=False
+    ):
+      self._check_numerical_correctness(*case)
+
+  def _check_numerical_correctness(
       self,
       B,
       T_list,
@@ -1742,6 +1772,164 @@ class ChunkedStreamIndexTopKTest(parameterized.TestCase):
           si, mi, err_msg=f"row {row}: positions differ"
       )
       np.testing.assert_array_equal(ss, ms, err_msg=f"row {row}: scores differ")
+
+
+_SEL_PAGE_SIZE = 128
+_SEL_H_I = 4
+_SEL_D = 128
+# Score scale of each key class: class `c` keys are `_SEL_CLASS_SCALES[c]`
+# times one shared direction that every query head is aligned with, so class
+# scores are strictly ordered by scale and identical within a class.
+_SEL_CLASS_SCALES = (4.0, 3.0, 2.0, 1.0)
+
+
+def _sel_key_classes(pattern: str, num_positions: int) -> np.ndarray:
+  """Key class of every compressed position for a tie-heavy pattern."""
+  j = np.arange(num_positions)
+  if pattern == "all_equal":
+    return np.zeros_like(j)
+  if pattern == "periodic":
+    return (j % 3) + 1
+  if pattern == "lane_skew":
+    # The best class only ever lands in lane 0 of each 128-wide tile, and the
+    # next class has far more members than `k`.
+    return np.where(j % 128 == 0, 0, 1 + (j // 128) % 3)
+  if pattern == "blocks":
+    # Long runs of equal keys, alternating between two classes.
+    return np.where((j // 200) % 2 == 0, 2, 1)
+  raise ValueError(pattern)
+
+
+class TensorCoreSelectTopKTest(parameterized.TestCase):
+  """The threshold-select Top-K must match the streaming Top-K bit for bit."""
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 7:
+      self.skipTest("Requires TPU v7 or newer.")
+
+  def _inputs(self, q_lens, seq_lens, *, pattern=None, seed=0):
+    """Builds one batch at `compression_ratio=1` on shuffled pages."""
+    rng = np.random.default_rng(seed)
+    num_seqs = len(q_lens)
+    num_tokens = int(sum(q_lens))
+    pages_per_seq = -(-max(seq_lens) // _SEL_PAGE_SIZE)
+    num_pages = num_seqs * pages_per_seq
+    block_table = (
+        rng.permutation(num_pages)
+        .astype(np.int32)
+        .reshape(num_seqs, pages_per_seq)
+    )
+    if pattern is None:
+      keys = rng.standard_normal(
+          (num_pages, _SEL_PAGE_SIZE, _SEL_D), dtype=np.float32
+      )
+      q = rng.standard_normal((num_tokens, _SEL_H_I, _SEL_D), dtype=np.float32)
+    else:
+      direction = np.abs(rng.standard_normal(_SEL_D)).astype(np.float32)
+      direction /= np.linalg.norm(direction)
+      classes = _sel_key_classes(pattern, pages_per_seq * _SEL_PAGE_SIZE)
+      scales = np.asarray(_SEL_CLASS_SCALES, np.float32)[classes]
+      logical = scales[:, None] * direction[None, :]
+      keys = np.zeros((num_pages, _SEL_PAGE_SIZE, _SEL_D), np.float32)
+      for s in range(num_seqs):
+        for p in range(pages_per_seq):
+          keys[block_table[s, p]] = logical[
+              p * _SEL_PAGE_SIZE : (p + 1) * _SEL_PAGE_SIZE
+          ]
+      q = np.broadcast_to(direction, (num_tokens, _SEL_H_I, _SEL_D)).copy()
+    num_decodes = 0
+    while num_decodes < num_seqs and q_lens[num_decodes] == 1:
+      num_decodes += 1
+    cache = _pack_fp8_cache(keys)
+    return dict(
+        q=jnp.asarray(q),
+        indexer_weights=jnp.asarray(
+            rng.uniform(0.25, 1.75, (num_tokens, _SEL_H_I)).astype(np.float32)
+        ),
+        cache_kv=jnp.asarray(cache),
+        seq_lens=jnp.asarray(seq_lens, jnp.int32),
+        page_indices=jnp.asarray(block_table.reshape(-1)),
+        cu_q_lens=jnp.asarray(
+            np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        ),
+        distribution=jnp.asarray([num_decodes, num_decodes, num_seqs]),
+    )
+
+  def _run(self, inputs, *, k, topk_impl, bkv_p, bq, return_scores=True):
+    out = tc_streamindex_topk.tc_streamindex_topk(
+        **inputs,
+        k=k,
+        compression_ratio=1,
+        num_kv_pages_per_block=bkv_p,
+        num_queries_per_block=bq,
+        decode_req_batch_size=4,
+        return_scores=return_scores,
+        topk_impl=topk_impl,
+    )
+    return jax.tree.map(np.asarray, out)
+
+  def _assert_impls_match(self, inputs, *, k, bkv_p, bq):
+    stream_idx, stream_sc = self._run(
+        inputs, k=k, topk_impl="stream", bkv_p=bkv_p, bq=bq
+    )
+    sel_idx, sel_sc = self._run(
+        inputs, k=k, topk_impl="select", bkv_p=bkv_p, bq=bq
+    )
+    np.testing.assert_array_equal(sel_idx, stream_idx, err_msg="indices")
+    np.testing.assert_array_equal(sel_sc, stream_sc, err_msg="score bits")
+    return sel_idx
+
+  @parameterized.named_parameters(
+      # name, q_lens, seq_lens, k, bkv_p, bq
+      ("prefill_multi_block", [40], [2048], 256, 2, 16),
+      ("prefill_single_block", [24], [1536], 128, 12, 8),
+      ("decode_batch", [1] * 8, [1024, 2048, 640, 1800, 128, 2048, 900, 1],
+       512, 2, 8),
+      ("decode_partitions", [1], [4096], 1024, 4, 8),
+      ("decode_partitions_2", [1, 1], [3000, 4096], 128, 1, 8),
+      ("k_exceeds_kv_len", [3, 1], [200, 90], 512, 1, 8),
+      ("large_k", [1, 1, 1, 1], [8192, 6000, 8192, 300], 2048, 4, 8),
+      ("mixed_ragged", [1, 7, 33], [700, 1500, 2600], 256, 2, 16),
+      # Enough KV blocks of >= 4 tiles for the two-level (cell) select.
+      ("two_level_decode", [1, 1, 1], [8192, 5000, 300], 128, 4, 8),
+      ("two_level_prefill", [48], [8192], 256, 8, 16),
+  )
+  def test_random_scores_match_stream(self, q_lens, seq_lens, k, bkv_p, bq):
+    inputs = self._inputs(q_lens, seq_lens, seed=len(q_lens) * 7 + k)
+    self._assert_impls_match(inputs, k=k, bkv_p=bkv_p, bq=bq)
+
+  @parameterized.product(
+      pattern=("all_equal", "periodic", "lane_skew", "blocks"),
+      case=(
+          # q_lens, seq_lens, k, bkv_p, bq
+          ([1, 1], [4096, 1500], 128, 4, 8),
+          ([20], [2048], 256, 2, 16),
+          ([1], [3072], 1024, 8, 8),
+      ),
+  )
+  def test_ties_resolve_by_lowest_index(self, pattern, case):
+    q_lens, seq_lens, k, bkv_p, bq = case
+    inputs = self._inputs(q_lens, seq_lens, pattern=pattern, seed=3)
+    sel_idx = self._assert_impls_match(inputs, k=k, bkv_p=bkv_p, bq=bq)
+
+    # Closed form: classes ranked by scale, then positions ascending.
+    pages_per_seq = -(-max(seq_lens) // _SEL_PAGE_SIZE)
+    classes = _sel_key_classes(pattern, pages_per_seq * _SEL_PAGE_SIZE)
+    token = 0
+    for q_len, seq_len in zip(q_lens, seq_lens):
+      for i in range(q_len):
+        n_visible = seq_len - q_len + i + 1
+        pos = np.arange(n_visible)
+        order = np.lexsort((pos, classes[:n_visible]))[:k]
+        expected = np.full((k,), -1, np.int32)
+        expected[: len(order)] = pos[order]
+        np.testing.assert_array_equal(
+            sel_idx[token], expected, err_msg=f"token {token}"
+        )
+        token += 1
 
 
 if __name__ == "__main__":
