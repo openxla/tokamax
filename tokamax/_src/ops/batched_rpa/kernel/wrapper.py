@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.batched_rpa.kernel import (
     configs,
     kernel,
@@ -590,8 +591,8 @@ def ragged_paged_attention(
         chunk_prefill_size: Not used.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
-        vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
-            size of the hardware.
+        vmem_limit_bytes: VMEM size limit of the kernel. Defaults to
+            `mosaic_tpu.default_tc_vmem_limit_bytes()`.
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
@@ -642,7 +643,7 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = cast(int, pltpu.get_tpu_info().vmem_capacity_bytes)
+        vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
