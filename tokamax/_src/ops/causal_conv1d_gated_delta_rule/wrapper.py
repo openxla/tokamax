@@ -207,8 +207,9 @@ def inner_kernel(
 
   # Store output and recurrent to vmem.
   out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-  recurrent_out_slot_ref[...] = new_recurrent_state.astype(
-      recurrent_out_slot_ref.dtype
+  # Round to the state dtype, then pack into the uint32 window.
+  recurrent_out_slot_ref[...] = pltpu.bitcast(
+      new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
   )
 
   if carry_recurrent_scratch_ref is not None:
@@ -221,14 +222,12 @@ def outer_kernel(
     qkv_ref: jax.Array,
     b_ref: jax.Array,
     a_ref: jax.Array,
-    conv_state_ref: jax.Array,
-    recurrent_state_ref: jax.Array,
+    states_ref: jax.Array | tuple[jax.Array, jax.Array],
     _: jax.Array,
     weights_ref: memory_ref.WeightRefs,
     # Outputs.
     out_ref: jax.Array,
-    conv_state_out_ref: jax.Array,
-    recurrent_state_out_ref: jax.Array,
+    states_out_ref: jax.Array | tuple[jax.Array, jax.Array],
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
@@ -278,6 +277,13 @@ def outer_kernel(
       _explicit_indices=True,
   )
 
+  if isinstance(states_ref, tuple) and isinstance(states_out_ref, tuple):
+    conv_state_ref, recurrent_state_ref = states_ref
+    conv_state_out_ref, recurrent_state_out_ref = states_out_ref
+  else:
+    conv_state_ref = recurrent_state_ref = states_ref
+    conv_state_out_ref = recurrent_state_out_ref = states_out_ref
+
   @pl.with_scoped(
       allocations=(
           qkv_alloc,
@@ -313,7 +319,7 @@ def outer_kernel(
 
 
 @jax.jit(
-    donate_argnames=("conv_state", "recurrent_state"),
+    donate_argnames=("states",),
     static_argnames=(
         "n_kq",
         "n_v",
@@ -325,10 +331,11 @@ def outer_kernel(
         "mixed_tile_size",
         "zero_initialize_out",
         "compute_precision",
+        "recurrent_dtype",
+        "conv_dtype",
         "attention_mode",
         "gate_lower_bound",
         "kernel_act_dtype",
-        "kernel_conv_state_dtype",
         "kernel_conv_weight_dtype",
     ),
 )
@@ -336,8 +343,10 @@ def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
-    conv_state: jax.Array,  # [num_seqs + 1, kernel_size - 1, dim_size]
-    recurrent_state: jax.Array,  # [num_seqs + 1, nv, dk, dv]
+    states: (
+        jax.Array | tuple[jax.Array, jax.Array]
+    ),  # [num_blocks, total_granules, 1, num_lanes * packing] or
+    # ([num_seqs + 1, kernel_size - 1, dim_size], [num_seqs + 1, nv, dk, dv])
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     a_log: jax.Array,  # [n_v]
@@ -348,6 +357,7 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_state_indices: jax.Array | None = None,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
+    ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
     *,
     n_kq: int,
     n_v: int,
@@ -359,12 +369,13 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    recurrent_dtype: jnp.dtype | None = None,
+    conv_dtype: jnp.dtype | None = None,
     kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
-    kernel_conv_state_dtype: jnp.dtype = jnp.float32.dtype,
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
+) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
   """Perform conv1d and gdn in a single fused kernel.
 
   Args:
@@ -372,15 +383,11 @@ def fused_conv1d_gdn(
       where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
     b: b tensor (for beta) of shape [batch_size, n_v].
     a: a tensor (for g) of shape [batch_size, n_v].
-    conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-      kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-      from the last sequence invocation. The first slot is a null block used for
-      padded or invalid tokens. It may contain garbage data if it is a first
-      invocation of a sequence.
-    recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
-      d_k, d_v]. The first slot is a null block used for padded or invalid
-      tokens. It may contain garbage data if it is a first invocation of a
-      sequence.
+    states: Either a unified state pool tensor of shape [num_blocks,
+      total_granules, 1, num_lanes * packing] containing both recurrent and
+      convolution states, or a tuple `(conv_state, recurrent_state)` of shape
+      `([num_seqs + 1, kernel_size - 1, dim_size], [num_seqs + 1, n_v, d_k,
+      d_v])`.
     conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
     conv_bias: Optional convolution bias tensor of shape [dim_size].
     a_log: a_log tensor of shape [n_v].
@@ -404,9 +411,13 @@ def fused_conv1d_gdn(
       `state_indices`.
     read_offsets: Optional [num_seqs] int32 — per-sequence state read offset
       (num_accepted - 1 from the last verify step). Windowed sequences read
-      their initial state from `read_state_indices[s] + read_offsets[s]` and
-      write one checkpoint per window position to `state_indices[s] + t`.
-      Required when `num_spec_tokens > 0`.
+      their initial state from `read_state_indices[s] + read_offsets[s]` (or
+      `ckpt_indices[s, read_offsets[s]]`) and write one checkpoint per window
+      position to `state_indices[s] + t` (or `ckpt_indices[s, t]`). Required
+      when `num_spec_tokens > 0`.
+    ckpt_indices: Optional [num_seqs, num_spec_tokens + 1] int32 — per-sequence,
+      per-checkpoint state slot indices. When None, checkpoints are addressed as
+      contiguous offsets from `read_state_indices` / `state_indices`.
     n_kq: Number of key/query heads.
     n_v: Number of value heads.
     d_k: Key/query dimension.
@@ -424,8 +435,9 @@ def fused_conv1d_gdn(
     zero_initialize_out: Whether to zero-initialize the output buffer before
       executing non-batched sequences.
     compute_precision: Computation precision dtype.
+    recurrent_dtype: Recurrent state dtype when `states` is a unified pool.
+    conv_dtype: Convolution state dtype when `states` is a unified pool.
     kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
-    kernel_conv_state_dtype: Dtype conv_state is cast to before the kernel.
     kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to before
       the kernel.
     decode_tile_size: Tile size along sequence dimension for decode sequences.
@@ -433,15 +445,28 @@ def fused_conv1d_gdn(
       sequences.
 
   Returns:
-    (new_conv_state, new_recurrent_state): Updated convolution state cache and
-      recurrent state cache tensors.
+    new_states: Updated unified state pool or `(new_conv_state,
+      new_recurrent_state)` tuple.
     out: Fused output tensor.
   """
+  is_shared = isinstance(states, jax.Array)
+  if is_shared:
+    assert conv_dtype is not None
+    assert recurrent_dtype is not None
+    state_packing = 4 // states.dtype.itemsize
+    assert states.shape[-2] == state_packing
+  else:
+    conv_dtype = states[0].dtype
+    recurrent_dtype = states[1].dtype
+
+  if conv_dtype != jnp.float32:
+    raise NotImplementedError(f"Unsupported conv_dtype: {conv_dtype}")
+  if recurrent_dtype not in (jnp.float32, jnp.bfloat16):
+    raise NotImplementedError(f"Unsupported recurrent_dtype: {recurrent_dtype}")
+
   # TODO: Support bf16
   act_in_dtype = qkv.dtype
   act_out_dtype = qkv.dtype
-  conv_out_dtype = conv_state.dtype
-  recurrent_out_dtype = recurrent_state.dtype
   assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
   if jnp.dtype(kernel_act_dtype) != jnp.float32:
@@ -453,7 +478,6 @@ def fused_conv1d_gdn(
   qkv = qkv.astype(kernel_act_dtype)
   b = b.astype(kernel_act_dtype)
   a = a.astype(kernel_act_dtype)
-  conv_state = conv_state.astype(kernel_conv_state_dtype)
 
   # Step 1: Validate inputs.
   is_kda = attention_mode == config.AttentionMode.KDA
@@ -493,12 +517,15 @@ def fused_conv1d_gdn(
     read_state_indices = state_indices
   assert read_state_indices.shape == (num_seqs,)
   read_state_indices = read_state_indices.astype(state_indices.dtype)
+  if ckpt_indices is not None:
+    assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
+    ckpt_indices = ckpt_indices.astype(jnp.int32)
 
   # Step 2: Compute tile sizes and pad/reshape activations.
   num_lanes = pltpu.get_tpu_info().num_lanes
   packing = 4 // act_in_dtype.itemsize
   padded_batch_size = pl.cdiv(batch_size, packing) * packing
-  conv_state_dim_size = conv_state.shape[-1]
+  conv_state_dim_size = dim
   window_size = num_spec_tokens + 1
   decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
   mixed_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes()
@@ -513,7 +540,7 @@ def fused_conv1d_gdn(
       kernel_size=kernel_size,
       conv_state_dim_size=conv_state_dim_size,
       act_out_dtype=act_out_dtype,
-      recurrent_state_dtype=recurrent_state.dtype,
+      recurrent_state_dtype=recurrent_dtype,
       num_lanes=num_lanes,
       decode_vmem_limit_bytes=decode_vmem_limit_bytes,
       mixed_vmem_limit_bytes=mixed_vmem_limit_bytes,
@@ -540,8 +567,18 @@ def fused_conv1d_gdn(
 
   # Step 3: States and weights pre-processing.
   # To eliminate runtime cost, this logic can be moved into model loading
-  conv_state_shape = conv_state.shape
-  conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+  conv_state_shape = None
+  recurrent_state_shape = None
+  if not is_shared:
+    conv_state, recurrent_state = states
+    conv_state_shape = conv_state.shape
+    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+    if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
+      # Pack d_k pairs into a size-2 2nd-minor axis so HBM uses (2, 128) tiling
+      # and granule_view's uint32 bitcast lands on a (1, 128) tile.
+      recurrent_state_shape = recurrent_state.shape
+      recurrent_state = recurrent_state.reshape(-1, n_v * (d_k // 2), 2, d_v)
+    states = (conv_state, recurrent_state)
   conv_weight = conv_weight.swapaxes(0, 2).astype(kernel_conv_weight_dtype)
   if conv_bias is not None:
     conv_bias = conv_bias.astype(kernel_conv_weight_dtype)
@@ -558,11 +595,10 @@ def fused_conv1d_gdn(
   weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
   def call_kernel(
-      in_conv_state: jax.Array,
-      in_recurrent_state: jax.Array,
+      in_states: jax.Array | tuple[jax.Array, jax.Array],
       in_act: jax.Array | None,
       mode: config.GDNMode,
-  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+  ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
     if mode == config.GDNMode.PER_SEQ:
       tile_size = mixed_tile_size
       # Prefill / mixed sequences keep a single state checkpoint.
@@ -579,6 +615,7 @@ def fused_conv1d_gdn(
         kernel_size=kernel_size,
         tile_size=tile_size,
         window_size=window_size,
+        is_shared=is_shared,
         dim_size=dim,
         num_kq_heads=n_kq,
         num_v_heads=n_v,
@@ -590,8 +627,8 @@ def fused_conv1d_gdn(
             act_in=qkv.dtype,
             act_out=act_out_dtype,
             compute=compute_precision,
-            recurrent_state=in_recurrent_state.dtype,
-            conv_state=in_conv_state.dtype,
+            recurrent_state=recurrent_dtype,
+            conv_state=conv_dtype,
         ),
     )
 
@@ -606,6 +643,7 @@ def fused_conv1d_gdn(
           read_offsets=read_offsets,
           end_seq=distribution[0],
           read_indices=read_state_indices,
+          ckpt_indices=ckpt_indices,
       )
     else:
       metadata_obj = metadata.compute_per_seq_metadata(
@@ -617,36 +655,45 @@ def fused_conv1d_gdn(
           end_seq=distribution[-1],
           read_indices=read_state_indices,
           read_offsets=read_offsets,
+          ckpt_indices=ckpt_indices,
       )
 
     metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+    states_spec = jax.tree.map(lambda _: hbm_spec, in_states)
 
     # Step 7: Handle case where write needs to be done in existing out.
     in_out_spec = None
-    input_output_aliases = {len(metadata_obj) + 3: 1, len(metadata_obj) + 4: 2}
     out_shape = cfg.get_out_shape()
+    if is_shared:
+      input_output_aliases = {len(metadata_obj) + 3: 1}
+      in_act_idx = len(metadata_obj) + 4
+    else:
+      input_output_aliases = {
+          len(metadata_obj) + 3: 1,
+          len(metadata_obj) + 4: 2,
+      }
+      in_act_idx = len(metadata_obj) + 5
 
     if in_act is None and zero_initialize_out:
       in_act = jnp.zeros_like(out_shape)
     if in_act is not None:
       out_shape = in_act
       in_out_spec = hbm_spec
-      input_output_aliases[len(metadata_obj) + 5] = 0
+      input_output_aliases[in_act_idx] = 0
 
     return pl.pallas_call(
         functools.partial(outer_kernel, cfg=cfg),
-        out_shape=(out_shape, in_conv_state, in_recurrent_state),
+        out_shape=(out_shape, in_states),
         in_specs=(
             metadata_spec,
             hbm_spec,
             hbm_spec,
             hbm_spec,
-            hbm_spec,
-            hbm_spec,
+            states_spec,
             in_out_spec,
             weights_spec,
         ),
-        out_specs=(hbm_spec, hbm_spec, hbm_spec),
+        out_specs=(hbm_spec, states_spec),
         scratch_shapes=cfg.get_scratch_shape_dict(),
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
@@ -660,8 +707,7 @@ def fused_conv1d_gdn(
         qkv,
         b,
         a,
-        in_conv_state,
-        in_recurrent_state,
+        in_states,
         in_act,
         weights,
     )
@@ -669,25 +715,23 @@ def fused_conv1d_gdn(
   # Phase 1: The first segment holds verify windows of up to
   # `num_spec_tokens + 1` tokens, or plain 1-token decodes without
   # speculative decoding.
-  out_act, out_conv_state, out_recurrent_state = call_kernel(
-      conv_state,
-      recurrent_state,
-      None,
-      config.GDNMode.BATCHED,
-  )
+  out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
 
   # Phase 2: Prefill/mixed pass over sequences
   # [distribution[0], distribution[-1])
-  out_act, out_conv_state, out_recurrent_state = call_kernel(
-      out_conv_state,
-      out_recurrent_state,
+  out_act, out_states = call_kernel(
+      out_states,
       out_act,
       config.GDNMode.PER_SEQ,
   )
 
   out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-  out_conv_state = out_conv_state.astype(conv_out_dtype)
-  out_conv_state = out_conv_state.reshape(conv_state_shape)
-  out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
+  if not is_shared:
+    assert isinstance(out_states, tuple)
+    out_conv_state, out_recurrent_state = out_states
+    out_conv_state = out_conv_state.reshape(conv_state_shape)
+    if recurrent_state_shape is not None:
+      out_recurrent_state = out_recurrent_state.reshape(recurrent_state_shape)
+    out_states = (out_conv_state, out_recurrent_state)
 
-  return (out_conv_state, out_recurrent_state), out_act
+  return out_states, out_act
