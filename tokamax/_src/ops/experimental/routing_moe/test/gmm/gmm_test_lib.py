@@ -40,13 +40,14 @@ def _local_weight(
     quantize: bool,
     fused_gate_up: bool = False,
     quant_block_size: int | None = None,
+    quant_dtype: jnp.dtype | None = None,
 ) -> arg.SingleWeightWrapper[jax.Array]:
-  """Slices this shard's experts from `w` and optionally quantizes to float8."""
+  """Slices this shard's experts from `w` and optionally quantizes them."""
   w = w[group_offset : group_offset + num_local_experts]
   scale = None
   if quantize:
     w, scale = test_inputs.sub_channel_quantize(
-        w, jnp.float8_e4m3fn, quant_block_size
+        w, quant_dtype or jnp.float8_e4m3fn, quant_block_size
     )
   return arg.make_weight_wrapper(w, scale, fused_gate_up=fused_gate_up)
 
@@ -130,12 +131,14 @@ class GmmCase:
             fused_gate_up=True,
             **local,
             quant_block_size=shape.w_quant_block_size,
+            quant_dtype=shape.w_dtype,
         ),
         w2=_local_weight(
             layer_inputs.w2,
             quantize=quant_w2 or quant_shape,
             **local,
             quant_block_size=shape.w_quant_block_size,
+            quant_dtype=shape.w_dtype,
         ),
         routing=test_inputs.Routing.make_routing(
             topk_indices, shape.num_experts, **local
