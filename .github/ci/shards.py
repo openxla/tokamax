@@ -635,6 +635,9 @@ SHARDS: ShardMap = {
     # each of the three runs since.
     'experimental-routing-moe': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/routing_moe/api_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/base_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
         ),
