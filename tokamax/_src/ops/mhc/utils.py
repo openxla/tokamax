@@ -18,13 +18,10 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
-
-# Explicit scoped-VMEM budget. Never rely on the backend default — it varies
-# by Mosaic version.
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def round_up(x: int, multiple: int) -> int:
@@ -37,7 +34,7 @@ def select_token_block(
     token_block_size: int,
     *,
     vmem_need: Callable[[int], int] | None = None,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[int, int]:
   """Picks the grid token block and pads the token count to a multiple of it.
 
@@ -49,11 +46,14 @@ def select_token_block(
     num_tokens: Number of tokens.
     token_block_size: Requested token block size.
     vmem_need: Estimates a kernel's VMEM footprint for a block of `tb` tokens.
-    vmem_limit_bytes: Scoped-VMEM budget the block must fit within.
+    vmem_limit_bytes: Scoped-VMEM budget the block must fit within. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     `(token_block, padded_tokens)`.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   tb = min(token_block_size, round_up(num_tokens, SUBLANE))
   if vmem_need is not None:
     while tb > SUBLANE and vmem_need(tb) > vmem_limit_bytes:

@@ -38,9 +38,7 @@ class Config:
   num_kv_pages_per_block: tuple[int, int, int] | int = (1, 1, 1)
   num_queries_per_block: tuple[int, int, int] | int = (1, 16, 16)
   buffer_count: tuple[int, int, int] | int = kernel_config.DEFAULT_BUFFER_COUNT
-  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] = (
-      kernel_lib.DEFAULT_VMEM_LIMIT_BYTES
-  )
+  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] | None = None
   decode_req_batch_size: Annotated[int, pydantic.Field(gt=0)] = 4
   enable_early_exit: bool = False
   chunk_tokens: Annotated[int, pydantic.Field(gt=0)] | None = None
@@ -110,7 +108,6 @@ class PallasTpuLightningIndexer(base.LightningIndexer[Config]):
         num_kv_pages_per_block=(1, 1, 1),
         num_queries_per_block=(1, 16, 16),
         buffer_count=kernel_config.DEFAULT_BUFFER_COUNT,
-        vmem_limit_bytes=kernel_lib.DEFAULT_VMEM_LIMIT_BYTES,
         decode_req_batch_size=4,
         enable_early_exit=False,
         chunk_tokens=None,

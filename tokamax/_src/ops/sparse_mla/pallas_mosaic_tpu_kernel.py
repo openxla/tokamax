@@ -21,9 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.csa_gather import pallas_mosaic_tpu_kernel as csa_gather
-
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 def cdiv(a, b):
@@ -643,7 +642,7 @@ def sparse_ragged_paged_attention(
     # Kernel optimization params.
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
   """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -661,11 +660,14 @@ def sparse_ragged_paged_attention(
       sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
       k is also the total number of sequences.
     sm_scale: the softmax scale which will be applied to the Q@K^T.
-    vmem_limit_bytes: the vmem limit for the pallas kernel.
+    vmem_limit_bytes: the vmem limit for the pallas kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     The output of attention.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   # The cache is DSV4 FP8 format.
   # nope_cache contains 448 fp8 + 7 fp8 scales,
   # rope_cache contains 64 bf16

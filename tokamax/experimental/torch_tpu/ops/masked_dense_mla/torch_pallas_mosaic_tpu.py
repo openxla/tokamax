@@ -62,7 +62,10 @@ class _PallasMosaicTpuMaskedDenseMla(
     ), f"Expected 3 fields in Config, got {len(dataclasses.fields(config))}."
     kv_pages = _to_triple(config.num_kv_pages_per_block)
     queries = _to_triple(config.num_queries_per_block)
-    vmem_limit = int(config.vmem_limit_bytes)
+    # `None` (use `mosaic_tpu.default_tc_vmem_limit_bytes()`) is passed as -1.
+    vmem_limit = (
+        -1 if config.vmem_limit_bytes is None else int(config.vmem_limit_bytes)
+    )
     return (*kv_pages, *queries, vmem_limit)
 
   @override
@@ -77,7 +80,7 @@ class _PallasMosaicTpuMaskedDenseMla(
     return Config(
         num_kv_pages_per_block=(int(flat[0]), int(flat[1]), int(flat[2])),
         num_queries_per_block=(int(flat[3]), int(flat[4]), int(flat[5])),
-        vmem_limit_bytes=int(flat[6]),
+        vmem_limit_bytes=None if flat[6] <= 0 else int(flat[6]),
     )
 
   @override

@@ -20,8 +20,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.mhc import utils
-from tokamax._src.ops.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES  # pylint: disable=g-importing-member
 
 
 def _fused_kernel(
@@ -120,7 +120,7 @@ def fused_post_pre_mixes(
     *,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   """The Pallas seam kernel: post recombine fused with pre's GEMM and collapse.
 
@@ -136,13 +136,14 @@ def fused_post_pre_mixes(
     hc_base: (hc_mult3,), float32 — logit biases, pre entries first.
     rms_eps: static; RMS-norm epsilon for the in-block pre gates.
     hc_pre_eps: static; additive floor on the sigmoid pre gates.
-    token_block_size: tokens per grid step. Default 32 keeps the worst-case
-      VMEM footprint (f32 old streams + bf16 blocks + the three resident bf16
-      fn chunks) near 12 MB at DeepSeek-V4 shapes; 64 also fits.
+    token_block_size: tokens per grid step. Default 32 keeps the worst-case VMEM
+      footprint (f32 old streams + bf16 blocks + the three resident bf16 fn
+      chunks) near 12 MB at DeepSeek-V4 shapes; 64 also fits.
     gemm_precision: "highest" (3-pass exact decomposition, the default) or
-      "default" (hi-chunk pass only; pre_mix and the collapse then also see
-      the hi-only mixes).
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+      "default" (hi-chunk pass only; pre_mix and the collapse then also see the
+      hi-only mixes).
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
@@ -151,6 +152,8 @@ def fused_post_pre_mixes(
     sqrsum: (num_tokens, 1), float32.
     layer2d: (num_tokens, hidden_size), bfloat16.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   assert x2d.dtype == jnp.bfloat16, x2d.dtype
   assert res2d.dtype == jnp.bfloat16, res2d.dtype
   assert post2d.dtype == jnp.float32, post2d.dtype
@@ -238,15 +241,14 @@ def mhc_fused_post_pre(
     *,
     token_block_size: int = 32,
     gemm_precision: str = "highest",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue.
 
   Args:
     x: `(..., hidden_size)` bf16 sublayer output.
     residual: `(..., hc_mult, hidden_size)` bf16 residual streams.
-    post_layer_mix: `(..., hc_mult, 1)` f32 post gates of the finished
-      sublayer.
+    post_layer_mix: `(..., hc_mult, 1)` f32 post gates of the finished sublayer.
     comb_res_mix: `(..., hc_mult, hc_mult)` f32 stream-mixing matrix of the
       finished sublayer.
     fn: `(hc_mult3, hc_mult * hidden_size)` f32 gate projection of the next
@@ -260,7 +262,8 @@ def mhc_fused_post_pre(
     sinkhorn_repeat: Number of Sinkhorn normalization rounds.
     token_block_size: Tokens per grid step.
     gemm_precision: See `fused_post_pre_mixes`.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     `(residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur)`.

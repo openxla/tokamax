@@ -64,7 +64,10 @@ class _PallasMosaicTpuLightningIndexer(
     kv_pages = _to_triple(config.num_kv_pages_per_block)
     queries = _to_triple(config.num_queries_per_block)
     buf_cnt = _to_triple(config.buffer_count)
-    vmem_limit = int(config.vmem_limit_bytes)
+    # `None` (use `mosaic_tpu.default_tc_vmem_limit_bytes()`) is passed as -1.
+    vmem_limit = (
+        -1 if config.vmem_limit_bytes is None else int(config.vmem_limit_bytes)
+    )
     decode_bs = int(config.decode_req_batch_size)
     early_exit = int(bool(config.enable_early_exit))
     chunk_tokens = (
@@ -93,7 +96,7 @@ class _PallasMosaicTpuLightningIndexer(
         num_kv_pages_per_block=(flat[0], flat[1], flat[2]),
         num_queries_per_block=(flat[3], flat[4], flat[5]),
         buffer_count=(flat[6], flat[7], flat[8]),
-        vmem_limit_bytes=int(flat[9]),
+        vmem_limit_bytes=None if flat[9] <= 0 else int(flat[9]),
         decode_req_batch_size=int(flat[10]),
         enable_early_exit=bool(flat[11]),
         chunk_tokens=None if flat[12] <= 0 else int(flat[12]),

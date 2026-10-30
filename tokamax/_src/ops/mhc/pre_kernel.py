@@ -20,8 +20,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.mhc import utils
-from tokamax._src.ops.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES  # pylint: disable=g-importing-member
 
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
@@ -107,7 +107,7 @@ def mhc_pre_mixes(
     fn: jax.Array,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Pallas replacement for the mix GEMM + squared sum of mhc_pre.
 
@@ -117,12 +117,15 @@ def mhc_pre_mixes(
     token_block_size: tokens per grid step. The default (64) keeps the
       worst-case VMEM footprint (bf16 block + f32 cast + resident fn) around
       14 MB at DeepSeek-V4 shapes.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     mixes: (num_tokens, hc_mult3), float32.
     sqrsum: (num_tokens, 1), float32.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   assert x2d.dtype == jnp.bfloat16, x2d.dtype
   assert fn.dtype == jnp.float32, fn.dtype
   num_tokens, hc_hidden = x2d.shape
@@ -195,7 +198,7 @@ def mhc_pre_mixes_collapse(
     hc_pre_eps: float,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Mixes + in-block collapse: the full memory-bound half of `mhc_pre`.
 
@@ -207,12 +210,15 @@ def mhc_pre_mixes_collapse(
     rms_eps: RMS-norm epsilon.
     hc_pre_eps: Additive floor on the sigmoid pre gates.
     token_block_size: Tokens per grid step.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernel.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     `(mixes (T, hc_mult3) f32, sqrsum (T, 1) f32, layer_input2d (T,
     hidden_size) bf16)`. `mixes` is raw and unscaled, for the XLA gates.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   assert x2d.dtype == jnp.bfloat16, x2d.dtype
   assert fn.dtype == jnp.float32, fn.dtype
   num_tokens, hc_hidden = x2d.shape
@@ -297,7 +303,7 @@ def mhc_pre(
     sinkhorn_repeat: int,
     *,
     token_block_size: int = 64,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """`mhc_pre` with the mix GEMM and the collapse in Pallas.
 
@@ -316,7 +322,8 @@ def mhc_pre(
     hc_post_mult_value: Scale of the sigmoid post gates.
     sinkhorn_repeat: Number of Sinkhorn normalization rounds.
     token_block_size: Tokens per grid step.
-    vmem_limit_bytes: Scoped-VMEM budget for the kernels.
+    vmem_limit_bytes: Scoped-VMEM budget for the kernels. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
 
   Returns:
     `(post_mix (..., hc_mult, 1) f32, comb_mix (..., hc_mult, hc_mult) f32,

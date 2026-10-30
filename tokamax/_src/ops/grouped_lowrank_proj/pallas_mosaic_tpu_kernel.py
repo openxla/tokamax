@@ -24,6 +24,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.deepseek_rope import pallas_mosaic_tpu_kernel as rope_kernel
 
 LANE = rope_kernel.LANE
@@ -32,9 +33,6 @@ _cos_sin_lanes = rope_kernel._cos_sin_lanes  # pylint: disable=protected-access
 _rotate_gptj = rope_kernel._rotate_gptj  # pylint: disable=protected-access
 
 FP8_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
-
-# Upstream's limit. Mosaic caps it at the VMEM capacity (64 MiB on TPU7x).
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 SUBLANE = 8
 
@@ -164,7 +162,7 @@ def gather_cos_sin(
           out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
       ),
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=mosaic_tpu.default_tc_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
       name=name,
@@ -332,7 +330,7 @@ def wo_a_projection(
           (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
       ),
       compiler_params=pltpu.CompilerParams(
-          vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=mosaic_tpu.default_tc_vmem_limit_bytes(),
           disable_bounds_checks=True,
       ),
       name=name,

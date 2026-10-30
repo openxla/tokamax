@@ -26,6 +26,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops.lightning_indexer.kernel import (
     bref_override,
     config,
@@ -40,7 +41,6 @@ sparsecore_topk = pallas_mosaic_tpu_kernel.sparsecore_topk
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
@@ -993,7 +993,7 @@ def streamindex_topk(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     decode_req_batch_size: int = 4,
     enable_early_exit: bool = False,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
@@ -1035,7 +1035,8 @@ def streamindex_topk(
       pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
     buffer_count: buffer count for the pallas kernel. This is a tuple of
       (decode, prefill, mixed) cases or a single integer. Defaults to (4, 3, 3).
-    vmem_limit_bytes: the vmem limit for the pallas kernel.
+    vmem_limit_bytes: the vmem limit for the pallas kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
     enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
       kv_len for all sequences in the batch. Defaults to False.
     decode_req_batch_size: maximum decode batch size per iteration.
@@ -1074,6 +1075,8 @@ def streamindex_topk(
     `(indices, scores)` if `return_scores`. Unfilled slots are `-1` with
     score `-inf`.
   """
+  if vmem_limit_bytes is None:
+    vmem_limit_bytes = mosaic_tpu.default_tc_vmem_limit_bytes()
   # Scale factors for the FP8 index cache format are packed directly inside
   # `cache_kv`, keeping HBM transactions fused.
 
@@ -1636,7 +1639,7 @@ def streamindex_topk_dcp(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     buffer_count: tuple[int, int, int] | int | None = DEFAULT_BUFFER_COUNT,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    vmem_limit_bytes: int | None = None,
     decode_req_batch_size: int = 4,
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
@@ -1691,7 +1694,8 @@ def streamindex_topk_dcp(
     num_kv_pages_per_block: number of kv pages per block in pallas kernel.
     num_queries_per_block: number of queries per block in pallas kernel.
     buffer_count: buffer count for pallas kernel.
-    vmem_limit_bytes: vmem limit for pallas kernel.
+    vmem_limit_bytes: vmem limit for pallas kernel. Defaults to
+      `mosaic_tpu.default_tc_vmem_limit_bytes()`.
     decode_req_batch_size: maximum decode batch size per iteration.
     kv_layout: physical layout of `cache_kv`, a `KVLayout` or its string value.
     chunk_tokens: forwarded to `streamindex_topk` for the per-rank local scoring
