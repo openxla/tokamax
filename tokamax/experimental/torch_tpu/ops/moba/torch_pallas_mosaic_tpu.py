@@ -103,7 +103,6 @@ class _PallasMosaicTpuMixtureOfBlockAttentionVjp(
 PallasMosaicTpuMixtureOfBlockAttentionVjp = (
     _PallasMosaicTpuMixtureOfBlockAttentionVjp()
 )
-torch_base.register_cpu_kernel(PallasMosaicTpuMixtureOfBlockAttentionVjp)
 
 
 class _PallasMosaicTpuMixtureOfBlockAttention(
@@ -165,4 +164,3 @@ class _PallasMosaicTpuMixtureOfBlockAttention(
 PallasMosaicTpuMixtureOfBlockAttention = (
     _PallasMosaicTpuMixtureOfBlockAttention()
 )
-torch_base.register_cpu_kernel(PallasMosaicTpuMixtureOfBlockAttention)

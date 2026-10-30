@@ -18,22 +18,29 @@
 import unittest
 from absl import logging
 from absl.testing import absltest
-import torch
+import jax
 from tokamax._src.ops.experimental.moba import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.moba import torch_base
 from tokamax.experimental.torch_tpu.ops.moba import torch_pallas_mosaic_tpu
+import torch
+import torch_tpu  # pylint: disable=unused-import
 
 moba_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuMixtureOfBlockAttention
 
 
 class MoBAPallasKernelTest(unittest.TestCase):
-  """Tests for MoBA PyTorch operator on TPU and fallback devices."""
+  """Tests for MoBA PyTorch operator on TPU."""
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
 
   def test_forward_shape_and_parity(self):
-    device = "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
-    chunk_size, topk = 64, 2
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 256, 4, 128
+    chunk_size, topk = 128, 2
 
     torch.manual_seed(42)
     q = torch.randn(
@@ -94,18 +101,18 @@ class MoBAPallasKernelTest(unittest.TestCase):
     logging.info("MoBA forward shape and parity test passed.")
 
   def test_chunk_size_validation(self):
-    device = "cpu"
-    q = torch.randn(2, 100, 4, 16, device=device)
-    k = torch.randn(2, 100, 4, 16, device=device)
-    v = torch.randn(2, 100, 4, 16, device=device)
+    device = "tpu"
+    q = torch.randn(2, 100, 4, 128, device=device)
+    k = torch.randn(2, 100, 4, 128, device=device)
+    v = torch.randn(2, 100, 4, 128, device=device)
 
     with self.assertRaises(ValueError):
-      moba_pallas(q, k, v, chunk_size=64)
+      moba_pallas(q, k, v, chunk_size=128)
 
   def test_backward_autograd(self):
-    device = "cpu"
-    batch_size, seq_len, num_heads, head_dim = 2, 64, 4, 16
-    chunk_size, topk = 64, 1
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 256, 4, 128
+    chunk_size, topk = 128, 1
 
     torch.manual_seed(42)
     q = torch.randn(

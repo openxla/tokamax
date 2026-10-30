@@ -19,7 +19,6 @@ from collections.abc import Sequence
 from typing import Any, Optional, TypeVar
 import jax
 import jax.numpy as jnp
-import numpy as np
 from tokamax._src.ops.experimental.moba import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
@@ -29,51 +28,6 @@ _Config = TypeVar("_Config")
 
 _CHUNK_SIZE = 256
 _TOPK = 4
-
-
-def _torch_to_jax_cpu(tensor: torch.Tensor) -> jax.Array:
-  if tensor.dtype == torch.bfloat16:
-    return jnp.asarray(
-        tensor.detach().cpu().to(torch.float32).numpy(), dtype=jnp.bfloat16
-    )
-  return jnp.asarray(tensor.detach().cpu().numpy())
-
-
-def _jax_to_torch_cpu(array: jax.Array, like: torch.Tensor) -> torch.Tensor:
-  if array.dtype == jnp.bfloat16:
-    return torch.as_tensor(
-        np.asarray(array, dtype=np.float32),
-        dtype=torch.bfloat16,
-        device=like.device,
-    )
-  return torch.as_tensor(
-      np.asarray(array), dtype=like.dtype, device=like.device
-  )
-
-
-def register_cpu_kernel(op: torch_op.TorchOp[Any]) -> None:
-  """Registers a CPU kernel on `op._torch_tokamax_op` delegating to `op.op_impl_call`."""
-  if op._torch_tokamax_op is None:  # pylint: disable=protected-access
-    return
-
-  def _cpu_kernel(*args: Any, **kwargs: Any) -> Any:
-    first_tensor = next(
-        a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor)
-    )
-    jax_args = [
-        _torch_to_jax_cpu(a) if isinstance(a, torch.Tensor) else a
-        for a in args
-    ]
-    jax_kwargs = {
-        k: _torch_to_jax_cpu(v) if isinstance(v, torch.Tensor) else v
-        for k, v in kwargs.items()
-    }
-    res = op.op_impl_call(*jax_args, **jax_kwargs)
-    if isinstance(res, tuple):
-      return tuple(_jax_to_torch_cpu(r, first_tensor) for r in res)
-    return _jax_to_torch_cpu(res, first_tensor)
-
-  op._torch_tokamax_op.register_kernel("cpu")(_cpu_kernel)  # pylint: disable=protected-access
 
 
 class _MixtureOfBlockAttentionVjp(torch_op.TorchOp[_Config]):
@@ -188,7 +142,6 @@ class _MixtureOfBlockAttentionVjp(torch_op.TorchOp[_Config]):
 
 
 MixtureOfBlockAttentionVjp = _MixtureOfBlockAttentionVjp[Any]()
-register_cpu_kernel(MixtureOfBlockAttentionVjp)
 
 
 class _MixtureOfBlockAttention(torch_op.TorchOp[_Config]):
@@ -340,4 +293,3 @@ class _MixtureOfBlockAttention(torch_op.TorchOp[_Config]):
 
 
 MixtureOfBlockAttention = _MixtureOfBlockAttention[Any]()
-register_cpu_kernel(MixtureOfBlockAttention)
