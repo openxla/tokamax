@@ -37,7 +37,11 @@ DTYPE = jnp.bfloat16
 def rms_norm(x: jax.Array) -> jax.Array:
   """Pre-norm of the wrapped (identity) branch, with unit scale."""
   with jax.named_scope("rms_norm"):
-    return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), -1, keepdims=True) + EPS)
+    x_f32 = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    return (
+        x_f32
+        * jax.lax.rsqrt(jnp.mean(jnp.square(x_f32), -1, keepdims=True) + EPS)
+    ).astype(x.dtype)
 
 
 @jax.jit
