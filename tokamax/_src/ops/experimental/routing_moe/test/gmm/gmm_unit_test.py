@@ -462,6 +462,45 @@ class RoutingGmmUnitTest(parameterized.TestCase):
           gmm_test_lib.to_large_layout(expected)[written],
       )
 
+  @parameterized.product(
+      case_offset=[
+          (test_cases.DECODE_1, 0),
+          (test_cases.DECODE_16, 0),
+          (test_cases.DECODE_1_EP8, 128),
+          (test_cases.DECODE_64_EP8, 128),
+      ],
+      tile_n=[None, 512],
+  )
+  def test_resident_idx(
+      self, case_offset: tuple[test_cases.Case, int], tile_n: int | None
+  ):
+    # Resident index tables only change where each tile reads its row indices
+    # from, so outputs must match the streamed ones.
+    case_spec, group_offset = case_offset
+    case = gmm_test_lib.GmmCase.make_case(case_spec, group_offset=group_offset)
+    stages = (
+        (case.x_compact, dict(gather=case.routing.gather, fuse_act="silu")),
+        (case.x_sorted_compact, dict(scatter=case.routing.scatter)),
+    )
+    rows = (case.routing.sorted_rows, case.routing.scattered_rows)
+    for (x, kwargs), written in zip(stages, rows, strict=True):
+      kwargs = kwargs | case.routing.kernel_kwargs
+      actual, expected = (
+          kernel.routing_gmm(
+              x,
+              case.w1,
+              custom_plan=gmm_plan.RoutingGmmPlan(
+                  tile_n=tile_n, resident_idx=resident_idx
+              ),
+              **kwargs,
+          )
+          for resident_idx in (True, False)
+      )
+      np.testing.assert_array_equal(
+          gmm_test_lib.to_large_layout(actual)[written],
+          gmm_test_lib.to_large_layout(expected)[written],
+      )
+
 
 class RemoteRoutingGmmUnitTest(parameterized.TestCase):
 

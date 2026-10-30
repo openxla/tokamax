@@ -41,6 +41,10 @@ class MetadataInputs[T]:
   group_cum_sum: T
   group_offset: T
   row_group: T | None = None
+  # Padded row-index tables of the sorted rows, resident in SMEM when the plan
+  # selects it; otherwise each tile's indices are streamed from HBM.
+  gather_idx: T | None = None
+  scatter_idx: T | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -244,17 +248,22 @@ def create_metadata(
     cfg: config.RoutingGmmConfig,
     *,
     row_group: jax.Array | None = None,
+    gather_idx: jax.Array | None = None,
+    scatter_idx: jax.Array | None = None,
 ) -> tuple[MetadataInputs[jax.Array], Any]:
   """Returns the SMEM metadata inputs and scratch specs for this config."""
+  idx = dict(gather_idx=gather_idx, scatter_idx=scatter_idx)
   if row_group is not None and cfg.plan.live_group_walk:
     metadata_in = MetadataInputs(
         group_cum_sum=group_cum_sum,
         group_offset=group_offset,
         row_group=row_group,
+        **idx,
     )
     return metadata_in, LiveGroupMetadataRef.create_scratch_types(cfg)
   metadata_in = MetadataInputs(
       group_cum_sum=group_cum_sum,
       group_offset=group_offset,
+      **idx,
   )
   return metadata_in, SortedMetadataRef.create_scratch_types(cfg)

@@ -139,6 +139,10 @@ class RoutingBufferedRef(_BypassBufferedRef):
   def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
     return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
 
+  def with_idx_ref(self, idx_ref: Any) -> Self:
+    """Uses a resident SMEM row-index table indexed by absolute row."""
+    return dataclasses.replace(self, idx_ref=idx_ref)
+
   @classmethod
   def create(
       cls,
@@ -430,6 +434,9 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       self, grid_indices: GridIndices, rows_ds: pl.Slice
   ) -> jax.Array:
     """SMEM offset that accounts for N tile dim buffering."""
+    if self.cfg.plan.resident_idx:
+      # The resident table holds every sorted row at its absolute position.
+      return jnp.uint32(rows_ds.start)
     idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
     ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
     num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
