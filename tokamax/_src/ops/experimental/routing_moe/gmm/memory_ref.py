@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
@@ -705,7 +706,9 @@ class QuantizedBufferedRef(BranchlessBufferedRef):
     )
     # Compute per-lane scales immediately as the result leaves the MXU.
     value = value.astype(jnp.float32)
-    scale, inv_scale = compute.row_scale(value, self.cfg.out.dynamic_quant)
+    scale, inv_scale = quant_util.compute_scale(
+        value, self.cfg.out.dynamic_quant
+    )
     slot = self._stash_slot(grid_indices[1])
     rows = value.shape[0]
     stash = value.astype(self.stash_dtype)
