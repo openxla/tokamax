@@ -1862,6 +1862,147 @@ def test_saved_v_new_vs_recomputed_v_new(dtype, scalar_gate):
     ), f"Mismatch in {name} between saved v_new and recomputed v_new"
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", [True, False])
+def test_native_qkv_conv_and_in_kernel_l2norm(dtype, use_qk_l2norm_in_kernel):
+  if jax.default_backend() != "tpu":
+    pytest.skip("TPU required")
+  from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as bwd_mod  # pylint: disable=g-import-not-at-top
+
+  b, t, h_qk, h, k, v = 2, 128, 2, 8, 128, 128
+  chunk_size = 64
+  nt = t // chunk_size
+  repeats = h // h_qk
+  k_dim = h_qk * k
+  v_dim = h * v
+  mb = 4 if jax.default_backend() != "tpu" else None
+
+  key = jax.random.PRNGKey(123)
+  k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+  qkv_conv = jax.random.normal(k1, (b, t, 2 * k_dim + v_dim), dtype=dtype) * 0.2
+  g_hb = -jnp.abs(jax.random.uniform(k2, (h, b, t, 1), dtype=jnp.float32)) * 0.5
+  beta_hb = jax.random.uniform(k3, (h, b, t), dtype=jnp.float32) * 0.5
+  do_bthv = jax.random.normal(k4, (b, t, h, v), dtype=dtype) * 0.1
+  a_native = jnp.tril(
+      jax.random.normal(
+          k5, (b, nt, h, chunk_size, chunk_size), dtype=jnp.float32
+      )
+      * 0.05,
+      k=-1,
+  ) + jnp.eye(chunk_size, dtype=jnp.float32)
+  h_native = jax.random.normal(k6, (b, nt, h, k, v), dtype=jnp.float32) * 0.1
+
+  q_raw = qkv_conv[:, :, :k_dim].reshape(b, t, h_qk, k).astype(jnp.float32)
+  k_raw = (
+      qkv_conv[:, :, k_dim : 2 * k_dim]
+      .reshape(b, t, h_qk, k)
+      .astype(jnp.float32)
+  )
+  v_raw = qkv_conv[:, :, 2 * k_dim :].reshape(b, t, h, v)
+
+  if use_qk_l2norm_in_kernel:
+    rstd_q = jax.lax.rsqrt(
+        jnp.sum(q_raw * q_raw, axis=-1, keepdims=True) + 1e-6
+    )
+    rstd_k = jax.lax.rsqrt(
+        jnp.sum(k_raw * k_raw, axis=-1, keepdims=True) + 1e-6
+    )
+    q_norm = q_raw * rstd_q
+    k_norm = k_raw * rstd_k
+    rstd_q_hb = rstd_q.transpose(2, 0, 1, 3)
+    rstd_k_hb = rstd_k.transpose(2, 0, 1, 3)
+  else:
+    q_norm, k_norm = q_raw, k_raw
+    rstd_q_hb = rstd_k_hb = None
+
+  q_hb = q_norm.transpose(2, 0, 1, 3).astype(dtype)
+  k_hb = k_norm.transpose(2, 0, 1, 3).astype(dtype)
+  v_hb = v_raw.transpose(2, 0, 1, 3).astype(dtype)
+  do_hb = do_bthv.transpose(2, 0, 1, 3).astype(dtype)
+
+  dq_hb, dk_hb, dv_hb, db_ref, dg_ref, _ = (
+      bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+          q_hb,
+          k_hb,
+          v_hb,
+          None,
+          None,
+          None,
+          None,
+          g_hb,
+          beta_hb,
+          a_native,
+          h_native,
+          do_hb,
+          None,
+          None,
+          None,
+          k**-0.5,
+          chunk_size=chunk_size,
+          mini_batch=mb,
+          use_exp2=True,
+          per_channel_gate=False,
+          return_dh0=False,
+          gqa_repeats=repeats,
+          rstd_q=rstd_q_hb,
+          rstd_k=rstd_k_hb,
+          dqkv_dtype=dtype,
+          native_state_layout=True,
+      )
+  )
+  dy_conv_ref = jnp.concatenate(
+      [
+          dq_hb.transpose(1, 2, 0, 3).reshape(b, t, k_dim),
+          dk_hb.transpose(1, 2, 0, 3).reshape(b, t, k_dim),
+          dv_hb.transpose(1, 2, 0, 3).reshape(b, t, v_dim),
+      ],
+      axis=-1,
+  )
+
+  dy_conv_actual, _, _, db_actual, dg_actual, _ = (
+      bwd_mod._fused_dhu_wy_intra_cumsum_pallas_jit(
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          g_hb,
+          beta_hb,
+          a_native,
+          h_native,
+          do_bthv,
+          None,
+          None,
+          None,
+          k**-0.5,
+          chunk_size=chunk_size,
+          mini_batch=mb,
+          use_exp2=True,
+          per_channel_gate=False,
+          return_dh0=False,
+          gqa_repeats=repeats,
+          dqkv_dtype=dtype,
+          native_state_layout=True,
+          qkv_conv=qkv_conv,
+          use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+      )
+  )
+
+  atol = 1e-3 if dtype == jnp.bfloat16 else 1e-5
+  rtol = 1e-2 if dtype == jnp.bfloat16 else 1e-5
+  assert compare_tensor(
+      "dy_conv", dy_conv_actual, dy_conv_ref, atol=atol, rtol=rtol, dtype=dtype
+  )
+  assert compare_tensor(
+      "db", db_actual, db_ref, atol=atol, rtol=rtol, dtype=jnp.float32
+  )
+  assert compare_tensor(
+      "dg", dg_actual, dg_ref, atol=atol, rtol=rtol, dtype=jnp.float32
+  )
+
+
 class _ShardPlugin:
 
   def pytest_collection_modifyitems(self, items):

@@ -14,6 +14,8 @@
 # ==============================================================================
 """Pallas/Mosaic TPU backward kernels for experimental KDA."""
 
+# pylint: disable=invalid-name
+
 from __future__ import annotations
 
 import dataclasses
@@ -26,7 +28,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
-
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.common import (
     chunk_gated_delta_rule_fwd_h,
@@ -895,8 +896,9 @@ def compute_intra_backward(
         a, b, d, preferred_element_type=jnp.float32, precision=precision
     )
 
-    dq_intra = _dot(dAqk_d, bk, _b1)
-    dk_row_pre = _dot(dAkk_d, bk, _b1)
+    dq_dk_row = _dot(jnp.concatenate([dAqk_d, dAkk_d], axis=1), bk, _b1)
+    dq_intra = dq_dk_row[:, :BT]
+    dk_row_pre = dq_dk_row[:, BT:]
     # beta indexes the row, matching the blocked path's `dAkk_diag * beta_b`.
     dk_col = _dot(dAqk_d, bq, _b1t) + _dot(dAkk_d * bb[:, :, None], bk, _b1t)
 
@@ -1144,16 +1146,23 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     per_channel_gate=True,
     gqa_repeats=1,
     native_state_layout=False,
+    native_qkv_do_layout=False,
+    use_qk_l2norm_in_kernel=False,
+    is_varlen=True,
 ):
   """Fuse Dhu, WY, intra backward, and reverse cumsum for one chunk tile."""
   _, batch_idx, rev_c = step.index
   chunk_id = NT - 1 - rev_c
-  _, seq_idx, _, is_first_chunk, is_last_chunk = _chunk_segment_metadata(
-      chunk_seg_ids_smem_ref,
-      batch_idx,
-      chunk_id,
-      NT,
-  )
+  if is_varlen:
+    _, _, _, is_first_chunk, is_last_chunk = _chunk_segment_metadata(
+        chunk_seg_ids_smem_ref,
+        batch_idx,
+        chunk_id,
+        NT,
+    )
+  else:
+    is_last_chunk = rev_c == 0
+    is_first_chunk = rev_c == NT - 1
   precision = (
       jax.lax.Precision.DEFAULT
       if q_ref.dtype == jnp.bfloat16
@@ -1162,19 +1171,60 @@ def _fused_dhu_wy_intra_cumsum_kernel(
 
   @pl.when(is_last_chunk)
   def _():
-    dh_scratch[:] = dht_ref[:, 0, 0, :].astype(dh_scratch.dtype)
+    if dht_ref is None:
+      dh_scratch[:] = jnp.zeros_like(dh_scratch)
+    else:
+      dh_scratch[:] = dht_ref[:, 0, 0, :].astype(dh_scratch.dtype)
 
   dh = dh_scratch[:].astype(jnp.float32)
   # Native GQA: q and k arrive at the key head count (MB // gqa_repeats heads
   # per tile) and are broadcast to the MB value heads in VMEM, so no repeated
   # copy of q and k is needed in HBM.
-  bq = q_ref[:, 0, 0].astype(jnp.float32)
-  bk = k_ref[:, 0, 0].astype(jnp.float32)
+  MB_QK = MB // gqa_repeats
+  if native_qkv_do_layout:
+    # Unpack lane-aligned [BT, D] head slices from [1, BT, M * D] windows
+    # directly into [M, BT, D] without any VMEM transpose.
+    bq_raw = jnp.stack(
+        [q_ref[0, :, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    ).astype(jnp.float32)
+    bk_raw = jnp.stack(
+        [k_ref[0, :, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    ).astype(jnp.float32)
+    bv = jnp.stack(
+        [v_ref[0, :, h * V : (h + 1) * V] for h in range(MB)], axis=0
+    ).astype(jnp.float32)
+    bdo = jnp.stack(
+        [do_ref[0, :, h * V : (h + 1) * V] for h in range(MB)], axis=0
+    ).astype(jnp.float32)
+  else:
+    bq_raw = q_ref[:, 0, 0].astype(jnp.float32)
+    bk_raw = k_ref[:, 0, 0].astype(jnp.float32)
+    bv = v_ref[:, 0, 0].astype(jnp.float32)
+    bdo = do_ref[:, 0, 0].astype(jnp.float32)
+
+  brstd_q = brstd_k = None
+  bq_unit = bk_unit = None
+  if use_qk_l2norm_in_kernel:
+    q_sq = jnp.sum(bq_raw * bq_raw, axis=-1, keepdims=True)
+    k_sq = jnp.sum(bk_raw * bk_raw, axis=-1, keepdims=True)
+    brstd_q = jnp.where(q_sq == 0.0, 0.0, jax.lax.rsqrt(q_sq + 1e-6))
+    brstd_k = jnp.where(k_sq == 0.0, 0.0, jax.lax.rsqrt(k_sq + 1e-6))
+    bq_unit = bq_raw * brstd_q
+    bk_unit = bk_raw * brstd_k
+    bq_k = bq_unit.astype(q_ref.dtype).astype(jnp.float32)
+    bk_k = bk_unit.astype(k_ref.dtype).astype(jnp.float32)
+  else:
+    bq_k = bq_raw
+    bk_k = bk_raw
+
   if gqa_repeats > 1:
-    bq = jnp.repeat(bq, gqa_repeats, axis=0)
-    bk = jnp.repeat(bk, gqa_repeats, axis=0)
-  bv = v_ref[:, 0, 0].astype(jnp.float32)
-  # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1] and broadcast to K in VMEM.
+    bq = jnp.repeat(bq_k, gqa_repeats, axis=0)
+    bk = jnp.repeat(bk_k, gqa_repeats, axis=0)
+  else:
+    bq = bq_k
+    bk = bk_k
+
+  # Transpose scalar gate from [.., 1, BT] back to [MB, BT, 1].
   if g_ref.shape[-2] == 1:
     bg = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
   else:
@@ -1183,9 +1233,10 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     bg = compute_forward_cumsum_g(bg)
   bg_scalar = bg
   _gate_narrow = bg.shape[-1] != K
-  if _gate_narrow:
+  if _gate_narrow and per_channel_gate:
     bg = jnp.broadcast_to(bg, bg.shape[:-1] + (K,))
-  g_exp_last = jnp.exp2(bg[:, BT - 1, :])
+  g_exp = jnp.exp2(bg)
+  g_exp_last = g_exp[:, BT - 1, :]
   bb = beta_ref[:, 0, 0, 0].astype(jnp.float32)
   if native_state_layout:
     # A and h blocks are [1, 1, MB, ...] in the forward's [B, NC, H, ...] layout.
@@ -1194,7 +1245,6 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   else:
     bA = A_ref[:, 0, 0].astype(jnp.float32)
     bh = h_ref[:, 0, 0].astype(jnp.float32)
-  bdo = do_ref[:, 0, 0].astype(jnp.float32)
 
   bkbg = None
   if qg_ref is not None and kg_ref is not None and w_ref is not None:
@@ -1202,14 +1252,13 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     bkg = kg_ref[:, 0, 0].astype(jnp.float32)
     bw = w_ref[:, 0, 0].astype(jnp.float32)
   else:
-    g_exp = jnp.exp2(bg)
     bqg = (bq * g_exp).astype(q_ref.dtype).astype(jnp.float32)
     bkg = (
         (bk * jnp.exp2(bg[:, BT - 1 : BT, :] - bg))
         .astype(k_ref.dtype)
         .astype(jnp.float32)
     )
-    bkbg = bk * bb[:, :, None] * g_exp  # k * beta * g, f32
+    bkbg = bk * (bb[:, :, None] * g_exp)  # k * beta * g, f32
     if v_new_ref is None:
       # w-free path: w = A @ k_beta_g is never formed.
       bw = None
@@ -1232,8 +1281,8 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     bdv0 = dv0_ref[:, 0, 0].astype(jnp.float32)
     bdAqk = dAqk_ref[:, 0, 0].astype(jnp.float32)
   elif bw is None:
-    assert bkbg is not None
     # Two-matmul v_new = A @ (v * beta - k_beta_g @ h); no u, no w.
+    assert bkbg is not None
     bvn = jnp.matmul(
         bA,
         bv * bb[:, :, None]
@@ -1269,13 +1318,16 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     diff_g = bg_scalar - jnp.swapaxes(bg_scalar, 1, 2)
     safe_diff = jnp.where(m_causal[None, :, :], diff_g, 0.0)
     decay_mat = jnp.where(m_causal[None, :, :], jnp.exp2(safe_diff), 0.0)
+    # Compute q @ k^T on the MB_QK key heads before repeating across GQA groups.
     qk_dot = jax.lax.dot_general(
-        bq,
-        bk,
+        bq_k,
+        bk_k,
         (((2,), (2,)), ((0,), (0,))),
         precision=precision,
         preferred_element_type=jnp.float32,
     )
+    if gqa_repeats > 1:
+      qk_dot = jnp.repeat(qk_dot, gqa_repeats, axis=0)
     bAqk = qk_dot * decay_mat * scale
     do_vn_dot = jax.lax.dot_general(
         bdo,
@@ -1296,8 +1348,8 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   # --- dhu reverse recurrence ---
   assert bdv0 is not None and bdAqk is not None
   if bw is None:
-    assert bkbg is not None
     # w-free chain: w^T dv = k_beta_g^T (A^T dv) = k_beta_g^T b_dvb.
+    assert bkbg is not None
     bdv, b_dvb, dh_new = compute_dhu_recurrence_wfree(
         bkg,
         dh,
@@ -1380,13 +1432,21 @@ def _fused_dhu_wy_intra_cumsum_kernel(
 
   # Sum value heads back to key heads in VMEM before writing dq and dk.
   if gqa_repeats > 1:
-    MB_QK = dq_ref.shape[0]
     _red = lambda x: x.reshape(MB_QK, gqa_repeats, *x.shape[1:]).sum(axis=1)
     dq_total = _red(dq_total)
     dk_total = _red(dk_total)
-  if rstd_q_ref is not None and rstd_k_ref is not None:
-    bq_norm = q_ref[:, 0, 0].astype(jnp.float32)
-    bk_norm = k_ref[:, 0, 0].astype(jnp.float32)
+  if use_qk_l2norm_in_kernel:
+    assert brstd_q is not None and brstd_k is not None
+    assert bq_unit is not None and bk_unit is not None
+    dq_total = brstd_q * (
+        dq_total - bq_unit * jnp.sum(bq_unit * dq_total, axis=-1, keepdims=True)
+    )
+    dk_total = brstd_k * (
+        dk_total - bk_unit * jnp.sum(bk_unit * dk_total, axis=-1, keepdims=True)
+    )
+  elif rstd_q_ref is not None and rstd_k_ref is not None:
+    bq_norm = bq_k
+    bk_norm = bk_k
     brstd_q = rstd_q_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
     brstd_k = rstd_k_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
     dq_total = brstd_q * (
@@ -1395,18 +1455,35 @@ def _fused_dhu_wy_intra_cumsum_kernel(
     dk_total = brstd_k * (
         dk_total - bk_norm * jnp.sum(bk_norm * dk_total, axis=-1, keepdims=True)
     )
-  dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
-  dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
-  dv_ref[:, 0, 0] = (b_dvb * bb[:, :, None]).astype(dv_ref.dtype)
+  dv_total = b_dvb * bb[:, :, None]
+  if native_qkv_do_layout:
+    dq_cast = dq_total.astype(dq_ref.dtype)
+    dk_cast = dk_total.astype(dk_ref.dtype)
+    dv_cast = dv_total.astype(dv_ref.dtype)
+    dq_ref[...] = jnp.concatenate([dq_cast[h] for h in range(MB_QK)], axis=-1)[
+        None, ...
+    ]
+    dk_ref[...] = jnp.concatenate([dk_cast[h] for h in range(MB_QK)], axis=-1)[
+        None, ...
+    ]
+    dv_ref[...] = jnp.concatenate([dv_cast[h] for h in range(MB)], axis=-1)[
+        None, ...
+    ]
+  else:
+    dq_ref[:, 0, 0] = dq_total.astype(dq_ref.dtype)
+    dk_ref[:, 0, 0] = dk_total.astype(dk_ref.dtype)
+    dv_ref[:, 0, 0] = dv_total.astype(dv_ref.dtype)
   db_ref[:, 0, 0, 0] = db_total.astype(db_ref.dtype)
   if dg_ref.shape[-2] == 1:
     dg_ref[:, 0, 0, 0] = dg_reverse_cumsum[..., 0].astype(dg_ref.dtype)
   else:
     dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
 
-  @pl.when(is_first_chunk)
-  def _():
-    dh0_ref[:, 0, 0, :] = dh_scratch[:].astype(dh0_ref.dtype)
+  if dh0_ref is not None:
+
+    @pl.when(is_first_chunk)
+    def _():
+      dh0_ref[:, 0, 0, :] = dh_scratch[:].astype(dh0_ref.dtype)
 
 
 @partial(
@@ -1422,14 +1499,18 @@ def _fused_dhu_wy_intra_cumsum_kernel(
         "gqa_repeats",
         "dqkv_dtype",
         "native_state_layout",
+        "use_qk_l2norm_in_kernel",
     ],
 )
 @jaxtyping.jaxtyped
 def _fused_dhu_wy_intra_cumsum_pallas_jit(
     # `H_QK` is `H // gqa_repeats`, and equals H when gqa_repeats is 1.
-    q: Float[Array, "H_QK B T K"],
-    k: Float[Array, "H_QK B T K"],
-    v: Float[Array, "H B T V"],
+    # When `qkv_conv` is passed, `q`, `k`, and `v` may be None and the kernel
+    # reads `qkv_conv [B, T, 2*H_QK*K + H*V]` and `do [B, T, H, V]` in place
+    # and writes `dy_conv [B, T, 2*H_QK*K + H*V]` directly.
+    q: Float[Array, "H_QK B T K"] | None,
+    k: Float[Array, "H_QK B T K"] | None,
+    v: Float[Array, "H B T V"] | None,
     v_new: Float[Array, "H B T V"] | None,
     qg: Float[Array, "H B T K"] | None,
     kg: Float[Array, "H B T K"] | None,
@@ -1440,7 +1521,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     # forward's own [B, NT, H, BT, BT] and [B, NT, H, K, V] (no transpose).
     A: Float[Array, "..."],
     h: Float[Array, "..."],
-    do: Float[Array, "H B T V"],
+    do: Float[Array, "..."],
     dv0: Float[Array, "H B T V"] | None,
     dAqk: Float[Array, "H B T BT"] | None,
     dht: Float[Array, "B N H K V"] | None,
@@ -1458,10 +1539,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     rstd_k: Float[Array, "H_QK B T ..."] | None = None,
     dqkv_dtype=None,
     native_state_layout: bool = False,
+    qkv_conv: Float[Array, "B T C"] | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[
-    Float[Array, "H_QK B T K"],
-    Float[Array, "H_QK B T K"],
-    Float[Array, "H B T V"],
+    Float[Array, "..."],
+    Float[Array, "H_QK B T K"] | None,
+    Float[Array, "H B T V"] | None,
     Float[Array, "H B T"],
     Float[Array, "H B T GW"],
     Float[Array, "B N_OUT H K V"] | None,
@@ -1473,12 +1556,34 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   """
   # `q` and `k` carry the key head count; everything else carries the value
   # head count. H below is always the value head count.
-  H_QK, B, T, K = q.shape
-  H = H_QK * gqa_repeats
-  V = v.shape[-1]
+  native_qkv_do_layout = qkv_conv is not None
+  if native_qkv_do_layout:
+    assert qkv_conv is not None
+    B, T, C = qkv_conv.shape
+    H = g.shape[0]
+    H_QK = H // gqa_repeats
+    K = h.shape[3]
+    V = h.shape[4]
+    act_dtype = qkv_conv.dtype
+  else:
+    assert q is not None and k is not None and v is not None
+    H_QK, B, T, K = q.shape
+    H = H_QK * gqa_repeats
+    V = v.shape[-1]
+    C = 2 * H_QK * K + H * V
+    act_dtype = q.dtype
   BT = chunk_size
   NT = T // BT
-  HB = H * B
+  q_size = H_QK * K
+  k_size = H_QK * K
+  v_size = H * V
+  if native_qkv_do_layout:
+    assert (
+        C == q_size + k_size + v_size
+    ), f"qkv_conv.shape[-1]={C} != {q_size + k_size + v_size}"
+    assert (
+        K % 128 == 0 and V % 128 == 0
+    ), f"native qkv_conv layout requires K={K}, V={V} multiples of 128"
 
   is_varlen = segment_ids is not None
   assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
@@ -1494,8 +1599,11 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     "fused_dhu_wy_intra_cumsum_pallas currently expects log2 gates and use_exp2=True"
   )
 
-  segment_ids = jnp.ones((B, T), dtype=jnp.int32) if not is_varlen else segment_ids
-  chunk_seg_ids = segment_ids.reshape(B, NT, BT)[:, :, 0]  # [B, NT]
+  if is_varlen:
+    assert segment_ids is not None
+    chunk_seg_ids = segment_ids.reshape(B, NT, BT)[:, :, 0]  # [B, NT]
+  else:
+    chunk_seg_ids = jnp.ones((B, 1), dtype=jnp.int32)
   if dht is not None:
     N = dht.shape[1]  # dht is [B, N, H, K, V], N is dim 1
   elif is_varlen:
@@ -1504,13 +1612,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     N = 1  # uniform: one sequence per batch element
   if dht is not None:
     assert dht.shape[1] == N, f"dht has N={dht.shape[1]}, expected {N}"
-  dht_arr = dht if dht is not None else jnp.zeros((B, N, H, K, V), dtype=jnp.float32)
 
   has_qg_kg_w = qg is not None and kg is not None and w is not None
   has_vn_dv0_dAqk = v_new is not None and dv0 is not None and dAqk is not None
   has_rstd_qk = rstd_q is not None and rstd_k is not None
+  GW = g.shape[-1]
+  scalar_gate = GW == 1
   if mini_batch is None:
-    elem_size = 2 if q.dtype == jnp.bfloat16 else 4
+    elem_size = 2 if act_dtype == jnp.bfloat16 else 4
     num_k_io = 8 if has_qg_kg_w else 5
     io_per_head = (
         num_k_io * BT * K + 4 * BT * V + BT + 3 * BT * BT + 2 * K * V
@@ -1526,9 +1635,33 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       vmem_budget = int(vmem_budget * _frac)
     elif BT > 64:
       vmem_budget = (vmem_budget * 64) // BT
+    if (
+        act_dtype == jnp.bfloat16
+        and scalar_gate
+        and not has_qg_kg_w
+        and not has_vn_dv0_dAqk
+        and BT <= 64
+    ):
+      max_mb = 32
+    else:
+      max_mb = 16
     MB = max(1, vmem_budget // per_head)
-    MB = min(MB, H, 16)
-    while H % MB != 0 and MB > 1:
+    MB = min(MB, H, max_mb)
+    while MB > gqa_repeats:
+      mb_qk = MB // gqa_repeats
+      aligned = (
+          H % MB == 0
+          and MB % gqa_repeats == 0
+          and (
+              not native_qkv_do_layout
+              or (
+                  q_size % (mb_qk * K) == 0
+                  and (q_size + k_size) % (MB * V) == 0
+              )
+          )
+      )
+      if aligned:
+        break
       MB -= 1
   else:
     MB = mini_batch
@@ -1536,17 +1669,23 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   # Keep [H, B, ...] layout; reshape T → (NT, BT) only. No transpose.
   # B is an independent dimension handled by a separate grid axis.
-  q_r = q.reshape(H_QK, B, NT, BT, K)
-  k_r = k.reshape(H_QK, B, NT, BT, K)
-  rstd_q_r = rstd_q.reshape(H_QK, B, NT, 1, BT) if has_rstd_qk else None
-  rstd_k_r = rstd_k.reshape(H_QK, B, NT, 1, BT) if has_rstd_qk else None
-  v_r = v.reshape(H, B, NT, BT, V)
-  vn_r = v_new.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
-  qg_r = qg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
-  kg_r = kg.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
-  w_r = w.reshape(H, B, NT, BT, K) if has_qg_kg_w else None
-  GW = g.shape[-1]
-  scalar_gate = GW == 1
+  if native_qkv_do_layout:
+    q_r = qkv_conv
+    k_r = qkv_conv
+    v_r = qkv_conv
+    do_r = do.reshape(B, T, H * V)
+  else:
+    assert q is not None and k is not None and v is not None
+    q_r = q.reshape(H_QK, B, NT, BT, K)
+    k_r = k.reshape(H_QK, B, NT, BT, K)
+    v_r = v.reshape(H, B, NT, BT, V)
+    do_r = do.reshape(H, B, NT, BT, V)
+  rstd_q_r = rstd_q.reshape(H_QK, B, NT, 1, BT) if rstd_q is not None else None
+  rstd_k_r = rstd_k.reshape(H_QK, B, NT, 1, BT) if rstd_k is not None else None
+  vn_r = v_new.reshape(H, B, NT, BT, V) if v_new is not None else None
+  qg_r = qg.reshape(H, B, NT, BT, K) if qg is not None else None
+  kg_r = kg.reshape(H, B, NT, BT, K) if kg is not None else None
+  w_r = w.reshape(H, B, NT, BT, K) if w is not None else None
   # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
   g_r = (
       g.reshape(H, B, NT, 1, BT) if scalar_gate else g.reshape(H, B, NT, BT, GW)
@@ -1558,22 +1697,28 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   else:
     A_r = A.reshape(H, B, NT, BT, BT)
     h_r = h  # already [H, B, NT, K, V]
-  do_r = do.reshape(H, B, NT, BT, V)
-  dv0_r = dv0.reshape(H, B, NT, BT, V) if has_vn_dv0_dAqk else None
-  dAqk_r = dAqk.reshape(H, B, NT, BT, BT) if has_vn_dv0_dAqk else None
+  dv0_r = dv0.reshape(H, B, NT, BT, V) if dv0 is not None else None
+  dAqk_r = dAqk.reshape(H, B, NT, BT, BT) if dAqk is not None else None
 
   def idx_chunk(head_group, batch, chunk, chunk_seg_ids_smem_ref):
+    del chunk_seg_ids_smem_ref
     return (head_group, batch, NT - 1 - chunk, 0, 0)
 
   def idx_state(head_group, batch, chunk, chunk_seg_ids_smem_ref):
+    if not is_varlen:
+      return (head_group, batch, 0, 0, 0)
     chunk_id = NT - 1 - chunk
     _, seq_idx, _, _, _ = _chunk_segment_metadata(
         chunk_seg_ids_smem_ref, batch, chunk_id, NT
     )
     return (head_group, batch, seq_idx, 0, 0)
 
-  # dht_arr [B, N, H, K, V] → [H, B, N, K, V]
-  dht_arr = dht_arr.transpose(2, 0, 1, 3, 4)
+  # dht_arr [B, N, H, K, V] → [H, B, N, K, V] only when dht is provided.
+  dht_arr = (
+      dht.astype(jnp.float32).transpose(2, 0, 1, 3, 4)
+      if dht is not None
+      else None
+  )
 
   # q/k blocks carry MB // gqa_repeats key heads for the MB value heads of the
   # tile. MB divides H and gqa_repeats divides MB, so this is exact.
@@ -1581,7 +1726,29 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   assert (
       MB % gqa_repeats == 0
   ), f"MB={MB} must be divisible by gqa_repeats={gqa_repeats}"
-  qk_spec = pl.BlockSpec((MB_QK, 1, 1, BT, K), index_map=idx_chunk)
+  if native_qkv_do_layout:
+    tile_q = MB_QK * K
+    tile_k = MB_QK * K
+    tile_v = MB * V
+    k_block_off = q_size // tile_k
+    v_block_off = (q_size + k_size) // tile_v
+    q_spec = pl.BlockSpec(
+        (1, BT, tile_q), lambda hg, b, c, _: (b, NT - 1 - c, hg)
+    )
+    k_spec = pl.BlockSpec(
+        (1, BT, tile_k), lambda hg, b, c, _: (b, NT - 1 - c, k_block_off + hg)
+    )
+    v_spec = pl.BlockSpec(
+        (1, BT, tile_v), lambda hg, b, c, _: (b, NT - 1 - c, v_block_off + hg)
+    )
+    do_spec = pl.BlockSpec(
+        (1, BT, tile_v), lambda hg, b, c, _: (b, NT - 1 - c, hg)
+    )
+  else:
+    q_spec = pl.BlockSpec((MB_QK, 1, 1, BT, K), index_map=idx_chunk)
+    k_spec = q_spec
+    v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
+    do_spec = v_spec
   rstd_spec = (
       pl.BlockSpec((MB_QK, 1, 1, 1, BT), index_map=idx_chunk)
       if has_rstd_qk
@@ -1593,8 +1760,11 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       if has_qg_kg_w
       else None
   )
-  v_spec = pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
-  vn_dv0_spec = v_spec if has_vn_dv0_dAqk else None
+  vn_dv0_spec = (
+      pl.BlockSpec((MB, 1, 1, BT, V), index_map=idx_chunk)
+      if has_vn_dv0_dAqk
+      else None
+  )
   g_spec = (
       pl.BlockSpec((MB, 1, 1, 1, BT), index_map=idx_chunk)
       if scalar_gate
@@ -1607,11 +1777,13 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   if native_state_layout:
 
     def idx_chunk_bnh(head_group, batch, chunk, chunk_seg_ids_smem_ref):
+      del chunk_seg_ids_smem_ref
       return (batch, NT - 1 - chunk, head_group, 0, 0)
 
     A_spec = pl.BlockSpec((1, 1, MB, BT, BT), index_map=idx_chunk_bnh)
     h_spec = pl.BlockSpec((1, 1, MB, K, V), index_map=idx_chunk_bnh)
   state_spec = pl.BlockSpec((MB, 1, 1, K, V), index_map=idx_state)
+  dht_spec = state_spec if dht_arr is not None else None
 
   kernel = partial(
       _fused_dhu_wy_intra_cumsum_kernel,
@@ -1619,6 +1791,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       per_channel_gate=per_channel_gate,
       gqa_repeats=gqa_repeats,
       native_state_layout=native_state_layout,
+      native_qkv_do_layout=native_qkv_do_layout,
+      use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+      is_varlen=is_varlen,
       BT=BT,
       K=K,
       V=V,
@@ -1629,20 +1804,32 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # dq/dk/dv may be written in the activation dtype (e.g. bf16), which halves
   # their HBM writes. db/dg stay f32 for the gate sums.
   dqkv_out_dtype = jnp.float32 if dqkv_dtype is None else dqkv_dtype
-  out_shape = [
-      jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), dqkv_out_dtype),
-      jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), dqkv_out_dtype),
-      jax.ShapeDtypeStruct((H, B, NT, BT, V), dqkv_out_dtype),
-      jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32),
+  b_out_shape = jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32)
+  g_out_shape = (
       jax.ShapeDtypeStruct((H, B, NT, 1, BT), jnp.float32)
       if scalar_gate
-      else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32),
-      jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32),
-  ]
+      else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32)
+  )
+  if native_qkv_do_layout:
+    out_shape = [
+        jax.ShapeDtypeStruct((B, T, C), dqkv_out_dtype),
+        b_out_shape,
+        g_out_shape,
+    ]
+  else:
+    out_shape = [
+        jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), dqkv_out_dtype),
+        jax.ShapeDtypeStruct((H_QK, B, NT, BT, K), dqkv_out_dtype),
+        jax.ShapeDtypeStruct((H, B, NT, BT, V), dqkv_out_dtype),
+        b_out_shape,
+        g_out_shape,
+    ]
+  if return_dh0:
+    out_shape.append(jax.ShapeDtypeStruct((H, B, N, K, V), jnp.float32))
 
   in_specs = [
-      qk_spec,
-      qk_spec,
+      q_spec,
+      k_spec,
       v_spec,
       vn_dv0_spec,
       qgw_spec,
@@ -1652,15 +1839,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       b_spec,
       A_spec,
       h_spec,
-      v_spec,
+      do_spec,
       vn_dv0_spec,
       dAqk_spec,
-      state_spec,
+      dht_spec,
       rstd_spec,
       rstd_spec,
   ]
   # dq and dk are written at the key head count H_QK.
-  out_specs = [qk_spec, qk_spec, v_spec, b_spec, g_spec, state_spec]
+  out_specs = [q_spec, k_spec, v_spec, b_spec, g_spec]
+  if return_dh0:
+    out_specs.append(state_spec)
   inputs = [
       q_r,
       k_r,
@@ -1684,9 +1873,16 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # the kernel body as None.
   present = [x is not None for x in inputs]
   in_specs = [s for s, p in zip(in_specs, present) if p]
-  inputs = [x for x in inputs if x is not None]
-  num_in = len(inputs)
-  num_out = len(out_specs)
+  if native_qkv_do_layout:
+    # Pass qkv_conv once as an HBM operand; pipeline_kernel expands it to 3
+    # refs.
+    hbm_inputs = [qkv_conv] + [x for x in inputs[3:] if x is not None]
+  else:
+    hbm_inputs = [x for x in inputs if x is not None]
+  num_pipe_in = len(in_specs)
+  num_pipe_out = len(out_specs)
+  num_hbm_in = len(hbm_inputs)
+  num_hbm_out = len(out_shape)
 
   def bind_seg_ids(spec, seg_ids_smem_ref):
     # emit_pipeline index maps only receive the grid indices.
@@ -1697,14 +1893,39 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   # Ref order: SMEM seg ids, HBM inputs, HBM outputs, VMEM scratch.
   def pipeline_kernel(seg_ids_smem_ref, *refs):
-    in_hbm_refs = refs[:num_in]
-    out_hbm_refs = refs[num_in : num_in + num_out]
-    scratch_vmem_refs = refs[num_in + num_out :]
+    in_hbm_refs = refs[:num_hbm_in]
+    out_hbm_refs = refs[num_hbm_in : num_hbm_in + num_hbm_out]
+    scratch_vmem_refs = refs[num_hbm_in + num_hbm_out :]
+    if native_qkv_do_layout:
+      pipe_in_refs = (
+          in_hbm_refs[0],
+          in_hbm_refs[0],
+          in_hbm_refs[0],
+      ) + tuple(in_hbm_refs[1:])
+      pipe_out_refs = (
+          out_hbm_refs[0],
+          out_hbm_refs[0],
+          out_hbm_refs[0],
+      ) + tuple(out_hbm_refs[1:])
+    else:
+      pipe_in_refs = in_hbm_refs
+      pipe_out_refs = out_hbm_refs
 
     def body(step, *block_vmem_refs):
-      blocks = iter(block_vmem_refs[:num_in])
+      blocks = iter(block_vmem_refs[:num_pipe_in])
       kernel_inputs = [next(blocks) if p else None for p in present]
-      kernel(step, seg_ids_smem_ref, *kernel_inputs, *block_vmem_refs[num_in:])
+      out_blocks = list(
+          block_vmem_refs[num_pipe_in : num_pipe_in + num_pipe_out]
+      )
+      if not return_dh0:
+        out_blocks.append(None)
+      kernel(
+          step,
+          seg_ids_smem_ref,
+          *kernel_inputs,
+          *out_blocks,
+          *block_vmem_refs[num_pipe_in + num_pipe_out :],
+      )
 
     pltpu.emit_pipeline(
         body,
@@ -1712,21 +1933,21 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         in_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in in_specs],
         out_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in out_specs],
         _explicit_indices=True,
-    )(*in_hbm_refs, *out_hbm_refs, scratches=tuple(scratch_vmem_refs))
+    )(*pipe_in_refs, *pipe_out_refs, scratches=tuple(scratch_vmem_refs))
 
   # Operands stay in HBM. Inside a single kernel invocation, emit_pipeline
   # walks the (head group, batch, reversed chunk) grid and pipelines the block
   # copies. Chunks run in order: `dh_tmp` carries dh from one chunk to the
   # previous one.
   hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-  dq_r, dk_r, dv_r, db_r, dg_r, dh0_r = pl.pallas_call(
+  pallas_out = pl.pallas_call(
       pipeline_kernel,
       out_shape=out_shape,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
           grid=(),
-          in_specs=[hbm_spec] * num_in,
-          out_specs=[hbm_spec] * num_out,
+          in_specs=[hbm_spec] * num_hbm_in,
+          out_specs=[hbm_spec] * num_hbm_out,
           scratch_shapes=[dh_tmp],
       ),
       compiler_params=pltpu.CompilerParams(
@@ -1735,9 +1956,30 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       ),
       interpret=get_interpret(),
       name="_fused_dhu_wy_intra_cumsum_pallas_jit",
-  )(chunk_seg_ids, *inputs)
+  )(chunk_seg_ids, *hbm_inputs)
 
-  dh0_out = dh0_r.transpose(1, 2, 0, 3, 4) if return_dh0 else None
+  if native_qkv_do_layout:
+    if return_dh0:
+      dy_conv_r, db_r, dg_r, dh0_r = pallas_out
+      dh0_out = dh0_r.transpose(1, 2, 0, 3, 4)
+    else:
+      dy_conv_r, db_r, dg_r = pallas_out
+      dh0_out = None
+    return (
+        dy_conv_r,
+        None,
+        None,
+        db_r.reshape(H, B, T),
+        dg_r.reshape(H, B, T, GW),
+        dh0_out,
+    )
+
+  if return_dh0:
+    dq_r, dk_r, dv_r, db_r, dg_r, dh0_r = pallas_out
+    dh0_out = dh0_r.transpose(1, 2, 0, 3, 4)
+  else:
+    dq_r, dk_r, dv_r, db_r, dg_r = pallas_out
+    dh0_out = None
   return (
       dq_r.reshape(H_QK, B, T, K),
       dk_r.reshape(H_QK, B, T, K),
