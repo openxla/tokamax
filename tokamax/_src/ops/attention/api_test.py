@@ -37,9 +37,13 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    if jax.default_backend() == 'gpu':
-      # TODO: Remove once Mosaic GPU support is fixed.
-      self.skipTest('Mosaic GPU support is broken.')
+    if (
+        jax.default_backend() == 'gpu'
+        and self.IMPL is None
+        and gpu_utils.is_sm100()
+    ):
+      # TODO: Remove once SM100 Mosaic GPU support is fixed.
+      self.skipTest('SM100 Mosaic GPU support is broken.')
 
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
@@ -366,8 +370,6 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     super().setUp()
     match jax.default_backend():
       case 'gpu':
-        # TODO: Remove once Mosaic GPU support is fixed.
-        self.skipTest('Mosaic GPU support is broken.')
         if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
           self.skipTest(
               'Skip test. Mosaic implementation is not supported on this'
@@ -380,6 +382,37 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
             'Skip test. Mosaic implementation is not supported on this'
             ' platform.'
         )
+
+  @parameterized.parameters('fwd', 'fwd_bwd')
+  def test_sm80_seq_lengths_linear_memory_scaling(self, mode):
+    if jax.default_backend() != 'gpu' or not gpu_utils.is_sm80():
+      self.skipTest('SM80 sequence-length linear memory scaling test.')
+
+    seq_len = 1024
+    scale = 4
+    x0 = jax.ShapeDtypeStruct((2, seq_len, 16, 128), jnp.bfloat16)
+    x1 = jax.ShapeDtypeStruct((2, seq_len * scale, 16, 128), jnp.bfloat16)
+    q_len = jax.ShapeDtypeStruct((2,), jnp.int32)
+    kv_len = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def fwd_fn(x, ql, kvl):
+      return api.dot_product_attention(
+          x,
+          x,
+          x,
+          is_causal=True,
+          query_seq_lengths=ql,
+          key_value_seq_lengths=kvl,
+          implementation='mosaic',
+      )
+
+    bwd_fn = lambda x, ql, kvl: jax.vjp(fwd_fn, x, ql, kvl)[1](x)
+    f = jax.jit(fwd_fn) if mode == 'fwd' else jax.jit(bwd_fn)
+
+    assert (mem0 := f.lower(x0, q_len, kv_len).compile().memory_analysis())
+    assert (mem1 := f.lower(x1, q_len, kv_len).compile().memory_analysis())
+    mem_increase = mem1.peak_memory_in_bytes / mem0.peak_memory_in_bytes
+    self.assertBetween(mem_increase, minv=(scale * 0.25), maxv=(scale * 1.5))
 
 
 class DotProductAttentionTritonTest(DotProductAttentionTest):

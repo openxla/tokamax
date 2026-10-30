@@ -25,12 +25,41 @@ import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import splash_attention_kernel
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 NUM_LANES: Final[int] = 128
 LOG2E = splash_attention_kernel.LOG2E
+
+
+def slice_mask_info(
+    mask_info: mask_info_lib.MaskInfo,
+    q_shard_idx: int | jax.Array,
+    q_seq_shards: int,
+) -> mask_info_lib.MaskInfo:
+  """Slices `MaskInfo` along the Q sequence shard dimension."""
+  if q_seq_shards == 1:
+    return mask_info
+
+  def _slice(arr: jax.Array | np.ndarray | None):
+    if arr is None:
+      return None
+    shard_len = int(arr.shape[0]) // q_seq_shards
+    return jax.lax.dynamic_slice_in_dim(
+        arr, q_shard_idx * shard_len, shard_len, axis=0
+    )
+
+  return mask_info_lib.MaskInfo(
+      mask_next=_slice(mask_info.mask_next),
+      active_rows=_slice(mask_info.active_rows),
+      active_cols=_slice(mask_info.active_cols),
+      num_active_blocks=_slice(mask_info.num_active_blocks),
+      block_mask=_slice(mask_info.block_mask),
+      partial_mask_blocks=mask_info.partial_mask_blocks,
+      q_sequence=_slice(mask_info.q_sequence),
+  )
 
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -136,9 +165,12 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     if config.use_base2_exp:
       lse = lse * LOG2E
 
+    q_seq_shards, q_shard_idx = (
+        mask.get_q_seq_shard_info() if isinstance(mask, base.Mask) else (1, 0)
+    )
     q_seq_len = q.shape[-2]
     kv_seq_len = k.shape[-2]
-    mask_shape = (q_seq_len, kv_seq_len)
+    mask_shape = (q_seq_len * q_seq_shards, kv_seq_len)
 
     if isinstance(mask, mask_lib.Mask):
       splash_mask = mask
@@ -149,7 +181,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         splash_mask = mask.bool_mask
       elif mask.is_causal:
         splash_mask = mask_lib.CausalMask(
-            shape=mask_shape, offset=mask.offset, shard_count=1
+            shape=mask_shape, offset=mask.offset, shard_count=q_seq_shards
         )
       else:
         splash_mask = mask_lib.FullMask(mask_shape)
@@ -237,14 +269,20 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       )
     else:
       splash_maker = (
-          splash_attention_kernel.make_splash_mqa_single_device
+          splash_attention_kernel.make_splash_mqa
           if is_mqa
-          else splash_attention_kernel.make_splash_mha_single_device
+          else splash_attention_kernel.make_splash_mha
       )
       attn_fn = splash_maker(
           splash_mask,
           config=splash_config,
           mask_value=mask_value,
+          q_seq_shards=q_seq_shards,
+      )
+      dkv_mask_info = (
+          slice_mask_info(attn_fn.dkv_mask_info, q_shard_idx, q_seq_shards)
+          if attn_fn.dkv_mask_info is not None
+          else None
       )
 
       def single_bwd_static(dout, q, k, v, out, lse, segment_ids, sinks):
@@ -256,7 +294,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
             sinks,
             out,
             lse,
-            attn_fn.dkv_mask_info,
+            dkv_mask_info,
             prng_key,
         )
         splash_fn_kwargs = attn_fn.kwargs

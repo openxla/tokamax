@@ -513,16 +513,7 @@ class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
   # and ignores the kernel dtype arguments, so it is run without them.
   @parameterized.named_parameters(
       dict(
-          testcase_name="conv_state_bf16",
-          kernel_conv_state_dtype=jnp.bfloat16,
-      ),
-      dict(
           testcase_name="conv_weight_bf16",
-          kernel_conv_weight_dtype=jnp.bfloat16,
-      ),
-      dict(
-          testcase_name="conv_state_and_weight_bf16",
-          kernel_conv_state_dtype=jnp.bfloat16,
           kernel_conv_weight_dtype=jnp.bfloat16,
       ),
   )

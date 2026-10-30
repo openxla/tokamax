@@ -139,7 +139,9 @@ def make_gdn_spec(
       "qkv": ShapeDtype((num_tokens, dim_size), dtype),
       "b": ShapeDtype((num_tokens, n_v), dtype),
       "a": ShapeDtype((num_tokens, n_v), dtype),
-      "conv_state": ShapeDtype((num_blocks, kernel_size - 1, dim_size), dtype),
+      "conv_state": ShapeDtype(
+          (num_blocks, kernel_size - 1, dim_size), jnp.float32
+      ),
       "recurrent_state": ShapeDtype((num_blocks, n_v, d_k, d_v), state_dtype),
       "conv_weight": ShapeDtype((dim_size, 1, kernel_size), dtype),
       "conv_bias": ShapeDtype((dim_size,), dtype),

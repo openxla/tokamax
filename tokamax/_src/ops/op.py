@@ -542,7 +542,9 @@ class BoundArguments[C, K: Hashable]:
   @property
   def cached_autotuning_data(self) -> AutotuningData[C] | None:
     """Returns autotuning data from the cache, if available."""
-    if config_lib.ignore_autotuning_cache.value:
+    if (
+        config_lib.ignore_autotuning_cache.value
+    ):
       return None
 
     device_kind = infer_device_kind(self)

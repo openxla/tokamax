@@ -412,6 +412,50 @@ class SplashAttentionApiTest(parameterized.TestCase):
       with self.assertRaises(NotImplementedError):
         api.splash_attention(q, k, v, implementation="mosaic_tpu")
 
+  @parameterized.product(
+      implementation=["base", "mosaic_tpu"],
+      shard_axis=[0, 1],
+  )
+  def test_splash_attention_sharding(self, implementation, shard_axis):
+    if implementation == "mosaic_tpu" and jax.default_backend() != "tpu":
+      self.skipTest("mosaic_tpu only runs on TPU.")
+
+    num_devices = min(jax.device_count(), 2)
+    devices = jax.devices()[:num_devices]
+    mesh = jax.sharding.Mesh(devices, ("x",))
+    spec: list[str | None] = [None, None, None]
+    spec[shard_axis] = "x"
+    sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(*spec)
+    )
+
+    num_heads = 4
+    seq_len = 512
+    head_dim = 64
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    k_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    v_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=99)
+
+    ref_out = api.splash_attention(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        implementation=implementation,
+    )
+    out = api.splash_attention(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        implementation=implementation,
+        q_sharding=sharding,
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
+
 
 if __name__ == "__main__":
   absltest.main()

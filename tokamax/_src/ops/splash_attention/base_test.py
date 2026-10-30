@@ -145,7 +145,7 @@ class SplashAttentionBaseTest(parameterized.TestCase):
 
     # Unsupported mask type
     with self.assertRaises(TypeError):
-      self.op(q, q, q, mask="invalid_mask", is_mqa=False)
+      self.op(q, q, q, mask="invalid_mask", is_mqa=False)  # pyrefly: ignore[no-matching-overload]
 
     # return_residuals success
     out, res = self.op(q, q, q, mask, return_residuals=True, is_mqa=False)
@@ -432,6 +432,102 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     )
 
     chex.assert_trees_all_close(out_symbolic, out_explicit, atol=1e-5)
+
+  def test_sharding_errors(self):
+    q = jnp.ones((4, 128, 64))
+    k = jnp.ones((4, 128, 64))
+    v = jnp.ones((4, 128, 64))
+    devices = jax.devices()[:1]
+    mesh = jax.sharding.Mesh(devices, ("x",))
+    P = jax.sharding.PartitionSpec
+    NamedSharding = jax.sharding.NamedSharding
+
+    with self.assertRaisesRegex(
+        NotImplementedError, "Sharding is not supported in `bind`"
+    ):
+      self.op.bind(q, k, v, q_sharding=NamedSharding(mesh, P("x", None, None)))
+
+    with self.assertRaisesRegex(
+        ValueError, "Too many dimensions in q_sharding's pspec"
+    ):
+      self.op(
+          q,
+          k,
+          v,
+          q_sharding=NamedSharding(mesh, P("x", None, None, None)),
+      )
+
+    mesh2 = jax.sharding.Mesh(devices, ("y",))
+    with self.assertRaisesRegex(
+        ValueError, "q_sharding and k_sharding must have the same mesh"
+    ):
+      self.op(
+          q,
+          k,
+          v,
+          q_sharding=NamedSharding(mesh, P("x", None, None)),
+          k_sharding=NamedSharding(mesh2, P("y", None, None)),
+      )
+
+  @parameterized.parameters(
+      (("x", None, None), False, False),
+      ((None, "x", None), False, False),
+      (("x", None, None), True, True),
+      ((None, "x", None), True, True),
+  )
+  def test_sharding_execution(self, spec_tuple, is_mqa, use_extras):
+    num_devices = min(jax.device_count(), 2)
+    devices = jax.devices()[:num_devices]
+    mesh = jax.sharding.Mesh(devices, ("x",))
+    sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(*spec_tuple)
+    )
+
+    num_q_heads, q_seq_len, head_dim = 4, 256, 64
+    num_kv_heads, kv_seq_len = (1, 256) if is_mqa else (4, 256)
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype)
+    if is_mqa:
+      k_s = jax.ShapeDtypeStruct((kv_seq_len, head_dim), dtype)
+    else:
+      k_s = jax.ShapeDtypeStruct((num_kv_heads, kv_seq_len, head_dim), dtype)
+
+    v_s = k_s
+    do_s = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype)
+    q, k, v, do = numerics.random_initialize((q_s, k_s, v_s, do_s), seed=12)
+
+    segment_ids = None
+    sinks = None
+    if use_extras:
+      # Simulate different sequences
+      q_seg = jnp.array(
+          [0] * (q_seq_len // 2) + [1] * (q_seq_len // 2), dtype=jnp.int32
+      )
+      segment_ids = reference.SegmentIds(q=q_seg, kv=q_seg)
+      sinks = numerics.random_initialize(
+          jax.ShapeDtypeStruct((num_q_heads,), dtype), seed=13
+      )
+
+    kwargs = dict(
+        mask=base.CAUSAL_MASK,
+        segment_ids=segment_ids,
+        sinks=sinks,
+        is_mqa=is_mqa,
+    )
+
+    out_ref, f_vjp_ref = jax.vjp(functools.partial(self.op, **kwargs), q, k, v)
+    dq_ref, dk_ref, dv_ref = f_vjp_ref(do)
+
+    out_sharded, f_vjp_sharded = jax.vjp(
+        functools.partial(self.op, q_sharding=sharding, **kwargs), q, k, v
+    )
+    dq_sharded, dk_sharded, dv_sharded = f_vjp_sharded(do)
+
+    chex.assert_trees_all_close(out_sharded, out_ref, atol=1e-2)
+    chex.assert_trees_all_close(dq_sharded, dq_ref, atol=1e-2)
+    chex.assert_trees_all_close(dk_sharded, dk_ref, atol=1e-2)
+    chex.assert_trees_all_close(dv_sharded, dv_ref, atol=1e-2)
 
 
 if __name__ == "__main__":
