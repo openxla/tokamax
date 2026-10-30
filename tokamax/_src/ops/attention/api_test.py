@@ -322,11 +322,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Memory scaling guarantees not made for this implementation'
       )
-    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
-    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
-      self.skipTest(
-          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
-      )
     # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
     if (
         jax.default_backend() == 'tpu'
