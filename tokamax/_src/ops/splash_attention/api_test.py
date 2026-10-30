@@ -223,6 +223,28 @@ class SplashAttentionApiTest(parameterized.TestCase):
     chex.assert_shape(out, (num_heads, seq_len, head_dim))
     chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
 
+  def test_is_causal_and_segment_ids(self):
+    num_heads, seq_len, head_dim = 4, 128, 64
+    q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    k_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    v_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=5)
+
+    half_seq = seq_len // 2
+    q_seg = jnp.array([0] * half_seq + [1] * (seq_len - half_seq), jnp.int32)
+
+    out = api.splash_attention(
+        q, k, v, segment_ids=q_seg, is_causal=True, implementation="base"
+    )
+    ref_out = base.SplashAttention()(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        segment_ids=base.SegmentIds(q=q_seg, kv=q_seg),
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
+
   def test_bound_args_and_hlo(self):
     num_heads, seq_len, head_dim = 2, 64, 32
     q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)

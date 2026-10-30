@@ -23,7 +23,7 @@ from typing import Any, Final, Literal, NotRequired, TypeAlias, TypeVar, TypedDi
 import jax
 from jax.experimental import shard_map
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 from tokamax._src import batching
 from tokamax._src import jaxtyping
@@ -75,7 +75,7 @@ class Mask:
 
   Attributes:
     bool_mask: An optional explicit 2D boolean mask.
-    is_causal: Whether causal masking is applied.
+    is_causal: Whether causal masking should be applied.
     offset: Offset of q start with respect to kv. Only meaningful when
       is_causal=True. Semantics match splash_attention_mask.CausalMask.offset
       (q_idx + offset >= kv_idx). A positive offset allows queries to attend to
@@ -157,6 +157,43 @@ def _canonicalize_mask(
   raise TypeError(f"Unsupported mask type: {type(mask)}")
 
 
+def _canonicalize_segment_ids(
+    segment_ids: (
+        SegmentIds
+        | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+        | Int[Array, "*#B T"]
+        | None
+    ),
+) -> SegmentIds | None:
+  """Canonicalizes the segment ids and constructs internal dataclass.
+
+  Args:
+    segment_ids: The document segment IDs. Can be of several different types
+      including SegmentIds, any object with q and kv attributes, a (q, kv) tuple
+      of tensors, or a single tensor used for both q and kv (for
+      self-attention).
+
+  Returns:
+    A SegmentIds instance or None.
+  """
+  if segment_ids is None:
+    return None
+  if isinstance(segment_ids, SegmentIds):
+    return segment_ids
+  if isinstance(segment_ids, tuple) and len(segment_ids) == 2:
+    return SegmentIds(
+        q=jnp.asarray(segment_ids[0]), kv=jnp.asarray(segment_ids[1])
+    )
+  if isinstance(segment_ids, (jax.Array, np.ndarray)):
+    # allow single array for self-attention
+    return SegmentIds(q=jnp.asarray(segment_ids), kv=jnp.asarray(segment_ids))
+  if hasattr(segment_ids, "q") and hasattr(segment_ids, "kv"):
+    return SegmentIds(
+        q=jnp.asarray(segment_ids.q), kv=jnp.asarray(segment_ids.kv)
+    )
+  raise TypeError(f"Unsupported segment ids type: {type(segment_ids)}")
+
+
 @dataclasses.dataclass(frozen=True)
 class SplashAttention[_Config](
     op.Op[Any, Float[Array, "*B H T d"], Residuals, _Config, Any]
@@ -178,10 +215,16 @@ class SplashAttention[_Config](
       k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
       v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = ...,
-      segment_ids: SegmentIds | None = ...,
+      segment_ids: (
+          SegmentIds
+          | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+          | Int[Array, "*#B T"]
+          | None
+      ) = ...,
       sinks: Float[Array, "*#B H"] | None = ...,
       *,
       is_mqa: bool = ...,
+      is_causal: bool = ...,
       mask_value: float = ...,
       attn_logits_soft_cap: float | None = ...,
       dropout_rate: float = ...,
@@ -199,10 +242,16 @@ class SplashAttention[_Config](
       k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
       v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = ...,
-      segment_ids: SegmentIds | None = ...,
+      segment_ids: (
+          SegmentIds
+          | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+          | Int[Array, "*#B T"]
+          | None
+      ) = ...,
       sinks: Float[Array, "*#B H"] | None = ...,
       *,
       is_mqa: bool = ...,
+      is_causal: bool = ...,
       mask_value: float = ...,
       attn_logits_soft_cap: float | None = ...,
       dropout_rate: float = ...,
@@ -213,17 +262,22 @@ class SplashAttention[_Config](
   ) -> tuple[Float[Array, "*B H T d"], Residuals]:
     ...
 
-  @jaxtyping.jaxtyped
   def __call__(
       self,
       q: Float[Array, "*B H T D"],
       k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
       v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = None,
-      segment_ids: SegmentIds | None = None,
+      segment_ids: (
+          SegmentIds
+          | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+          | Int[Array, "*#B T"]
+          | None
+      ) = None,
       sinks: Float[Array, "*#B H"] | None = None,
       *,
       is_mqa: bool = False,
+      is_causal: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
@@ -237,7 +291,9 @@ class SplashAttention[_Config](
     params.pop("self")
     params.pop("q_sharding")
     params.pop("k_sharding")
-    mask: Mask = cast(Mask, self.bind(**params).kwargs["mask"])
+    bound_args = self.bind(**params)
+    mask = cast(Mask, bound_args.kwargs["mask"])
+    segment_ids = cast(SegmentIds | None, bound_args.kwargs["segment_ids"])
 
     def fwd_closed(q, k, v, mask, segment_ids, sinks):
       return op.Op.__call__(
@@ -344,11 +400,17 @@ class SplashAttention[_Config](
       k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
       v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = None,
-      segment_ids: SegmentIds | None = None,
+      segment_ids: (
+          SegmentIds
+          | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+          | Int[Array, "*#B T"]
+          | None
+      ) = None,
       sinks: Float[Array, "*#B H"] | None = None,
       *,
       is_mqa: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
+      is_causal: bool = False,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
@@ -364,6 +426,12 @@ class SplashAttention[_Config](
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
     if dropout_rate > 0.0 and prng_key is None:
       raise ValueError("prng_key must be provided when dropout_rate > 0.")
+
+    if is_causal and mask is not None:
+      raise ValueError(
+          "Cannot specify both a mask and the is_causal parameter. Pass only"
+          " one."
+      )
 
     if is_mqa:
       if k.ndim == q.ndim and k.shape[-3] != 1:
@@ -383,7 +451,11 @@ class SplashAttention[_Config](
             f" ({k.shape[-3]})."
         )
 
-    mask = _canonicalize_mask(mask)
+    if is_causal:
+      mask = CAUSAL_MASK
+    else:
+      mask = _canonicalize_mask(mask)
+    segment_ids = _canonicalize_segment_ids(segment_ids)
 
     return super().bind(
         q,
@@ -505,11 +577,17 @@ class SplashAttentionVjp[_Config](
       k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
       v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
       mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = None,
-      segment_ids: SegmentIds | None = None,
+      segment_ids: (
+          SegmentIds
+          | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+          | Int[Array, "*#B T"]
+          | None
+      ) = None,
       sinks: Float[Array, "*#B H"] | None = None,
       *,
       is_mqa: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
+      is_causal: bool = False,
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
@@ -520,6 +598,12 @@ class SplashAttentionVjp[_Config](
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
     if dropout_rate > 0.0 and prng_key is None:
       raise ValueError("prng_key must be provided when dropout_rate > 0.")
+
+    if is_causal and mask is not None:
+      raise ValueError(
+          "Cannot specify both a mask and the is_causal parameter. Pass only"
+          " one."
+      )
 
     if is_mqa:
       if k.ndim == q.ndim and k.shape[-3] != 1:
@@ -539,7 +623,11 @@ class SplashAttentionVjp[_Config](
             f" ({k.shape[-3]})."
         )
 
-    mask = _canonicalize_mask(mask)
+    if is_causal:
+      mask = CAUSAL_MASK
+    else:
+      mask = _canonicalize_mask(mask)
+    segment_ids = _canonicalize_segment_ids(segment_ids)
 
     return super().bind(
         residuals,

@@ -15,16 +15,24 @@
 
 """Tests for base SplashAttention operator and reference implementation."""
 
+import dataclasses
 import functools
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import numerics
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+
+
+@dataclasses.dataclass(frozen=True)
+class _CustomSegmentIds:
+  q: jax.Array
+  kv: jax.Array
 
 
 class SplashAttentionBaseTest(parameterized.TestCase):
@@ -97,7 +105,16 @@ class SplashAttentionBaseTest(parameterized.TestCase):
 
     chex.assert_trees_all_close(out_op, out_ref, atol=1e-5)
 
-  def test_with_segment_ids(self):
+  @parameterized.parameters(
+      lambda q, kv: None,
+      lambda q, kv: reference.SegmentIds(q=q, kv=kv),
+      lambda q, kv: (q, kv),
+      lambda q, kv: (np.asarray(q), np.asarray(kv)),
+      lambda q, _: q,
+      lambda q, _: np.asarray(q),
+      lambda q, kv: _CustomSegmentIds(q=q, kv=kv),
+  )
+  def test_with_segment_ids(self, segment_ids_fn):
     q_seq_len, kv_seq_len, head_dim = 128, 128, 64
     num_q_heads = 2
 
@@ -112,18 +129,28 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     mask = base.CAUSAL_MASK
     q_seg = jnp.array([0] * 64 + [1] * 64, dtype=jnp.int32)
     kv_seg = jnp.array([0] * 64 + [1] * 64, dtype=jnp.int32)
-    segment_ids = reference.SegmentIds(q=q_seg, kv=kv_seg)
+    segment_ids = segment_ids_fn(q_seg, kv_seg)
 
-    out_op = self.op(q, k, v, mask, segment_ids=segment_ids)
+    segment_ids_ref = None
+    if segment_ids is not None:
+      segment_ids_ref = reference.SegmentIds(q=q_seg, kv=kv_seg)
+
+    ba = self.op.bind(q, k, v, mask, segment_ids=segment_ids)
+    if segment_ids is None:
+      self.assertIsNone(ba.arguments["segment_ids"])
+    else:
+      self.assertIsInstance(ba.arguments["segment_ids"], reference.SegmentIds)
+
     out_ref = reference.attention_reference(
         q=q,
         k=k,
         v=v,
         mask=mask.as_array(q_seq_len, kv_seq_len),
-        segment_ids=segment_ids,
+        segment_ids=segment_ids_ref,
         is_mqa=False,
     )
 
+    out_op = self.op(q, k, v, mask, segment_ids=segment_ids)
     chex.assert_trees_all_close(out_op, out_ref, atol=1e-5)
 
   def test_validation_errors(self):
@@ -143,9 +170,15 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "dropout_rate must be in"):
       self.op(q, q, q, mask, dropout_rate=-0.1, is_mqa=False)
 
-    # Unsupported mask type
+    # Incorrect mask type
     with self.assertRaises(TypeError):
       self.op(q, q, q, mask="invalid_mask", is_mqa=False)  # pyrefly: ignore[no-matching-overload]
+
+    # Both is_causal and mask specified
+    with self.assertRaisesRegex(
+        ValueError, "Cannot specify both a mask and the is_causal parameter"
+    ):
+      self.op(q, q, q, mask=mask, is_causal=True, is_mqa=False)
 
     # return_residuals success
     out, res = self.op(q, q, q, mask, return_residuals=True, is_mqa=False)
@@ -158,6 +191,12 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     assert self.op.vjp is not None
     with self.assertRaises(NotImplementedError):
       self.op.vjp(res, out, out, q, q, q, mask, return_residuals=True)
+
+    # VJP validation errors for is_causal + mask
+    with self.assertRaisesRegex(
+        ValueError, "Cannot specify both a mask and the is_causal parameter"
+    ):
+      self.op.vjp(res, out, out, q, q, q, mask=mask, is_causal=True)
 
   def test_symbolic_mask_direct(self):
     q = jnp.ones((2, 128, 64))
@@ -174,6 +213,13 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     self.assertTrue(ba_causal.arguments["mask"].is_causal)
     out_causal = self.op(q, q, q, causal_mask, is_mqa=False)
     self.assertEqual(out_causal.shape, (2, 128, 64))
+
+    ba_is_causal = self.op.bind(q, q, q, is_causal=True, is_mqa=False)
+    self.assertEqual(ba_is_causal.arguments["mask"], base.CAUSAL_MASK)
+    self.assertTrue(ba_is_causal.arguments["mask"].is_causal)
+    out_is_causal = self.op(q, q, q, is_causal=True, is_mqa=False)
+    self.assertEqual(out_is_causal.shape, (2, 128, 64))
+    chex.assert_trees_all_close(out_is_causal, out_causal, atol=1e-5)
 
   def test_mask_as_array_composite(self):
     dense = jnp.ones((8, 8), dtype=jnp.bool_)
