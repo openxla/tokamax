@@ -18,8 +18,10 @@
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Final, NotRequired, TypeAlias, TypeVar, TypedDict, cast, override
+import math
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypeVar, TypedDict, cast, overload, override
 import jax
+from jax.experimental import shard_map
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
@@ -56,6 +58,16 @@ def vmap_batch_dims[**P, T](f: Callable[P, T]) -> Callable[P, T]:
   return functools.wraps(f)(functools.partial(vmap, f))
 
 
+def _mesh_axis_size(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh, axis: Any
+):
+  """Returns the number of shards for a PartitionSpec entry in a mesh."""
+  if axis is None:
+    return 1
+  axis_names = axis if isinstance(axis, tuple) else (axis,)
+  return math.prod(mesh.shape[name] for name in axis_names)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class Mask:
@@ -75,10 +87,25 @@ class Mask:
   _: dataclasses.KW_ONLY
   is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
   offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+  q_seq_axis: str | tuple[str, ...] | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
 
   def __post_init__(self):
     if self.offset != 0 and not self.is_causal:
       raise ValueError("`offset` can only be non-zero when `is_causal=True`.")
+
+  def get_q_seq_shard_info(self) -> tuple[int, int | jax.Array]:
+    """Returns (q_seq_shards, q_shard_idx) when inside a jax shard_map."""
+    if self.q_seq_axis is None:
+      return 1, 0
+    try:
+      return (
+          jax.lax.axis_size(self.q_seq_axis),
+          jax.lax.axis_index(self.q_seq_axis),
+      )
+    except (NameError, ValueError):
+      return 1, 0
 
   def as_array(
       self,
@@ -86,7 +113,8 @@ class Mask:
       kv_seq_len: int,
   ) -> Bool[Array, "*#B T t"]:
     """Returns the mask as a 2D boolean array."""
-    q_idx = jnp.arange(q_seq_len)[:, None]
+    _, q_shard_idx = self.get_q_seq_shard_info()
+    q_idx = (q_shard_idx * q_seq_len + jnp.arange(q_seq_len))[:, None]
     kv_idx = jnp.arange(kv_seq_len)[None, :]
 
     if self.bool_mask is not None and self.is_causal:
@@ -143,6 +171,173 @@ class SplashAttention[_Config](
           SplashAttentionVjp(),
       )
 
+  @overload
+  def __call__(
+      self,
+      q: Float[Array, "*B H T D"],
+      k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+      v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
+      mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = ...,
+      segment_ids: SegmentIds | None = ...,
+      sinks: Float[Array, "*#B H"] | None = ...,
+      *,
+      is_mqa: bool = ...,
+      mask_value: float = ...,
+      attn_logits_soft_cap: float | None = ...,
+      dropout_rate: float = ...,
+      prng_key: jax.Array | None = ...,
+      q_sharding: jax.sharding.NamedSharding | None = ...,
+      k_sharding: jax.sharding.NamedSharding | None = ...,
+      return_residuals: Literal[False] = ...,
+  ) -> Float[Array, "*B H T d"]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      q: Float[Array, "*B H T D"],
+      k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+      v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
+      mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = ...,
+      segment_ids: SegmentIds | None = ...,
+      sinks: Float[Array, "*#B H"] | None = ...,
+      *,
+      is_mqa: bool = ...,
+      mask_value: float = ...,
+      attn_logits_soft_cap: float | None = ...,
+      dropout_rate: float = ...,
+      prng_key: jax.Array | None = ...,
+      q_sharding: jax.sharding.NamedSharding | None = ...,
+      k_sharding: jax.sharding.NamedSharding | None = ...,
+      return_residuals: Literal[True],
+  ) -> tuple[Float[Array, "*B H T d"], Residuals]:
+    ...
+
+  @jaxtyping.jaxtyped
+  def __call__(
+      self,
+      q: Float[Array, "*B H T D"],
+      k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+      v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
+      mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None = None,
+      segment_ids: SegmentIds | None = None,
+      sinks: Float[Array, "*#B H"] | None = None,
+      *,
+      is_mqa: bool = False,
+      mask_value: float = DEFAULT_MASK_VALUE,
+      attn_logits_soft_cap: float | None = None,
+      dropout_rate: float = 0.0,
+      prng_key: jax.Array | None = None,
+      q_sharding: jax.sharding.NamedSharding | None = None,
+      k_sharding: jax.sharding.NamedSharding | None = None,
+      return_residuals: bool = False,
+  ) -> Float[Array, "*B H T d"] | tuple[Float[Array, "*B H T d"], Residuals]:
+    """Performs Splash Attention."""
+    params = locals().copy()
+    params.pop("self")
+    params.pop("q_sharding")
+    params.pop("k_sharding")
+    mask: Mask = cast(Mask, self.bind(**params).kwargs["mask"])
+
+    def fwd_closed(q, k, v, mask, segment_ids, sinks):
+      return op.Op.__call__(
+          self,
+          q,
+          k,
+          v,
+          mask=mask,
+          segment_ids=segment_ids,
+          sinks=sinks,
+          is_mqa=is_mqa,
+          mask_value=mask_value,
+          attn_logits_soft_cap=attn_logits_soft_cap,
+          dropout_rate=dropout_rate,
+          prng_key=prng_key,
+          return_residuals=return_residuals,
+      )
+
+    if q_sharding is None:
+      return fwd_closed(q, k, v, mask, segment_ids, sinks)
+
+    mesh, q_spec = q_sharding.mesh, q_sharding.spec
+
+    if len(q_spec) > len(q.shape):
+      raise ValueError("Too many dimensions in q_sharding's pspec.")
+
+    q_axes = tuple(q_spec) + (None,) * (q.ndim - len(q_spec))
+    *batch_axes, heads_axis, seq_q_axis, head_dim_axis = q_axes
+    if seq_q_axis is not None:
+      mask = dataclasses.replace(mask, q_seq_axis=seq_q_axis)
+
+    if k_sharding is None:
+      k_batch_axes = batch_axes
+      k_heads_axis = heads_axis
+      seq_k_axis = None
+    else:
+      if q_sharding.mesh != k_sharding.mesh:
+        raise ValueError("q_sharding and k_sharding must have the same mesh.")
+      k_spec = k_sharding.spec
+      if len(k_spec) > len(k.shape):
+        raise ValueError("Too many dimensions in k_sharding's pspec.")
+      k_axes = tuple(k_spec) + (None,) * (k.ndim - len(k_spec))
+      if is_mqa and k.ndim == q.ndim - 1:
+        *k_batch_axes, seq_k_axis, k_head_dim_axis = k_axes
+        k_heads_axis = None
+      else:
+        *k_batch_axes, k_heads_axis, seq_k_axis, k_head_dim_axis = k_axes
+      if _mesh_axis_size(mesh, seq_k_axis) != 1:
+        raise ValueError("Sharding along seq_k_axis is unsupported.")
+      if _mesh_axis_size(mesh, k_head_dim_axis) != 1:
+        raise ValueError("Sharding along head_dim is unsupported.")
+
+    if _mesh_axis_size(mesh, head_dim_axis) != 1:
+      raise ValueError("Sharding along head_dim is unsupported.")
+
+    def _create_spec(batch_axes, heads_axis, seq_axis, head_dim_axis):
+      if is_mqa:
+        if k.ndim == q.ndim - 1:
+          axes_spec = [*batch_axes, seq_axis, head_dim_axis]
+        else:
+          axes_spec = [*batch_axes, None, seq_axis, head_dim_axis]
+      else:
+        axes_spec = [*batch_axes, heads_axis, seq_axis, head_dim_axis]
+      return axes_spec
+
+    k_axes_spec = _create_spec(
+        k_batch_axes, k_heads_axis, seq_k_axis, head_dim_axis
+    )
+    v_axes_spec = _create_spec(
+        k_batch_axes, k_heads_axis, seq_k_axis, head_dim_axis
+    )
+
+    in_axes = (
+        [*batch_axes, heads_axis, seq_q_axis, head_dim_axis],
+        k_axes_spec,
+        v_axes_spec,
+        dataclasses.replace(mask, bool_mask=[*batch_axes, seq_q_axis, seq_k_axis]),  # pyrefly: ignore[bad-argument-type]
+        SegmentIds(q=[*batch_axes, seq_q_axis], kv=[*batch_axes, seq_k_axis]),  # pyrefly: ignore[bad-argument-type]
+        [*batch_axes, heads_axis],
+    )
+    P = jax.sharding.PartitionSpec  # pylint: disable=invalid-name
+    residual_spec = P(*batch_axes, heads_axis, seq_q_axis)
+    out_specs = (P(*q_axes), residual_spec) if return_residuals else P(*q_axes)
+    is_array = lambda x: isinstance(x, jax.Array)
+
+    def spec(x, axes):
+      if not is_array(x):
+        return None
+      # Do not shard along axes that are broadcast.
+      return P(*(None if d == 1 else a for a, d in zip(axes, x.shape)))
+
+    def fwd_sharded(*args):
+      is_leaf = lambda x: x is None
+      in_specs = jax.tree.map(spec, args, in_axes, is_leaf=is_leaf)
+      return shard_map.shard_map(
+          fwd_closed, mesh, in_specs, out_specs, check_rep=False
+      )(*args)
+
+    return fwd_sharded(q, k, v, mask, segment_ids, sinks)
+
   def bind(
       self,
       q: Float[Array, "*B H T D"],
@@ -157,9 +352,13 @@ class SplashAttention[_Config](
       attn_logits_soft_cap: float | None = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
+      q_sharding: jax.sharding.NamedSharding | None = None,
+      k_sharding: jax.sharding.NamedSharding | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds and validates arguments for Splash Attention."""
+    if q_sharding is not None or k_sharding is not None:
+      raise NotImplementedError("Sharding is not supported in `bind` yet.")
 
     if not (0.0 <= dropout_rate < 1.0):
       raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}.")
