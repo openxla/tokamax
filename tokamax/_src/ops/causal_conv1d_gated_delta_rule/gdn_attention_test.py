@@ -16,7 +16,9 @@
 
 import dataclasses
 import functools
+import math
 import sys
+from unittest import mock
 
 from absl import flags
 from absl.testing import absltest
@@ -460,8 +462,6 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv,
         b=b,
         a=a,
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         a_log=A_log,
@@ -479,10 +479,17 @@ class GDNAttentionTest(parameterized.TestCase):
     )
 
     # Run ref
-    new_states_ref, output_ref = gdn_attention_ref(**common_kwargs)
+    new_states_ref, output_ref = gdn_attention_ref(
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        **common_kwargs,
+    )
 
     # Run chunked
-    new_states_chunked, output_chunked = gdn_attention_jitted(**common_kwargs)
+    new_states_chunked, output_chunked = gdn_attention_jitted(
+        states=(conv_state, recurrent_state),
+        **common_kwargs,
+    )
 
     # Compare results
     np.testing.assert_allclose(output_chunked, output_ref, rtol=2e-2, atol=2e-2)
@@ -597,8 +604,7 @@ class GDNAttentionTest(parameterized.TestCase):
         mixed_qkv,
         b,
         a,
-        conv_state,
-        recurrent_state,
+        (conv_state, recurrent_state),
         conv_weight,
         conv_bias,
         A_log,
@@ -797,8 +803,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
     # Reference run: fresh-zero slots.
     (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-        conv_state=conv_state_fresh,
-        recurrent_state=recurrent_state_fresh,
+        states=(conv_state_fresh, recurrent_state_fresh),
         **common_kwargs,
     )
     # Stale-slot run: same inputs, but the slots already contain a
@@ -806,8 +811,7 @@ class GDNAttentionTest(parameterized.TestCase):
     # masks that out — outputs and the writeback at the active slots
     # must match the fresh-zero run.
     (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-        conv_state=conv_state_stale,
-        recurrent_state=recurrent_state_stale,
+        states=(conv_state_stale, recurrent_state_stale),
         **common_kwargs,
     )
 
@@ -905,8 +909,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_full,
         b=b,
         a=a,
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
+        states=(conv_state_zero, recurrent_state_zero),
         query_start_loc=jnp.array([0, full]),
         distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
         seq_lens=jnp.array([full], dtype=jnp.int32),
@@ -918,8 +921,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_a,
         b=b[:half],
         a=a[:half],
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
+        states=(conv_state_zero, recurrent_state_zero),
         query_start_loc=jnp.array([0, half]),
         distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
         seq_lens=jnp.array([half], dtype=jnp.int32),
@@ -933,8 +935,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_b,
         b=b[half:],
         a=a[half:],
-        conv_state=conv_after_a,
-        recurrent_state=rec_after_a,
+        states=(conv_after_a, rec_after_a),
         query_start_loc=jnp.array([0, half]),
         distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
         seq_lens=jnp.array([full], dtype=jnp.int32),
@@ -1020,8 +1021,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_full,
         b=b,
         a=a,
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
+        states=(conv_state_zero, recurrent_state_zero),
         query_start_loc=jnp.array([0, full]),
         state_indices=jnp.array([read_slot]),
         read_state_indices=jnp.array([read_slot]),
@@ -1035,8 +1035,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_full[:half],
         b=b[:half],
         a=a[:half],
-        conv_state=conv_state_zero,
-        recurrent_state=recurrent_state_zero,
+        states=(conv_state_zero, recurrent_state_zero),
         query_start_loc=jnp.array([0, half]),
         state_indices=jnp.array([read_slot]),
         read_state_indices=jnp.array([read_slot]),
@@ -1051,8 +1050,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=mixed_qkv_full[half:],
         b=b[half:],
         a=a[half:],
-        conv_state=conv_after_a,
-        recurrent_state=rec_after_a,
+        states=(conv_after_a, rec_after_a),
         query_start_loc=jnp.array([0, half]),
         state_indices=jnp.array([write_slot]),
         read_state_indices=jnp.array([read_slot]),
@@ -1129,8 +1127,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=qkv,
         b=b,
         a=a,
-        conv_state=jnp.array(conv_state),
-        recurrent_state=jnp.array(recurrent_state),
+        states=(jnp.array(conv_state), jnp.array(recurrent_state)),
         query_start_loc=jnp.array([0, 1, 33], dtype=jnp.int32),
         state_indices=jnp.array([1, 10], dtype=jnp.int32),
         read_state_indices=jnp.array([1, 10], dtype=jnp.int32),
@@ -1146,8 +1143,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=qkv[1:],
         b=b[1:],
         a=a[1:],
-        conv_state=jnp.array(conv_state),
-        recurrent_state=jnp.array(recurrent_state),
+        states=(jnp.array(conv_state), jnp.array(recurrent_state)),
         query_start_loc=jnp.array([0, 32], dtype=jnp.int32),
         state_indices=jnp.array([10], dtype=jnp.int32),
         read_state_indices=jnp.array([12], dtype=jnp.int32),
@@ -1198,8 +1194,7 @@ class GDNAttentionTest(parameterized.TestCase):
         qkv=qkv,
         b=b,
         a=a,
-        conv_state=jnp.array(conv_state),
-        recurrent_state=jnp.array(recurrent_state),
+        states=(jnp.array(conv_state), jnp.array(recurrent_state)),
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         a_log=a_log,
@@ -1397,6 +1392,11 @@ class GDNAttentionTest(parameterized.TestCase):
 
   def test_state_pipeline_has_no_dma_race(self):
     """Pallas interpret-mode vector-clock detector finds zero DMA races."""
+    if jax.__version_info__ < (0, 11, 2):
+      self.skipTest(
+          "Pallas TPU interpret mode requires jax >= 0.11.2 to unwrap"
+          " TransformedRef views."
+      )
     n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
     dim = 2 * n_kq * d_k + n_v * d_v
     # 6 decode sequences, then 3 one-token prefill sequences (one PER_SEQ tile
@@ -1416,7 +1416,7 @@ class GDNAttentionTest(parameterized.TestCase):
     a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     init_conv = jax.random.normal(
-        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.float32
     )
     init_rec = jax.random.normal(
         next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
@@ -1428,12 +1428,20 @@ class GDNAttentionTest(parameterized.TestCase):
     seq_lens = jnp.full((num_seqs,), 11, dtype=jnp.int32)
 
     # OSS jax 0.11.x has no InterpretParams.on_race, so read the detector's
-    # verdict before each pallas_call clears the shared state.
+    # verdict before each pallas_call clears the shared state. Also resolve
+    # granule_view's BitcastTransform and ReshapeTransform in CPU interpret
+    # mode, which otherwise assumes NDIndexer-only DMA transforms. Delete the
+    # shim once JAX interpret mode resolves bitcast and reshape refs.
     mosaic_interpret = sys.modules[
         pltpu.reset_tpu_interpret_mode_state.__module__
     ]
+    interpret_utils = mosaic_interpret.interpret_utils
+    indexing = interpret_utils.indexing
+    state_types = interpret_utils.state_types
+    shared_memory = sys.modules[f"{mosaic_interpret.__package__}.shared_memory"]
     races_per_call: list[bool] = []
     orig_clear = getattr(mosaic_interpret, "_clear_shared_memory")
+    orig_store = shared_memory.SharedMemory.store_buffer_content
 
     def _record_and_clear():
       races = getattr(mosaic_interpret, "races", None)
@@ -1441,23 +1449,63 @@ class GDNAttentionTest(parameterized.TestCase):
         races_per_call.append(bool(races.races_found))
       orig_clear()
 
+    # granule_view = ref.bitcast(uint32).reshape(*lead, -1, 1, 128) over the
+    # 3 state dims. Resolve ref ranges on the lead axes only: drop the state
+    # dims at the first view and the granule dims after it, requiring a
+    # full-state block; Buffer._normalize_range re-expands the state dims.
+    def _resolve_to_range(transforms):
+      ret, viewed = (), False
+      for t in transforms:
+        if isinstance(t, indexing.NDIndexer):
+          idx = tuple(
+              interpret_utils._transform_slice_or_index(i) for i in t.indices
+          )
+          if viewed:
+            full = tuple(slice(0, d, 1) for d in t.shape[-3:])
+            assert idx[-3:] == full, f"partial-state ref: {idx}"
+            idx = idx[:-3]
+          ret = interpret_utils._compose_slice_or_index(ret, idx)
+        elif isinstance(
+            t, (state_types.BitcastTransform, state_types.ReshapeTransform)
+        ):
+          if not viewed:
+            ret, viewed = ret[:-3], True
+        else:
+          raise NotImplementedError(f"unsupported ref transform: {t}")
+      return ret
+
+    def _store_buffer_content(buf_self, key, rnge, value, *args, **kwargs):
+      # Bitcast DMAs move raw bits between equal-width dtypes only.
+      buff_dtype = buf_self.mem[key].dtype
+      assert value.itemsize == buff_dtype.itemsize, (value.dtype, buff_dtype)
+      return orig_store(
+          buf_self, key, rnge, value.view(buff_dtype), *args, **kwargs
+      )
+
     pltpu.reset_tpu_interpret_mode_state()
     setattr(mosaic_interpret, "_clear_shared_memory", _record_and_clear)
     try:
-      with pltpu.force_tpu_interpret_mode(
-          pltpu.InterpretParams(
-              detect_races=True,
-              dma_execution_mode="eager",
-              skip_floating_point_ops=False,
-              vector_clock_size=128,
-          )
+      with (
+          mock.patch.object(interpret_utils, "to_range", _resolve_to_range),
+          mock.patch.object(
+              shared_memory.SharedMemory,
+              "store_buffer_content",
+              _store_buffer_content,
+          ),
+          pltpu.force_tpu_interpret_mode(
+              pltpu.InterpretParams(
+                  detect_races=True,
+                  dma_execution_mode="eager",
+                  skip_floating_point_ops=False,
+                  vector_clock_size=128,
+              )
+          ),
       ):
         (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=init_conv,
-            recurrent_state=init_rec,
+            states=(init_conv, init_rec),
             conv_weight=conv_w,
             conv_bias=conv_b,
             a_log=a_log,
@@ -1517,7 +1565,7 @@ class GDNAttentionTest(parameterized.TestCase):
     init_conv = jnp.broadcast_to(
         block_ids[:, None, None] * jnp.float32(1e-2),
         (num_seqs, kernel_size - 1, dim),
-    ).astype(jnp.bfloat16)
+    ).astype(jnp.float32)
     init_rec = jnp.broadcast_to(
         block_ids[:, None, None, None] * jnp.float32(1e-2),
         (num_seqs, n_v, d_k, d_v),
@@ -1562,8 +1610,7 @@ class GDNAttentionTest(parameterized.TestCase):
           qkv=qkv,
           b=b,
           a=a,
-          conv_state=init_conv.copy(),
-          recurrent_state=init_rec.copy(),
+          states=(init_conv.copy(), init_rec.copy()),
           conv_weight=conv_weight,
           conv_bias=conv_bias,
           a_log=a_log,
@@ -1655,7 +1702,7 @@ class GDNAttentionTest(parameterized.TestCase):
     a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     init_conv = jax.random.normal(
-        next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+        next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.float32
     )
     init_rec = jax.random.normal(
         next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
@@ -1696,8 +1743,7 @@ class GDNAttentionTest(parameterized.TestCase):
           qkv=qkv,
           b=b,
           a=a,
-          conv_state=init_conv.copy(),
-          recurrent_state=init_rec.copy(),
+          states=(init_conv.copy(), init_rec.copy()),
           conv_weight=conv_w,
           conv_bias=conv_b,
           a_log=a_log,
@@ -1751,7 +1797,7 @@ class GDNAttentionTest(parameterized.TestCase):
     a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
     init_conv = jax.random.normal(
-        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+        next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.float32
     )
     init_rec = jax.random.normal(
         next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
@@ -1788,8 +1834,7 @@ class GDNAttentionTest(parameterized.TestCase):
           qkv=qkv,
           b=b,
           a=a,
-          conv_state=init_conv.copy(),
-          recurrent_state=init_rec.copy(),
+          states=(init_conv.copy(), init_rec.copy()),
           conv_weight=conv_w,
           conv_bias=conv_b,
           a_log=a_log,
@@ -1899,7 +1944,7 @@ class GDNAttentionTest(parameterized.TestCase):
         num_blocks = num_seqs * window + 4
         k1, k2, k3, k4, k5, k6, k7, k8, k9, rng = jax.random.split(rng, 10)
         init_conv = jax.random.normal(
-            k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+            k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.float32
         )
         init_rec = jax.random.normal(
             k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
@@ -1943,8 +1988,7 @@ class GDNAttentionTest(parameterized.TestCase):
             **common_kwargs,
         )
         (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
-            conv_state=init_conv.copy(),
-            recurrent_state=init_rec.copy(),
+            states=(init_conv.copy(), init_rec.copy()),
             read_offsets=(
                 jnp.zeros((num_seqs,), dtype=jnp.int32)
                 if num_spec_tokens > 0
@@ -1962,6 +2006,890 @@ class GDNAttentionTest(parameterized.TestCase):
           np.testing.assert_allclose(
               rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
           )
+
+
+# ----------------------------------------------------------------------------
+# Host-side unified-pool state layout helpers and seam tests (ported from
+# vllm-torchtpu PR #1620: gdn_pool_state_utils.py, test_gdn_pool_state_utils.py,
+# and test_v3_pool_state_seam.py).
+# ----------------------------------------------------------------------------
+
+_GRANULE = 512
+_WORDS_PER_GRANULE = _GRANULE // 4
+
+_SEAM_N_KQ, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V = 2, 8, 128, 128
+_SEAM_KERNEL_SIZE = 4
+_SEAM_DIM = _SEAM_N_KQ * _SEAM_D_K * 2 + _SEAM_N_V * _SEAM_D_V  # 1536
+_SEAM_SPLIT, _SEAM_KBS, _SEAM_LANES = 3, 256, 256
+_SEAM_PAYLOAD = (1, 2)
+_SEAM_TOK_BYTES = 2 * _SEAM_LANES * 2  # bf16 pool
+_SEAM_CONV_GRANULES = (
+    (_SEAM_KERNEL_SIZE - 1) * _SEAM_DIM * 4 // _GRANULE
+)  # 36
+_SEAM_CONV_END_TOK = (
+    _SEAM_CONV_GRANULES * _GRANULE // _SEAM_TOK_BYTES
+)  # 18
+_SEAM_NUM_MGR = 5  # null block + 4 slots
+_SEAM_STATE_SHAPES = dict(
+    recurrent_shape=(_SEAM_N_V, _SEAM_D_K, _SEAM_D_V),
+    conv_shape=(_SEAM_KERNEL_SIZE - 1, _SEAM_DIM),
+)
+
+
+def _on_cpu(fn, *args):
+  """Run a pure bit-shuffle on CPU, then hand the result back to the TPU.
+
+  TPU canonicalises NaN payloads whenever float bytes pass through a vector
+  register, so bitcasting or transposing a bf16/fp8 pool on device silently
+  rewrites about a percent of its words -- measured on v7/jax 0.10.2: 71 of
+  4096 uint32 words through bfloat16, 77 through float8_e4m3fn, 0 through
+  int8. The kernel never meets this, because its granule DMA moves the pool
+  as uint32 and no float register ever sees it; a host-side harness that
+  builds or reads the pool *through the pool's own dtype* does. CPU bitcasts
+  are exact, so the byte layout these tests assert on is the real one.
+
+  Args:
+    fn: Pure bit-shuffle function to execute on CPU.
+    *args: Arguments to pass to `fn`.
+
+  Returns:
+    Result of `fn(*args)` placed back on the default TPU device.
+  """
+  cpu = jax.devices("cpu")[0]
+  with jax.default_device(cpu):
+    out = jax.jit(fn)(*jax.device_put(args, cpu))
+  return jax.device_put(out, jax.devices()[0])
+
+
+def _state_words(pool, split):
+  """The pool the way the kernel addresses it: one uint32 row per state.
+
+  A ref's `bitcast(uint32)` packs along the *second-minor* (sublane) axis,
+  which for a pool row `(..., packing, lanes)` means one word per lane, not
+  one word per adjacent pair. Moving that axis minormost first is what makes
+  the host view agree with the kernel's granule stream.
+
+  Args:
+    pool: Unified state pool tensor.
+    split: Number of kernel blocks per manager block.
+
+  Returns:
+    A 2D uint32 view with one row per manager state block.
+  """
+  words = jnp.moveaxis(pool, -2, -1).view(jnp.uint32)
+  return words.reshape(pool.shape[0] // split, -1)
+
+
+def _words_to_pool(words, pool):
+  """Inverse of `_state_words`, back to `pool`'s shape and dtype."""
+  moved = words.reshape(*pool.shape[:-2], pool.shape[-1], 1).view(pool.dtype)
+  return jnp.moveaxis(moved, -2, -1).reshape(pool.shape)
+
+
+def _put_words(words, idx, granule0, payload):
+  """Drop `payload`'s raw bytes at a granule offset of each named state."""
+  body = payload.reshape(idx.shape[0], -1).view(jnp.uint32)
+  start = granule0 * _WORDS_PER_GRANULE
+  return words.at[idx, start : start + body.shape[1]].set(body)
+
+
+def _take_words(words, idx, granule0, shape, dtype):
+  """Read `shape`-shaped `dtype` values at a granule offset of each state."""
+  nwords = math.prod(shape) * jnp.dtype(dtype).itemsize // 4
+  start = granule0 * _WORDS_PER_GRANULE
+  return (
+      words[idx, start : start + nwords]
+      .view(dtype)
+      .reshape(idx.shape[0], *shape)
+  )
+
+
+def _pack_bf16_rows(values):
+  """bf16 [..., D_K, D_V] -> uint32 [..., D_K // 2, D_V] matching ref bitcast."""
+  pairs = values.astype(jnp.bfloat16).reshape(
+      *values.shape[:-2], values.shape[-2] // 2, 2, values.shape[-1]
+  )
+  return jax.lax.bitcast_convert_type(jnp.moveaxis(pairs, -2, -1), jnp.uint32)
+
+
+def _unpack_bf16_rows(words):
+  """Inverse of `_pack_bf16_rows`."""
+  pairs = jax.lax.bitcast_convert_type(words, jnp.bfloat16)
+  rows = jnp.moveaxis(pairs, -1, -2)
+  return rows.reshape(*words.shape[:-2], words.shape[-2] * 2, words.shape[-1])
+
+
+def _recurrent_granules(recurrent_shape, recurrent_dtype=jnp.float32) -> int:
+  """Granules taken by one recurrent state, i.e. where the conv state starts."""
+  nbytes = math.prod(recurrent_shape) * jnp.dtype(recurrent_dtype).itemsize
+  assert nbytes % _GRANULE == 0, (recurrent_shape, recurrent_dtype)
+  return nbytes // _GRANULE
+
+
+def _recurrent_words(recurrent, recurrent_dtype):
+  if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
+    return _pack_bf16_rows(recurrent)
+  assert jnp.dtype(recurrent_dtype) == jnp.float32, recurrent_dtype
+  return jnp.asarray(recurrent, jnp.float32).view(jnp.uint32)
+
+
+def _write_pool_states(
+    pool, ssm, conv, idx, *, split, recurrent_dtype=jnp.float32
+):
+  """Place recurrent and conv states of the states named by `idx`."""
+
+  def build(pool, ssm, conv, idx):
+    words = _state_words(pool, split)
+    words = _put_words(words, idx, 0, _recurrent_words(ssm, recurrent_dtype))
+    words = _put_words(
+        words,
+        idx,
+        _recurrent_granules(ssm.shape[1:], recurrent_dtype),
+        jnp.asarray(conv, jnp.float32),
+    )
+    return _words_to_pool(words, pool)
+
+  return _on_cpu(build, pool, ssm, conv, idx)
+
+
+def _read_pool_states(
+    pool,
+    idx,
+    *,
+    split,
+    recurrent_shape,
+    conv_shape,
+    recurrent_dtype=jnp.float32,
+):
+  """Read back `(ssm, conv)` of the states named by `idx`."""
+
+  def take(pool, idx):
+    words = _state_words(pool, split)
+    if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
+      num_v_heads, d_k, d_v = recurrent_shape
+      packed = _take_words(
+          words, idx, 0, (num_v_heads, d_k // 2, d_v), jnp.uint32
+      )
+      ssm = _unpack_bf16_rows(packed)
+    else:
+      ssm = _take_words(words, idx, 0, recurrent_shape, recurrent_dtype)
+    conv = _take_words(
+        words,
+        idx,
+        _recurrent_granules(recurrent_shape, recurrent_dtype),
+        conv_shape,
+        jnp.float32,
+    )
+    return ssm, conv
+
+  return _on_cpu(take, pool, idx)
+
+
+def _garbage_pool(seed, num_mgr: int = _SEAM_NUM_MGR):
+  rng = np.random.default_rng(seed)
+  shape = (num_mgr * _SEAM_SPLIT, _SEAM_KBS) + _SEAM_PAYLOAD + (_SEAM_LANES,)
+  return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
+
+
+def _write_states(
+    pool, ssm, conv, idx, split=_SEAM_SPLIT, ssm_dtype=jnp.float32
+):
+  return _write_pool_states(
+      pool, ssm, conv, idx, split=split, recurrent_dtype=ssm_dtype
+  )
+
+
+def _read_states(pool, idx, split=_SEAM_SPLIT, ssm_dtype=jnp.float32):
+  return _read_pool_states(
+      pool, idx, split=split, recurrent_dtype=ssm_dtype, **_SEAM_STATE_SHAPES
+  )
+
+
+_write_states_bf16 = functools.partial(_write_states, ssm_dtype=jnp.bfloat16)
+_read_states_bf16 = functools.partial(_read_states, ssm_dtype=jnp.bfloat16)
+
+
+def _rand_inputs(seed, num_tokens):
+  rngs = iter(jax.random.split(jax.random.key(seed), 8))
+  return dict(
+      qkv=jax.random.normal(next(rngs), (num_tokens, _SEAM_DIM)),
+      b=jax.random.normal(next(rngs), (num_tokens, _SEAM_N_V)),
+      a=jax.random.normal(next(rngs), (num_tokens, _SEAM_N_V)),
+      conv_weight=jax.random.normal(
+          next(rngs), (_SEAM_DIM, 1, _SEAM_KERNEL_SIZE)
+      ),
+      conv_bias=jax.random.normal(next(rngs), (_SEAM_DIM,)),
+      a_log=jax.random.normal(next(rngs), (_SEAM_N_V,)),
+      dt_bias=jax.random.normal(next(rngs), (_SEAM_N_V,)),
+      n_kq=_SEAM_N_KQ,
+      n_v=_SEAM_N_V,
+      d_k=_SEAM_D_K,
+      d_v=_SEAM_D_V,
+      kernel_size=_SEAM_KERNEL_SIZE,
+  )
+
+
+def _run_roundtrip(pool, idx, kwargs):
+  """The pre-seam pooled path (gather -> tuple kernel -> scatter)."""
+  ssm, conv = _read_states(pool, idx)
+  identity = jnp.arange(idx.shape[0], dtype=jnp.int32)
+  (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+      states=(conv, ssm), state_indices=identity, **kwargs
+  )
+  return _write_states(pool, new_ssm, new_conv, idx), out
+
+
+def _merge(pool, split=_SEAM_SPLIT):
+  """Kernel blocks -> manager blocks, as the pooled caller does."""
+  return pool.reshape(
+      pool.shape[0] // split, split * pool.shape[1], *pool.shape[2:]
+  )
+
+
+def _split(pool, shape):
+  return pool.reshape(shape)
+
+
+def _run_seam(pool, idx, kwargs, split=_SEAM_SPLIT):
+  out_pool, out = wrapper.fused_conv1d_gdn(
+      states=_merge(pool, split),
+      state_indices=idx,
+      conv_dtype=jnp.float32,
+      recurrent_dtype=jnp.float32,
+      **kwargs,
+  )
+  return _split(out_pool, pool.shape), out
+
+
+def _bits(x):
+  return np.asarray(jax.lax.bitcast_convert_type(x, jnp.int16))
+
+
+class GdnPoolStateUtilsTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:  # pylint: disable=broad-except
+      self.skipTest("Failed to get TPU info.")
+
+  @parameterized.product(
+      num_v_heads=[1, 4, 8],
+      recurrent_dtype=[jnp.float32, jnp.bfloat16],
+  )
+  def test_conv_offset_matches_kernel_config(
+      self, num_v_heads, recurrent_dtype
+  ):
+    """The helper must place conv where the kernel reads it."""
+    cfg = config.GDNConfig(
+        mode=config.GDNMode.PER_SEQ,
+        dtypes=config.Dtypes(
+            act_in=jnp.bfloat16.dtype,
+            act_out=jnp.bfloat16.dtype,
+            compute=jnp.float32.dtype,
+            recurrent_state=jnp.dtype(recurrent_dtype),
+            conv_state=jnp.float32.dtype,
+        ),
+        batch_size=1,
+        dim_size=(2 + num_v_heads) * 128,
+        kernel_size=4,
+        tile_size=64,
+        num_kq_heads=1,
+        num_v_heads=num_v_heads,
+        kq_head_dim=128,
+        v_head_dim=128,
+        is_shared=True,
+    )
+
+    self.assertEqual(cfg.recurrent_hbm_offset, 0)
+    self.assertEqual(
+        cfg.conv_hbm_offset,
+        _recurrent_granules((num_v_heads, 128, 128), recurrent_dtype),
+    )
+
+  @parameterized.product(
+      pool_dtype=[jnp.float8_e4m3fn, jnp.bfloat16],
+      recurrent_dtype=[jnp.float32, jnp.bfloat16],
+  )
+  def test_write_read_roundtrip_leaves_other_states(
+      self, pool_dtype, recurrent_dtype
+  ):
+    split, block_tokens, lanes = 2, 256, 128
+    packing = 4 // jnp.dtype(pool_dtype).itemsize
+    num_states, num_v_heads, conv_shape = 4, 2, (3, 512)
+    pool_shape = (num_states * split, block_tokens, 1, packing, lanes)
+    rng = np.random.default_rng(0)
+    pool_bytes = rng.integers(
+        0,
+        256,
+        size=(*pool_shape[:-1], lanes * jnp.dtype(pool_dtype).itemsize),
+        dtype=np.uint8,
+    )
+    pool = (
+        np.asarray(pool_bytes).view(jnp.dtype(pool_dtype)).reshape(pool_shape)
+    )
+    idx = jnp.asarray([2, 1], dtype=jnp.int32)
+    keys = jax.random.split(jax.random.key(0), 2)
+    ssm = jax.random.normal(keys[0], (2, num_v_heads, 128, 128)).astype(
+        recurrent_dtype
+    )
+    conv = jax.random.normal(keys[1], (2, *conv_shape), dtype=jnp.float32)
+
+    new_pool = _write_pool_states(
+        pool, ssm, conv, idx, split=split, recurrent_dtype=recurrent_dtype
+    )
+    got_ssm, got_conv = _read_pool_states(
+        new_pool,
+        idx,
+        split=split,
+        recurrent_shape=(num_v_heads, 128, 128),
+        conv_shape=conv_shape,
+        recurrent_dtype=recurrent_dtype,
+    )
+
+    np.testing.assert_array_equal(np.asarray(got_ssm), np.asarray(ssm))
+    np.testing.assert_array_equal(np.asarray(got_conv), np.asarray(conv))
+    new_bytes = np.asarray(jax.device_get(new_pool)).view(np.uint8)
+    old_bytes = pool.view(np.uint8)
+    for state in (0, 3):
+      rows = slice(state * split, (state + 1) * split)
+      np.testing.assert_array_equal(new_bytes[rows], old_bytes[rows])
+
+
+class GdnSeamMatchesRoundTripTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:  # pylint: disable=broad-except
+      self.skipTest("Failed to get TPU info.")
+
+  def _compare(self, pool, idx, kwargs):
+    pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
+    pool_seam, out_seam = _run_seam(jnp.copy(pool), idx, kwargs)
+
+    tol = dict(rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(np.asarray(out_seam), np.asarray(out_rt), **tol)
+    ssm_rt, conv_rt = _read_states(pool_rt, idx)
+    ssm_seam, conv_seam = _read_states(pool_seam, idx)
+    np.testing.assert_allclose(np.asarray(ssm_seam), np.asarray(ssm_rt), **tol)
+    np.testing.assert_allclose(
+        np.asarray(conv_seam, dtype=np.float32),
+        np.asarray(conv_rt, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    touched = set()
+    for mgr in np.asarray(idx):
+      touched.update(
+          range(int(mgr) * _SEAM_SPLIT, int(mgr) * _SEAM_SPLIT + _SEAM_SPLIT)
+      )
+    for kb in range(pool_seam.shape[0]):
+      if kb not in touched:
+        self.assertTrue(
+            bool(
+                jnp.array_equal(
+                    pool_seam[kb].view(jnp.int16), pool_rt[kb].view(jnp.int16)
+                )
+            ),
+            msg=f"kb={kb}",
+        )
+
+  def test_decode_continuation(self):
+    n = 4
+    idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+    keys = iter(jax.random.split(jax.random.key(10), 2))
+    pool = _write_states(
+        _garbage_pool(0),
+        jax.random.normal(next(keys), (n, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        jax.random.normal(
+            next(keys), (n, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+        ).astype(jnp.bfloat16),
+        idx,
+    )
+    kwargs = _rand_inputs(1, n) | dict(
+        query_start_loc=jnp.arange(n + 1),
+        distribution=jnp.array([n, n, n], dtype=jnp.int32),
+        seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+    )
+    self._compare(pool, idx, kwargs)
+
+  def test_per_ckpt_read_selects_the_named_block(self):
+    """Rollback must resume from `ckpt_indices[s, read_offsets[s]]`."""
+    n, num_spec = 2, 3
+    window = num_spec + 1
+    ckpt_blocks = jnp.asarray(
+        np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32)
+    )
+    num_mgr = 9
+    keys = iter(jax.random.split(jax.random.key(77), 2 * window))
+    states = []
+    pool = _garbage_pool(11, num_mgr)
+    for t in range(window):
+      ssm_t = jax.random.normal(
+          next(keys), (n, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)
+      )
+      conv_t = jax.random.normal(
+          next(keys), (n, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+      ).astype(jnp.bfloat16)
+      states.append((ssm_t, conv_t))
+      pool = _write_states(pool, ssm_t, conv_t, ckpt_blocks[:, t])
+
+    kwargs = _rand_inputs(12, n) | dict(
+        query_start_loc=jnp.arange(n + 1),
+        distribution=jnp.array([n, n, n], dtype=jnp.int32),
+        seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+    )
+
+    def _run(src, read_ckpt):
+      return wrapper.fused_conv1d_gdn(
+          states=_merge(jnp.copy(src)),
+          state_indices=jnp.zeros((n,), dtype=jnp.int32),
+          conv_dtype=jnp.float32,
+          recurrent_dtype=jnp.float32,
+          read_offsets=jnp.full((n,), read_ckpt, dtype=jnp.int32),
+          ckpt_indices=ckpt_blocks,
+          num_spec_tokens=num_spec,
+          **kwargs,
+      )[1]
+
+    for r in range(window):
+      ssm_r, conv_r = states[r]
+      at_col0 = _write_states(
+          _garbage_pool(11, num_mgr), ssm_r, conv_r, ckpt_blocks[:, 0]
+      )
+      np.testing.assert_allclose(
+          np.asarray(_run(pool, r)),
+          np.asarray(_run(at_col0, 0)),
+          rtol=1e-6,
+          atol=1e-6,
+          err_msg=f"checkpoint {r}",
+      )
+
+  def test_per_ckpt_writes_only_touch_named_blocks(self):
+    """Checkpoint `t` is written to `ckpt_indices[:, t]`; nothing else changes."""
+    n, num_spec = 2, 3
+    window = num_spec + 1
+    ckpt_blocks = np.array([[1, 3, 5, 7], [8, 6, 4, 2]], dtype=np.int32)
+    num_mgr = 9
+    pool = _garbage_pool(13, num_mgr)
+    kwargs = _rand_inputs(14, n * window) | dict(
+        query_start_loc=jnp.arange(0, n * window + 1, window),
+        distribution=jnp.array([n, n, n], dtype=jnp.int32),
+        seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+    )
+    before = np.asarray(pool.view(jnp.int16))
+    out_pool, _ = wrapper.fused_conv1d_gdn(
+        states=_merge(jnp.copy(pool)),
+        state_indices=jnp.zeros((n,), dtype=jnp.int32),
+        conv_dtype=jnp.float32,
+        recurrent_dtype=jnp.float32,
+        read_offsets=jnp.zeros((n,), dtype=jnp.int32),
+        ckpt_indices=jnp.asarray(ckpt_blocks),
+        num_spec_tokens=num_spec,
+        **kwargs,
+    )
+    out_pool = _split(out_pool, pool.shape)
+
+    named = set(int(m) for m in ckpt_blocks.reshape(-1))
+    touched_kb = set()
+    for m in named:
+      touched_kb.update(range(m * _SEAM_SPLIT, m * _SEAM_SPLIT + _SEAM_SPLIT))
+    after = np.asarray(out_pool.view(jnp.int16))
+    changed = {
+        kb
+        for kb in range(after.shape[0])
+        if not np.array_equal(after[kb], before[kb])
+    }
+    self.assertTrue(changed, "the run wrote no state at all")
+    self.assertLessEqual(changed, touched_kb, msg=sorted(changed - touched_kb))
+
+  def test_fresh_prefill_on_garbage_pool(self):
+    idx = jnp.array([2, 4], dtype=jnp.int32)
+    kwargs = _rand_inputs(2, 128) | dict(
+        query_start_loc=jnp.array([0, 64, 128]),
+        distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.array([64, 64], dtype=jnp.int32),
+    )
+    self._compare(_garbage_pool(3), idx, kwargs)
+
+  def test_chunked_prefill_continuation(self):
+    idx = jnp.array([1, 3], dtype=jnp.int32)
+    keys = iter(jax.random.split(jax.random.key(11), 2))
+    pool = _write_states(
+        _garbage_pool(4),
+        jax.random.normal(next(keys), (2, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        jax.random.normal(
+            next(keys), (2, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+        ).astype(jnp.bfloat16),
+        idx,
+    )
+    kwargs = _rand_inputs(5, 112) | dict(
+        query_start_loc=jnp.array([0, 64, 112]),
+        distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.array([96, 80], dtype=jnp.int32),
+    )
+    self._compare(pool, idx, kwargs)
+
+  def test_mixed_decode_and_prefill(self):
+    idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+    keys = iter(jax.random.split(jax.random.key(12), 2))
+    decode_idx = idx[:2]
+    pool = _write_states(
+        _garbage_pool(6),
+        jax.random.normal(next(keys), (2, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        jax.random.normal(
+            next(keys), (2, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+        ).astype(jnp.bfloat16),
+        decode_idx,
+    )
+    kwargs = _rand_inputs(7, 130) | dict(
+        query_start_loc=jnp.array([0, 1, 2, 66, 130]),
+        distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
+        seq_lens=jnp.array([7, 9, 64, 64], dtype=jnp.int32),
+    )
+    self._compare(pool, idx, kwargs)
+
+
+class GdnSeamSkipsInvalidSlotsTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:  # pylint: disable=broad-except
+      self.skipTest("Failed to get TPU info.")
+
+  def test_padded_slots_and_null_block_untouched(self):
+    idx = jnp.array([2, 4, 0, 0], dtype=jnp.int32)
+    keys = iter(jax.random.split(jax.random.key(13), 2))
+    pool = _write_states(
+        _garbage_pool(8),
+        jax.random.normal(next(keys), (2, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        jax.random.normal(
+            next(keys), (2, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+        ).astype(jnp.bfloat16),
+        idx[:2],
+    )
+    before = jnp.copy(pool)
+    kwargs = _rand_inputs(9, 2) | dict(
+        query_start_loc=jnp.array([0, 1, 2, 2, 2]),
+        distribution=jnp.array([2, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.array([5, 5, 0, 0], dtype=jnp.int32),
+    )
+    after, _ = _run_seam(pool, idx, kwargs)
+
+    def b16(x):
+      return x.view(jnp.int16)
+
+    for kb in (0, 1, 2, 3, 4, 5, 9, 10, 11):
+      self.assertTrue(
+          bool(jnp.array_equal(b16(after[kb]), b16(before[kb]))), msg=f"kb={kb}"
+      )
+    for mgr in (2, 4):
+      self.assertFalse(
+          bool(
+              jnp.array_equal(
+                  b16(after[mgr * _SEAM_SPLIT]), b16(before[mgr * _SEAM_SPLIT])
+              )
+          ),
+          msg=f"mgr={mgr}",
+      )
+      conv_kb = mgr * _SEAM_SPLIT + 2
+      self.assertTrue(
+          bool(
+              jnp.array_equal(
+                  b16(after[conv_kb, _SEAM_CONV_END_TOK:]),
+                  b16(before[conv_kb, _SEAM_CONV_END_TOK:]),
+              )
+          ),
+          msg=f"mgr={mgr}",
+      )
+
+
+class GdnPooledSpecWindowsTest(parameterized.TestCase):
+  """Speculative verify windows on the pooled path."""
+
+  NUM_SPEC = 1
+  WINDOW = NUM_SPEC + 1
+  N = 3
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:  # pylint: disable=broad-except
+      self.skipTest("Failed to get TPU info.")
+
+  def _pool(self, split):
+    if split > 1:
+      prefix = (_SEAM_NUM_MGR * self.WINDOW * split, _SEAM_KBS)
+    else:
+      prefix = (_SEAM_NUM_MGR * self.WINDOW, 1280)
+    shape = prefix + _SEAM_PAYLOAD + (_SEAM_LANES,)
+    rng = np.random.default_rng(20)
+    return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
+
+  def _steps(self):
+    n = self.N
+    return [
+        dict(
+            num_tokens=5,
+            query_start_loc=jnp.array([0, 2, 3, 5]),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.array([10, 7, 9], dtype=jnp.int32),
+            read_offsets=jnp.zeros((n,), dtype=jnp.int32),
+        ),
+        dict(
+            num_tokens=5,
+            query_start_loc=jnp.array([0, 2, 4, 5]),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.array([12, 9, 10], dtype=jnp.int32),
+            read_offsets=jnp.array([1, 0, 1], dtype=jnp.int32),
+        ),
+        dict(
+            num_tokens=6,
+            query_start_loc=jnp.array([0, 1, 6, 6]),
+            distribution=jnp.array([1, 1, n], dtype=jnp.int32),
+            seq_lens=jnp.array([14, 14, 0], dtype=jnp.int32),
+            read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32),
+        ),
+    ]
+
+  @parameterized.named_parameters(
+      dict(testcase_name="kernel_grained", split=6),
+      dict(testcase_name="manager", split=1),
+  )
+  def test_pooled_spec_matches_dense(self, split):
+    n, window = self.N, self.WINDOW
+    pool = self._pool(split)
+    pool_idx = jnp.array([4, 1, 3], dtype=jnp.int32)
+    ckpt_indices = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
+
+    keys = iter(jax.random.split(jax.random.key(21), 2))
+    ssm0 = jax.random.normal(next(keys), (n, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V))
+    conv0 = jax.random.normal(
+        next(keys), (n, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)
+    )
+    pool = _write_states(pool, ssm0, conv0, pool_idx, split=split)
+
+    rng = np.random.default_rng(22)
+    num_slots = 1 + n * window
+    dense_base = jnp.array(
+        [1 + i * window for i in range(n)], dtype=jnp.int32
+    )
+    dense_conv = jnp.asarray(
+        rng.standard_normal((num_slots, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)),
+        dtype=jnp.float32,
+    )
+    dense_rec = jnp.asarray(
+        rng.standard_normal((num_slots, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        dtype=jnp.float32,
+    )
+    dense_conv = dense_conv.at[dense_base].set(conv0)
+    dense_rec = dense_rec.at[dense_base].set(ssm0.astype(jnp.float32))
+
+    for step_num, step in enumerate(self._steps()):
+      kwargs = _rand_inputs(30 + step_num, step["num_tokens"]) | dict(
+          query_start_loc=step["query_start_loc"],
+          distribution=step["distribution"],
+          seq_lens=step["seq_lens"],
+          num_spec_tokens=self.NUM_SPEC,
+          read_offsets=step["read_offsets"],
+      )
+      (dense_conv, dense_rec), out_dense = wrapper.fused_conv1d_gdn(
+          states=(dense_conv, dense_rec), state_indices=dense_base, **kwargs
+      )
+      pool_shape = pool.shape
+      pool, out_pooled = wrapper.fused_conv1d_gdn(
+          states=_merge(pool, split),
+          state_indices=pool_idx,
+          ckpt_indices=ckpt_indices,
+          conv_dtype=jnp.float32,
+          recurrent_dtype=jnp.float32,
+          **kwargs,
+      )
+      pool = _split(pool, pool_shape)
+      np.testing.assert_allclose(
+          np.asarray(out_pooled),
+          np.asarray(out_dense),
+          rtol=2e-2,
+          atol=2e-2,
+          err_msg=f"step {step_num}",
+      )
+
+
+class GdnPooledBf16RecurrentTest(parameterized.TestCase):
+  """bf16 recurrent state with an fp32 conv state."""
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    try:
+      if not pltpu.get_tpu_info().generation >= 6:
+        self.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
+    except Exception:  # pylint: disable=broad-except
+      self.skipTest("Failed to get TPU info.")
+
+  def _states(self, seed, n):
+    keys = iter(jax.random.split(jax.random.key(seed), 2))
+    ssm = jax.random.normal(
+        next(keys), (n, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)
+    ).astype(jnp.bfloat16)
+    conv = jax.random.normal(next(keys), (n, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM))
+    return ssm, conv
+
+  def _tuple(self, ssm, conv, kwargs):
+    ident = jnp.arange(ssm.shape[0], dtype=jnp.int32)
+    (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+        states=(conv, ssm), state_indices=ident, **kwargs
+    )
+    return new_ssm, new_conv, out
+
+  def _pooled(self, ssm, conv, idx, kwargs, write=_write_states_bf16):
+    pool = write(_garbage_pool(0), ssm, conv, idx)
+    out_pool, out = wrapper.fused_conv1d_gdn(
+        states=_merge(pool),
+        state_indices=idx,
+        conv_dtype=jnp.float32,
+        recurrent_dtype=jnp.bfloat16,
+        **kwargs,
+    )
+    new_ssm, new_conv = _read_states_bf16(_split(out_pool, pool.shape), idx)
+    return new_ssm, new_conv, out
+
+  def _assert_same(self, got, want, ssm_ulps=0):
+    diff = np.abs(
+        _bits(got[0]).astype(np.int32) - _bits(want[0]).astype(np.int32)
+    )
+    self.assertLessEqual(int(diff.max()), ssm_ulps)
+    np.testing.assert_allclose(
+        np.asarray(got[1]), np.asarray(want[1]), rtol=2e-2, atol=2e-2
+    )
+    np.testing.assert_allclose(
+        np.asarray(got[2]), np.asarray(want[2]), rtol=2e-2, atol=2e-2
+    )
+
+  def _mixed_kwargs(self, seed):
+    return _rand_inputs(seed, 130) | dict(
+        query_start_loc=jnp.array([0, 1, 2, 66, 130]),
+        distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
+        seq_lens=jnp.array([7, 9, 96, 80], dtype=jnp.int32),
+    )
+
+  def test_pooled_bf16_recurrent_matches_tuple_path(self):
+    idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+    ssm, conv = self._states(40, 4)
+    kwargs = self._mixed_kwargs(41)
+    self._assert_same(
+        self._pooled(ssm, conv, idx, kwargs),
+        self._tuple(ssm, conv, kwargs),
+        ssm_ulps=32,
+    )
+
+  def test_bf16_recurrent_matches_fp32_on_bf16_values(self):
+    ssm, conv = self._states(42, 4)
+    kwargs = self._mixed_kwargs(43)
+    ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+    got = self._tuple(ssm, conv, kwargs)
+    new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+    self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+  def test_multi_tile_prefill_with_bf16_recurrent_keeps_fp32_carry(self):
+    ssm, conv = self._states(44, 1)
+    kwargs = _rand_inputs(45, 200) | dict(
+        query_start_loc=jnp.array([0, 200]),
+        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([230], dtype=jnp.int32),
+    )
+    ssm32, conv32 = ssm.astype(jnp.float32), conv.copy()
+    got = self._tuple(ssm, conv, kwargs)
+    new_ssm, new_conv, out = self._tuple(ssm32, conv32, kwargs)
+    self._assert_same(got, (new_ssm.astype(jnp.bfloat16), new_conv, out))
+
+  def test_spec_windows_with_bf16_recurrent_match_fp32_on_bf16_values(self):
+    spec = GdnPooledSpecWindowsTest()
+    n, window = spec.N, spec.WINDOW
+    base = jnp.array([1 + i * window for i in range(n)], dtype=jnp.int32)
+    rng = np.random.default_rng(46)
+    num_slots = 1 + n * window
+    conv = jnp.asarray(
+        rng.standard_normal((num_slots, _SEAM_KERNEL_SIZE - 1, _SEAM_DIM)),
+        jnp.float32,
+    )
+    rec = jnp.asarray(
+        rng.standard_normal((num_slots, _SEAM_N_V, _SEAM_D_K, _SEAM_D_V)),
+        jnp.bfloat16,
+    )
+    conv16, rec16 = conv, rec
+    conv32, rec32 = conv.copy(), rec.astype(jnp.float32)
+    for step_num, step in enumerate(spec._steps()):
+      kwargs = _rand_inputs(47 + step_num, step["num_tokens"]) | dict(
+          query_start_loc=step["query_start_loc"],
+          distribution=step["distribution"],
+          seq_lens=step["seq_lens"],
+          num_spec_tokens=spec.NUM_SPEC,
+          read_offsets=step["read_offsets"],
+      )
+      (conv16, rec16), out16 = wrapper.fused_conv1d_gdn(
+          states=(conv16, rec16), state_indices=base, **kwargs
+      )
+      (conv32, rec32), out32 = wrapper.fused_conv1d_gdn(
+          states=(conv32, rec32), state_indices=base, **kwargs
+      )
+      rec32 = rec32.astype(jnp.bfloat16)
+      self._assert_same((rec16, conv16, out16), (rec32, conv32, out32))
+      rec32 = rec32.astype(jnp.float32)
+
+  def test_conv_first_pool_layout_is_detected(self):
+    """Negative control: regions written in the other order must not match."""
+
+    def write_conv_first(pool, ssm, conv, idx, split=_SEAM_SPLIT):
+      def build(pool, ssm, conv, idx):
+        words = _state_words(pool, split)
+        words = _put_words(words, idx, 0, jnp.asarray(conv, jnp.float32))
+        body = _pack_bf16_rows(ssm).reshape(idx.shape[0], -1)
+        start = _SEAM_CONV_GRANULES * _WORDS_PER_GRANULE
+        words = words.at[idx, start : start + body.shape[1]].set(body)
+        return _words_to_pool(words, pool)
+
+      return _on_cpu(build, pool, ssm, conv, idx)
+
+    idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+    ssm, conv = self._states(48, 4)
+    kwargs = _rand_inputs(49, 4) | dict(
+        query_start_loc=jnp.arange(5),
+        distribution=jnp.array([4, 4, 4], dtype=jnp.int32),
+        seq_lens=jnp.full((4,), 9, dtype=jnp.int32),
+    )
+    got = self._pooled(ssm, conv, idx, kwargs, write=write_conv_first)
+    want = self._tuple(ssm, conv, kwargs)
+    self.assertFalse(np.array_equal(np.asarray(got[2]), np.asarray(want[2])))
+
+  def test_bf16_conv_state_is_rejected(self):
+    ssm, conv = self._states(50, 1)
+    kwargs = _rand_inputs(51, 1) | dict(
+        query_start_loc=jnp.arange(2),
+        distribution=jnp.array([1, 1, 1], dtype=jnp.int32),
+        seq_lens=jnp.array([3], dtype=jnp.int32),
+    )
+    with self.assertRaises(NotImplementedError):
+      self._tuple(ssm, conv.astype(jnp.bfloat16), kwargs)
 
 
 if __name__ == "__main__":
