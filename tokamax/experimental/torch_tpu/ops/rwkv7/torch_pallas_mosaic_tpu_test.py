@@ -15,7 +15,6 @@
 
 """Unit tests for RWKV-7 PyTorch Pallas operator."""
 
-from typing import Any
 import unittest
 
 from absl import logging
@@ -25,8 +24,6 @@ import torch
 from torch._subclasses import fake_tensor
 import torch.nn.functional as F
 import torch_tpu  # pylint: disable=unused-import
-from tokamax.experimental.torch_tpu.ops import torch_op
-from tokamax.experimental.torch_tpu.ops import torch_test_utils
 from tokamax.experimental.torch_tpu.ops import torch_utils
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_base
 from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_pallas_mosaic_tpu
@@ -34,67 +31,20 @@ from tokamax.experimental.torch_tpu.ops.rwkv7 import torch_pallas_mosaic_tpu
 Config = torch_pallas_mosaic_tpu.Config
 
 
-def _register_cpu_kernel(op_obj: torch_op.TorchOp[Any]) -> None:
-  """Registers a CPU test kernel delegating to `op_obj.op_impl_call`."""
-  custom_op = op_obj._torch_tokamax_op  # pylint: disable=protected-access
-  assert custom_op is not None
-
-  def _cpu_kernel(*args: Any, **kwargs: Any) -> Any:
-    jax_args = jax.tree.map(
-        lambda x: (
-            torch_test_utils.torch_to_jax(x)
-            if isinstance(x, torch.Tensor)
-            else x
-        ),
-        args,
-    )
-    jax_kwargs = jax.tree.map(
-        lambda x: (
-            torch_test_utils.torch_to_jax(x)
-            if isinstance(x, torch.Tensor)
-            else x
-        ),
-        kwargs,
-    )
-    jax_out = op_obj.op_impl_call(*jax_args, **jax_kwargs)
-    return jax.tree.map(
-        lambda x: (
-            torch_test_utils.jax_to_torch(x, device="cpu")
-            if isinstance(x, jax.Array)
-            else x
-        ),
-        jax_out,
-    )
-
-  custom_op.register_kernel("cpu")(_cpu_kernel)
-
-
-for _op in (
-    torch_base.Rwkv7,
-    torch_base.Rwkv7.backward_op_torch,
-    torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7,
-    torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7.backward_op_torch,
-):
-  if _op is not None:
-    _register_cpu_kernel(_op)
-
-
 class PallasMosaicTpuRwkv7Test(unittest.TestCase):
   """Tests for RWKV-7 Pallas operator against base reference."""
 
-  def _get_device(self) -> str:
-    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
-      accel = torch.accelerator.current_accelerator()
-      if accel is not None and accel.type in ("tpu", "xla"):
-        return accel.type
-    return "cpu"
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
 
   def test_forward_shape_and_parity(self):
-    device = self._get_device()
+    device = "tpu"
     chunk_size = 64
 
     for seq_len in (64, 128, 256):
-      batch_size, num_heads, head_dim = 2, 4, 16
+      batch_size, num_heads, head_dim = 2, 4, 128
       torch.manual_seed(42)
       q = (
           torch.randn(
@@ -187,13 +137,13 @@ class PallasMosaicTpuRwkv7Test(unittest.TestCase):
       )
 
   def test_chunk_size_validation(self):
-    device = self._get_device()
-    q = torch.randn(2, 100, 4, 16, device=device)
-    k = torch.randn(2, 100, 4, 16, device=device)
-    v = torch.randn(2, 100, 4, 16, device=device)
-    alpha = torch.randn(2, 100, 4, 16, device=device)
-    beta = torch.randn(2, 100, 4, 16, device=device)
-    gk = torch.randn(2, 100, 4, 16, device=device)
+    device = "tpu"
+    q = torch.randn(2, 100, 4, 128, device=device)
+    k = torch.randn(2, 100, 4, 128, device=device)
+    v = torch.randn(2, 100, 4, 128, device=device)
+    alpha = torch.randn(2, 100, 4, 128, device=device)
+    beta = torch.randn(2, 100, 4, 128, device=device)
+    gk = torch.randn(2, 100, 4, 128, device=device)
 
     with self.assertRaises(ValueError):
       torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
@@ -201,8 +151,8 @@ class PallasMosaicTpuRwkv7Test(unittest.TestCase):
       )
 
   def test_backward_autograd_matches_reference(self):
-    device = self._get_device()
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 128
     chunk_size = 64
 
     torch.manual_seed(42)
@@ -273,16 +223,16 @@ class PallasMosaicTpuRwkv7Test(unittest.TestCase):
 
   def test_fake_impl(self):
     with fake_tensor.FakeTensorMode():
-      q = torch.empty((2, 128, 4, 16), dtype=torch.float32)
-      k = torch.empty((2, 128, 4, 16), dtype=torch.float32)
-      v = torch.empty((2, 128, 4, 16), dtype=torch.float32)
-      alpha = torch.empty((2, 128, 4, 16), dtype=torch.float32)
-      beta = torch.empty((2, 128, 4, 16), dtype=torch.float32)
-      gk = torch.empty((2, 128, 4, 16), dtype=torch.float32)
+      q = torch.empty((2, 128, 4, 128), dtype=torch.float32)
+      k = torch.empty((2, 128, 4, 128), dtype=torch.float32)
+      v = torch.empty((2, 128, 4, 128), dtype=torch.float32)
+      alpha = torch.empty((2, 128, 4, 128), dtype=torch.float32)
+      beta = torch.empty((2, 128, 4, 128), dtype=torch.float32)
+      gk = torch.empty((2, 128, 4, 128), dtype=torch.float32)
       out = torch_pallas_mosaic_tpu.PallasMosaicTpuRwkv7(
           q, k, v, alpha, beta, gk, chunk_size=64
       )
-      self.assertEqual(out.shape, (2, 128, 4, 16))
+      self.assertEqual(out.shape, (2, 128, 4, 128))
       self.assertEqual(out.dtype, torch.float32)
 
   def test_deconstruct_and_reconstruct_config_roundtrip(self):
