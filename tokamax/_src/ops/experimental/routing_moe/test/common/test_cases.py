@@ -199,4 +199,11 @@ PROD_CASES = (
         shardings=(MoESharding(ep=4),),
         max_to_mean_loads=(2.0, 4.0),
     ),
+    # The same model with the MoE tensor-parallel over the host, for decode and
+    # prefill. Unlike the other TP cases, which need 8 devices, it runs on 4.
+    *_prod_sweep(
+        test_shapes.QWEN_38_FLASH_NEXT,
+        (4, 8, 12, 16384),
+        shardings=(MoESharding(tp=4),),
+    ),
 )
