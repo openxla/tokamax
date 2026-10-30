@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.lightning_indexer.kernel import metadata
+from tokamax._src.ops.lightning_indexer.kernel import tc_topk
 from tokamax._src.ops.lightning_indexer.kernel.config import KVLayout
 from tokamax._src.ops.lightning_indexer.kernel.streamindex_topk import (
     convert_cache_to_seq_along_lane,
@@ -120,6 +121,96 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
   q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
   scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
   return q, scale
+
+
+# (B, T_list, S_list, page_size, H_I, H_KV, D, k, comp_ratio, bq_sz, bkv_p,
+#  block_table_list)
+_NUMERICAL_CORRECTNESS_CASES = (
+    # 0. Single sequence, single page (page_indices shape (1,))
+    (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 16, [[0]]),
+    # 1. Single sequence, highly fragmented block table
+    (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 16, [[2, 0]]),
+    # 2. Batched Decode (T=1, B=2)
+    (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[1, 3], [0, 2]]),
+    # 3. High GQA (8 Query Heads, 2 KV Heads)
+    (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 32, [[4, 1, 3, 0, 2]]),
+    # 4. Multi-Batch Prefill with variable query/sequence lengths
+    (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[3, 1], [2, 4]]),
+    # 5. Dummy sequences / Padding (B=3, but sequence 1 has 0 tokens)
+    (
+        3,
+        [2, 0, 3],
+        [16, 0, 8],
+        8,
+        4,
+        1,
+        16,
+        1024,
+        1,
+        8,
+        16,
+        [[1, 2], [0, 0], [4, 3]],
+    ),
+    # 6. Mixed batch: sequence 0 has 1 token, sequence 1 has 5 tokens
+    (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 16, [[1, 3], [2, 0]]),
+    (
+        1,
+        [4],
+        [384],
+        16,
+        4,
+        1,
+        16,
+        1024,
+        1,
+        8,
+        8,
+        [[
+            13,
+            2,
+            21,
+            7,
+            0,
+            18,
+            5,
+            11,
+            23,
+            1,
+            9,
+            16,
+            3,
+            20,
+            6,
+            14,
+            22,
+            4,
+            10,
+            17,
+            8,
+            15,
+            19,
+            12,
+        ]],
+    ),
+    # 8. Mixed batch with max_num_seqs == max_num_tokens (B=4, T=4):
+    # 2 decode sequences (T=1), 1 chunked-prefill sequence (T=2), and
+    # 1 padded inactive sequence (T=0). S_list // comp_ratio > k so
+    # _common_path is exercised even with enable_early_exit=True.
+    (
+        4,
+        [1, 1, 2, 0],
+        [64, 80, 96, 0],
+        128,
+        4,
+        1,
+        128,
+        16,
+        2,
+        8,
+        2,
+        [[1, 3], [0, 2], [4, 5], [0, 0]],
+    ),
+)
 
 
 class StreamIndexTopKTest(parameterized.TestCase):
@@ -393,95 +484,25 @@ class StreamIndexTopKTest(parameterized.TestCase):
     assert out_shape_idxs.dtype == jnp.int32
     print("Result: PASS")
 
-  @parameterized.parameters(
-      [
-          # 0. Single sequence, single page (page_indices shape (1,))
-          (1, [1], [8], 8, 4, 1, 16, 1024, 1, 1, 16, [[0]]),
-          # 1. Single sequence, highly fragmented block table
-          (1, [4], [16], 8, 4, 1, 16, 1024, 2, 8, 16, [[2, 0]]),
-          # 2. Batched Decode (T=1, B=2)
-          (2, [1, 1], [12, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[1, 3], [0, 2]]),
-          # 3. High GQA (8 Query Heads, 2 KV Heads)
-          (1, [6], [20], 4, 8, 1, 16, 1024, 1, 8, 32, [[4, 1, 3, 0, 2]]),
-          # 4. Multi-Batch Prefill with variable query/sequence lengths
-          (2, [5, 3], [16, 16], 8, 4, 1, 16, 1024, 1, 8, 16, [[3, 1], [2, 4]]),
-          # 5. Dummy sequences / Padding (B=3, but sequence 1 has 0 tokens)
-          (
-              3,
-              [2, 0, 3],
-              [16, 0, 8],
-              8,
-              4,
-              1,
-              16,
-              1024,
-              1,
-              8,
-              16,
-              [[1, 2], [0, 0], [4, 3]],
-          ),
-          # 6. Mixed batch: sequence 0 has 1 token, sequence 1 has 5 tokens
-          (2, [1, 5], [12, 16], 8, 4, 1, 16, 1024, 2, 8, 16, [[1, 3], [2, 0]]),
-          (
-              1,
-              [4],
-              [384],
-              16,
-              4,
-              1,
-              16,
-              1024,
-              1,
-              8,
-              8,
-              [[
-                  13,
-                  2,
-                  21,
-                  7,
-                  0,
-                  18,
-                  5,
-                  11,
-                  23,
-                  1,
-                  9,
-                  16,
-                  3,
-                  20,
-                  6,
-                  14,
-                  22,
-                  4,
-                  10,
-                  17,
-                  8,
-                  15,
-                  19,
-                  12,
-              ]],
-          ),
-          # 8. Mixed batch with max_num_seqs == max_num_tokens (B=4, T=4):
-          # 2 decode sequences (T=1), 1 chunked-prefill sequence (T=2), and
-          # 1 padded inactive sequence (T=0). S_list // comp_ratio > k so
-          # _common_path is exercised even with enable_early_exit=True.
-          (
-              4,
-              [1, 1, 2, 0],
-              [64, 80, 96, 0],
-              128,
-              4,
-              1,
-              128,
-              16,
-              2,
-              8,
-              2,
-              [[1, 3], [0, 2], [4, 5], [0, 0]],
-          ),
-      ],
-  )
-  def test_streamindex_topk_numerical_correctness(
+  @parameterized.parameters(*_NUMERICAL_CORRECTNESS_CASES)
+  def test_streamindex_topk_numerical_correctness(self, *case):
+    self._check_numerical_correctness(*case)
+
+  @parameterized.parameters(*_NUMERICAL_CORRECTNESS_CASES)
+  def test_tensorcore_topk_numerical_correctness(self, *case):
+    """Runs the numerical test with the SparseCore-free kernels forced.
+
+    TPUs with >= 32 SparseCore subcores would otherwise never exercise the
+    fused TensorCore scoring + top-k kernel.
+    """
+    jax.clear_caches()
+    self.addCleanup(jax.clear_caches)
+    with mock.patch.object(
+        tc_topk, "has_full_sparsecore_topk", return_value=False
+    ):
+      self._check_numerical_correctness(*case)
+
+  def _check_numerical_correctness(
       self,
       B,
       T_list,

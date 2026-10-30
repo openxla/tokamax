@@ -31,13 +31,13 @@ KVLayout = kernel_config.KVLayout
 
 
 def skip_if_unsupported(test_case: absltest.TestCase) -> None:
-  """Skips `test_case` unless running on a TPU v7+ with SparseCore."""
+  """Skips `test_case` unless running on a TPU v7+."""
   if jax.default_backend() != "tpu":
     test_case.skipTest("Only supported on TPUs.")
   try:
     info = pltpu.get_tpu_info()
-    if info.generation < 7 or info.sparse_core is None:
-      test_case.skipTest("Requires TPU v7+ with SparseCore.")
+    if info.generation < 7:
+      test_case.skipTest("Requires TPU v7+.")
   except Exception:  # pylint: disable=broad-except
     test_case.skipTest("Failed to get TPU info.")
 

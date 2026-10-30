@@ -113,6 +113,57 @@ def next_power_of_2(x):
   return 1 << (x - 1).bit_length()
 
 
+QBLOCK_END_SENTINEL = 0x3FFFFFFF
+
+
+def lookup_qblock_step(
+    meta_ref: MetadataRef,
+    target_step: jax.Array | int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Resolves flat step `target_step` in a `qblock_schedule=True` `MetadataRef`.
+
+  In `qblock_schedule` mode, `meta_ref` stores one descriptor per query block
+  (`O(num_q_blocks)` SMEM, independent of `kv_len`), with `meta_ref.bkv_idx`
+  holding the cumulative exclusive end step `q_end_step` of each query block.
+
+  Args:
+    meta_ref: Query-block `MetadataRef`.
+    target_step: Global pipeline step (`step_offset + p_id`).
+
+  Returns:
+    `(batch_tile_idx, bq_idx, cur_bkv, is_last_bkv, q_blk_idx)`.
+  """
+  n_slots = meta_ref.bkv_idx.shape[0]
+  target = jnp.asarray(target_step, dtype=jnp.int32)
+  idx = jnp.int32(0)
+  step_bit = 1 << ((n_slots - 1).bit_length() - 1) if n_slots > 1 else 0
+  is_pow2 = (n_slots & (n_slots - 1)) == 0
+  while step_bit > 0:
+    probe = idx + step_bit
+    if is_pow2:
+      end_prev = meta_ref.bkv_idx[probe - 1]
+      take_upper = target >= end_prev
+    else:
+      safe_prev = jnp.minimum(probe - 1, n_slots - 1)
+      end_prev = meta_ref.bkv_idx[safe_prev]
+      take_upper = (probe < n_slots) & (target >= end_prev)
+    idx = jnp.where(take_upper, probe, idx)
+    step_bit >>= 1
+
+  prev_idx = jnp.maximum(idx - 1, 0)
+  q_start_step = jnp.where(idx > 0, meta_ref.bkv_idx[prev_idx], jnp.int32(0))
+  q_end_step = meta_ref.bkv_idx[idx]
+  cur_bkv = jnp.maximum(0, target - q_start_step)
+  is_last_bkv = (target + 1) >= q_end_step
+  return (
+      meta_ref.batch_tile_idx[idx],
+      meta_ref.bq_idx[idx],
+      cur_bkv,
+      is_last_bkv,
+      idx,
+  )
+
+
 def generate_max_steps(
     num_seqs: int,
     max_pages_per_seq: int,
@@ -160,6 +211,7 @@ def compute_batched_seq_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    qblock_schedule: bool = False,
 ) -> MetadataRef:
   max_num_seqs = seq_lens.shape[0]
   max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
@@ -199,16 +251,28 @@ def compute_batched_seq_metadata(
         pl.cdiv(chunk_tokens, seq_batch_size * bq_sz)
         + min(max_seq_tiles, chunk_tokens),
     )
-    req_max_steps = num_chunks * per_chunk_bq * max_bkv
+    req_q_blocks = num_chunks * per_chunk_bq
+    req_max_steps = req_q_blocks * max_bkv
   else:
+    req_q_blocks = total_max_bq
     req_max_steps = total_max_bq * max_bkv
   req_max_steps = pl.cdiv(req_max_steps, 128) * 128
 
   max_steps = max(128, req_max_steps)
+  max_q_blocks = next_power_of_2(max(128, req_q_blocks))
 
   is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
 
   def _empty_schedule():
+    if qblock_schedule:
+      return MetadataRef.create(
+          num_steps=jnp.zeros((num_chunks,), dtype=jnp.int32),
+          batch_tile_idx=jnp.zeros((max_q_blocks,), dtype=jnp.int32),
+          bq_idx=jnp.zeros((max_q_blocks,), dtype=jnp.int32),
+          bkv_idx=jnp.full(
+              (max_q_blocks,), QBLOCK_END_SENTINEL, dtype=jnp.int32
+          ),
+      )
     return MetadataRef.create(
         num_steps=jnp.zeros((num_chunks,), dtype=jnp.int32),
         batch_tile_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
@@ -224,7 +288,6 @@ def compute_batched_seq_metadata(
   # valid_seq_lens, while the Pallas attention scoring kernel strictly
   # executes num_steps active pipeline steps on the MXU.
   def _compute_schedule():
-    all_steps = jnp.arange(max_steps, dtype=jnp.int32)
     all_seq_tiles = jnp.arange(max_seq_tiles, dtype=jnp.int32)
     padded_len = max_seq_tiles * seq_batch_size
     pad_size = padded_len - max_num_seqs
@@ -289,6 +352,8 @@ def compute_batched_seq_metadata(
       hi = jnp.clip(chunk_start + chunk_tokens, tile_tok_start, tile_tok_end)
       num_bq = pl.cdiv(hi - lo, bq_span).astype(jnp.int32)
     else:
+      lo = None
+      hi = None
       num_bq = s_num_bq[None, :]
 
     # A segment is one (chunk, sequence tile) pair. Segments sit back to back
@@ -303,6 +368,100 @@ def compute_batched_seq_metadata(
         if num_chunks == 1
         else jnp.tile(all_seq_tiles, num_chunks)
     )
+
+    if qblock_schedule:
+      seg_is_valid = (
+          is_valid_seq_tile
+          if num_chunks == 1
+          else jnp.tile(is_valid_seq_tile, num_chunks)
+      )
+      seg_num_bq = jnp.where(seg_is_valid, num_bq.reshape(-1), 0).astype(
+          jnp.int32
+      )
+      seg_start_qb = jnp.cumulative_sum(seg_num_bq, include_initial=True)
+      total_active_qbs = seg_start_qb[-1]
+
+      all_qbs = jnp.arange(max_q_blocks, dtype=jnp.int32)
+      qb_is_active = all_qbs < total_active_qbs
+      is_qb_in_seg = (all_qbs[None, :] >= seg_start_qb[:-1, None]) & (
+          all_qbs[None, :] < seg_start_qb[1:, None]
+      )
+      qb_seg = jnp.sum(
+          jnp.arange(num_chunks * max_seq_tiles, dtype=jnp.int32)[:, None]
+          * is_qb_in_seg,
+          axis=0,
+      )
+      qb_seq_tile = jnp.sum(seg_seq_tiles[:, None] * is_qb_in_seg, axis=0)
+      batch_tile_idx = qb_seq_tile * seq_batch_size
+      qb_start_in_seg = jnp.sum(
+          seg_start_qb[:-1, None] * is_qb_in_seg, axis=0
+      )
+      bq_idx = jnp.where(qb_is_active, all_qbs - qb_start_in_seg, 0)
+
+      if seq_batch_size > 1:
+        qb_num_bkv = jnp.where(
+            qb_is_active, jnp.minimum(max_bkv, seg_num_bkv[qb_seg]), 0
+        ).astype(jnp.int32)
+      else:
+        seq_idx_clamped = jnp.minimum(batch_tile_idx, max_num_seqs - 1)
+        if chunked:
+          assert lo is not None and hi is not None
+          seg_lo = lo.reshape(-1)[qb_seg]
+          seg_hi = hi.reshape(-1)[qb_seg]
+        else:
+          seg_lo = cu_q_lens[seq_idx_clamped]
+          seg_hi = cu_q_lens[seq_idx_clamped + 1]
+
+        blk_start_tok = seg_lo + bq_idx * bq_sz
+        blk_end_tok = jnp.minimum(seg_hi, blk_start_tok + bq_sz)
+        last_tok = blk_end_tok - 1
+
+        seq_q_end = cu_q_lens[seq_idx_clamped + 1]
+        seq_len_val = valid_seq_lens[seq_idx_clamped]
+        kv_len_val = seq_len_val // compression_ratio
+        max_q_abs_pos = seq_len_val - (seq_q_end - last_tok)
+        vis_global = jnp.where(
+            blk_end_tok > blk_start_tok,
+            jnp.clip(max_q_abs_pos // compression_ratio + 1, 0, kv_len_val),
+            0,
+        )
+        if cp_size > 1:
+          vis_local = cp_local_length(
+              vis_global, cp_rank, cp_size, interleave_c
+          )
+        else:
+          vis_local = vis_global
+        qb_num_bkv = jnp.where(
+            qb_is_active,
+            jnp.minimum(max_bkv, jnp.maximum(1, pl.cdiv(vis_local, bkv_sz))),
+            0,
+        ).astype(jnp.int32)
+
+      cum_end_steps = jnp.cumulative_sum(qb_num_bkv, include_initial=False)
+      bkv_idx = jnp.where(
+          qb_is_active,
+          cum_end_steps,
+          jnp.int32(QBLOCK_END_SENTINEL),
+      )
+
+      qb_chunk = qb_seg // max_seq_tiles
+      if num_chunks == 1:
+        chunk_num_steps = jnp.sum(qb_num_bkv, keepdims=True).astype(jnp.int32)
+      else:
+        chunk_ids = jnp.arange(num_chunks, dtype=jnp.int32)[:, None]
+        in_chunk = qb_is_active[None, :] & (qb_chunk[None, :] == chunk_ids)
+        chunk_num_steps = jnp.sum(
+            jnp.where(in_chunk, qb_num_bkv[None, :], 0), axis=1
+        ).astype(jnp.int32)
+
+      return MetadataRef.create(
+          num_steps=chunk_num_steps,
+          batch_tile_idx=batch_tile_idx,
+          bq_idx=bq_idx,
+          bkv_idx=bkv_idx,
+      )
+
+    all_steps = jnp.arange(max_steps, dtype=jnp.int32)
     seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
     seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
 
@@ -364,6 +523,7 @@ def compute_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    qblock_schedule: bool = False,
 ) -> MetadataRef:
   """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx.
 
@@ -388,4 +548,5 @@ def compute_metadata(
       cp_rank=cp_rank,
       cp_size=cp_size,
       interleave_c=interleave_c,
+      qblock_schedule=qblock_schedule,
   )
