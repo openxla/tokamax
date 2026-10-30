@@ -226,6 +226,15 @@ def advance_bcast_ptr(
 
 
 @triton.jit
+def row_offset(offs_r, bound_r, stride_r):
+  """Returns `offs_r[:, None] * stride_r`, using int64 only if needed."""
+  if (bound_r + offs_r.shape[0]) * stride_r >= 2**31:
+    return offs_r[:, None].to(tl.int64) * stride_r
+  else:
+    return offs_r[:, None] * stride_r
+
+
+@triton.jit
 def mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c):
   """Returns the in-bounds mask for a 2D block, or `None` if not needed."""
   if check_r and check_c:
@@ -258,9 +267,9 @@ def load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
   block_r: tl.constexpr = offs_r.shape[0]
   block_c: tl.constexpr = offs_c.shape[0]
   # Broadcast dims still get a size-1 axis, so callers can transpose the block.
-  zero = tl.zeros((1, 1), dtype=tl.int64)
-  r = zero if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
-  c = zero if bound_c == 1 else offs_c[None, :].to(tl.int64)
+  zero = tl.zeros((1, 1), dtype=tl.int32)
+  r = zero if bound_r == 1 else row_offset(offs_r, bound_r, bound_c)
+  c = zero if bound_c == 1 else offs_c[None, :]
   check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
   check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
   mask = mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c)

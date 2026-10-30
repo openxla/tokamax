@@ -22,7 +22,6 @@ from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
@@ -76,8 +75,8 @@ def inner_pipeline(
     # compute. Therefore, DMA is issued after the waiting.
     x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
-    # Step 3: Load data from VMEM.
-    act = layout_util.load_compact_to_large(x_ref.at[:bucket_m], cfg.dim.size_k)
+    # Step 3: Read input from VMEM.
+    act = x_bref.read_vmem(x_ref.at[:bucket_m], _at(0))
 
     # Step 4: Perform computation.
     weight = in_ref.w.get_weight()
@@ -96,10 +95,8 @@ def inner_pipeline(
     # load and the matmul behind it instead of sharing bundles with the matmul.
     out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
-    # Step 5: Store output into VMEM.
-    layout_util.store_large_to_compact(
-        out_ref.at[:bucket_m], act.astype(out_ref.dtype)
-    )
+    # Step 5: Write output into VMEM.
+    out_bref.write_vmem(out_ref.at[:bucket_m], act, _at(0))
 
   # Select which bucket to choose based on number of active rows of given tile.
   num_rows = metadata_ref.gm_id_to_num_rows[gm_id]

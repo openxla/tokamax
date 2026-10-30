@@ -34,6 +34,11 @@ def get_uint_dtype(itemsize: int) -> jnp.dtype:
       raise NotImplementedError()
 
 
+def get_packing(dtype: jnp.dtype) -> int:
+  """Returns the number of `dtype` elements packed in one 32-bit word."""
+  return 4 // jnp.dtype(dtype).itemsize
+
+
 def to_compact_shape(
     large_shape: Sequence[int], dtype: jax.typing.DTypeLike, lanes: int = 128
 ) -> tuple[int, int, int, int]:
@@ -168,3 +173,23 @@ def large_deinterleave_lane(
   lhs = jnp.concat(chunks[0::2], axis=-1)
   rhs = jnp.concat(chunks[1::2], axis=-1)
   return lhs, rhs
+
+
+def store_compact_chunk(
+    vmem: hijax.TransformedRef, first_row: int, chunk: int, words: jax.Array
+) -> None:
+  """Stores `[rows, lanes]` u32 words into `chunk` starting at `first_row`.
+
+  Chunk `c` of compact row `r` is u32 word `r * vmem.shape[1] + c`, so one
+  strided store fills a chunk across consecutive compact rows.
+
+  Args:
+    vmem: Destination compact `[rows, chunks, packing, lanes]` VMEM reference.
+    first_row: Index of the first compact row to write.
+    chunk: Index of the chunk within each row to write.
+    words: Packed `u32[rows, lanes]` words, one row per compact output row.
+  """
+  lanes, stride = vmem.shape[-1], vmem.shape[1]
+  flat = vmem.bitcast(jnp.uint32).reshape(-1, lanes)
+  start = first_row * stride + chunk
+  flat[start : start + words.shape[0] * stride : stride] = words

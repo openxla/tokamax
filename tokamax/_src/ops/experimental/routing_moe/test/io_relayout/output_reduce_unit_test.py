@@ -156,6 +156,18 @@ class OutputReduceUnitTest(parameterized.TestCase):
         out, jnp.zeros((num_tokens, hidden_size), dtype=jnp.bfloat16)
     )
 
+  def test_non_bfloat16_rows_raises(self):
+    num_tokens, top_k, hidden_size = 16, 4, 512
+    rows_fp8 = jnp.zeros(
+        layout_util.to_compact_shape(
+            (num_tokens * top_k, hidden_size), jnp.float8_e4m3fn
+        ),
+        dtype=jnp.float8_e4m3fn,
+    )
+    weights = jnp.ones((num_tokens, top_k), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, "rows must be bf16"):
+      kernel.output_reduce_unpack(rows_fp8, weights)
+
 
 if __name__ == "__main__":
   absltest.main()
