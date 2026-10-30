@@ -60,6 +60,8 @@ def splash_attention(
     dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
+    q_sharding: jax.sharding.NamedSharding | None = None,
+    k_sharding: jax.sharding.NamedSharding | None = None,
 ) -> Float[Array, "*B H T d"]:
   """Splash Attention.
 
@@ -78,6 +80,9 @@ def splash_attention(
     implementation: The implementation to use ('mosaic_tpu', 'base', or None for
       automatic selection). If a sequence is passed, the first implementation
       that doesn't raise a NotImplementedError is used.
+    q_sharding: NamedSharding for q. Sharding information for the other tensors
+      is inferred from this if k_sharding is not provided.
+    k_sharding: NamedSharding for k and v.
 
   Returns:
     Attention output array.
@@ -115,6 +120,8 @@ def splash_attention(
           attn_logits_soft_cap=attn_logits_soft_cap,
           dropout_rate=dropout_rate,
           prng_key=prng_key,
+          q_sharding=q_sharding,
+          k_sharding=k_sharding,
       )
     except NotImplementedError as e:
       if len(implementations) == 1:

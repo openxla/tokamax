@@ -134,6 +134,15 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     out_dtype = q.dtype
     orig_seq_len_q = q.shape[-3]
     orig_seq_len_k = k.shape[-3]
+    q_start = q_end = None
+    if isinstance(config, ConfigSM80):
+      mask, q_start, q_end = common.extract_q_range(
+          mask,
+          q.ndim,
+          q_indices,
+          k_indices,
+          fold_q_sequence_heads=config.fold_q_sequence_heads,
+      )
     q, k, v, bias, mask, is_causal, k_start, k_end = common.prepare_inputs(
         q,
         k,
@@ -192,15 +201,26 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       block = split_k * config.block_kv
       return shape_lib.pad_to_next_multiple_of(x, block, axis)
 
-    seq_k_axes = (None, -3, -3, -1, -1, None, None)
-    args = (q, k, v, bias, mask, k_start, k_end)
+    if isinstance(config, ConfigSM80):
+      seq_k_axes = (None, -3, -3, -1, -1, None, None, None, None)
+      args = (q, k, v, bias, mask, k_start, k_end, q_start, q_end)
+    else:
+      seq_k_axes = (None, -3, -3, -1, -1, None, None)
+      args = (q, k, v, bias, mask, k_start, k_end)
     args = tuple(pad_seq_k(x, ax) for x, ax in zip(args, seq_k_axes))
 
     if split_k > 1:
-      if is_causal or k_start is not None or k_end is not None:
+      if (
+          is_causal
+          or k_start is not None
+          or k_end is not None
+          or q_start is not None
+          or q_end is not None
+      ):
         raise ValueError(
             # TODO: Support causality and k_start/k_end with split_k > 1.
-            "split_k > 1 only supported without causality and k_start/k_end."
+            "split_k > 1 only supported without causality and"
+            " q/k_start/end."
         )
       f = functools.partial(f, normalize_output=False, return_residuals=True)
       f = batching.vmap_split(f, in_axes=seq_k_axes, num_parts=split_k)

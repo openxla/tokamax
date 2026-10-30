@@ -24,17 +24,24 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
 
 
+def _fused_conv1d_gdn_tuple(*, conv_state, recurrent_state, **kwargs):
+  return wrapper.fused_conv1d_gdn(
+      states=(conv_state, recurrent_state),
+      **kwargs,
+  )
+
+
 class GDNAttentionTest(test_base.CausalConv1dGatedDeltaRuleTestBase):
 
   def __init__(self, *args):
     # `wrapper.fused_conv1d_gdn` disables buffer donation.
-    super().__init__(*args, gdn_fn=wrapper.fused_conv1d_gdn)
+    super().__init__(*args, gdn_fn=_fused_conv1d_gdn_tuple)
 
 
 class GDNSecurityTest(test_base.CausalConv1dGatedDeltaRuleSecurityTestBase):
 
   def __init__(self, *args):
-    super().__init__(*args, gdn_fn=wrapper.fused_conv1d_gdn)
+    super().__init__(*args, gdn_fn=_fused_conv1d_gdn_tuple)
 
 
 class GDNReferenceL2NormTest(parameterized.TestCase):
