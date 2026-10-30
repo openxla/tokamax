@@ -108,13 +108,15 @@ def post_hc(
   w_res = context.residual.astype(x.dtype)
   res_out = jnp.einsum("...kd,mk->...md", x_streams, w_res)
 
-  w_post = context.h_post.astype(x.dtype)
+  dtype = jnp.promote_types(x.dtype, jnp.float32)
+  w_post = context.h_post.astype(x.dtype).astype(dtype)
   if w_post.ndim == 1:
     w_post = w_post[:, None]
-  post_out = jnp.expand_dims(layer_output.astype(x.dtype), axis=-2) * w_post
-  out = (res_out.astype(jnp.float32) + post_out.astype(jnp.float32)).astype(
-      x.dtype
+  post_out = (
+      jnp.expand_dims(layer_output.astype(x.dtype).astype(dtype), axis=-2)
+      * w_post
   )
+  out = (res_out.astype(dtype) + post_out).astype(x.dtype)
   out_shape = (
       (*layer_output.shape[:2], streams, embedding)
       if layer_output.ndim == 3
