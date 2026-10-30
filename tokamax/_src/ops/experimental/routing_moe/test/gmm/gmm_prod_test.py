@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import sharding
+import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
@@ -185,8 +186,13 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
     test_util.skip_unless_supported(self, min_devices=4)
     super().setUp()
 
-  @parameterized.product(num_tokens=[1280, 2560, 5120, 10240])
-  def test_remote_vs_local_scatter(self, num_tokens: int):
+  @parameterized.product(
+      num_tokens=[1280, 2560, 5120, 10240],
+      out_dtype=[None, gmm_test_lib.FP8],
+  )
+  def test_remote_vs_local_scatter(
+      self, num_tokens: int, out_dtype: jax.typing.DTypeLike | None
+  ):
     shape = test_shapes.REMOTE_SCATTER
     topk = shape.top_k
     moe_sharding = test_cases.MoESharding(ep=4)
@@ -212,6 +218,7 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         topk=topk,
         remote_scatter=False,
         all_to_all=True,
+        out_dtype=out_dtype,
     )
     local_kernel = test_util.Timed.create(
         gmm_test_lib.sharded_gmm_unpermute,
@@ -221,6 +228,7 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         topk=topk,
         remote_scatter=False,
         all_to_all=False,
+        out_dtype=out_dtype,
     )
     remote = test_util.Timed.create(
         gmm_test_lib.sharded_gmm_unpermute,
@@ -228,8 +236,13 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         case.routing.sorted_to_flat,
         mesh=mesh,
         remote_scatter=True,
+        out_dtype=out_dtype,
     )
-    np.testing.assert_array_equal(remote.fn(remote.args), local.fn(local.args))
+    # Bytes, not values: an fp8 scale chunk is f32 bits, some of them fp8 NaNs.
+    np.testing.assert_array_equal(
+        np.asarray(remote.fn(remote.args)).view(np.uint8),
+        np.asarray(local.fn(local.args)).view(np.uint8),
+    )
     local_us = local.latency_us()
     kernel_us = local_kernel.latency_us()
     remote_us = remote.latency_us()
@@ -237,9 +250,10 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
       for timed in (local, remote):
         jax.block_until_ready(jax.jit(timed.fn)(timed.args))
     logging.info(
-        "tokens=%d: local_total=%.0f us, local_kernel=%.0f us,"
+        "tokens=%d out=%s: local_total=%.0f us, local_kernel=%.0f us,"
         " local_a2a=%.0f us, remote=%.0f us (%.2fx) %s",
         num_tokens,
+        jnp.dtype(out_dtype or jnp.bfloat16).name,
         local_us,
         kernel_us,
         local_us - kernel_us,

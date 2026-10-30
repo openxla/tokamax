@@ -21,6 +21,7 @@ import jax
 from jax import sharding
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
@@ -28,6 +29,7 @@ from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
 from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 
 P = sharding.PartitionSpec
+FP8 = jnp.float8_e4m3fn
 
 
 def _local_weight(
@@ -146,7 +148,53 @@ def to_large_layout(out: arg.ActivationWrapper[jax.Array]) -> jax.Array:
   return out.data.reshape(out.spec.large_shape)
 
 
-@jax.jit(static_argnames=("mesh", "topk", "remote_scatter", "all_to_all"))
+def split_scaled_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+  """Splits compact quantized output rows into payload values and f32 scales.
+
+  Args:
+    x: Compact output array of shape `[m, chunks + 1, 4, lanes]` from
+      `routing_gmm`.
+
+  Returns:
+    A `(payload, scales)` pair where `payload` has shape `[m, chunks * 4 *
+    lanes]` with dtype `x.dtype` and `scales` has shape `f32[m, lanes]`.
+  """
+  # The scale bytes are not fp8 values: moved as fp8, a NaN-pattern byte may
+  # come back canonicalized, so they are bytes from the start.
+  scale_bytes = jax.lax.bitcast_convert_type(x, jnp.uint8)[:, -1]
+  scales = jax.lax.bitcast_convert_type(
+      jnp.swapaxes(scale_bytes, 1, 2), jnp.float32
+  )
+  payload = x[:, :-1]
+  return payload.reshape(layout_util.to_large_shape(payload.shape)), scales
+
+
+def dequantize_rows(x: jax.Array) -> jax.Array:
+  """Dequantizes compact `routing_gmm` output rows to `f32[m, cols]`.
+
+  Args:
+    x: Compact output array of shape `[m, chunks + 1, 4, lanes]` from
+      `routing_gmm`.
+
+  Returns:
+    Dequantized `f32[m, cols]` array where column `c` is scaled by lane
+    `c % lanes`.
+  """
+  payload, scales = split_scaled_rows(x)
+  m, lanes = scales.shape
+  chunks = payload.astype(jnp.float32).reshape(m, -1, lanes)
+  return (chunks * scales[:, None, :]).reshape(m, -1)
+
+
+@jax.jit(
+    static_argnames=(
+        "mesh",
+        "topk",
+        "remote_scatter",
+        "all_to_all",
+        "out_dtype",
+    )
+)
 def sharded_gmm_unpermute(
     x: arg.ActivationWrapper[jax.Array],
     w: jax.Array,
@@ -157,6 +205,7 @@ def sharded_gmm_unpermute(
     topk: int | None = None,
     remote_scatter: bool = True,
     all_to_all: bool = False,
+    out_dtype: jax.typing.DTypeLike | None = None,
 ) -> jax.Array:
   """Runs EP-sharded `routing_gmm` scatter, with fused or unfused all-to-all."""
   axis = test_cases.EP_AXIS
@@ -180,6 +229,7 @@ def sharded_gmm_unpermute(
         scatter=arg.make_routing_wrapper(
             scatter_indices, remote_axis=remote_axis
         ),
+        out_dtype=out_dtype,
     ).data
     if remote_scatter or not all_to_all:
       return out

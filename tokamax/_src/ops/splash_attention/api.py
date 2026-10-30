@@ -14,11 +14,11 @@
 # ==============================================================================
 """Splash Attention Op API."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, Final, Literal
 import immutabledict
 import jax
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
@@ -51,11 +51,17 @@ def splash_attention(
     k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
     v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
     mask: base.Mask | mask_lib.Mask | Bool[Array, "*#B T t"] | None = None,
-    segment_ids: base.SegmentIds | None = None,
+    segment_ids: (
+        base.SegmentIds
+        | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+        | Int[Array, "*#B T"]
+        | None
+    ) = None,
     sinks: Float[Array, "*#B H"] | None = None,
     *,
     is_mqa: bool = False,
     mask_value: float = reference.DEFAULT_MASK_VALUE,
+    is_causal: bool = False,
     attn_logits_soft_cap: float | None = None,
     dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
@@ -74,6 +80,7 @@ def splash_attention(
     sinks: Optional attention sinks tensor.
     is_mqa: Whether to use Multi-Query Attention format.
     mask_value: Additive mask value for masked-out positions (defaults to -1e30)
+    is_causal: Boolean indicating whether the mask is a causal mask
     attn_logits_soft_cap: Optional logits soft cap.
     dropout_rate: Dropout probability in [0, 1).
     prng_key: PRNG key for generating dropout masks when dropout_rate > 0.
@@ -117,6 +124,7 @@ def splash_attention(
           sinks=sinks,
           is_mqa=is_mqa,
           mask_value=mask_value,
+          is_causal=is_causal,
           attn_logits_soft_cap=attn_logits_soft_cap,
           dropout_rate=dropout_rate,
           prng_key=prng_key,
