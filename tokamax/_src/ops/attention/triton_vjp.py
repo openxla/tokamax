@@ -932,8 +932,10 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     configs = set()
-    for block_m in [32, 64, 128, 256]:
-      for block_n in [32, 64, 128, 256]:
+    # 256-wide tiles spill heavily with 2-4 warps and can take ptxas over an
+    # hour per config, and they never won in autotuning.
+    for block_m in [32, 64, 128]:
+      for block_n in [32, 64, 128]:
         if block_n < block_m:
           continue
         for num_warps in [2, 4]:
