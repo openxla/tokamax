@@ -29,126 +29,10 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from tokamax._src.ops.experimental.gdn2 import base as jax_base
 from tokamax.experimental.torch_tpu.ops import torch_op
 import torch
 from typing_extensions import override
-
-
-def _torch_to_jax(tensor: torch.Tensor) -> jax.Array:
-  tensor_cpu = tensor.detach().cpu()
-  if tensor_cpu.dtype == torch.bfloat16:
-    return jnp.asarray(tensor_cpu.float().numpy()).astype(jnp.bfloat16)
-  return jnp.asarray(tensor_cpu.numpy())
-
-
-def _jax_to_torch(
-    arr: jax.Array, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-  if arr.dtype == jnp.bfloat16:
-    np_arr = np.array(arr.astype(jnp.float32), copy=True)
-    return torch.from_numpy(np_arr).to(device=device, dtype=dtype)
-  return torch.from_numpy(np.array(arr, copy=True)).to(
-      device=device, dtype=dtype
-  )
-
-
-def _register_cpu_kernel(
-    op_self: torch_op.TorchOp[Any],
-    is_vjp: bool,
-) -> None:
-  """Registers a CPU custom_op kernel that dispatches to `op_self.op_impl_call`."""
-  assert op_self._torch_tokamax_op is not None  # pylint: disable=protected-access
-  if is_vjp:
-
-    def _cpu_bwd(
-        a_mat_c: torch.Tensor,
-        merged_out_c: torch.Tensor,
-        s_in_c: torch.Tensor,
-        out: torch.Tensor,
-        dout: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        b: torch.Tensor,
-        w: torch.Tensor,
-        chunk_size: int = 64,
-        scale: float | None = None,
-        return_residuals: bool = False,
-        config: Sequence[int] | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-      grads_jax = op_self.op_impl_call(
-          _torch_to_jax(a_mat_c),
-          _torch_to_jax(merged_out_c),
-          _torch_to_jax(s_in_c),
-          _torch_to_jax(out),
-          _torch_to_jax(dout),
-          _torch_to_jax(q),
-          _torch_to_jax(k),
-          _torch_to_jax(v),
-          _torch_to_jax(g),
-          _torch_to_jax(b),
-          _torch_to_jax(w),
-          chunk_size=chunk_size,
-          scale=scale,
-          return_residuals=return_residuals,
-          config=None if config is None else tuple(config),
-      )
-      return (
-          _jax_to_torch(grads_jax[0], q.device, q.dtype),
-          _jax_to_torch(grads_jax[1], k.device, k.dtype),
-          _jax_to_torch(grads_jax[2], v.device, v.dtype),
-          _jax_to_torch(grads_jax[3], g.device, g.dtype),
-          _jax_to_torch(grads_jax[4], b.device, b.dtype),
-          _jax_to_torch(grads_jax[5], w.device, w.dtype),
-      )
-
-    op_self._torch_tokamax_op.register_kernel("cpu")(_cpu_bwd)  # pylint: disable=protected-access
-  else:
-
-    def _cpu_fwd(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        b: torch.Tensor,
-        w: torch.Tensor,
-        chunk_size: int = 64,
-        scale: float | None = None,
-        return_residuals: bool = True,
-        config: Sequence[int] | None = None,
-        bwd_config: Sequence[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-      out_jax, a_mat_jax, merged_out_jax, s_in_jax = op_self.op_impl_call(
-          _torch_to_jax(q),
-          _torch_to_jax(k),
-          _torch_to_jax(v),
-          _torch_to_jax(g),
-          _torch_to_jax(b),
-          _torch_to_jax(w),
-          chunk_size=chunk_size,
-          scale=scale,
-          return_residuals=return_residuals,
-          config=None if config is None else tuple(config),
-          bwd_config=None if bwd_config is None else tuple(bwd_config),
-      )
-      return (
-          _jax_to_torch(out_jax, v.device, v.dtype),
-          _jax_to_torch(a_mat_jax, q.device, q.dtype),
-          _jax_to_torch(merged_out_jax, q.device, torch.float32),
-          _jax_to_torch(s_in_jax, q.device, torch.float32),
-      )
-
-    op_self._torch_tokamax_op.register_kernel("cpu")(_cpu_fwd)  # pylint: disable=protected-access
 
 
 class _GatedDeltaNet2Vjp[Config](torch_op.TorchOp[Config]):
@@ -160,11 +44,6 @@ class _GatedDeltaNet2Vjp[Config](torch_op.TorchOp[Config]):
     self.jax_op_name = "base_gdn2_vjp"
     self.is_vjp = True
     self.fake_impl = self._fake_impl
-
-  @override
-  def _register_ops(self) -> None:
-    super()._register_ops()
-    _register_cpu_kernel(self, is_vjp=True)
 
   def _fake_impl(
       self,
@@ -337,11 +216,6 @@ class _GatedDeltaNet2[Config](torch_op.TorchOp[Config]):
     self.jax_op_name = "base_gdn2"
     self.is_vjp = False
     self.fake_impl = self._fake_impl
-
-  @override
-  def _register_ops(self) -> None:
-    super()._register_ops()
-    _register_cpu_kernel(self, is_vjp=False)
 
   def _fake_impl(
       self,

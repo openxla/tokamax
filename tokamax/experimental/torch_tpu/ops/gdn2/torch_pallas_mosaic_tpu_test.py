@@ -15,33 +15,31 @@
 
 """Unit tests for Gated Delta Net 2 (GDN-2) PyTorch Pallas operator."""
 
-import unittest
-
 from absl import logging
 from absl.testing import absltest
+import jax
 import torch
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_base
 from tokamax.experimental.torch_tpu.ops.gdn2 import torch_pallas_mosaic_tpu
+import torch_tpu  # pylint: disable=unused-import
 
 gdn2_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet2
 
 
-class GDN2PallasKernelTest(unittest.TestCase):
+class GDN2PallasKernelTest(absltest.TestCase):
   """Tests for GDN-2 Pallas kernel against base reference."""
 
-  def _get_device(self) -> str:
-    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
-      accel = torch.accelerator.current_accelerator()
-      if accel is not None and accel.type in ("tpu", "xla"):
-        return accel.type
-    return "cpu"
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
 
   def test_forward_shape_and_parity_multi_chunk(self):
-    device = self._get_device()
+    device = "tpu"
     chunk_size = 64
 
     for seq_len in (64, 128, 256):
-      batch_size, num_heads, head_dim = 2, 4, 16
+      batch_size, num_heads, head_dim = 2, 4, 128
       torch.manual_seed(42)
       q = (
           torch.randn(
@@ -116,20 +114,20 @@ class GDN2PallasKernelTest(unittest.TestCase):
       logging.info("GDN-2 forward parity test passed for seq_len=%d.", seq_len)
 
   def test_chunk_size_validation(self):
-    device = self._get_device()
-    q = torch.randn(2, 100, 4, 16, device=device)
-    k = torch.randn(2, 100, 4, 16, device=device)
-    v = torch.randn(2, 100, 4, 16, device=device)
-    g = torch.randn(2, 100, 4, 16, device=device)
-    b_mat = torch.randn(2, 100, 4, 16, device=device)
-    w_mat = torch.randn(2, 100, 4, 16, device=device)
+    device = "tpu"
+    q = torch.randn(2, 100, 4, 128, device=device)
+    k = torch.randn(2, 100, 4, 128, device=device)
+    v = torch.randn(2, 100, 4, 128, device=device)
+    g = torch.randn(2, 100, 4, 128, device=device)
+    b_mat = torch.randn(2, 100, 4, 128, device=device)
+    w_mat = torch.randn(2, 100, 4, 128, device=device)
 
     with self.assertRaises(ValueError):
       gdn2_pallas(q, k, v, g, b_mat, w_mat, chunk_size=64)
 
   def test_backward_autograd_matches_reference(self):
-    device = self._get_device()
-    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 16
+    device = "tpu"
+    batch_size, seq_len, num_heads, head_dim = 2, 128, 4, 128
     chunk_size = 64
 
     torch.manual_seed(42)
