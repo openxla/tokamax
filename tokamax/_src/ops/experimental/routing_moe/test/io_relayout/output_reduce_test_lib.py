@@ -91,6 +91,7 @@ class ReduceCase:
         case.num_tokens,
         shape.num_experts,
         active_expert_ratio=case.active_expert_ratio,
+        max_to_mean_load=case.max_to_mean_load,
         dtype=jnp.float32,
     )
     topk_weights, topk_indices = test_inputs.top_k(

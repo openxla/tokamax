@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
+from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
+from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_lib
@@ -65,6 +67,13 @@ class MoETestCase(parameterized.TestCase):
     )
     moe_case.assert_close(actual)
     if capture_xprof:
+      _, topk_indices = test_reference.compute_topk(moe_case.raw, case.shape)
+      routing = test_inputs.Routing.make_routing(
+          topk_indices, case.shape.num_experts
+      )
+      test_util.log_expert_load(
+          case.name, routing.group_sizes, ep=sharding.ep
+      )
       with test_util.XprofTrace():
         moe_case.run(
             self.mode,
