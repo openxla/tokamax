@@ -248,7 +248,7 @@ def get_heuristics_config(
   ):
     split_k = num_clusters // grid_size
     split_k = min(kv_seq_len // block_kv, split_k)
-    while kv_seq_len % split_k != 0:
+    while (kv_seq_len // block_kv) % split_k != 0:
       split_k -= 1
 
   q, k, v, bias, mask = eval_in_shapes(split_k=split_k)
