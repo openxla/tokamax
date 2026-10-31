@@ -134,8 +134,8 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     lane_max = np.abs(payload.reshape(len(rows), -1, 128)).max(axis=1)
     np.testing.assert_array_equal(lane_max, float(jnp.finfo(FP8).max))
 
-  def test_gmm_scatter_fp8_zero_row_has_unit_scale(self):
-    # A zero row has a zero absmax, so its scale should be 1 instead of 0.
+  def test_gmm_scatter_fp8_zero_row_has_zero_scale(self):
+    # A zero row has a zero absmax, so its scales and payload are all 0.
     case = gmm_test_lib.GmmCase.make_case(test_cases.TOP1_200)
     routing = case.routing
     zeros = 4
@@ -148,7 +148,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     ).data
     rows = np.asarray(routing.scattered_rows[:zeros])
     _, scales = gmm_test_lib.split_scaled_rows(actual)
-    np.testing.assert_array_equal(np.asarray(scales)[rows], 1.0)
+    np.testing.assert_array_equal(np.asarray(scales)[rows], 0.0)
     np.testing.assert_array_equal(
         np.asarray(gmm_test_lib.dequantize_rows(actual))[rows], 0
     )
@@ -437,7 +437,6 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       )
 
   @parameterized.named_parameters(
-      ("skip", gmm_plan.RoutingGmmPlan(skip_metadata_size=2)),
       ("live_group_walk", gmm_plan.RoutingGmmPlan(live_group_walk=True)),
       ("sorted_walk", gmm_plan.RoutingGmmPlan(live_group_walk=False)),
   )
@@ -461,18 +460,6 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       np.testing.assert_array_equal(
           gmm_test_lib.to_large_layout(actual)[written],
           gmm_test_lib.to_large_layout(expected)[written],
-      )
-
-  def test_negative_skip_metadata_size(self):
-    case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
-    with self.assertRaisesRegex(ValueError, "skip_metadata_size"):
-      kernel.routing_gmm(
-          case.x_compact,
-          case.w1,
-          gather=case.routing.gather,
-          fuse_act="silu",
-          custom_plan=gmm_plan.RoutingGmmPlan(skip_metadata_size=-1),
-          **case.routing.kernel_kwargs,
       )
 
 

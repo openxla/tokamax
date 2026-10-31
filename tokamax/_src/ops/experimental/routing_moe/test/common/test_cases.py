@@ -64,14 +64,15 @@ class Case:
     shape: Static MoE model dimensions and quantization settings.
     num_tokens: Number of input tokens.
     sharding: Expert- and tensor-parallel shard counts.
-    active_expert_ratio: Fraction of experts that receive routing weight.
+    max_to_mean_load: Expected rows of the most-loaded expert over the mean
+      rows per expert. 1.0 routes every expert equally often.
   """
 
   name: str
   shape: test_shapes.MoEShape
   num_tokens: int
   sharding: MoESharding = MoESharding()
-  active_expert_ratio: float = 1.0
+  max_to_mean_load: float = 1.0
 
   @property
   def num_local_experts(self) -> int:
@@ -96,18 +97,25 @@ def _prod_sweep(
     token_counts: tuple[int, ...],
     shardings: tuple[MoESharding, ...],
     *,
-    active_expert_ratio: float = 1.0,
+    max_to_mean_loads: tuple[float, ...] = (1.0,),
 ) -> tuple[Case, ...]:
-  """Expands `shape` across `token_counts` and `shardings`."""
+  """Expands `shape` across `token_counts`, `shardings` and expert loads."""
+
+  def _name(n: int, s: MoESharding, load: float) -> str:
+    skew = "" if load == 1.0 else f"_load{load:g}x"
+    return f"{shape.name}_{n}_ep{s.ep}_tp{s.tp}{skew}"
+
   return tuple(
       Case(
-          f"{shape.name}_{n}_ep{s.ep}_tp{s.tp}",
+          _name(n, s, load),
           shape,
           n,
           sharding=s,
-          active_expert_ratio=active_expert_ratio,
+          max_to_mean_load=load,
       )
-      for n, s in itertools.product(token_counts, shardings)
+      for n, s, load in itertools.product(
+          token_counts, shardings, max_to_mean_loads
+      )
   )
 
 
@@ -154,13 +162,13 @@ PROD_CASES = (
         test_shapes.QWEN_CODER_480B,
         (64, 8192),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
-        active_expert_ratio=0.6,
+        max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
         test_shapes.MISTRAL_3_LARGE,
         (2048, 4096, 32768),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
-        active_expert_ratio=0.6,
+        max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
         test_shapes.QWEN_35_397B,
@@ -183,5 +191,12 @@ PROD_CASES = (
         test_shapes.QWEN_38_FLASH_NEXT,
         (4, 8, 12),
         shardings=(MoESharding(ep=4),),
+    ),
+    # Prefill with moderately and heavily skewed expert loads.
+    *_prod_sweep(
+        test_shapes.QWEN_38_FLASH_NEXT,
+        (16384,),
+        shardings=(MoESharding(ep=4),),
+        max_to_mean_loads=(2.0, 4.0),
     ),
 )

@@ -37,13 +37,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    if (
-        jax.default_backend() == 'gpu'
-        and self.IMPL is None
-        and gpu_utils.is_sm100()
-    ):
-      # TODO: Remove once SM100 Mosaic GPU support is fixed.
-      self.skipTest('SM100 Mosaic GPU support is broken.')
 
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
@@ -322,11 +315,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Memory scaling guarantees not made for this implementation'
       )
-    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
-    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
-      self.skipTest(
-          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
-      )
     # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
     if (
         jax.default_backend() == 'tpu'
@@ -370,11 +358,7 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     super().setUp()
     match jax.default_backend():
       case 'gpu':
-        if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
-          self.skipTest(
-              'Skip test. Mosaic implementation is not supported on this'
-              ' platform.'
-          )
+        pass
       case 'tpu':
         pass
       case _:
@@ -511,15 +495,9 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
     shape_2d = (batch_dim_0, batch_dim_1, seq_len, num_heads, head_dim)
     shape_1d = (total_batch, seq_len, num_heads, head_dim)
 
-    q_input = jax.random.normal(
-        jax.random.key(10), shape_2d, dtype=jnp.float32
-    )
-    k_input = jax.random.normal(
-        jax.random.key(11), shape_2d, dtype=jnp.float32
-    )
-    v_input = jax.random.normal(
-        jax.random.key(12), shape_2d, dtype=jnp.float32
-    )
+    q_input = jax.random.normal(jax.random.key(10), shape_2d, dtype=jnp.float32)
+    k_input = jax.random.normal(jax.random.key(11), shape_2d, dtype=jnp.float32)
+    v_input = jax.random.normal(jax.random.key(12), shape_2d, dtype=jnp.float32)
 
     query_seq_lengths = jnp.array([[4, 8, 12], [6, 10, 16]], dtype=jnp.int32)
     kv_seq_lengths = jnp.array([[6, 10, 14], [8, 12, 16]], dtype=jnp.int32)
@@ -536,7 +514,7 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
         v_flat,
         query_seq_lengths=q_len_flat,
         key_value_seq_lengths=kv_len_flat,
-        implementation="xla",
+        implementation='xla',
     )
     expected_out = jnp.reshape(expected_out_flat, shape_2d)
 
@@ -546,7 +524,7 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
         v_input,
         query_seq_lengths=query_seq_lengths,
         key_value_seq_lengths=kv_seq_lengths,
-        implementation="xla",
+        implementation='xla',
     )
     self.assertTrue(
         jnp.allclose(actual_out, expected_out, atol=1e-3, rtol=1e-3)
