@@ -533,5 +533,170 @@ class ChunkedMetadataTest(parameterized.TestCase):
     np.testing.assert_array_equal(np.array(meta_.num_steps), [0, 0, 0])
 
 
+class QBlockScheduleMetadataTest(parameterized.TestCase):
+  """Tests for `qblock_schedule=True` and `lookup_qblock_step`."""
+
+  def _expand_qblock_schedule(self, meta: metadata.MetadataRef, chunk_idx=0):
+    offset = int(np.sum(np.array(meta.num_steps)[:chunk_idx]))
+    n_steps = int(meta.num_steps[chunk_idx])
+    out = []
+    for p in range(n_steps):
+      bt, bq, cur_bkv, is_last, qb_id = metadata.lookup_qblock_step(
+          meta, offset + p
+      )
+      out.append(
+          (int(bt), int(bq), int(cur_bkv), bool(is_last), int(qb_id))
+      )
+    return out
+
+  def test_causal_pruning_prefill_and_smem_bound(self):
+    # Full causal prefill: q_len = seq_len = 1024, bq_sz = 128, bkv_sz = 256.
+    # Query blocks 0..7 end at tokens 127, 255, ..., 1023 -> visible KV counts
+    # 128, 256, 384, 512, 640, 768, 896, 1024 -> bkv counts [1,1,2,2,3,3,4,4].
+    meta = metadata.compute_metadata(
+        seq_lens=jnp.array([1024], dtype=jnp.int32),
+        cu_q_lens=jnp.array([0, 1024], dtype=jnp.int32),
+        start_seq_idx=0,
+        end_seq_idx=1,
+        bq_sz=128,
+        bkv_sz=256,
+        pages_per_seq=16,
+        page_size=64,
+        max_num_tokens=1024,
+        qblock_schedule=True,
+    )
+    self.assertEqual(meta.bkv_idx.shape, (128,))
+    self.assertEqual(int(meta.num_steps[0]), 20)
+    steps = self._expand_qblock_schedule(meta)
+    expected_counts = [1, 1, 2, 2, 3, 3, 4, 4]
+    expected = []
+    for qb, cnt in enumerate(expected_counts):
+      for kv in range(cnt):
+        expected.append((0, qb, kv, kv == cnt - 1, qb))
+    self.assertEqual(steps, expected)
+
+    # 1M-context chunked prefill still uses (128,) SMEM descriptor slots.
+    meta_1m = metadata.compute_metadata(
+        seq_lens=jnp.array([1048576], dtype=jnp.int32),
+        cu_q_lens=jnp.array([0, 1024], dtype=jnp.int32),
+        start_seq_idx=0,
+        end_seq_idx=1,
+        bq_sz=128,
+        bkv_sz=1024,
+        pages_per_seq=16384,
+        page_size=64,
+        max_num_tokens=1024,
+        qblock_schedule=True,
+    )
+    self.assertEqual(meta_1m.bkv_idx.shape, (128,))
+    self.assertEqual(int(meta_1m.num_steps[0]), 8 * 1024)
+
+  def test_batched_decode_matches_flat_schedule(self):
+    seq_lens = jnp.array([128, 256, 512, 64], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32)
+    kwargs = dict(
+        seq_lens=seq_lens,
+        cu_q_lens=cu_q_lens,
+        start_seq_idx=0,
+        end_seq_idx=4,
+        bq_sz=1,
+        bkv_sz=64,
+        pages_per_seq=8,
+        page_size=32,
+        max_num_tokens=4,
+        compression_ratio=2,
+        static_q_len=1,
+        seq_batch_size=2,
+    )
+    flat = metadata.compute_metadata(**kwargs, qblock_schedule=False)
+    qb = metadata.compute_metadata(**kwargs, qblock_schedule=True)
+    self.assertEqual(int(qb.num_steps[0]), int(flat.num_steps[0]))
+    expanded = self._expand_qblock_schedule(qb)
+    for p, (bt, bq_i, cur_bkv, _, _) in enumerate(expanded):
+      self.assertEqual(bt, int(flat.batch_tile_idx[p]))
+      self.assertEqual(bq_i, int(flat.bq_idx[p]))
+      self.assertEqual(cur_bkv, int(flat.bkv_idx[p]))
+
+  def test_chunked_qblock_schedule_matches_standalone_chunks(self):
+    seq_lens = jnp.array([512, 1024, 768, 256], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 100, 512, 1024, 1024], dtype=jnp.int32)
+    starts = (0, 256, 512, 768)
+    combined = metadata.compute_metadata(
+        seq_lens=seq_lens,
+        cu_q_lens=cu_q_lens,
+        start_seq_idx=0,
+        end_seq_idx=4,
+        bq_sz=64,
+        bkv_sz=128,
+        pages_per_seq=16,
+        page_size=64,
+        max_num_tokens=1024,
+        chunk_token_start=starts,
+        chunk_tokens=256,
+        qblock_schedule=True,
+    )
+    for m, s in enumerate(starts):
+      solo = metadata.compute_metadata(
+          seq_lens=seq_lens,
+          cu_q_lens=cu_q_lens,
+          start_seq_idx=0,
+          end_seq_idx=4,
+          bq_sz=64,
+          bkv_sz=128,
+          pages_per_seq=16,
+          page_size=64,
+          max_num_tokens=1024,
+          chunk_token_start=s,
+          chunk_tokens=256,
+          qblock_schedule=True,
+      )
+      self.assertEqual(int(combined.num_steps[m]), int(solo.num_steps[0]))
+      comb_steps = [x[:4] for x in self._expand_qblock_schedule(combined, m)]
+      solo_steps = [x[:4] for x in self._expand_qblock_schedule(solo, 0)]
+      self.assertEqual(comb_steps, solo_steps)
+
+  def test_non_pow2_slots_and_empty_pass(self):
+    # Verify `lookup_qblock_step` handles arbitrary non-power-of-2 slot counts
+    # (e.g. 100_000 in mock OOM tests) and empty passes safely.
+    n = 100
+    bkv_end = np.full((n,), metadata.QBLOCK_END_SENTINEL, dtype=np.int32)
+    bkv_end[:3] = [2, 3, 6]
+    bt = np.zeros((n,), dtype=np.int32)
+    bt[:3] = [0, 1, 2]
+    bq = np.zeros((n,), dtype=np.int32)
+    bq[:3] = [0, 0, 1]
+    mock_meta = metadata.MetadataRef.create(
+        num_steps=jnp.array([6], dtype=jnp.int32),
+        batch_tile_idx=jnp.asarray(bt),
+        bq_idx=jnp.asarray(bq),
+        bkv_idx=jnp.asarray(bkv_end),
+    )
+    self.assertEqual(
+        self._expand_qblock_schedule(mock_meta),
+        [
+            (0, 0, 0, False, 0),
+            (0, 0, 1, True, 0),
+            (1, 0, 0, True, 1),
+            (2, 1, 0, False, 2),
+            (2, 1, 1, False, 2),
+            (2, 1, 2, True, 2),
+        ],
+    )
+    empty = metadata.compute_metadata(
+        seq_lens=jnp.array([128], dtype=jnp.int32),
+        cu_q_lens=jnp.array([0, 1], dtype=jnp.int32),
+        start_seq_idx=0,
+        end_seq_idx=0,
+        bq_sz=16,
+        bkv_sz=128,
+        pages_per_seq=1,
+        page_size=128,
+        max_num_tokens=1,
+        qblock_schedule=True,
+    )
+    self.assertEqual(int(empty.num_steps[0]), 0)
+    self.assertEqual(int(empty.bkv_idx[0]), metadata.QBLOCK_END_SENTINEL)
+
+
 if __name__ == "__main__":
   absltest.main()
