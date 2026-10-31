@@ -133,7 +133,7 @@ def lightning_indexer(
         f"compression_ratio ({compression_ratio})."
     )
   if cp_size > 1:
-    interleave_c = interleave_size // cp_size
+    interleave_c = interleave_size // compression_ratio
   else:
     interleave_c = 1
 
