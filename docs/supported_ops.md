@@ -192,6 +192,13 @@ table.ops-table code {
       <td align="center" style="text-align: center;">✅</td>
       <td>Diagonal-plus-low-rank (DPLR) state-transition linear attention with vector log-decay and in-context learning rate, implementing <a href="https://arxiv.org/abs/2503.14456">RWKV-7 "Goose" with Expressive Dynamic State Evolution</a>.</td>
     </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/raven"><code>raven</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Two-stage bounded-slot linear attention with decoupled slot-axis and state-axis exponential decay, implementing <a href="https://arxiv.org/abs/2409.07146">Gated Slot Attention for Efficient Linear-Time Sequence Modeling</a>.</td>
+    </tr>
   </tbody>
 </table>
 
