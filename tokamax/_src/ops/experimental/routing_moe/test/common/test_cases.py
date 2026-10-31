@@ -64,7 +64,6 @@ class Case:
     shape: Static MoE model dimensions and quantization settings.
     num_tokens: Number of input tokens.
     sharding: Expert- and tensor-parallel shard counts.
-    active_expert_ratio: Fraction of experts that receive routing weight.
     max_to_mean_load: Expected rows of the most-loaded expert over the mean
       rows per expert. 1.0 routes every expert equally often.
   """
@@ -73,9 +72,6 @@ class Case:
   shape: test_shapes.MoEShape
   num_tokens: int
   sharding: MoESharding = MoESharding()
-  # TODO: Consolidate active_expert_ratio and max_to_mean_load
-  # into one expert load setting.
-  active_expert_ratio: float = 1.0
   max_to_mean_load: float = 1.0
 
   @property
@@ -101,7 +97,6 @@ def _prod_sweep(
     token_counts: tuple[int, ...],
     shardings: tuple[MoESharding, ...],
     *,
-    active_expert_ratio: float = 1.0,
     max_to_mean_loads: tuple[float, ...] = (1.0,),
 ) -> tuple[Case, ...]:
   """Expands `shape` across `token_counts`, `shardings` and expert loads."""
@@ -116,7 +111,6 @@ def _prod_sweep(
           shape,
           n,
           sharding=s,
-          active_expert_ratio=active_expert_ratio,
           max_to_mean_load=load,
       )
       for n, s, load in itertools.product(
@@ -168,13 +162,13 @@ PROD_CASES = (
         test_shapes.QWEN_CODER_480B,
         (64, 8192),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
-        active_expert_ratio=0.6,
+        max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
         test_shapes.MISTRAL_3_LARGE,
         (2048, 4096, 32768),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
-        active_expert_ratio=0.6,
+        max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
         test_shapes.QWEN_35_397B,

@@ -90,13 +90,12 @@ def random_gating(
     num_tokens: int,
     num_experts: int,
     *,
-    active_expert_ratio: float = 1.0,
     max_to_mean_load: float = 1.0,
     num_skipped: int = 0,
     force_expert: int | None = None,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
 ) -> jax.Array:
-  """Generates router logits with optional expert masking or load skew.
+  """Generates router logits with optional expert load skew.
 
   By default, every expert is equally likely: logits are uniform in `[0, 1)`.
 
@@ -104,8 +103,6 @@ def random_gating(
     key: PRNG key.
     num_tokens: Number of tokens.
     num_experts: Number of routed experts.
-    active_expert_ratio: Fraction of experts that receive routing weight. The
-      others get logit 0.
     max_to_mean_load: Expected rows of the most-loaded expert over the mean
       rows per expert. Above 1, each token samples its experts without
       replacement, in proportion to long-tailed per-expert probabilities.
@@ -116,26 +113,19 @@ def random_gating(
   Returns:
     `[num_tokens, num_experts]` router logits.
   """
-  if active_expert_ratio < 1.0 and max_to_mean_load != 1.0:
-    raise ValueError(
-        "active_expert_ratio and max_to_mean_load cannot both be set."
-    )
-  k_logits, k_active = jax.random.split(key)
+  k_logits, k_popularity = jax.random.split(key)
   if max_to_mean_load == 1.0:
     gating_output = jax.random.uniform(
         k_logits, (num_tokens, num_experts), dtype=dtype
     )
   else:
-    popularity = _lognormal_popularity(k_active, num_experts, max_to_mean_load)
+    popularity = _lognormal_popularity(
+        k_popularity, num_experts, max_to_mean_load
+    )
     # Top-k of log probabilities plus Gumbel noise samples experts in
     # proportion to `popularity`, without replacement.
     gumbel = jax.random.gumbel(k_logits, (num_tokens, num_experts))
     gating_output = (jnp.log(popularity) + gumbel).astype(dtype)
-  if active_expert_ratio < 1.0:
-    score = jax.random.normal(k_active, (num_experts,))
-    num_active = int(num_experts * active_expert_ratio)
-    threshold, _ = jax.lax.top_k(score, k=num_active)
-    gating_output = jnp.where(score >= threshold[-1], gating_output, 0.0)
   # Skipped experts go below and the forced expert above every other logit,
   # which is -1 and 2 for uniform logits.
   if num_skipped:
@@ -246,7 +236,6 @@ class MoEInputs:
       num_tokens: int,
       *,
       seed: int = 0,
-      active_expert_ratio: float = 1.0,
       max_to_mean_load: float = 1.0,
       num_skipped: int = 0,
       force_expert: int | None = None,
@@ -262,7 +251,6 @@ class MoEInputs:
             keys[1],
             num_tokens,
             e,
-            active_expert_ratio=active_expert_ratio,
             max_to_mean_load=max_to_mean_load,
             num_skipped=num_skipped,
             force_expert=force_expert,

@@ -90,7 +90,6 @@ class ReduceCase:
         k_gate,
         case.num_tokens,
         shape.num_experts,
-        active_expert_ratio=case.active_expert_ratio,
         max_to_mean_load=case.max_to_mean_load,
         dtype=jnp.float32,
     )

@@ -39,7 +39,9 @@ class RandomGatingTest(parameterized.TestCase):
         jax.random.uniform(k_logits, (16, 8), dtype=jnp.bfloat16),
     )
 
-  @parameterized.product(num_experts=[256, 512], max_to_mean_load=[2.0, 4.0])
+  @parameterized.product(
+      num_experts=[256, 512], max_to_mean_load=[1.67, 2.0, 4.0]
+  )
   def test_skewed_load_follows_target(
       self, num_experts: int, max_to_mean_load: float
   ):
@@ -80,16 +82,6 @@ class RandomGatingTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "max_to_mean_load must be in"):
       test_inputs.random_gating(
           jax.random.key(0), 16, 8, max_to_mean_load=max_to_mean_load
-      )
-
-  def test_skew_with_active_expert_ratio_raises(self):
-    with self.assertRaisesRegex(ValueError, "cannot both be set"):
-      test_inputs.random_gating(
-          jax.random.key(0),
-          16,
-          8,
-          active_expert_ratio=0.5,
-          max_to_mean_load=2.0,
       )
 
 

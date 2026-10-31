@@ -102,7 +102,6 @@ class GmmCase:
     layer_inputs = test_inputs.MoEInputs.generate(
         shape,
         case.num_tokens,
-        active_expert_ratio=case.active_expert_ratio,
         max_to_mean_load=case.max_to_mean_load,
         num_skipped=num_skipped,
         force_expert=None if num_skipped or balanced_ep else group_offset,

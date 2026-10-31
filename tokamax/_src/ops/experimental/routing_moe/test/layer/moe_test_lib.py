@@ -135,7 +135,6 @@ def _make_raw_inputs(
     layout: WeightLayout,
     *,
     seed: int,
-    active_expert_ratio: float = 1.0,
     max_to_mean_load: float = 1.0,
 ) -> test_inputs.MoEInputs:
   """Generates, folds, and quantizes the unsharded inputs of one layer call."""
@@ -146,11 +145,7 @@ def _make_raw_inputs(
         "fold_shared_expert requires has_shared_expert and sharding.ep == 1."
     )
   moe = test_inputs.MoEInputs.generate(
-      shape,
-      num_tokens,
-      seed=seed,
-      active_expert_ratio=active_expert_ratio,
-      max_to_mean_load=max_to_mean_load,
+      shape, num_tokens, seed=seed, max_to_mean_load=max_to_mean_load
   )
   if layout.fold_shared_expert:
     moe = moe.fold_shared_expert()
@@ -397,7 +392,6 @@ class MoECase:
         case.num_tokens,
         layout,
         seed=seed,
-        active_expert_ratio=case.active_expert_ratio,
         max_to_mean_load=case.max_to_mean_load,
     )
     sharded = jax.block_until_ready(_shard_inputs(raw, mesh, layout))
