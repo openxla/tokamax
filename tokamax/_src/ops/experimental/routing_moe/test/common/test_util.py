@@ -22,6 +22,7 @@ from absl import logging
 from absl.testing import absltest
 import jax
 from jax.experimental.pallas import tpu as pltpu
+import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 
@@ -67,6 +68,30 @@ def check_moe_supported(
     raise absltest.SkipTest(
         "TODO: Support remote_scatter with hybrid parallelism."
     )
+
+
+def log_expert_load(
+    name: str, group_sizes: jax.Array | np.ndarray, *, ep: int = 1
+) -> None:
+  """Logs the rows each expert receives, overall and per EP shard.
+
+  Logs the max-to-mean rows per expert, then per shard its total rows and the
+  min, 10th percentile, median, and max rows per expert.
+
+  Args:
+    name: Name of the test case.
+    group_sizes: Rows routed to each global expert.
+    ep: Number of EP shards, each serving a contiguous range of experts.
+  """
+  rows = np.asarray(group_sizes)
+  parts = [f"max/mean rows per expert {rows.max() / rows.mean():.2f}x"]
+  for shard, local in enumerate(np.split(rows, ep)):
+    p10, p50 = np.percentile(local, [10, 50])
+    parts.append(
+        f"shard {shard}: {local.sum()} rows, per expert min {local.min()}"
+        f" p10 {p10:.0f} p50 {p50:.0f} max {local.max()}"
+    )
+  logging.info("%s expert load: %s", name, "; ".join(parts))
 
 
 class XprofTrace:

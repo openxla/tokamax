@@ -59,11 +59,7 @@ ROUTINGS = (
 )
 
 PLANS = (
-    gmm_plan.RoutingGmmPlan(skip_metadata_size=0),
-    gmm_plan.RoutingGmmPlan(skip_metadata_size=1),
-    gmm_plan.RoutingGmmPlan(skip_metadata_size=2),
-    gmm_plan.RoutingGmmPlan(skip_metadata_size=63),
-    gmm_plan.RoutingGmmPlan(skip_metadata_size=1024),
+    gmm_plan.RoutingGmmPlan(live_group_walk=False),
     gmm_plan.RoutingGmmPlan(live_group_walk=True),
 )
 

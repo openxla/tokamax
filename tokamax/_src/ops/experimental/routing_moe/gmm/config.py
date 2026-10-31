@@ -30,6 +30,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as plan_lib
 
 
@@ -47,31 +48,12 @@ class RoutingMode(enum.StrEnum):
 
 
 @dataclasses.dataclass(frozen=True)
-class DynamicQuantConfig:
-  """Dynamic quantization parameters for an activation tensor.
-
-  Each scale covers `block_size` elements of a row spaced `stride` columns
-  apart (`stride=1` for contiguous blocks, `stride=num_lanes` for per-lane
-  scales).
-
-  Attributes:
-    dtype: Target quantized element dtype.
-    block_size: Number of elements along the row sharing a single scale.
-    stride: Column stride between elements sharing a scale.
-  """
-
-  dtype: jnp.dtype
-  block_size: int
-  stride: int = 1
-
-
-@dataclasses.dataclass(frozen=True)
 class ActivationConfig:
   """User-provided spec of an activation and the kernel's decisions on it."""
 
   spec: arg.ActivationSpec
   mode: RoutingMode
-  dynamic_quant: DynamicQuantConfig | None = None
+  dynamic_quant: quant_util.DynamicQuantConfig | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +62,7 @@ class ComputeConfig:
 
   acc_dtype: jnp.dtype
   tpu_info: pltpu.TpuInfo
-  dynamic_quant: DynamicQuantConfig | None = None
+  dynamic_quant: quant_util.DynamicQuantConfig | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,7 +200,7 @@ class OutputConfig(ActivationConfig):
         raise ValueError(
             f"Output cols {dim.size_out_n} must fill whole {out_dtype} chunks."
         )
-      quant = DynamicQuantConfig(
+      quant = quant_util.DynamicQuantConfig(
           dtype=out_dtype, block_size=dim.size_out_n // lanes, stride=lanes
       )
       cols += packing * lanes
@@ -280,7 +262,7 @@ class RoutingGmmConfig:
     x_quant = None
     if plan.matmul_dtype != x.dtype:
       assert plan.x_quant_block_size is not None
-      x_quant = DynamicQuantConfig(
+      x_quant = quant_util.DynamicQuantConfig(
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
       )
 

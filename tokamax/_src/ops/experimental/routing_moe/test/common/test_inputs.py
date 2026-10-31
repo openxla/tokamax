@@ -15,6 +15,8 @@
 """Input generation and routing helpers shared across routing_moe tests."""
 
 import dataclasses
+import math
+import statistics
 from typing import Self
 
 import jax
@@ -49,30 +51,91 @@ def make_mesh(
   )
 
 
+def _lognormal_popularity(
+    key: jax.Array, num_experts: int, max_to_mean_load: float
+) -> np.ndarray:
+  """Returns long-tailed routing probabilities, one per expert.
+
+  The probabilities are evenly spaced quantiles of `exp(sigma * Z)` for a
+  standard normal `Z`, randomly assigned to experts, so a few experts are hot
+  and a few are cold. Since `E[exp(sigma * Z)] = exp(sigma**2 / 2)`, the
+  largest is about `exp(sigma * z_max - sigma**2 / 2)` times the mean, where
+  `z_max` is the top quantile. `sigma` solves this for `max_to_mean_load`.
+
+  Args:
+    key: PRNG key for assigning probabilities to experts.
+    num_experts: Number of routed experts.
+    max_to_mean_load: Ratio of the largest probability to the mean.
+
+  Returns:
+    A `float64[num_experts]` array of probabilities that sums to 1.
+  """
+  normal = statistics.NormalDist()
+  quantiles = (np.arange(num_experts) + 0.5) / num_experts
+  z = np.array([normal.inv_cdf(q) for q in quantiles])
+  z_max = z[-1]
+  if max_to_mean_load <= 1.0 or 2 * math.log(max_to_mean_load) > z_max**2:
+    raise ValueError(
+        f"max_to_mean_load must be in (1, {math.exp(z_max**2 / 2):.4g}] for"
+        f" {num_experts} experts. Got {max_to_mean_load}."
+    )
+  sigma = z_max - math.sqrt(z_max**2 - 2 * math.log(max_to_mean_load))
+  p = np.exp(sigma * z)
+  perm = np.asarray(jax.random.permutation(key, num_experts))
+  return (p / p.sum())[perm]
+
+
 def random_gating(
     key: jax.Array,
     num_tokens: int,
     num_experts: int,
     *,
-    active_expert_ratio: float = 1.0,
+    max_to_mean_load: float = 1.0,
     num_skipped: int = 0,
     force_expert: int | None = None,
     dtype: jax.typing.DTypeLike = jnp.bfloat16,
 ) -> jax.Array:
-  """Generates uniform router logits with optional expert masking."""
-  k_logits, k_active = jax.random.split(key)
-  gating_output = jax.random.uniform(
-      k_logits, (num_tokens, num_experts), dtype=dtype
-  )
-  if active_expert_ratio < 1.0:
-    score = jax.random.normal(k_active, (num_experts,))
-    num_active = int(num_experts * active_expert_ratio)
-    threshold, _ = jax.lax.top_k(score, k=num_active)
-    gating_output = jnp.where(score >= threshold[-1], gating_output, 0.0)
+  """Generates router logits with optional expert load skew.
+
+  By default, every expert is equally likely: logits are uniform in `[0, 1)`.
+
+  Args:
+    key: PRNG key.
+    num_tokens: Number of tokens.
+    num_experts: Number of routed experts.
+    max_to_mean_load: Expected rows of the most-loaded expert over the mean
+      rows per expert. Above 1, each token samples its experts without
+      replacement, in proportion to long-tailed per-expert probabilities.
+    num_skipped: Number of trailing experts that are never selected.
+    force_expert: Expert that token 0 always selects.
+    dtype: Logit dtype.
+
+  Returns:
+    `[num_tokens, num_experts]` router logits.
+  """
+  k_logits, k_popularity = jax.random.split(key)
+  if max_to_mean_load == 1.0:
+    gating_output = jax.random.uniform(
+        k_logits, (num_tokens, num_experts), dtype=dtype
+    )
+  else:
+    popularity = _lognormal_popularity(
+        k_popularity, num_experts, max_to_mean_load
+    )
+    # Top-k of log probabilities plus Gumbel noise samples experts in
+    # proportion to `popularity`, without replacement.
+    gumbel = jax.random.gumbel(k_logits, (num_tokens, num_experts))
+    gating_output = (jnp.log(popularity) + gumbel).astype(dtype)
+  # Skipped experts go below and the forced expert above every other logit,
+  # which is -1 and 2 for uniform logits.
   if num_skipped:
-    gating_output = gating_output.at[:, num_experts - num_skipped :].set(-1)
+    skipped = jnp.minimum(-1.0, gating_output.min() - 1).astype(dtype)
+    gating_output = gating_output.at[:, num_experts - num_skipped :].set(
+        skipped
+    )
   if force_expert is not None:
-    gating_output = gating_output.at[0, force_expert].set(2.0)
+    forced = jnp.maximum(2.0, gating_output[0].max() + 1).astype(dtype)
+    gating_output = gating_output.at[0, force_expert].set(forced)
   return gating_output
 
 
@@ -173,7 +236,7 @@ class MoEInputs:
       num_tokens: int,
       *,
       seed: int = 0,
-      active_expert_ratio: float = 1.0,
+      max_to_mean_load: float = 1.0,
       num_skipped: int = 0,
       force_expert: int | None = None,
   ) -> Self:
@@ -188,7 +251,7 @@ class MoEInputs:
             keys[1],
             num_tokens,
             e,
-            active_expert_ratio=active_expert_ratio,
+            max_to_mean_load=max_to_mean_load,
             num_skipped=num_skipped,
             force_expert=force_expert,
             dtype=dtype,

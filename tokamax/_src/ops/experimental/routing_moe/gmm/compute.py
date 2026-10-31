@@ -16,13 +16,13 @@
 """Functions required to perform matrix multiplication."""
 
 from collections.abc import Callable
-import functools
 
 import jax
 from jax.experimental import hijax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
@@ -105,10 +105,8 @@ def matmul(
     q_block_size = cfg.dynamic_quant.block_size
 
     if jnp.issubdtype(x_q_dtype, jnp.floating):
-      dtype_max = float(jnp.finfo(x_q_dtype).max)
       preferred_element_type = jnp.float32
     else:
-      dtype_max = float(jnp.iinfo(x_q_dtype).max)
       preferred_element_type = jnp.int32
 
     # Weight quantization block along K.
@@ -149,15 +147,10 @@ def matmul(
         # Perform lhs quantization. Note that for every block_lhs,
         # same computation will be performed tiles_n//mxu_size times.
         # But we can let compiler perform CSE and avoid recomputation.
-        block_abs_max = jnp.max(jnp.abs(block_x), axis=1, keepdims=True)
-        block_scale = block_abs_max / dtype_max
-
-        # If block_scale=0, it will cause division by zero and return either
-        # NaN or Inf. Since this can cause numeric issue when downcasting to
-        # quantized value, we convert them into 0.
-        block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-        # Convert lhs into quantized dtype.
-        block_x_q = (block_x * block_scale_inv).astype(x_q_dtype)
+        block_scale, block_scale_inv = quant_util.compute_scale(
+            block_x, cfg.dynamic_quant
+        )
+        block_x_q = quant_util.quantize(block_x, block_scale_inv, x_q_dtype)
 
         # Unlike unquantized path, compiler may not perform implicit type
         # conversion due to numeric concerns. As this can cause unsupported
@@ -202,38 +195,6 @@ def matmul(
   return acc
 
 
-def row_scale(
-    acc: jax.Array, quant: config.DynamicQuantConfig
-) -> tuple[jax.Array, jax.Array]:
-  """Computes per-group quantization scales and their reciprocals.
-
-  Scale `l` maps the maximum magnitude of columns `l, l + stride, ...` to the
-  quantized dtype's maximum finite value. All-zero groups receive a unit scale.
-
-  Args:
-    acc: Unquantized `f32[..., block_size * stride]` accumulator values.
-    quant: Dynamic quantization configuration specifying `dtype`, `block_size`,
-      and `stride`.
-
-  Returns:
-    A `(scale, inv_scale)` pair of `f32[..., stride]` arrays containing the
-    per-group scales and `1 / scale`.
-  """
-  assert acc.shape[-1] == quant.block_size * quant.stride
-  chunks = jnp.split(acc, quant.block_size, axis=-1)
-  absmax = functools.reduce(jnp.maximum, [jnp.abs(c) for c in chunks])
-  dtype_max = float(jnp.finfo(quant.dtype).max)
-  scale = jnp.where(absmax == 0, 1.0, absmax / dtype_max)
-  return scale, 1 / scale
-
-
-def quantize_words(
-    values: jax.Array, inv_scale: jax.Array, dtype: jnp.dtype
-) -> jax.Array:
-  """Scales `values` by `inv_scale`, casts to `dtype`, and packs u32 words."""
-  return pltpu.bitcast((values * inv_scale).astype(dtype), jnp.uint32)
-
-
 def quantize_rows(
     dst: hijax.TransformedRef,
     first_row: int,
@@ -258,7 +219,8 @@ def quantize_rows(
       dst, first_row, num_chunks, pltpu.bitcast(scale, jnp.uint32)
   )
   for chunk in range(num_chunks):
-    words = quantize_words(
+    payload = quant_util.quantize(
         load_chunk(chunk), inv_scale, out.dynamic_quant.dtype
     )
+    words = pltpu.bitcast(payload, jnp.uint32)
     layout_util.store_compact_chunk(dst, first_row, chunk, words)

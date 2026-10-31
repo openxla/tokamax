@@ -179,6 +179,13 @@ table.ops-table code {
       <td>Hardware-aligned hierarchical sparse attention combining compressed-block, selected-block, and sliding-window branches, implementing <a href="https://arxiv.org/abs/2502.11089">Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</a>.</td>
     </tr>
     <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/gdn2"><code>gdn2</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Chunkwise parallel gated delta-rule linear attention with decoupled write gating, implementing <a href="https://arxiv.org/abs/2412.06464">Gated Delta Networks: Improving Mamba2 with Delta Rule</a>.</td>
+    </tr>
+    <tr>
       <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/raven"><code>raven</code></a> (experimental)</td>
       <td>TPU</td>
       <td align="center" style="text-align: center;">✅</td>

@@ -60,8 +60,6 @@ class RoutingGmmPlan:
   # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
   # Revisit it based on per-group DMA vs. compute time.
   max_num_w_buffers: int | None = None
-  # Size of gap to try skipping when writing to metadata.
-  skip_metadata_size: int | None = None
   # Walk only the groups with rows when building the metadata (needs the
   # row_group input of routing_gmm).
   live_group_walk: bool | None = None
@@ -84,7 +82,6 @@ class ResolvedGmmPlan(RoutingGmmPlan):
   x_quant_block_size: int | None
   fuse_up_and_down: bool
   vmem_limit_bytes: int
-  skip_metadata_size: int
   live_group_walk: bool
 
   @property
@@ -156,16 +153,6 @@ class ResolvedGmmPlan(RoutingGmmPlan):
       acc_dtype = jnp.bfloat16.dtype
     else:
       acc_dtype = jnp.dtype(plan.acc_dtype)
-
-    skip_metadata_size = plan.skip_metadata_size
-    if skip_metadata_size is None:
-      # Use the largest power of 2 <= expected gap between touched experts.
-      gap = max(1, size_global_groups // size_out_m)
-      skip_metadata_size = (1 << (gap.bit_length() - 1)) - 1
-    if skip_metadata_size < 0:
-      raise ValueError(
-          f"skip_metadata_size must be >= 0. Got {skip_metadata_size}."
-      )
 
     live_group_walk = plan.live_group_walk
     if live_group_walk is None:
@@ -242,7 +229,6 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         x_quant_block_size=x_quant_block_size,
         fuse_up_and_down=fuse_up_and_down,
         vmem_limit_bytes=vmem_limit_bytes,
-        skip_metadata_size=skip_metadata_size,
         live_group_walk=live_group_walk,
     )
 

@@ -63,6 +63,10 @@ class RoutingGmmProdTest(parameterized.TestCase):
   def test_gather_gmm(self, case_spec: test_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
+    # The kernel runs shard 0.
+    test_util.log_expert_load(
+        case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
+    )
     self._check_and_log(
         fused=test_util.Timed.create(
             kernel.routing_gmm,
@@ -94,6 +98,10 @@ class RoutingGmmProdTest(parameterized.TestCase):
   def test_gmm_scatter(self, case_spec: test_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
+    # The kernel runs shard 0.
+    test_util.log_expert_load(
+        case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
+    )
     self._check_and_log(
         fused=test_util.Timed.create(
             kernel.routing_gmm,
