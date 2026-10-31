@@ -22,6 +22,9 @@ sharding. Unset fields are resolved by heuristics.
 import dataclasses
 from typing import Self
 
+import jax
+import jax.numpy as jnp
+
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingMoEPlan:
@@ -30,9 +33,11 @@ class RoutingMoEPlan:
   Attributes:
     remote_scatter: Whether `routing_gmm` scatters output rows directly to the
       device that owns each token.
+    scatter_dtype: Optional dtype for `routing_gmm` scatter output rows.
   """
 
   remote_scatter: bool | None = None
+  scatter_dtype: jax.typing.DTypeLike | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -40,6 +45,7 @@ class ResolvedMoEPlan(RoutingMoEPlan):
   """Plan with `None` fields from user-provided plan resolved by heuristics."""
 
   remote_scatter: bool
+  scatter_dtype: jnp.dtype | None = None
 
   @classmethod
   def create(cls, plan: RoutingMoEPlan | None) -> Self:
@@ -50,4 +56,7 @@ class ResolvedMoEPlan(RoutingMoEPlan):
     remote_scatter = plan.remote_scatter
     if remote_scatter is None:
       remote_scatter = False
-    return cls(remote_scatter=remote_scatter)
+    scatter_dtype = (
+        None if plan.scatter_dtype is None else jnp.dtype(plan.scatter_dtype)
+    )
+    return cls(remote_scatter=remote_scatter, scatter_dtype=scatter_dtype)

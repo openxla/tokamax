@@ -249,6 +249,7 @@ def _reduce(out: jax.Array, *, mesh: Mesh, layout: WeightLayout) -> jax.Array:
         "layout",
         "mesh",
         "remote_scatter",
+        "scatter_dtype",
         "reduce_output",
         "gmm_plan",
     )
@@ -261,6 +262,7 @@ def _run_moe(
     layout: WeightLayout,
     mesh: Mesh,
     remote_scatter: bool = False,
+    scatter_dtype: jax.typing.DTypeLike | None = None,
     reduce_output: bool = True,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
 ) -> jax.Array:
@@ -280,7 +282,9 @@ def _run_moe(
       reduce_output=reduce_output,
       gmm_plan=gmm_plan,
   )
-  moe_plan = moe_plan_lib.RoutingMoEPlan(remote_scatter=remote_scatter)
+  moe_plan = moe_plan_lib.RoutingMoEPlan(
+      remote_scatter=remote_scatter, scatter_dtype=scatter_dtype
+  )
 
   match mode:
     case "monolithic":
@@ -342,6 +346,7 @@ class MoECase:
       mode: Mode,
       *,
       remote_scatter: bool = False,
+      scatter_dtype: jax.typing.DTypeLike | None = None,
       reduce_output: bool = True,
       gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
   ) -> jax.Array:
@@ -353,17 +358,24 @@ class MoECase:
         layout=self.layout,
         mesh=self.mesh,
         remote_scatter=remote_scatter,
+        scatter_dtype=scatter_dtype,
         reduce_output=reduce_output,
         gmm_plan=gmm_plan,
     )
     return jax.block_until_ready(out)
 
-  def assert_close(self, actual: jax.Array) -> None:
+  def assert_close(
+      self,
+      actual: jax.Array,
+      *,
+      scatter_dtype: jax.typing.DTypeLike | None = None,
+  ) -> None:
     """Asserts that `actual` matches `reference_moe` on `raw`."""
     expected = test_reference.reference_moe(
         self.raw, self.shape, fold_shared_expert=self.layout.fold_shared_expert
     )
-    rtol = 2e-2 if self.shape.w_dtype is None else 5e-2
+    is_quant = self.shape.w_dtype is not None or scatter_dtype is not None
+    rtol = 5e-2 if is_quant else 2e-2
     atol = rtol * float(jnp.abs(expected).max())
     test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 

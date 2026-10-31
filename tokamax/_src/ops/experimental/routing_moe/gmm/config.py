@@ -169,10 +169,10 @@ class OutputConfig(ActivationConfig):
   When `dynamic_quant` is set, each scattered row in compact layout
   `[m, n // (packing * lanes) + 1, packing, lanes]` stores its quantized
   payload chunks followed by one trailing chunk of `f32` per-lane scales
-  (`absmax / dtype_max`, with lane `l` covering columns `l, l + lanes, ...`);
-  `spec.col_size` includes this scale chunk. Because the trailing chunk stores
-  `f32` bit patterns inside a narrow-dtype buffer, consumers must reinterpret
-  that chunk as raw bytes rather than narrow-float values.
+  (`absmax / dtype_max`, with lane `l` covering columns `l, l + lanes, ...`).
+  Because the trailing chunk stores `f32` bit patterns inside a narrow-dtype
+  buffer, consumers must reinterpret that chunk as raw bytes rather than
+  narrow-float values.
   """
 
   @classmethod
@@ -190,7 +190,7 @@ class OutputConfig(ActivationConfig):
     # A 1-byte out_dtype other than x's is quantized with per-lane scales.
     out_dtype = x_dtype if out_dtype is None else jnp.dtype(out_dtype)
     quant = None
-    cols = dim.size_out_n
+    quant_spec = None
     if out_dtype != x_dtype and out_dtype.itemsize == 1:
       if scatter is None:
         raise NotImplementedError("Quantized output needs a scatter.")
@@ -200,16 +200,18 @@ class OutputConfig(ActivationConfig):
         raise ValueError(
             f"Output cols {dim.size_out_n} must fill whole {out_dtype} chunks."
         )
+      block_size = dim.size_out_n // lanes
       quant = quant_util.DynamicQuantConfig(
-          dtype=out_dtype, block_size=dim.size_out_n // lanes, stride=lanes
+          dtype=out_dtype, block_size=block_size, stride=lanes
       )
-      cols += packing * lanes
+      quant_spec = arg.QuantSpec(block_size=block_size, stride=lanes)
 
     # A remote scatter leaves each device only the rows it owns.
     spec = arg.ActivationSpec(
         row_size=dim.size_out_m // dim.size_ep,
-        col_size=cols,
+        col_size=dim.size_out_n,
         dtype=out_dtype,
+        quant=quant_spec,
     )
     return cls(spec=spec, mode=mode, dynamic_quant=quant)
 

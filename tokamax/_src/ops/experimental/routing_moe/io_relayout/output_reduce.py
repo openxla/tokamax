@@ -36,8 +36,8 @@ class TokenWeights:
   """A token's `[k_lo, span, w[0], ..., w[topk - 1]]` record in SMEM.
 
   `k_lo` / `span` bound the token's non-zero weights so its rows are fetched
-  with one contiguous DMA; `w[k]` is the bf16 weight of pick k in both 16-bit
-  halves of the word.
+  with one contiguous DMA; `w[k]` is the weight of pick k (packed bf16 in both
+  16-bit halves).
   """
 
   smem: hijax.TransformedRef
@@ -62,6 +62,7 @@ class Config:
   num_tokens: int
   topk: int
   chunks: int
+  hidden_size: int
   num_batches: int
   tokens_per_batch: int
   tpu_info: pltpu.TpuInfo
@@ -84,6 +85,18 @@ class Config:
     return 4 // self.acc_dtype.itemsize
 
   @property
+  def is_quantized(self) -> bool:
+    return self.in_dtype.itemsize == 1
+
+  @property
+  def quant_scale_offset(self) -> int:
+    return self.hidden_size // (self.in_packing * self.lanes)
+
+  @property
+  def acc_chunks(self) -> int:
+    return self.hidden_size // (self.acc_packing * self.lanes)
+
+  @property
   def lanes(self) -> int:
     return self.tpu_info.num_lanes
 
@@ -91,16 +104,16 @@ class Config:
   def create(
       cls,
       *,
-      rows: jax.Array,
+      rows: arg.ActivationWrapper[jax.Array],
       weights: jax.Array,
       out_dtype: jax.typing.DTypeLike,
       acc_dtype: jax.typing.DTypeLike,
       tpu_info: pltpu.TpuInfo,
   ) -> Self:
     """Derives batching parameters and validates SMEM capacity."""
-    chunks = rows.shape[1]
+    spec = rows.spec
+    _, chunks, _, _ = spec.compact_shape
     num_tokens, topk = weights.shape
-    in_dtype = rows.dtype
     out_dtype = jnp.dtype(out_dtype)
     acc_dtype = jnp.dtype(acc_dtype)
     if acc_dtype != jnp.bfloat16:
@@ -118,11 +131,12 @@ class Config:
         num_tokens=num_tokens,
         topk=topk,
         chunks=chunks,
+        hidden_size=spec.col_size,
         num_batches=num_batches,
         tokens_per_batch=tokens_per_batch,
         tpu_info=tpu_info,
         out_dtype=out_dtype,
-        in_dtype=in_dtype,
+        in_dtype=spec.dtype,
         acc_dtype=acc_dtype,
     )
     if cfg.smem_allocation >= cfg.smem_threshold:
@@ -131,29 +145,19 @@ class Config:
           f" {cfg.smem_threshold} to avoid OOM. Got {cfg.smem_allocation}"
       )
 
-    if (
-        rows.dtype != jnp.bfloat16
-        or rows.ndim != 4
-        or rows.shape[2:] != (2, cfg.lanes)
-    ):
+    if spec.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn):
       raise ValueError(
-          "rows must be bf16[T * K, H / 256, 2, 128], got"
-          f" {rows.dtype}{rows.shape}"
+          f"rows dtype must be bfloat16 or float8_e4m3fn, got {spec.dtype}"
       )
     if weights.ndim != 2:
       raise ValueError(f"weights must be 2D [T, K], got {weights.shape}")
 
-    num_tokens, topk = weights.shape
-    if rows.shape[0] != num_tokens * topk:
+    if spec.row_size != num_tokens * topk:
       raise ValueError(
-          f"weights must be [T, K] with T * K == {rows.shape[0]}, got"
+          f"weights must be [T, K] with T * K == {spec.row_size}, got"
           f" {weights.shape}"
       )
     return cfg
-
-  @property
-  def hidden_size(self) -> int:
-    return self.chunks * self.in_packing * self.lanes
 
   @property
   def pad_tokens(self) -> int:
@@ -161,7 +165,7 @@ class Config:
 
   @property
   def stride(self) -> int:
-    return layout_util.to_bank_conflict_aware_stride(self.chunks)
+    return layout_util.to_bank_conflict_aware_stride(self.acc_chunks)
 
   @property
   def num_topk_weights_buffers(self) -> int:
@@ -267,11 +271,23 @@ def _reduce_token(
       cfg.tokens_per_batch, cfg.topk, -1, cfg.lanes
   )
   for k in range(cfg.topk):
-    weight = jnp.broadcast_to(token_weights.weight(k), (cfg.chunks, cfg.lanes))
-    weight = pltpu.bitcast(weight, cfg.in_dtype).astype(cfg.acc_dtype)
-    input_row = pltpu.bitcast(input_rows_u32[token, k], cfg.in_dtype).astype(
-        cfg.acc_dtype
+    row_u32 = input_rows_u32[token, k]
+    weight = jnp.broadcast_to(
+        token_weights.weight(k), (cfg.acc_chunks, cfg.lanes)
     )
+    weight = pltpu.bitcast(weight, cfg.acc_dtype)
+    if cfg.is_quantized:
+      row_u32, scale_u32 = jnp.split(row_u32, [cfg.quant_scale_offset], axis=0)
+      scale_f32 = pltpu.bitcast(scale_u32, jnp.float32)
+      scale_u32 = pltpu.pack_elementwise(
+          [scale_f32, scale_f32], packed_dtype=jnp.bfloat16
+      )
+      scale = pltpu.bitcast(
+          jnp.broadcast_to(scale_u32, (cfg.acc_chunks, cfg.lanes)),
+          cfg.acc_dtype,
+      )
+      weight = jnp.where(weight != 0, weight * scale, 0)
+    input_row = pltpu.bitcast(row_u32, cfg.in_dtype).astype(cfg.acc_dtype)
     weighted_row = input_row * weight
     weighted_row = jnp.where(weight != 0, weighted_row, 0)
     acc = weighted_row if acc is None else acc + weighted_row
@@ -451,7 +467,7 @@ def _kernel(
 
 @jax.jit(static_argnames=("num_local_experts", "out_dtype", "acc_dtype"))
 def output_reduce_unpack(
-    rows: arg.ActivationWrapper[jax.Array] | jax.Array,
+    rows: arg.ActivationWrapper[jax.Array],
     weights: jax.Array,
     topk_indices: jax.Array | None = None,
     group_offset: jax.Array | int | None = None,
@@ -461,9 +477,6 @@ def output_reduce_unpack(
     acc_dtype: jax.typing.DTypeLike = jnp.bfloat16,
 ) -> jax.Array:
   """Reduces top-k rows and unpacks from compact 4D to large 2D layout."""
-  if isinstance(rows, arg.ActivationWrapper):
-    rows = rows.data
-
   cfg = Config.create(
       rows=rows,
       weights=weights,
@@ -536,5 +549,5 @@ def output_reduce_unpack(
       ),
       name=cfg.kernel_name,
       metadata=cfg.kernel_metadata,
-  )(topk_weights, rows)
+  )(topk_weights, rows.data)
   return out[: cfg.num_tokens]

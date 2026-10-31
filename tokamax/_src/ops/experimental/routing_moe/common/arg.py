@@ -33,6 +33,8 @@ class QuantSpec:
 
   # Contracting-dim elements sharing one scale value.
   block_size: int
+  # Column stride between elements sharing a scale (1 for contiguous).
+  stride: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,6 +42,7 @@ class ActivationSpec:
   """Static description of an activation tensor stored in compact layout."""
 
   row_size: int
+  # Logical column size; physical column size is `col_size + quant_col_size`.
   col_size: int
   dtype: jnp.dtype
   quant: QuantSpec | None = None
@@ -52,9 +55,21 @@ class ActivationSpec:
       )
 
   @property
+  def quant_col_size(self) -> int:
+    if self.quant is None:
+      return 0
+    if self.quant.stride != 128:
+      raise NotImplementedError(
+          "Only per-lane strided quantization (stride=128) is supported, got"
+          f" stride={self.quant.stride}."
+      )
+    num_scales = self.col_size // self.quant.block_size
+    return num_scales * layout_util.get_packing(self.dtype)
+
+  @property
   def compact_shape(self) -> tuple[int, int, int, int]:
     return layout_util.to_compact_shape(
-        (self.row_size, self.col_size), self.dtype
+        (self.row_size, self.col_size + self.quant_col_size), self.dtype
     )
 
   @property
@@ -137,9 +152,9 @@ class ActivationWrapper[T]:
           f"Activation data must have dtype {self.spec.dtype}. Got"
           f" {self.data.dtype}."
       )
-    if (self.scale is None) != (self.spec.quant is None):
+    if self.scale is not None and self.spec.quant is None:
       raise ValueError(
-          "Activation scale must be present iff spec.quant is set. Got"
+          "Activation scale requires spec.quant to be set. Got"
           f" scale={self.scale is not None}, quant={self.spec.quant}."
       )
 

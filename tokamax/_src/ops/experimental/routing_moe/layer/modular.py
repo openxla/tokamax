@@ -123,6 +123,7 @@ def _routing_moe_local(
           remote_axis=cfg.ep_axis if cfg.plan.remote_scatter else None,
       ),
       fuse_act=cfg.activation,
+      out_dtype=cfg.plan.scatter_dtype,
       group_offset=group_offset,
       row_group=row_group,
       custom_plan=gmm_plan,

@@ -17,6 +17,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
@@ -81,12 +82,14 @@ class MoEProdTest(moe_test_base.MoETestCase):
       num_tokens=[1280, 10240],
       use_sp=[True, False],
       remote_scatter=[False, True],
+      scatter_dtype=[None, jnp.float8_e4m3fn],
   )
   def test_remote_scatter(
       self,
       num_tokens: int,
       use_sp: bool,
       remote_scatter: bool,
+      scatter_dtype: jax.typing.DTypeLike | None,
   ):
     case = test_cases.Case(
         "remote_scatter",
@@ -96,7 +99,11 @@ class MoEProdTest(moe_test_base.MoETestCase):
     )
     layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
     self.check_case(
-        case, layout, remote_scatter=remote_scatter, capture_xprof=True
+        case,
+        layout,
+        remote_scatter=remote_scatter,
+        scatter_dtype=scatter_dtype,
+        capture_xprof=True,
     )
 
   @parameterized.named_parameters(
