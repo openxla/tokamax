@@ -15,7 +15,8 @@
 """Lightning Indexer (StreamIndex Top-K) benchmark argument specifications."""
 
 from collections.abc import Sequence
-from typing import Final
+import random
+from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
@@ -30,15 +31,24 @@ _KV_PACKING = 4
 
 
 class _HashableNPArray(np.ndarray):
+  """Numpy array that can be retained as a concrete argument in an ArgSpec."""
 
-  def __new__(cls, input_array):
+  def __new__(cls, input_array: Any) -> "_HashableNPArray":
     return np.asarray(input_array).view(cls)
 
-  def __hash__(self):
+  def __hash__(self) -> int:
     return hash((self.tobytes(), self.shape, self.dtype))
 
+  def __eq__(self, other: Any) -> bool:
+    return (
+        isinstance(other, np.ndarray)
+        and self.shape == other.shape
+        and self.dtype == other.dtype
+        and bool(np.array_equal(self, other))
+    )
 
-def _int32_array(x) -> _HashableNPArray:
+
+def _int32_array(x: Any) -> _HashableNPArray:
   return _HashableNPArray(np.asarray(x, dtype=np.int32))
 
 
@@ -61,43 +71,130 @@ def _make_argspec(
     kv_len: int = 1024,
     t_list: Sequence[int] | None = None,
     s_list: Sequence[int] | None = None,
+    shuffle_s_list: bool = False,
     page_size: int = 1024,
+    shuffle_page_indices: bool = False,
+    page_indices: Sequence[int] | np.ndarray | None = None,
     compression_ratio: int = 4,
     kv_layout: KVLayout = KVLayout.SEQ_ALONG_LANE,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+    interleave_size: int = 1,
+    return_scores: bool = False,
+    uniform_q_len: int | None = None,
     q_dtype: jax.typing.DTypeLike = jnp.float8_e4m3fn,
     indexer_weights_dtype: jax.typing.DTypeLike = jnp.float32,
     tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
 ) -> arg_spec.ArgSpec:
   """Creates an argspec for Lightning Indexer."""
+  if batch_size <= 0:
+    raise ValueError(f"batch_size must be positive, got {batch_size}.")
   if t_list is None:
     t_list = [q_len] * batch_size
   else:
-    t_list = list(t_list)
+    t_list = [int(x) for x in t_list]
   if s_list is None:
     s_list = [kv_len] * batch_size
   else:
-    s_list = list(s_list)
+    s_list = [int(x) for x in s_list]
 
   if len(t_list) != batch_size or len(s_list) != batch_size:
     raise ValueError(
         f"t_list ({len(t_list)}) and s_list ({len(s_list)}) must match"
         f" batch_size ({batch_size})."
     )
+  if shuffle_s_list:
+    random.Random(42).shuffle(s_list)
 
-  max_pages_per_seq = _cdiv(max(s_list), page_size)
+  if (
+      compression_ratio < 1
+      or (compression_ratio & (compression_ratio - 1)) != 0
+  ):
+    raise ValueError("compression_ratio must be a power of 2.")
+  if page_size <= 0 or page_size % compression_ratio != 0:
+    raise ValueError(
+        f"page_size ({page_size}) must be a positive multiple of"
+        f" compression_ratio ({compression_ratio})."
+    )
+  if cp_size < 1:
+    raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+  if not 0 <= cp_rank < cp_size:
+    raise ValueError(f"cp_rank ({cp_rank}) must be in [0, {cp_size}).")
+  if cp_size > 1 and interleave_size % compression_ratio != 0:
+    raise ValueError(
+        f"interleave_size ({interleave_size}) must be a multiple of"
+        f" compression_ratio ({compression_ratio})."
+    )
+
   compressed_page_size = page_size // compression_ratio
+  if kv_layout == KVLayout.SEQ_ALONG_LANE and compressed_page_size % 128 != 0:
+    raise ValueError(
+        "SEQ_ALONG_LANE requires compressed_page_size"
+        f" ({compressed_page_size}) to be a multiple of 128."
+    )
+  if (
+      kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+      and compressed_page_size % _KV_PACKING != 0
+  ):
+    raise ValueError(
+        "HEAD_ALONG_SUBLANE requires compressed_page_size"
+        f" ({compressed_page_size}) to be a multiple of {_KV_PACKING}."
+    )
+
+  if cp_size == 1:
+    required_pages_per_seq = max(1, _cdiv(max(s_list), page_size))
+  else:
+    interleave_c = interleave_size // compression_ratio
+    cycle_c = cp_size * interleave_c
+    max_global_c = _cdiv(max(s_list), compression_ratio)
+    full_cycles, rem_c = divmod(max_global_c, cycle_c)
+    max_local_c = full_cycles * interleave_c + min(rem_c, interleave_c)
+    required_pages_per_seq = max(1, _cdiv(max_local_c, compressed_page_size))
+
+  if page_indices is not None:
+    if shuffle_page_indices:
+      raise ValueError(
+          "Cannot specify both page_indices and shuffle_page_indices."
+      )
+    page_indices_arr = np.asarray(page_indices, dtype=np.int32)
+    if page_indices_arr.ndim != 1 or page_indices_arr.shape[0] % batch_size:
+      raise ValueError(
+          f"page_indices shape {page_indices_arr.shape} must be 1D and"
+          f" divisible by batch_size ({batch_size})."
+      )
+    max_pages_per_seq = page_indices_arr.shape[0] // batch_size
+    if max_pages_per_seq < required_pages_per_seq:
+      raise ValueError(
+          f"page_indices provides {max_pages_per_seq} pages per sequence,"
+          f" need at least {required_pages_per_seq}."
+      )
+    if np.any(page_indices_arr < 0):
+      raise ValueError("page_indices entries must be non-negative.")
+    total_pages = max(
+        batch_size * max_pages_per_seq, int(np.max(page_indices_arr)) + 1
+    )
+  else:
+    max_pages_per_seq = required_pages_per_seq
+    total_pages = batch_size * max_pages_per_seq
+    if shuffle_page_indices:
+      page_indices_arr = (
+          np.random.default_rng(42).permutation(total_pages).astype(np.int32)
+      )
+    else:
+      page_indices_arr = np.arange(total_pages, dtype=np.int32)
+
   num_tokens = sum(t_list)
-  total_pages = batch_size * max_pages_per_seq
+  padded_head_dim = _align_to(head_dim, 128)
 
   if kv_layout == KVLayout.SEQ_ALONG_LANE:
     cache_shape = (
         total_pages,
-        (head_dim + _KV_PACKING) // _KV_PACKING,
+        padded_head_dim // _KV_PACKING + 1,
         _KV_PACKING,
         compressed_page_size,
     )
   else:
-    width = _align_to(head_dim + 1, 128)
+    width = _align_to(padded_head_dim + padded_head_dim // 128, 128)
     cache_shape = (
         total_pages,
         compressed_page_size // _KV_PACKING,
@@ -109,24 +206,45 @@ def _make_argspec(
   while num_decodes < batch_size and t_list[num_decodes] == 1:
     num_decodes += 1
 
+  uniform_end = num_decodes
+  if uniform_q_len is not None:
+    if uniform_q_len <= 0:
+      raise ValueError(
+          f"uniform_q_len must be positive, got {uniform_q_len}."
+      )
+    while uniform_end < batch_size and t_list[uniform_end] == uniform_q_len:
+      uniform_end += 1
+
   cu_q_lens = np.concatenate([[0], np.cumsum(t_list)]).astype(np.int32)
-  distribution = np.array([num_decodes, num_decodes, batch_size], np.int32)
+  distribution = np.array([num_decodes, uniform_end, batch_size], np.int32)
+
+  args: dict[str, Any] = {
+      "q": ShapeDtype((num_tokens, num_q_heads, head_dim), q_dtype),
+      "indexer_weights": ShapeDtype(
+          (num_tokens, num_q_heads), indexer_weights_dtype
+      ),
+      "cache_kv": ShapeDtype(cache_shape, jnp.uint8),
+      "seq_lens": _int32_array(s_list),
+      "page_indices": _int32_array(page_indices_arr),
+      "cu_q_lens": _int32_array(cu_q_lens),
+      "distribution": _int32_array(distribution),
+      "k": k,
+      "compression_ratio": compression_ratio,
+      "kv_layout": kv_layout,
+  }
+  if cp_size != 1:
+    args["cp_size"] = cp_size
+  if cp_rank != 0:
+    args["cp_rank"] = cp_rank
+  if interleave_size != 1:
+    args["interleave_size"] = interleave_size
+  if return_scores:
+    args["return_scores"] = True
+  if uniform_q_len is not None:
+    args["uniform_q_len"] = uniform_q_len
 
   return arg_spec.ArgSpec(
-      args={
-          "q": ShapeDtype((num_tokens, num_q_heads, head_dim), q_dtype),
-          "indexer_weights": ShapeDtype(
-              (num_tokens, num_q_heads), indexer_weights_dtype
-          ),
-          "cache_kv": ShapeDtype(cache_shape, jnp.uint8),
-          "seq_lens": _int32_array(s_list),
-          "page_indices": _int32_array(np.arange(total_pages, dtype=np.int32)),
-          "cu_q_lens": _int32_array(cu_q_lens),
-          "distribution": _int32_array(distribution),
-          "k": k,
-          "compression_ratio": compression_ratio,
-          "kv_layout": kv_layout,
-      },
+      args=args,
       project="inference",
       name=name,
       tags=tags,
@@ -209,6 +327,225 @@ _COMPRESSED_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         q_len=1,
         s_list=[1024] * 64 + [3072] * 64 + [6144] * 64 + [9216] * 64,
         page_size=1024,
+    ),
+    _make_argspec(
+        name="ragged_decode_b256_k512_shuffled",
+        batch_size=256,
+        k=512,
+        q_len=1,
+        s_list=[1024] * 64 + [3072] * 64 + [6144] * 64 + [9216] * 64,
+        shuffle_s_list=True,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_has",
+        batch_size=256,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k1024_has",
+        batch_size=256,
+        k=1024,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv8192_k512_has",
+        batch_size=1,
+        k=512,
+        q_len=1024,
+        kv_len=8192,
+        page_size=1024,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv8192_k1024_has",
+        batch_size=1,
+        k=1024,
+        q_len=1024,
+        kv_len=8192,
+        page_size=1024,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv1024_k512",
+        batch_size=1,
+        k=512,
+        q_len=1024,
+        kv_len=1024,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv1024_k1024",
+        batch_size=1,
+        k=1024,
+        q_len=1024,
+        kv_len=1024,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="mixed_b9_d8_p1024_kv8192_k512",
+        batch_size=9,
+        k=512,
+        t_list=[1] * 8 + [1024],
+        kv_len=8192,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="mixed_b10_d8_p512_kv8192_k1024",
+        batch_size=10,
+        k=1024,
+        t_list=[1] * 8 + [512, 512],
+        s_list=[9216] * 8 + [4096, 8192],
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="spec_verify_b256_q2_kv8192_k512",
+        batch_size=256,
+        k=512,
+        q_len=2,
+        kv_len=8192,
+        page_size=1024,
+        uniform_q_len=2,
+    ),
+    _make_argspec(
+        name="spec_verify_b256_q4_kv8192_k512",
+        batch_size=256,
+        k=512,
+        q_len=4,
+        kv_len=8192,
+        page_size=1024,
+        uniform_q_len=4,
+    ),
+    _make_argspec(
+        name="spec_verify_b256_q8_kv8192_k512",
+        batch_size=256,
+        k=512,
+        q_len=8,
+        kv_len=8192,
+        page_size=1024,
+        uniform_q_len=8,
+    ),
+    _make_argspec(
+        name="spec_verify_b256_q16_kv8192_k512",
+        batch_size=256,
+        k=512,
+        q_len=16,
+        kv_len=8192,
+        page_size=1024,
+        uniform_q_len=16,
+    ),
+    _make_argspec(
+        name="mixed_spec_verify_b12_q6_kv8192_k512",
+        batch_size=12,
+        k=512,
+        t_list=[1] * 4 + [6] * 4 + [256, 512, 256, 512],
+        s_list=[9216] * 8 + [2048, 4096, 6144, 8192],
+        page_size=1024,
+        uniform_q_len=6,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv32768_k1024_cp4",
+        batch_size=1,
+        k=1024,
+        q_len=1024,
+        kv_len=32768,
+        page_size=1024,
+        cp_size=4,
+        interleave_size=4,
+        return_scores=True,
+    ),
+    _make_argspec(
+        name="decode_b64_q1_kv32768_k512_cp4",
+        batch_size=64,
+        k=512,
+        q_len=1,
+        kv_len=32768,
+        page_size=1024,
+        cp_size=4,
+        interleave_size=4,
+        return_scores=True,
+    ),
+    _make_argspec(
+        name="decode_b64_q1_kv1048576_k1024_cp8",
+        batch_size=64,
+        k=1024,
+        q_len=1,
+        kv_len=1048576,
+        page_size=1024,
+        cp_size=8,
+        interleave_size=4,
+        return_scores=True,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_h16",
+        batch_size=256,
+        num_q_heads=16,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_h8",
+        batch_size=256,
+        num_q_heads=8,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv8192_k512_h16",
+        batch_size=1,
+        num_q_heads=16,
+        k=512,
+        q_len=1024,
+        kv_len=8192,
+        page_size=1024,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_bf16q",
+        batch_size=256,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+        q_dtype=jnp.bfloat16,
+        indexer_weights_dtype=jnp.bfloat16,
+    ),
+    _make_argspec(
+        name="prefill_b1_q1024_kv8192_k512_bf16q",
+        batch_size=1,
+        k=512,
+        q_len=1024,
+        kv_len=8192,
+        page_size=1024,
+        q_dtype=jnp.bfloat16,
+        indexer_weights_dtype=jnp.bfloat16,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_p512",
+        batch_size=256,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=512,
+    ),
+    _make_argspec(
+        name="decode_b256_q1_kv9216_k512_fragmented_pages",
+        batch_size=256,
+        k=512,
+        q_len=1,
+        kv_len=9216,
+        page_size=1024,
+        shuffle_page_indices=True,
     ),
 )
 
