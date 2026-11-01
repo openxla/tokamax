@@ -139,7 +139,20 @@ THEMES = (
 )
 
 # Test files intentionally run by no shard.
-EXCLUDED_TESTS = ()
+#
+# The routing MoE `test/common/` modules are shared helpers -- cases, inputs,
+# reference implementations, shapes and timing utilities -- that the real test
+# files import. They declare no tests, but their `test_*.py` names match
+# pytest's `python_files`, so without this they land in the catch-all, where
+# pytest collects nothing from them, and every change that reaches them selects
+# the catch-all.
+EXCLUDED_TESTS = (
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_cases.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_inputs.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_reference.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_shapes.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_util.py',
+)
 
 # The JAX versions CI tests. `latest_jax()` is what every ordinary shard job
 # installs; every version in `older_jaxs()` gets a compat rerun
@@ -634,6 +647,28 @@ SHARDS: ShardMap = {
         minutes=15,
         compat_minutes=1,
     ),
+    # The routing MoE unit tests, out of the catch-all, where they have been
+    # since they landed on 2026-10-28 (openxla/tokamax@20d5afc787). The
+    # catch-all measured 20-30m on tpu7x from then on (runs 40727130450
+    # through 40929382681), against about a minute on h100 and tpu6e, and ran
+    # for every routing MoE change. Split three ways, by the kernel each group
+    # tests, so the three run in parallel and a change that reaches only one
+    # kernel's tests can select only that shard.
+    #
+    # The catch-all's job logs need repository admin rights to read, so the
+    # per-file times the other catch-all exits were split by are not available
+    # here. These `minutes` are estimates instead: the catch-all's ~28m on
+    # tpu7x, apportioned by each group's share of summed test time in an
+    # internal TPU run: GMM 66m, layer 47m and output reduce 43m of 156m.
+    # Re-measure them from the first green runs.
+    'experimental-routing-moe-gmm-unit': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/metadata_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/plan_unit_test.py',
+        ),
+        minutes=12,
+    ),
     # The masked dense MLA op. Its 1 was an estimate, from a catch-all run
     # that held it together with `sparse_mla`; timed on its own it is 10m on
     # tpu7x, 8m of that `scatter_test.py`, and about a minute elsewhere.
@@ -648,6 +683,26 @@ SHARDS: ShardMap = {
         ),
         minutes=10,
         compat_minutes=3,
+    ),
+    # Routing MoE layer unit tests; see `experimental-routing-moe-gmm-unit` for
+    # where they came from and how `minutes` was estimated.
+    'experimental-routing-moe-layer-unit': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',
+        ),
+        minutes=9,
+    ),
+    # Routing MoE output reduce tests, the unit and the prod one together:
+    # the prod test is one kernel's, unlike the two in `experimental-routing-moe`,
+    # and adding it there would lengthen that shard's 15m. See
+    # `experimental-routing-moe-gmm-unit` for how `minutes` was estimated.
+    'experimental-routing-moe-output-reduce': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_unit_test.py',
+        ),
+        minutes=8,
     ),
     # The DeepSeek-V4 compressor projection. Out of the catch-all, where it
     # was the largest single op at 7.7m on tpu6e, nearly all of it
@@ -857,6 +912,22 @@ SHARDS: ShardMap = {
         ),
         minutes=1,
         compat_minutes=1,
+    ),
+    # The MLA v3 kernel, out of the catch-all. TPU-only, and quick today:
+    # `flash_attention_test.py` and `schedule_test.py` take 0.7m and 0.1m in
+    # an internal TPU run, and `mla_kernel_v3_test.py` skips itself on every
+    # case, since the JAX that CI installs (0.11.2) has no
+    # `pltpu.BufferedRef.in_buffer_count` (see `bref_override.py`). Once it
+    # does, the kernel test is a full `MlaRaggedPagedAttentionTestBase` sweep,
+    # like `experimental-mla-v2-kernel`'s 35m, and should get a shard and a
+    # measurement of its own.
+    'experimental-mla-v3': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla/v3/flash_attention_test.py',
+            'tokamax/_src/ops/experimental/mla/v3/mla_kernel_v3_test.py',
+            'tokamax/_src/ops/experimental/mla/v3/schedule_test.py',
+        ),
+        minutes=1,
     ),
     # The topk tests that are not the kernel. Separate from
     # `experimental-topk-kernel` because that one is TPU-pinned and these two
