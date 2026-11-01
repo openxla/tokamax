@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
+from tokamax._src.ops.lightning_indexer.kernel import tc_topk
 
 SCAN_UNROLL = 8
 
@@ -102,9 +103,10 @@ def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
   b, width = vals.shape
   if vals.dtype != jnp.int32:
     raise ValueError(f"vals must be int32, got {vals.dtype}")
+  if not tc_topk.has_full_sparsecore_topk():
+    return tc_topk.pack_nonnegative_tc(vals)
   sc = pltpu.get_tpu_info().sparse_core
-  if sc is None:
-    raise NotImplementedError("SparseCore is not available")
+  assert sc is not None
 
   # Geometry off the chip: a row per subcore, a chunk per lane.
   lanes = sc.num_lanes
