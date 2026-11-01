@@ -30,8 +30,10 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import plan_util
 
 
+@plan_util.require_none_default
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingGmmPlan:
   """User-provided plan where None fields will be determined by heuristic."""
@@ -65,8 +67,37 @@ class RoutingGmmPlan:
   live_group_walk: bool | None = None
 
 
+def _resolve_dtypes(
+    plan: RoutingGmmPlan,
+    *,
+    x: arg.ActivationSpec,
+    w: arg.WeightSpec,
+) -> tuple[jnp.dtype, jnp.dtype, int | None]:
+  """Resolves execution dtypes and `x` quantization block size."""
+  # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
+  # dtype is used so that both operands enter the MXU in the same dtype.
+  if plan.matmul_dtype is not None:
+    matmul_dtype = jnp.dtype(plan.matmul_dtype)
+  elif x.quant is None and w.quant is not None:
+    # TODO: Support mixed precision and choose by hardware support.
+    matmul_dtype = w.dtype
+  else:
+    matmul_dtype = x.dtype
+
+  x_quant_block_size = plan.x_quant_block_size
+  if x_quant_block_size is None and matmul_dtype != x.dtype:
+    # TODO: Choose different block size based on HW.
+    x_quant_block_size = 512
+
+  if plan.acc_dtype is None:
+    acc_dtype = jnp.bfloat16.dtype
+  else:
+    acc_dtype = jnp.dtype(plan.acc_dtype)
+  return matmul_dtype, acc_dtype, x_quant_block_size
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class ResolvedGmmPlan(RoutingGmmPlan):
+class ResolvedGmmPlan:
   """Plan with None fields from user-provided plan resolved by heuristic."""
 
   tile_m: int
@@ -135,24 +166,9 @@ class ResolvedGmmPlan(RoutingGmmPlan):
     if plan is None:
       plan = RoutingGmmPlan()
 
-    # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
-    # dtype is used so that both operands enter the MXU in the same dtype.
-    if plan.matmul_dtype is not None:
-      matmul_dtype = jnp.dtype(plan.matmul_dtype)
-    elif x.quant is None and w.quant is not None:
-      # TODO: Support mixed precision and choose by hardware support.
-      matmul_dtype = w.dtype
-    else:
-      matmul_dtype = x.dtype
-    x_quant_block_size = plan.x_quant_block_size
-    if x_quant_block_size is None and matmul_dtype != x.dtype:
-      # TODO: Choose different block size based on HW.
-      x_quant_block_size = 512
-
-    if plan.acc_dtype is None:
-      acc_dtype = jnp.bfloat16.dtype
-    else:
-      acc_dtype = jnp.dtype(plan.acc_dtype)
+    matmul_dtype, acc_dtype, x_quant_block_size = _resolve_dtypes(
+        plan, x=x, w=w
+    )
 
     live_group_walk = plan.live_group_walk
     if live_group_walk is None:
@@ -165,11 +181,10 @@ class ResolvedGmmPlan(RoutingGmmPlan):
       # SMEM, small.
       live_group_walk = size_out_m < size_global_groups
 
-    if w2 is None:
-      if plan.tile_k2 is not None:
-        raise ValueError("tile_k2 requires w2 to be set.")
-      if plan.fuse_up_and_down:
-        raise ValueError("fuse_up_and_down=True requires w2 to be set.")
+    if w2 is None and plan.tile_k2 is not None:
+      raise ValueError("tile_k2 requires w2 to be set.")
+    if w2 is None and plan.fuse_up_and_down:
+      raise ValueError("fuse_up_and_down=True requires w2 to be set.")
 
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
@@ -189,6 +204,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
         tpu_info=tpu_info,
     )
     can_fuse = None
+    resolved_out_dtype = jnp.dtype(x.dtype if out_dtype is None else out_dtype)
     if w2 is not None:
       can_fuse = functools.partial(
           can_fuse_up_and_down,
@@ -198,7 +214,7 @@ class ResolvedGmmPlan(RoutingGmmPlan):
           is_fused_act=is_fused_act,
           matmul_dtype=matmul_dtype,
           acc_dtype=acc_dtype,
-          out_dtype=x.dtype if out_dtype is None else jnp.dtype(out_dtype),
+          out_dtype=resolved_out_dtype,
           vmem_limit_bytes=capped_vmem_limit_bytes,
           tpu_info=tpu_info,
       )
@@ -341,6 +357,109 @@ def _vmem_estimate(
   return x_vmem + out_vmem + matmul_vmem
 
 
+def _resolve_bucket_base(
+    plan: RoutingGmmPlan,
+    *,
+    w: arg.WeightSpec,
+    matmul_dtype: jnp.dtype,
+    max_group_rows: int,
+) -> int:
+  """Resolves `bucket_base` from user plan or bitwidth heuristics."""
+  if plan.bucket_base is not None:
+    return plan.bucket_base
+  is_mxu_quantized = matmul_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype)
+  w_bits = jax.dtypes.itemsize_bits(w.dtype)
+  # When using bf16 for x and w, 128 is the largest tile_m value that is safe
+  # to use for most scenarios. But if lower bitwidth is used, we need to tweak
+  # tile_m to account for using faster hardware unit.
+  bucket_base = 128 // min(pl.cdiv(16, w_bits), 2)
+  if is_mxu_quantized:
+    bucket_base *= 2
+  return min(bucket_base, plan.tile_m or max_group_rows)
+
+
+def _resolve_w_tile_n(
+    w_plan_tile_n: int | None,
+    *,
+    w_out_n: int,
+    out_chunk_cols: int,
+    min_tile_m: int,
+    estimate_vmem: Callable[..., int],
+    vmem_limit_bytes: int,
+) -> int:
+  """Splits `w`'s output width into the fewest whole-chunk tiles in VMEM."""
+  if w_plan_tile_n is not None:
+    return w_plan_tile_n
+  num_n_tiles = 1
+  w_tile_n = w_out_n
+  max_num_n_tiles = w_out_n // out_chunk_cols
+  while (
+      estimate_vmem(tile_m=min_tile_m, tile_n=w_tile_n) > vmem_limit_bytes
+      and num_n_tiles < max_num_n_tiles
+  ):
+    num_n_tiles += 1
+    # w_tile_n must divide w_out_n into whole compact chunks.
+    if w_out_n % (num_n_tiles * out_chunk_cols) == 0:
+      w_tile_n = w_out_n // num_n_tiles
+  return w_tile_n
+
+
+def _resolve_tile_m(
+    plan: RoutingGmmPlan,
+    *,
+    bucket_base: int,
+    max_group_rows: int,
+    w_tile_n: int,
+    estimate_vmem: Callable[..., int],
+    vmem_limit_bytes: int,
+) -> int:
+  """Resolves `tile_m` from user plan or VMEM-fitting bucket multiples."""
+  if plan.tile_m is not None:
+    return plan.tile_m
+  # TODO: Lift the 256 cap once larger tiles are validated.
+  max_tile_m = 256
+  # TODO: max number of bucket was choosen empiirically.
+  # Revisit the value to be based on number of instruction memory size.
+  max_num_buckets = 2
+  # Largest multiple of bucket_base that stays within max_tile_m and VMEM.
+  tile_m = bucket_base
+  for num_buckets in range(2, max_num_buckets + 1):
+    candidate = num_buckets * bucket_base
+    if (
+        candidate > max_tile_m
+        or estimate_vmem(tile_m=candidate, tile_n=w_tile_n) > vmem_limit_bytes
+    ):
+      break
+    tile_m = candidate
+  if plan.bucket_base is None:
+    tile_m = min(tile_m, max_group_rows)
+  return tile_m
+
+
+def _grow_num_w_buffers(
+    plan: RoutingGmmPlan,
+    *,
+    num_w_buffers: int,
+    allow_vmem_growth: bool,
+    tile_m: int,
+    w_tile_n: int,
+    estimate_vmem: Callable[..., int],
+    vmem_limit_bytes: int,
+) -> int:
+  """Grows weight buffer count into spare VMEM when permitted."""
+  if plan.num_w_buffers is not None or not allow_vmem_growth:
+    return num_w_buffers
+  max_num_w_buffers = plan.max_num_w_buffers or 3
+  while num_w_buffers < max_num_w_buffers and (
+      estimate_vmem(
+          tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
+      )
+      <= vmem_limit_bytes
+  ):
+    num_w_buffers += 1
+  return num_w_buffers
+
+
 def calculate_tiling(
     plan: RoutingGmmPlan,
     *,
@@ -392,19 +511,9 @@ def calculate_tiling(
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
   tile_k = plan.tile_k or size_k
-  is_mxu_quantized = matmul_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype)
-  w_bits = jax.dtypes.itemsize_bits(w.dtype)
-
-  if plan.bucket_base is not None:
-    bucket_base = plan.bucket_base
-  else:
-    # When using bf16 for x and w, 128 is the largest tile_m value that is safe
-    # to use for most scenarios. But if lower bitwidth is used, we need to tweak
-    # tile_m to account for using faster hardware unit.
-    bucket_base = 128 // min(pl.cdiv(16, w_bits), 2)
-    if is_mxu_quantized:
-      bucket_base *= 2
-    bucket_base = min(bucket_base, plan.tile_m or max_group_rows)
+  bucket_base = _resolve_bucket_base(
+      plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
+  )
 
   # Size w's output tile against size_k2 when w2 is present, or size_out_n when
   # w is the only weight.
@@ -433,53 +542,33 @@ def calculate_tiling(
 
   # Split w's output width into the fewest tiles that fit VMEM. This is chosen
   # before tile_m because the weight block usually dominates VMEM.
-  if w_plan_tile_n is not None:
-    w_tile_n = w_plan_tile_n
-  else:
-    num_n_tiles = 1
-    w_tile_n = w_out_n
-    max_num_n_tiles = w_out_n // out_chunk_cols
-    min_tile_m = plan.tile_m or bucket_base
-    while (
-        estimate_vmem(tile_m=min_tile_m, tile_n=w_tile_n) > vmem_limit_bytes
-        and num_n_tiles < max_num_n_tiles
-    ):
-      num_n_tiles += 1
-      # w_tile_n must divide w_out_n into whole compact chunks.
-      if w_out_n % (num_n_tiles * out_chunk_cols) == 0:
-        w_tile_n = w_out_n // num_n_tiles
-
-  if plan.tile_m is not None:
-    tile_m = plan.tile_m
-  else:
-    # TODO: Lift the 256 cap once larger tiles are validated.
-    max_tile_m = 256
-    # TODO: max number of bucket was choosen empiirically.
-    # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 2
-    # Largest multiple of bucket_base that stays within max_tile_m and VMEM.
-    tile_m = bucket_base
-    for num_buckets in range(2, max_num_buckets + 1):
-      candidate = num_buckets * bucket_base
-      if (
-          candidate > max_tile_m
-          or estimate_vmem(tile_m=candidate, tile_n=w_tile_n) > vmem_limit_bytes
-      ):
-        break
-      tile_m = candidate
-    if plan.bucket_base is None:
-      tile_m = min(tile_m, max_group_rows)
+  w_tile_n = _resolve_w_tile_n(
+      w_plan_tile_n,
+      w_out_n=w_out_n,
+      out_chunk_cols=out_chunk_cols,
+      min_tile_m=plan.tile_m or bucket_base,
+      estimate_vmem=estimate_vmem,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
+  tile_m = _resolve_tile_m(
+      plan,
+      bucket_base=bucket_base,
+      max_group_rows=max_group_rows,
+      w_tile_n=w_tile_n,
+      estimate_vmem=estimate_vmem,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
 
   # Spend spare VMEM on deeper weight prefetch.
-  if plan.num_w_buffers is None and allow_vmem_growth:
-    max_num_w_buffers = plan.max_num_w_buffers or 3
-    while num_w_buffers < max_num_w_buffers and (
-        estimate_vmem(
-            tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
-        )
-        <= vmem_limit_bytes
-    ):
-      num_w_buffers += 1
+  num_w_buffers = _grow_num_w_buffers(
+      plan,
+      num_w_buffers=num_w_buffers,
+      allow_vmem_growth=allow_vmem_growth,
+      tile_m=tile_m,
+      w_tile_n=w_tile_n,
+      estimate_vmem=estimate_vmem,
+      vmem_limit_bytes=vmem_limit_bytes,
+  )
 
   estimate = estimate_vmem(
       tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers

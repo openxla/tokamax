@@ -33,6 +33,43 @@ NamedSharding = sharding.NamedSharding
 Mesh = sharding.Mesh
 
 
+def _prepare_ep_inputs(
+    topk_weights: jax.Array,
+    w2_bias: jax.Array | None,
+    ep_shard_idx: jax.Array | None,
+    *,
+    local_num_experts: int,
+    cfg: config.RoutingMoEConfig,
+) -> tuple[int, jax.Array, jax.Array | None, jax.Array]:
+  """Derives global expert count, shard group offset, and EP-local inputs."""
+  if cfg.ep_axis is None:
+    return (
+        local_num_experts,
+        jnp.array([0], dtype=jnp.int32),
+        w2_bias,
+        topk_weights,
+    )
+
+  num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
+  global_num_experts = local_num_experts * num_ep_shards
+  if ep_shard_idx is None:
+    ep_shard_idx = jax.lax.axis_index(cfg.ep_axis)
+  elif not jnp.isscalar(ep_shard_idx):
+    ep_shard_idx = ep_shard_idx[0]
+  group_offset = jnp.array([ep_shard_idx * local_num_experts], dtype=jnp.int32)
+  if w2_bias is not None:
+    w2_bias = jnp.where(ep_shard_idx == 0, w2_bias, 0)
+  if cfg.plan.remote_scatter and not cfg.use_sp:
+    num_local_tokens = topk_weights.shape[0] // num_ep_shards
+    topk_weights = jax.lax.dynamic_slice_in_dim(
+        topk_weights,
+        ep_shard_idx * num_local_tokens,
+        num_local_tokens,
+        axis=0,
+    )
+  return global_num_experts, group_offset, w2_bias, topk_weights
+
+
 def _routing_moe_local(
     x: jax.Array,
     topk_weights: jax.Array,
@@ -54,29 +91,13 @@ def _routing_moe_local(
   topk = topk_indices.shape[-1]
 
   # Step 1: Book keep sharding related logictics.
-  if cfg.ep_axis is None:
-    global_num_experts = local_num_experts
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
-    global_num_experts = local_num_experts * num_ep_shards
-    if ep_shard_idx is None:
-      ep_shard_idx = jax.lax.axis_index(cfg.ep_axis)
-    elif not jnp.isscalar(ep_shard_idx):
-      ep_shard_idx = ep_shard_idx[0]
-    group_offset = jnp.array(
-        [ep_shard_idx * local_num_experts], dtype=jnp.int32
-    )
-    if w2_bias is not None:
-      w2_bias = jnp.where(ep_shard_idx == 0, w2_bias, 0)
-    if cfg.plan.remote_scatter and not cfg.use_sp:
-      num_local_tokens = topk_weights.shape[0] // num_ep_shards
-      topk_weights = jax.lax.dynamic_slice_in_dim(
-          topk_weights,
-          ep_shard_idx * num_local_tokens,
-          num_local_tokens,
-          axis=0,
-      )
+  global_num_experts, group_offset, w2_bias, topk_weights = _prepare_ep_inputs(
+      topk_weights,
+      w2_bias,
+      ep_shard_idx,
+      local_num_experts=local_num_experts,
+      cfg=cfg,
+  )
 
   if cfg.use_sp:
     # Step 2: If input is not replicated (SP), perform all-gather.

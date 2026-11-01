@@ -65,6 +65,73 @@ class ComputeConfig:
   dynamic_quant: quant_util.DynamicQuantConfig | None = None
 
 
+def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
+  """Resolves the DMA routing mode from a routing specification."""
+  if routing is None:
+    return RoutingMode.DIRECT
+  if routing.remote_axis is None:
+    return RoutingMode.LOCAL
+  return RoutingMode.REMOTE
+
+
+def _resolve_out_cols(
+    w: arg.WeightSpec, w2: arg.WeightSpec | None, fuse_act: str | None
+) -> tuple[int | None, int]:
+  """Validates weight specs and derives `(size_k2, size_out_n)`."""
+  if fuse_act is not None and not w.fused_gate_up:
+    raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
+  if w.has_bias or (w2 is not None and w2.has_bias):
+    raise NotImplementedError("Bias is not supported yet.")
+
+  # The fused activation combines a gate column and an up column into one, so
+  # the output halves only when fuse_act is applied. fused_gate_up alone does
+  # not change the width.
+  size_out_n = w.out_size
+  if fuse_act is not None:
+    size_out_n //= 2
+  if w2 is None:
+    return None, size_out_n
+
+  if fuse_act is None:
+    raise ValueError("w2 requires fuse_act to be set.")
+  if size_out_n != w2.in_size:
+    raise ValueError(f"w {size_out_n=} and {w2.in_size=} do not match.")
+  if w.group_size != w2.group_size:
+    raise ValueError(f"{w.group_size=} and {w2.group_size=} do not match.")
+  if w.in_size != w2.out_size:
+    raise ValueError(f"{w.in_size=} and {w2.out_size=} do not match.")
+  if w2.fused_gate_up:
+    raise ValueError("w2 cannot have fused_gate_up=True.")
+  return w2.in_size, w2.out_size
+
+
+def _resolve_out_rows(
+    size_m: int,
+    gather: arg.RoutingSpec | None,
+    scatter: arg.RoutingSpec | None,
+    size_ep: int,
+) -> int:
+  """Validates routing specs and derives `size_out_m`."""
+  size_out_m = size_m
+  if gather is not None:
+    if gather.remote_axis is not None:
+      raise NotImplementedError("Remote gather is not supported.")
+    size_out_m = gather.num_indices
+  if scatter is not None and scatter.num_indices != size_out_m:
+    raise ValueError(
+        f"scatter must map every computed row ({size_out_m}). Got"
+        f" num_indices {scatter.num_indices}."
+    )
+  if (scatter is None or scatter.remote_axis is None) and size_ep != 1:
+    raise ValueError(f"size_ep ({size_ep}) requires a remote scatter.")
+  if size_out_m % size_ep != 0:
+    raise ValueError(
+        f"Output rows ({size_out_m}) must divide evenly across"
+        f" {size_ep} devices."
+    )
+  return size_out_m
+
+
 @dataclasses.dataclass(frozen=True)
 class Dimension:
   """Problem sizes derived from the specs."""
@@ -103,54 +170,12 @@ class Dimension:
           f"group_sizes must cover at least {w.group_size} groups. Got"
           f" {num_global_groups}."
       )
-    if fuse_act is not None and not w.fused_gate_up:
-      raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
-    if w.has_bias or (w2 is not None and w2.has_bias):
-      raise NotImplementedError("Bias is not supported yet.")
 
-    size_m = x.row_size
-    # The fused activation combines a gate column and an up column into one, so
-    # the output halves only when fuse_act is applied. fused_gate_up alone does
-    # not change the width.
-    size_out_n = w.out_size
-    if fuse_act is not None:
-      size_out_n //= 2
-    size_k2 = None
-    if w2 is not None:
-      if fuse_act is None:
-        raise ValueError("w2 requires fuse_act to be set.")
-      if size_out_n != w2.in_size:
-        raise ValueError(f"w {size_out_n=} and {w2.in_size=} do not match.")
-      if w.group_size != w2.group_size:
-        raise ValueError(f"{w.group_size=} and {w2.group_size=} do not match.")
-      if w.in_size != w2.out_size:
-        raise ValueError(f"{w.in_size=} and {w2.out_size=} do not match.")
-      if w2.fused_gate_up:
-        raise ValueError("w2 cannot have fused_gate_up=True.")
-      size_k2 = w2.in_size
-      size_out_n = w2.out_size
-
-    size_out_m = size_m
-    if gather is not None:
-      if gather.remote_axis is not None:
-        raise NotImplementedError("Remote gather is not supported.")
-      size_out_m = gather.num_indices
-    if scatter is not None:
-      if scatter.num_indices != size_out_m:
-        raise ValueError(
-            f"scatter must map every computed row ({size_out_m}). Got"
-            f" num_indices {scatter.num_indices}."
-        )
-    if (scatter is None or scatter.remote_axis is None) and size_ep != 1:
-      raise ValueError(f"size_ep ({size_ep}) requires a remote scatter.")
-    if size_out_m % size_ep != 0:
-      raise ValueError(
-          f"Output rows ({size_out_m}) must divide evenly across"
-          f" {size_ep} devices."
-      )
+    size_k2, size_out_n = _resolve_out_cols(w, w2, fuse_act)
+    size_out_m = _resolve_out_rows(x.row_size, gather, scatter, size_ep)
 
     return cls(
-        size_m=size_m,
+        size_m=x.row_size,
         size_k=x.col_size,
         size_k2=size_k2,
         size_n=size_out_n,
@@ -268,13 +293,6 @@ class RoutingGmmConfig:
           dtype=plan.matmul_dtype, block_size=plan.x_quant_block_size
       )
 
-    def _resolve_mode(routing: arg.RoutingSpec | None) -> RoutingMode:
-      if routing is None:
-        return RoutingMode.DIRECT
-      if routing.remote_axis is None:
-        return RoutingMode.LOCAL
-      return RoutingMode.REMOTE
-
     x_mode = _resolve_mode(gather)
     compute_cfg = ComputeConfig(
         acc_dtype=plan.acc_dtype,
@@ -304,72 +322,81 @@ class RoutingGmmConfig:
         fuse_act=fuse_act,
         tpu_info=tpu_info,
     )
+    cfg._validate_dtypes()
+    cfg._validate_tiling_and_buffers()
+    return cfg
 
-    if w2 is not None and (
-        w2.dtype != w.dtype or (w2.quant is None) != (w.quant is None)
+  def _validate_dtypes(self) -> None:
+    """Validates precision and quantization invariants."""
+    if self.w2 is not None and (
+        self.w2.dtype != self.w.dtype
+        or (self.w2.quant is None) != (self.w.quant is None)
     ):
       # The intermediate is fed to the second matmul in x's execution dtype,
       # which is only valid when both weights share a precision.
       raise NotImplementedError("w2 must match the precision of w.")
-    if cfg.x.dynamic_quant is None and cfg.plan.x_quant_block_size is not None:
+    if (
+        self.x.dynamic_quant is None
+        and self.plan.x_quant_block_size is not None
+    ):
       raise ValueError(
           "plan.x_quant_block_size has no effect when x is not quantized."
       )
-    if cfg.plan.acc_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype):
+    if self.plan.acc_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype):
       raise ValueError(
-          "acc_dtype must be bfloat16 or float32. Got"
-          f" {cfg.plan.acc_dtype}."
+          f"acc_dtype must be bfloat16 or float32. Got {self.plan.acc_dtype}."
       )
-    x_bits = jax.dtypes.itemsize_bits(cfg.plan.matmul_dtype)
-    if x_bits < jax.dtypes.itemsize_bits(cfg.w.dtype):
+    x_bits = jax.dtypes.itemsize_bits(self.plan.matmul_dtype)
+    if x_bits < jax.dtypes.itemsize_bits(self.w.dtype):
       raise ValueError(
-          f"x_exec_dtype ({cfg.plan.matmul_dtype}) must not be narrower"
-          f" than w dtype ({cfg.w.dtype})."
+          f"x_exec_dtype ({self.plan.matmul_dtype}) must not be narrower"
+          f" than w dtype ({self.w.dtype})."
       )
-    if cfg.plan.tile_k != cfg.dim.size_k:
+
+  def _validate_tiling_and_buffers(self) -> None:
+    """Validates tile sizes, buffer counts, and SMEM footprint."""
+    if self.plan.tile_k != self.dim.size_k:
       raise NotImplementedError("K dim tiling is not supported yet.")
-    if cfg.w2 is not None:
-      if cfg.plan.tile_k2 != cfg.dim.size_k2:
-        raise NotImplementedError("K2 dim tiling is not supported yet.")
-      if cfg.plan.tile_n != cfg.dim.size_out_n:
-        raise NotImplementedError(
-            "N dim tiling is not supported when w2 is fused."
-        )
-    if cfg.dim.size_out_n % cfg.plan.tile_n != 0:
-      raise ValueError(
-          f"tile_n ({cfg.plan.tile_n}) must divide the output width"
-          f" ({cfg.dim.size_out_n})."
+    if self.w2 is not None and self.plan.tile_k2 != self.dim.size_k2:
+      raise NotImplementedError("K2 dim tiling is not supported yet.")
+    if self.w2 is not None and self.plan.tile_n != self.dim.size_out_n:
+      raise NotImplementedError(
+          "N dim tiling is not supported when w2 is fused."
       )
-    if cfg.out.spec.compact_shape[1] % cfg.num_n != 0:
+    if self.dim.size_out_n % self.plan.tile_n != 0:
       raise ValueError(
-          f"tile_n ({cfg.plan.tile_n}) must be a multiple of the output's"
+          f"tile_n ({self.plan.tile_n}) must divide the output width"
+          f" ({self.dim.size_out_n})."
+      )
+    if self.out.spec.compact_shape[1] % self.num_n != 0:
+      raise ValueError(
+          f"tile_n ({self.plan.tile_n}) must be a multiple of the output's"
           " compact chunk width."
       )
-    if not 0 < cfg.plan.bucket_base <= cfg.plan.tile_m:
+    if not 0 < self.plan.bucket_base <= self.plan.tile_m:
       raise ValueError(
-          f"bucket_base ({cfg.plan.bucket_base}) must be in (0, tile_m="
-          f"{cfg.plan.tile_m}]."
+          f"bucket_base ({self.plan.bucket_base}) must be in (0, tile_m="
+          f"{self.plan.tile_m}]."
       )
-    if cfg.plan.num_xo_buffers < 3:
+    if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
       )
-    if cfg.plan.num_w_buffers < 2:
+    if self.plan.num_w_buffers < 2:
       raise ValueError("Buffer counts must be at least 2.")
-    smem_threshold = int(0.45 * tpu_info.smem_capacity_bytes)
+    smem_threshold = int(0.45 * self.tpu_info.smem_capacity_bytes)
     # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
-    smem_allocation = (cfg.max_num_gm * 3) * 4
+    smem_allocation = (self.max_num_gm * 3) * 4
     if smem_allocation >= smem_threshold:
       raise ValueError(
           f"Total number of SMEM allocation must be less than {smem_threshold}"
           f" to avoid OOM. Got {smem_allocation}"
       )
-    if cfg.out.dynamic_quant is not None and cfg.num_n != 1:
+    if self.out.dynamic_quant is not None and self.num_n != 1:
       # The per-lane scale is taken over the whole output row.
       raise NotImplementedError(
           "A quantized output does not support N dim tiling yet."
       )
-    return cfg
 
   @property
   def max_num_gm(self) -> int:

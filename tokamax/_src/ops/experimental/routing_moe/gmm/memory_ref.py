@@ -38,7 +38,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
 
-def map_memory_constraint[T](obj: T, memory_space: Any) -> T:
+def map_memory_constraint[T](obj: T, memory_space: pltpu.MemorySpace) -> T:
   return jax.tree.map(
       lambda x: pltpu.with_memory_space_constraint(x, memory_space), obj
   )

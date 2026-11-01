@@ -21,11 +21,12 @@ sharding. Unset fields are resolved by heuristics.
 
 import dataclasses
 from typing import Self
-
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import plan_util
 
 
+@plan_util.require_none_default
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingMoEPlan:
   """User-provided plan where `None` fields are resolved by heuristics.
@@ -41,7 +42,7 @@ class RoutingMoEPlan:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class ResolvedMoEPlan(RoutingMoEPlan):
+class ResolvedMoEPlan:
   """Plan with `None` fields from user-provided plan resolved by heuristics."""
 
   remote_scatter: bool

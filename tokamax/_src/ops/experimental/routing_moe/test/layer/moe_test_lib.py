@@ -154,6 +154,34 @@ def _make_raw_inputs(
   return moe
 
 
+def _shared_expert_local(
+    x: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w_gate: jax.Array,
+    *,
+    axis: AxisSpec,
+    use_sp: bool,
+    activation: str,
+    reduce_output: bool,
+) -> jax.Array:
+  """Computes the shared expert on one shard and optionally reduces it."""
+  if use_sp:
+    x = jax.lax.all_gather(x, axis_name=axis, axis=0, tiled=True)
+  out = test_reference.shared_expert(
+      x, w1, w2, w1_scale, w2_scale, w_gate, activation=activation
+  )
+  if not reduce_output:
+    return out
+  if use_sp:
+    return jax.lax.psum_scatter(
+        out, axis_name=axis, scatter_dimension=0, tiled=True
+    )
+  return jax.lax.psum(out, axis_name=axis)
+
+
 def _shared_expert(
     moe: test_inputs.MoEInputs,
     *,
@@ -181,30 +209,14 @@ def _shared_expert(
     block_axis = _scale_block_axis(moe.w2_shared_scale, axis)
     w2_scale_spec = P(None, block_axis, None, None)
 
-  def _local_fn(
-      x: jax.Array,
-      w1: jax.Array,
-      w2: jax.Array,
-      w1_scale: jax.Array | None,
-      w2_scale: jax.Array | None,
-      w_gate: jax.Array,
-  ) -> jax.Array:
-    if layout.use_sp:
-      x = jax.lax.all_gather(x, axis_name=axis, axis=0, tiled=True)
-    out = test_reference.shared_expert(
-        x, w1, w2, w1_scale, w2_scale, w_gate, activation=activation
-    )
-    if reduce_output:
-      if layout.use_sp:
-        out = jax.lax.psum_scatter(
-            out, axis_name=axis, scatter_dimension=0, tiled=True
-        )
-      else:
-        out = jax.lax.psum(out, axis_name=axis)
-    return out
-
   return jax.shard_map(
-      _local_fn,
+      functools.partial(
+          _shared_expert_local,
+          axis=axis,
+          use_sp=layout.use_sp,
+          activation=activation,
+          reduce_output=reduce_output,
+      ),
       mesh=mesh,
       in_specs=(
           act_spec,

@@ -19,7 +19,7 @@ import abc
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, Self
 
 import jax
 from jax import lax
@@ -28,7 +28,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import config
-
 
 type WriteGroupFn = Callable[[jax.Array, jax.Array], jax.Array]
 
@@ -55,9 +54,7 @@ class AbstractMetadataRef(abc.ABC):
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
   @classmethod
-  def create_scratch_types(
-      cls, cfg: config.RoutingGmmConfig
-  ) -> Any:
+  def create_scratch_types(cls, cfg: config.RoutingGmmConfig) -> Self:
     """Creates SMEM scratch specs for the metadata tables."""
     return cls(
         gm_id_to_group_id=pltpu.SMEM((cfg.max_num_gm,), jnp.int32),

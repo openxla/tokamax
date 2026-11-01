@@ -21,6 +21,7 @@ outside of the kernel to be consolidated here without scavenging other modules.
 """
 
 import functools
+from typing import Any
 
 import jax
 from jax.experimental import pallas as pl
@@ -32,6 +33,74 @@ from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
 from tokamax._src.ops.experimental.routing_moe.gmm import plan
+
+
+def _padded_indices(
+    routing: arg.RoutingWrapper[jax.Array] | None, pad_size: int
+) -> jax.Array | None:
+  """Pads indices by `pad_size` so tile DMA and indexing stay in bounds."""
+  if routing is None:
+    return None
+  return jnp.pad(routing.indices, (0, pad_size))
+
+
+def _weight_ref(
+    wrapper: arg.SingleWeightWrapper[jax.Array],
+) -> memory_ref.SingleWeightRef[jax.Array]:
+  """Unwraps a `SingleWeightWrapper` into a `SingleWeightRef`."""
+  w_scale = wrapper.scale
+  if w_scale is not None:
+    w_scale = w_scale.astype(jnp.float32)
+  return memory_ref.SingleWeightRef(
+      weight=wrapper.weight, scale=w_scale, bias=wrapper.bias
+  )
+
+
+def _prepare_kernel_args(
+    x: arg.ActivationWrapper[jax.Array],
+    w: arg.SingleWeightWrapper[jax.Array],
+    w2: arg.SingleWeightWrapper[jax.Array] | None,
+    group_sizes: jax.Array,
+    *,
+    row_group: jax.Array | None,
+    group_offset: jax.Array | None,
+    gather: arg.RoutingWrapper[jax.Array] | None,
+    scatter: arg.RoutingWrapper[jax.Array] | None,
+    cfg: config.RoutingGmmConfig,
+) -> tuple[
+    metadata.MetadataInputs[jax.Array],
+    Any,
+    memory_ref.PipelineInputs[jax.Array],
+    pltpu.MemorySpace,
+]:
+  """Preprocesses XLA inputs and binds memory-space constraints."""
+  if group_offset is None:
+    group_offset = jnp.array([0], dtype=jnp.int32)
+  elif jnp.isscalar(group_offset):
+    group_offset = group_offset[None]
+  group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+
+  # Wrap inputs in the pipeline's parameter object. emit_pipeline needs HBM
+  # refs and VMEM allocations to share one pytree structure, so the API
+  # wrappers are reduced to their data here.
+  pad_size = cfg.plan.tile_m_idx
+  inputs = memory_ref.PipelineInputs[jax.Array](
+      x=x.data,
+      w=_weight_ref(w),
+      w2=None if w2 is None else _weight_ref(w2),
+      gather_idx=_padded_indices(gather, pad_size),
+      scatter_idx=_padded_indices(scatter, pad_size),
+  )
+
+  row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
+  metadata_in, metadata_scratch = metadata.create_metadata(
+      group_cum_sum, group_offset, cfg, row_group=row_group_i32
+  )
+
+  inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
+  metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
+  out = pltpu.HBM(cfg.out.spec.compact_shape, cfg.out.spec.dtype)
+  return metadata_in, metadata_scratch, inputs, out
 
 
 @jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
@@ -135,57 +204,21 @@ def routing_gmm(
       tpu_info=tpu_info,
   )
 
-  # Step 2: Pre-process inputs.
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    if jnp.isscalar(group_offset):
-      group_offset = group_offset[None]
-  group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
-
-  # Pad indices by tile_m_idx to ensure DMA and indexing does not trigger OOB.
-  def _padded_indices(
-      routing: arg.RoutingWrapper[jax.Array] | None,
-  ) -> jax.Array | None:
-    if routing is None:
-      return None
-    return jnp.pad(routing.indices, (0, cfg.plan.tile_m_idx))
-
-  # Step 3: Wrap inputs in the pipeline's parameter object. emit_pipeline needs
-  # HBM refs and VMEM allocations to share one pytree structure, so the API
-  # wrappers are reduced to their data here.
-  def _weight_ref(
-      wrapper: arg.SingleWeightWrapper[jax.Array],
-  ) -> memory_ref.SingleWeightRef[jax.Array]:
-    w_scale = wrapper.scale
-    if w_scale is not None:
-      w_scale = w_scale.astype(jnp.float32)
-    return memory_ref.SingleWeightRef(
-        weight=wrapper.weight, scale=w_scale, bias=wrapper.bias
-    )
-
+  # Step 2: Prepare kernel inputs and memory space constraints.
+  metadata_in, metadata_scratch, inputs, out = _prepare_kernel_args(
+      x,
+      w,
+      w2,
+      group_sizes,
+      row_group=row_group,
+      group_offset=group_offset,
+      gather=gather,
+      scatter=scatter,
+      cfg=cfg,
+  )
   remote = cfg.out.mode == config.RoutingMode.REMOTE
-  inputs = memory_ref.PipelineInputs[jax.Array](
-      x=x.data,
-      w=_weight_ref(w),
-      w2=None if w2 is None else _weight_ref(w2),
-      gather_idx=_padded_indices(gather),
-      scatter_idx=_padded_indices(scatter),
-  )
 
-  row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
-  metadata_in, metadata_scratch = metadata.create_metadata(
-      group_cum_sum, group_offset, cfg, row_group=row_group_i32
-  )
-
-  # Step 4: Specify memory space.
-  inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
-  metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
-  out = memory_ref.map_memory_constraint(
-      jnp.empty(cfg.out.spec.compact_shape, cfg.out.spec.dtype), pltpu.HBM
-  )
-
-  # Step 5: Call kernel.
+  # Step 3: Call kernel.
   num_cores = cfg.tpu_info.num_cores
   # NOTE: On megacore hardware, this will incur redundant compute. Furture work
   # is needed to enable parallelism in such hardware.
