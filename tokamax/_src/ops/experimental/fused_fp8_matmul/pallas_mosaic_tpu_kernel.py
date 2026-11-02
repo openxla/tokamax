@@ -487,7 +487,7 @@ def fused_fp8_matmul_pallas(
   outputs = pl.kernel(
       kernel,
       out_type=out_type,
-      mesh=pltpu.create_tensorcore_mesh(axis_name=_CORE_AXIS_NAME),
+      mesh=pltpu.TensorCoreMesh(axis_name=_CORE_AXIS_NAME),
       scratch_types=scratch_types,
       compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
   )(x, w, sw)

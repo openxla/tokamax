@@ -242,7 +242,7 @@ def fused_fp8_dlhs_pallas(
   return pl.kernel(
       kernel,
       out_type=jax.ShapeDtypeStruct((m, k), out_dtype or dout.dtype),
-      mesh=pltpu.create_tensorcore_mesh(axis_name=_CORE_AXIS_NAME),
+      mesh=pltpu.TensorCoreMesh(axis_name=_CORE_AXIS_NAME),
       scratch_types=scratch_types,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=fwd_kernel.VMEM_LIMIT_BYTES
