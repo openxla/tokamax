@@ -331,7 +331,7 @@ class MeshShape:
 class ShapeDtype:
   """Serializes `jax.Array`-like types to an abstract representation."""
 
-  PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?')
+  PATTERN = re.compile(r'(.*?)(\[.*?\])(\{vmap_axes=(\[.*\])\})?$')
   SHORT_DTYPE_NAMES_MAP = immutabledict.immutabledict(
       bool=bool,
       **(dict(i1=ml_dtypes.int1) if hasattr(ml_dtypes, 'int1') else {}),
