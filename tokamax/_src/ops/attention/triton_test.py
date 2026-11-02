@@ -66,6 +66,25 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
     super()._run_test(q_shape, *args, **kwargs)
 
+  def test_tf32_rounding(self):
+    assert fa is not None
+    tf32 = jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    fn = fa.TritonFlashAttention()
+    x = jnp.full((1, 16, 1, 16), 1.0 + 3 * 2**-12, dtype=jnp.float32)
+    out, vjp_fn = jax.vjp(lambda q, k, v: fn(q, k, v, precision=tf32), x, x, x)
+    _, _, dv = vjp_fn(x)
+    self.assertTrue(jnp.allclose(out, 1.0 + 2**-10, atol=1e-6, rtol=0))
+    self.assertTrue(jnp.allclose(dv, 1.0 + 2**-10, atol=1e-6, rtol=0))
+    self._run_test(
+        (2, 128, 2, 64),
+        dtype=jnp.float32,
+        impl=fn,
+        impl_kwargs=dict(precision=tf32),
+        ref_kwargs=dict(precision=tf32),
+        atol=5e-4,
+        atol_grads=2e-3,
+    )
+
   @override
   def _test_quantized_int8(self, channelwise_axes, quantize_q):
     assert jt is not None

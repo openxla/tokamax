@@ -210,6 +210,29 @@ def get_dot_dtype_and_precision(
 
 
 @triton.jit
+def _round_f32_to_tf32(x):
+  return tl.inline_asm_elementwise(
+      'cvt.rna.tf32.f32 $0, $1;',
+      '=r,r',
+      [x],
+      dtype=tl.float32,
+      is_pure=True,
+      pack=1,
+  )
+
+
+@triton.jit
+def dot(a, b, acc=None, input_precision=None):
+  """Computes `tl.dot`, rounding `float32` operands to TF32."""
+  if input_precision == 'tf32':
+    if a.dtype == tl.float32:
+      a = _round_f32_to_tf32(a)
+    if b.dtype == tl.float32:
+      b = _round_f32_to_tf32(b)
+  return tl.dot(a, b, acc=acc, input_precision=input_precision)
+
+
+@triton.jit
 def advance_bcast_ptr(
     ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads, shape
 ):

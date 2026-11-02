@@ -454,7 +454,7 @@ def _fwd_kernel(
             s += tl.dot(qs[i_d], tl.trans(k)).to(tl.float32) * qk_scale
           else:
             k = _dequantize(k, k_scale)
-            s += tl.dot(
+            s += triton_utils.dot(
                 qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
             )
         s = s.to(logits_dtype)
@@ -534,7 +534,9 @@ def _fwd_kernel(
               v_is_int4,
           )
           v = _dequantize(v, v_scale)
-          acc = accs[i_o] + tl.dot(p, v.to(wv_dtype), input_precision=wv_prec)
+          acc = accs[i_o] + triton_utils.dot(
+              p, v.to(wv_dtype), input_precision=wv_prec
+          )
           new_accs += (acc,)
         accs = new_accs
 

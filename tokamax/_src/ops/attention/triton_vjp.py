@@ -48,8 +48,8 @@ _MASK_BLOCK_SLICE_FACTOR = tl.constexpr(2)
 
 @triton.jit
 def _dot(a, b, input_precision, input_dtype):
-  """Casts both operands to `input_dtype` before `tl.dot`."""
-  return tl.dot(
+  """Casts both operands to `input_dtype` before `triton_utils.dot`."""
+  return triton_utils.dot(
       a.to(input_dtype), b.to(input_dtype), input_precision=input_precision
   )
 
