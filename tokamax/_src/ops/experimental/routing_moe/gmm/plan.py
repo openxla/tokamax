@@ -72,6 +72,7 @@ def _resolve_dtypes(
     *,
     x: arg.ActivationSpec,
     w: arg.WeightSpec,
+    tpu_info: pltpu.TpuInfo,
 ) -> tuple[jnp.dtype, jnp.dtype, int | None]:
   """Resolves execution dtypes and `x` quantization block size."""
   # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
@@ -79,8 +80,21 @@ def _resolve_dtypes(
   if plan.matmul_dtype is not None:
     matmul_dtype = jnp.dtype(plan.matmul_dtype)
   elif x.quant is None and w.quant is not None:
-    # TODO: Support mixed precision and choose by hardware support.
     matmul_dtype = w.dtype
+    # matmul_dtype is the dtype x is converted to right before it goes
+    # into the MXU. See RoutingGmmConfig.create(). compute.py converts the
+    # weight dtype to matmul_dtype before the matmul if
+    # is_matmul_supported(matmul_dtype, w.dtype) is false.
+    # We pick the narrowest x dtype that satisfies is_matmul_supported.
+    if jnp.issubdtype(w.dtype, jnp.floating):
+      for dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz):
+        dtype = jnp.dtype(dtype)
+        if tpu_info.is_matmul_supported(dtype, w.dtype) or (
+            _fits_in(w.dtype, dtype)
+            and tpu_info.is_matmul_supported(dtype, dtype)
+        ):
+          matmul_dtype = dtype
+          break
   else:
     matmul_dtype = x.dtype
 
@@ -167,7 +181,7 @@ class ResolvedGmmPlan:
       plan = RoutingGmmPlan()
 
     matmul_dtype, acc_dtype, x_quant_block_size = _resolve_dtypes(
-        plan, x=x, w=w
+        plan, x=x, w=w, tpu_info=tpu_info
     )
 
     live_group_walk = plan.live_group_walk
@@ -247,6 +261,18 @@ class ResolvedGmmPlan:
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
     )
+
+
+def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
+  """Returns whether every value of floating-point `src` is exact in `dst`."""
+  s, d = jnp.finfo(src), jnp.finfo(dst)
+  return (
+      d.nmant >= s.nmant  # number of mantissa bits
+      and float(d.max) >= float(s.max)
+      # smallest_subnormal is the smallest positive value the format can
+      # represent.
+      and float(d.smallest_subnormal) <= float(s.smallest_subnormal)
+  )
 
 
 def _choose_tiling_and_fusion(
