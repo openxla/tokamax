@@ -392,13 +392,27 @@ class ThemeTest(unittest.TestCase):
     }
     self.assertEqual(
         [n for n, _ in sorted(table.items(), key=shards.shard_order)],
-        # Unmeasured sorts last overall: absent is not zero.
+        # Unmeasured sorts as `UNMEASURED_MINUTES`, not last: absent is not
+        # zero.
         [
             'attention-slow',
+            'attention-unmeasured',
             'core-utils',
             'attention-fast',
-            'attention-unmeasured',
         ],
+    )
+
+  def test_unmeasured_sorts_as_unmeasured_minutes(self) -> None:
+    table = {
+        'core-longer': dict(paths=(), minutes=shards.UNMEASURED_MINUTES + 1),
+        'core-same': dict(paths=(), minutes=shards.UNMEASURED_MINUTES),
+        'core-shorter': dict(paths=(), minutes=shards.UNMEASURED_MINUTES - 1),
+        'core-unmeasured': dict(paths=()),
+    }
+    self.assertEqual(
+        [n for n, _ in sorted(table.items(), key=shards.shard_order)],
+        # A tie with a measured shard falls through to theme, then name.
+        ['core-longer', 'core-same', 'core-unmeasured', 'core-shorter'],
     )
 
   def test_theme_breaks_ties_between_equal_length_shards(self) -> None:
