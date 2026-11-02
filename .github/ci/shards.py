@@ -386,11 +386,6 @@ SHARDS: ShardMap = {
         minutes=6,
         compat_minutes=3,
     ),
-    'attention-pallas-triton': Spec(
-        paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
-        minutes=5,
-        compat_minutes=1,
-    ),
     # GPU only: `TritonFlashAttentionTest` skips itself on TPU. Its forward
     # tests run since openxla/tokamax#1706 (2026-10-22), 3.4-4.0m on h100.
     'attention-triton': Spec(
