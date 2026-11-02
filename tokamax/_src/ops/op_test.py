@@ -29,7 +29,6 @@ from tokamax._src import utils
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import arg_specs as attn_arg_specs
 from tokamax._src.ops.attention import base as attn_base
-from tokamax._src.ops.attention import pallas_triton as pl_attn
 from tokamax._src.ops.gated_linear_unit import arg_specs as glu_arg_specs
 from tokamax._src.ops.gated_linear_unit import base as glu_base
 from tokamax._src.ops.normalization import arg_specs as norm_arg_specs
@@ -37,6 +36,11 @@ from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+
+try:
+  from tokamax._src.ops.attention import triton as triton_attn  # pylint: disable=g-import-not-at-top
+except ImportError:
+  triton_attn = None
 
 try:
   from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
@@ -272,11 +276,21 @@ class BoundArgumentsTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       ("attention", attn_base.DotProductAttention(), _ATTN_ARG_SPECS),
-      ("pl_attn", pl_attn.PallasTritonFlashAttention(), _ATTN_ARG_SPECS),
-      (
-          "pl_attn_stable_softmax",
-          pl_attn.PallasTritonFlashAttention(use_stable_softmax=True),
-          _ATTN_ARG_SPECS,
+      *(
+          ()
+          if triton_attn is None
+          else (
+              (
+                  "triton_attn",
+                  triton_attn.TritonFlashAttention(),
+                  _ATTN_ARG_SPECS,
+              ),
+              (
+                  "triton_attn_stable_softmax",
+                  triton_attn.TritonFlashAttention(use_stable_softmax=True),
+                  _ATTN_ARG_SPECS,
+              ),
+          )
       ),
       ("glu", glu_base.GatedLinearUnit(), _GLU_ARG_SPECS),
       ("normalization", norm_base.Normalization(), _NORM_ARG_SPECS),
