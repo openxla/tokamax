@@ -115,7 +115,7 @@ def _routing_moe_local(
   # repacking triggers both input and output relayout. Thus, we need to perform
   # repacking after all-gather.
   # TODO: Support all-gather with compact layout.
-  x_compact = input_pack.input_pack(x)
+  x_compact = input_pack.input_pack(x, cfg.gmm_in_format)
 
   # Step 4: Sort indices and compute expert group sizes.
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
@@ -135,16 +135,18 @@ def _routing_moe_local(
   # Step 5: Invoke GMM Gate and Up.
   gmm_res = gmm.routing_gmm(
       x=x_compact,
-      w=arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
-      w2=arg.make_weight_wrapper(w2, w2_scale, w2_bias),
+      w=arg.SingleWeightWrapper.create(
+          w1, w1_scale, w1_bias, fused_gate_up=True
+      ),
+      w2=arg.SingleWeightWrapper.create(w2, w2_scale, w2_bias),
       group_sizes=group_sizes,
-      gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
-      scatter=arg.make_routing_wrapper(
+      gather=arg.RoutingWrapper.create(topk_argsort_indices // topk),
+      scatter=arg.RoutingWrapper.create(
           topk_argsort_indices,
           remote_axis=cfg.ep_axis if cfg.plan.remote_scatter else None,
       ),
       fuse_act=cfg.activation,
-      out_dtype=cfg.plan.scatter_dtype,
+      out_format=cfg.gmm_out_format,
       group_offset=group_offset,
       row_group=row_group,
       custom_plan=gmm_plan,
@@ -240,7 +242,9 @@ def routing_moe(
   if w1_bias is not None or w2_bias is not None:
     raise NotImplementedError("Bias is currently not supported.")
 
-  resolved_plan = moe_plan_lib.ResolvedMoEPlan.create(moe_plan)
+  resolved_plan = moe_plan_lib.ResolvedMoEPlan.create(
+      moe_plan, x_dtype=hidden_states.dtype
+  )
   cfg = config.RoutingMoEConfig.create(
       tp_axis=tp_axis,
       ep_axis=ep_axis,
@@ -270,9 +274,9 @@ def routing_moe(
       ),
       mesh=mesh,
       in_specs=(
-          cfg.act_spec,
-          cfg.act_spec,
-          cfg.act_spec,
+          cfg.act_pspec,
+          cfg.act_pspec,
+          cfg.act_pspec,
           w1_spec,
           w2_spec,
           w1_scale_spec,
@@ -281,7 +285,7 @@ def routing_moe(
           w2_bias_spec,
           ep_shard_idx_spec,
       ),
-      out_specs=(cfg.out_spec),
+      out_specs=(cfg.out_pspec),
       check_vma=False,
   )(
       hidden_states,

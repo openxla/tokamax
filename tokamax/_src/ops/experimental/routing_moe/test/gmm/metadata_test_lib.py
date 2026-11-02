@@ -21,11 +21,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
+from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
 
@@ -74,44 +76,45 @@ def make_gmm_config(
     custom_plan: gmm_plan.RoutingGmmPlan | None = None,
 ) -> config.RoutingGmmConfig:
   """Builds a direct-mode bf16 config resolved the same way as `routing_gmm`."""
-  x = arg.ActivationSpec(
-      row_size=num_rows, col_size=size_k, dtype=jnp.dtype(jnp.bfloat16)
+  x = spec.ActivationSpec(
+      row_size=num_rows,
+      col_size=size_k,
+      dtype=jnp.dtype(jnp.bfloat16),
+      quant=None,
   )
-  w = arg.WeightSpec(
+  w = spec.WeightSpec(
       group_size=num_local_groups,
       in_size=size_k,
       out_size=size_n,
       dtype=jnp.dtype(jnp.bfloat16),
+      quant=None,
+      has_bias=False,
+      fused_gate_up=False,
   )
   tpu_info = pltpu.get_tpu_info()
-  dim = config.Dimension.create(
+  gmm_spec = gmm_spec_lib.RoutingGmmSpec(
       x=x,
       w=w,
-      num_global_groups=num_global_groups,
+      w2=None,
       gather=None,
       scatter=None,
+      num_global_groups=num_global_groups,
       fuse_act=None,
+      size_ep=1,
+  )
+  resolved_out_format = out_format_lib.ResolvedActivationFormat(
+      dtype=x.dtype, quant=None
   )
   resolved_plan = gmm_plan.ResolvedGmmPlan.create(
       custom_plan,
-      x=x,
-      w=w,
-      out_dtype=None,
-      size_out_m=dim.size_out_m,
-      size_global_groups=dim.size_global_groups,
-      size_k=dim.size_k,
-      size_out_n=dim.size_out_n,
+      spec=gmm_spec,
+      out_format=resolved_out_format,
       tpu_info=tpu_info,
   )
   return config.RoutingGmmConfig.create(
-      x=x,
-      w=w,
-      dim=dim,
+      spec=gmm_spec,
+      out_format=resolved_out_format,
       plan=resolved_plan,
-      gather=None,
-      scatter=None,
-      fuse_act=None,
-      out_dtype=None,
       tpu_info=tpu_info,
   )
 

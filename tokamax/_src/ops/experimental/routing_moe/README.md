@@ -24,20 +24,27 @@
 ```text
 routing_moe/
 ├── common/
-│   ├── arg.py: Spec and wrapper of inputs for communicating between modules.
-│   └── layout_util.py: Utility for compact and large layout transformation.
+│   ├── arg.py: PyTree wrappers pairing tensor data with static specs.
+│   ├── dataclass_util.py: Decorators enforcing invariants on unresolved and resolved dataclasses.
+│   ├── layout_util.py: Utility for compact and large layout transformation.
+│   ├── out_format.py: Target representation formats for kernel outputs.
+│   ├── quant_util.py: Dynamic activation quantization helpers.
+│   └── spec.py: Static specifications of materialized kernel inputs and outputs.
 ├── gmm/
+│   ├── __init__.py: Public API of the routing GMM kernel.
 │   ├── compute.py: Stateless matrix multiplication logic.
 │   ├── config.py: Compile time static configuration object.
 │   ├── kernel.py: gmm entry point that expects compact layout for activations.
 │   ├── memory_ref.py: Memory module that handles buffer management and DMA.
 │   ├── metadata.py: Dynamic per-step metadata consumed by pipeline and memory module.
-│   ├── plan.py: Tunable parameters for kernel execution that has no impact on outputs.
-│   └── pipeline.py: Main Orchestrator for stateful DMA and stateless compute.
+│   ├── pipeline.py: Main Orchestrator for stateful DMA and stateless compute.
+│   ├── plan.py: Tunable parameters for kernel execution that have no impact on outputs.
+│   └── spec.py: Validated problem specification of the routing GMM kernel.
 ├── io_relayout/
 │   ├── input_pack.py: Handles large -> compact layout transformation.
 │   └── output_reduce.py: Handles topk reduce and compact -> large transformation.
 ├── layer/
+│   ├── __init__.py: Public API of the routing MoE layer.
 │   ├── config.py: Compile time static configuration object for MoE layer.
 │   ├── modular.py: Modular MoE entry point accepting pre-computed top-k weights and indices.
 │   ├── monolithic.py: Monolithic MoE entry point that computes routing and invokes modular MoE.

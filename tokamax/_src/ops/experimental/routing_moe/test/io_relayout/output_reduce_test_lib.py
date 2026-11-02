@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from tokamax._src import test_utils
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
@@ -55,11 +56,11 @@ def quantize_to_compact(
     nan_bytes = jnp.full(compact.shape, 0xFF, dtype=jnp.uint8)
     nan_compact = jax.lax.bitcast_convert_type(nan_bytes, dtype)
     compact = jnp.where(valid[:, None, None, None], compact, nan_compact)
-  spec = arg.ActivationSpec(
+  spec = spec_lib.ActivationSpec(
       row_size=m,
       col_size=cols,
       dtype=dtype,
-      quant=arg.QuantSpec(block_size=cols // lanes, stride=lanes),
+      quant=spec_lib.LaneStridedQuantSpec(block_col_size=cols),
   )
   return arg.ActivationWrapper(data=compact, scale=None, spec=spec)
 

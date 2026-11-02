@@ -24,6 +24,7 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
@@ -40,6 +41,9 @@ from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
 jax.config.parse_flags_with_absl()
 
 FP8 = gmm_test_lib.FP8
+_FP8_OUT_FORMAT = out_format.ActivationFormat(
+    dtype=FP8, quant=out_format.LaneStrided()
+)
 
 
 def _rel_diff(a: np.ndarray, b: np.ndarray) -> float:
@@ -115,7 +119,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         case.x_sorted_compact,
         case.w1,
         scatter=routing.scatter,
-        out_dtype=FP8,
+        out_format=_FP8_OUT_FORMAT,
         **routing.kernel_kwargs,
     ).data
     self.assertEqual(actual.dtype, FP8)
@@ -143,7 +147,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         input_pack.input_pack(case.x_sorted.at[:zeros].set(0)),
         case.w1,
         scatter=routing.scatter,
-        out_dtype=FP8,
+        out_format=_FP8_OUT_FORMAT,
         **routing.kernel_kwargs,
     ).data
     rows = np.asarray(routing.scattered_rows[:zeros])
@@ -163,7 +167,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         input_pack.input_pack(x),
         case.w1,
         scatter=routing.scatter,
-        out_dtype=FP8,
+        out_format=_FP8_OUT_FORMAT,
         **routing.kernel_kwargs,
     ).data
     expected = test_reference.reference_gmm(
@@ -194,7 +198,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         case.x_sorted_compact,
         case.w1,
         scatter=routing.scatter,
-        out_dtype=FP8,
+        out_format=_FP8_OUT_FORMAT,
         **routing.kernel_kwargs,
     ).data
     got = np.asarray(gmm_test_lib.dequantize_rows(actual))
@@ -538,10 +542,10 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
     w = case.w1.weight
     expected = kernel.routing_gmm(
         case.x_sorted_compact,
-        arg.make_weight_wrapper(w),
+        arg.SingleWeightWrapper.create(w),
         case.routing.group_sizes,
         scatter=case.routing.scatter,
-        out_dtype=out_dtype,
+        out_format=None if out_dtype is None else _FP8_OUT_FORMAT,
     ).data
     actual = gmm_test_lib.sharded_gmm_unpermute(
         case.x_sorted_compact,

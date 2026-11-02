@@ -143,7 +143,7 @@ class SortedMetadataRef(AbstractMetadataRef):
     # offset issue that was found in GMM v2.
 
     group_start = metadata_in.group_offset[0]
-    group_end = group_start + self.cfg.dim.size_local_groups
+    group_end = group_start + self.cfg.spec.size_local_groups
     self.gm_id_to_group_id[self.sink_gm_id] = 0
     self.gm_id_to_m_offset[self.sink_gm_id] = 0
     self.gm_id_to_num_rows[self.sink_gm_id] = 0

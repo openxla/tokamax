@@ -18,7 +18,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
+from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
@@ -73,23 +75,29 @@ class MoEProdTest(moe_test_base.MoETestCase):
     self.check_case(
         case,
         layout,
-        remote_scatter=remote_scatter,
         reduce_output=remote_scatter,
         capture_xprof=True,
+        moe_plan=moe_plan_lib.RoutingMoEPlan(remote_scatter=remote_scatter),
     )
 
   @parameterized.product(
       num_tokens=[1280, 10240],
       use_sp=[True, False],
       remote_scatter=[False, True],
-      scatter_dtype=[None, jnp.float8_e4m3fn],
+      scatter_format=[
+          None,
+          out_format.ActivationFormat(
+              dtype=jnp.float8_e4m3fn,
+              quant=out_format.auto_quant,
+          ),
+      ],
   )
   def test_remote_scatter(
       self,
       num_tokens: int,
       use_sp: bool,
       remote_scatter: bool,
-      scatter_dtype: jax.typing.DTypeLike | None,
+      scatter_format: out_format.ActivationFormat | None,
   ):
     case = test_cases.Case(
         "remote_scatter",
@@ -98,12 +106,14 @@ class MoEProdTest(moe_test_base.MoETestCase):
         test_cases.MoESharding(ep=4),
     )
     layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
+    moe_plan = moe_plan_lib.RoutingMoEPlan(
+        remote_scatter=remote_scatter, scatter_format=scatter_format
+    )
     self.check_case(
         case,
         layout,
-        remote_scatter=remote_scatter,
-        scatter_dtype=scatter_dtype,
         capture_xprof=True,
+        moe_plan=moe_plan,
     )
 
   @parameterized.named_parameters(

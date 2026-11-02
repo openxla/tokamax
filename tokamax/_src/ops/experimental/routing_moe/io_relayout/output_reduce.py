@@ -69,6 +69,7 @@ class Config:
   in_dtype: jnp.dtype
   out_dtype: jnp.dtype
   acc_dtype: jnp.dtype = jnp.bfloat16.dtype
+  is_quantized: bool = False
   max_tokens_per_batch: int = 128
   tile: int = 16
   # Input VMEM buffers (and matching output buffers): batch b is reduced from
@@ -83,10 +84,6 @@ class Config:
   @property
   def acc_packing(self) -> int:
     return 4 // self.acc_dtype.itemsize
-
-  @property
-  def is_quantized(self) -> bool:
-    return self.in_dtype.itemsize == 1
 
   @property
   def quant_scale_offset(self) -> int:
@@ -112,7 +109,7 @@ class Config:
   ) -> Self:
     """Derives batching parameters and validates SMEM capacity."""
     spec = rows.spec
-    _, chunks, _, _ = spec.compact_shape
+    chunks = spec.num_physical_chunks
     num_tokens, topk = weights.shape
     out_dtype = jnp.dtype(out_dtype)
     acc_dtype = jnp.dtype(acc_dtype)
@@ -138,6 +135,7 @@ class Config:
         out_dtype=out_dtype,
         in_dtype=spec.dtype,
         acc_dtype=acc_dtype,
+        is_quantized=spec.quant is not None,
     )
     if cfg.smem_allocation >= cfg.smem_threshold:
       raise ValueError(

@@ -27,9 +27,9 @@ from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
@@ -572,8 +572,8 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
       live: jax.Array,
       sem: Any,
   ) -> None:
-    assert self.cfg.scatter is not None
-    axis = self.cfg.scatter.remote_axis
+    assert self.cfg.spec.scatter is not None
+    axis = self.cfg.spec.scatter.remote_axis
     assert axis is not None
     assert self.recv_sem is not None
     # Unsigned lax div/rem skip the sign fixups of int32 jnp.divmod.
@@ -594,8 +594,8 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
   @override
   def prologue(self) -> None:
     # Every peer's output buffer must exist before the first row lands.
-    assert self.cfg.scatter is not None
-    axis, ep = self.cfg.scatter.remote_axis, self.cfg.dim.size_ep
+    assert self.cfg.spec.scatter is not None
+    axis, ep = self.cfg.spec.scatter.remote_axis, self.cfg.spec.size_ep
     assert axis is not None
 
     def signal_all(sem):
@@ -631,7 +631,7 @@ class QuantizedBufferedRef(BranchlessBufferedRef):
     stash_count: Number of tiles stashed at once. A tile is quantized one step
       after it is computed, so tiles alternate between two stash slots.
     stash_dtype: Dtype in which results wait to be quantized.
-    acc: VMEM buffer `[stash_count, num_payload_chunks, tile_m, ratio, packing,
+    acc: VMEM buffer `[stash_count, num_logical_chunks, tile_m, ratio, packing,
       lanes]` of `stash_dtype` results, one compact tile per output chunk.
     scale: VMEM buffer `f32[stash_count, tile_m, lanes]` of per-lane scales.
     inv_scale: VMEM buffer `u32[stash_count, ratio * tile_m, lanes]` of
@@ -664,7 +664,7 @@ class QuantizedBufferedRef(BranchlessBufferedRef):
         (tile_m, layout_util.get_packing(cfg.out.spec.dtype) * lanes),
         cls.stash_dtype,
     )
-    count, num_chunks = cls.stash_count, cfg.out.num_payload_chunks
+    count, num_chunks = cls.stash_count, cfg.out.spec.num_logical_chunks
     return dataclasses.replace(
         bref,
         acc=pltpu.VMEM((count, num_chunks, *chunk_shape), cls.stash_dtype),
@@ -702,18 +702,18 @@ class QuantizedBufferedRef(BranchlessBufferedRef):
         self.acc is not None
         and self.scale is not None
         and self.inv_scale is not None
-        and self.cfg.out.dynamic_quant is not None
+        and self.cfg.out.spec.quant is not None
     )
     # Compute per-lane scales immediately as the result leaves the MXU.
     value = value.astype(jnp.float32)
     scale, inv_scale = quant_util.compute_scale(
-        value, self.cfg.out.dynamic_quant
+        value, self.cfg.out.spec.dtype, self.cfg.out.spec.quant
     )
     slot = self._stash_slot(grid_indices[1])
     rows = value.shape[0]
     stash = value.astype(self.stash_dtype)
     for chunk, chunk_value in enumerate(
-        jnp.split(stash, self.cfg.out.num_payload_chunks, axis=-1)
+        jnp.split(stash, self.cfg.out.spec.num_logical_chunks, axis=-1)
     ):
       layout_util.store_large_to_compact(
           self.acc.at[slot, chunk, :rows], chunk_value
@@ -905,7 +905,7 @@ class PipelineBlockSpecs:
   def get_x_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the input activation tensor."""
     return self._act_spec(
-        self.cfg.x.spec.compact_shape,
+        self.cfg.x.spec.physical_compact_shape,
         self.cfg.num_k,
         self.index_map_provider.x_index,
     )
@@ -913,7 +913,7 @@ class PipelineBlockSpecs:
   def get_out_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the output activation tensor."""
     return self._act_spec(
-        self.cfg.out.spec.compact_shape,
+        self.cfg.out.spec.physical_compact_shape,
         self.cfg.num_n,
         self.index_map_provider.out_index,
     )
@@ -933,7 +933,7 @@ class PipelineBlockSpecs:
     )
 
   def get_scale_spec(
-      self, w_spec: arg.WeightSpec, tile_k: int, tile_n: int
+      self, w_spec: spec_lib.WeightSpec, tile_k: int, tile_n: int
   ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
     assert w_spec.quant is not None
@@ -992,10 +992,10 @@ class PipelineInputs[T]:
 
   def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
-    if cfg.fuse_act is None:
+    if not cfg.spec.is_fused_act:
       return self
     assert isinstance(self.w, SingleWeightRef)
-    n = cfg.w.out_size // 2
+    n = cfg.spec.w.out_size // 2
     w_fused = FusedWeightsRef(
         gate=self.w,
         up=jax.tree.map(lambda ref: ref.at[..., n:], self.w),
@@ -1044,7 +1044,7 @@ class PipelineAllocs:
 
     def _make_weight_bref(
         w_hbm_ref: AbstractWeightRef,
-        w_spec: arg.WeightSpec,
+        w_spec: spec_lib.WeightSpec,
         tile_k: int,
         tile_n: int,
         *,
@@ -1076,17 +1076,17 @@ class PipelineAllocs:
     w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
     w_bref = _make_weight_bref(
         in_hbm_ref.w,
-        cfg.w,
+        cfg.spec.w,
         cfg.plan.tile_k,
         w_tile_n,
-        fuse_act=cfg.fuse_act is not None,
+        fuse_act=cfg.spec.is_fused_act,
     )
     w2_bref = None
-    if cfg.w2 is not None:
+    if cfg.spec.w2 is not None:
       assert in_hbm_ref.w2 is not None and cfg.plan.tile_k2 is not None
       w2_bref = _make_weight_bref(
           in_hbm_ref.w2,
-          cfg.w2,
+          cfg.spec.w2,
           cfg.plan.tile_k2,
           cfg.plan.tile_n,
       )
@@ -1119,7 +1119,7 @@ class PipelineAllocs:
         metadata_ref=metadata_ref,
     )
     out_bref = _get_buffered_ref(
-        cfg.out.mode, quantized=cfg.out.dynamic_quant is not None
+        cfg.out.mode, quantized=cfg.out.spec.quant is not None
     ).output(
         spec=pipeline_block_specs.get_out_spec(),
         dtype_or_type=out_hbm_ref.dtype,

@@ -13,10 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Tunable parameters of the routing GMM kernel.
+"""Tunable parameters and heuristic planner of the routing GMM kernel.
 
-Plan fields affect performance and numerics but not the output shape, dtype,
-or placement. Unset fields are resolved by heuristics.
+`RoutingGmmPlan` exposes optional overrides where `None` delegates to the
+heuristic planner, while `ResolvedGmmPlan` holds the concrete parameters
+consumed by config construction and the kernel. Keeping them separate avoids
+carrying `None` unions past planning.
 """
 
 from collections.abc import Callable
@@ -28,12 +30,14 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.common import plan_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
+from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 
 
-@plan_util.require_none_default
+@dataclass_util.require_none_default
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingGmmPlan:
   """User-provided plan where None fields will be determined by heuristic."""
@@ -55,6 +59,10 @@ class RoutingGmmPlan:
   # Whether gate/up and down projections run in one fused kernel when w2 is set.
   fuse_up_and_down: bool | None = None
   vmem_limit_bytes: int | None = None
+  # Walk only the groups with rows when building the metadata (needs the
+  # row_group input of routing_gmm).
+  live_group_walk: bool | None = None
+  # These fields bound the heuristic search and are omitted once resolved.
   vmem_usage_fraction: float | None = None
   # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
   # groups' weight DMAs stay in flight during the current group's compute.
@@ -62,60 +70,19 @@ class RoutingGmmPlan:
   # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
   # Revisit it based on per-group DMA vs. compute time.
   max_num_w_buffers: int | None = None
-  # Walk only the groups with rows when building the metadata (needs the
-  # row_group input of routing_gmm).
-  live_group_walk: bool | None = None
 
 
-def _resolve_dtypes(
-    plan: RoutingGmmPlan,
-    *,
-    x: arg.ActivationSpec,
-    w: arg.WeightSpec,
-    tpu_info: pltpu.TpuInfo,
-) -> tuple[jnp.dtype, jnp.dtype, int | None]:
-  """Resolves execution dtypes and `x` quantization block size."""
-  # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
-  # dtype is used so that both operands enter the MXU in the same dtype.
-  if plan.matmul_dtype is not None:
-    matmul_dtype = jnp.dtype(plan.matmul_dtype)
-  elif x.quant is None and w.quant is not None:
-    matmul_dtype = w.dtype
-    # matmul_dtype is the dtype x is converted to right before it goes
-    # into the MXU. See RoutingGmmConfig.create(). compute.py converts the
-    # weight dtype to matmul_dtype before the matmul if
-    # is_matmul_supported(matmul_dtype, w.dtype) is false.
-    # We pick the narrowest x dtype that satisfies is_matmul_supported.
-    if jnp.issubdtype(w.dtype, jnp.floating):
-      for dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz):
-        dtype = jnp.dtype(dtype)
-        if tpu_info.is_matmul_supported(dtype, w.dtype) or (
-            _fits_in(w.dtype, dtype)
-            and tpu_info.is_matmul_supported(dtype, dtype)
-        ):
-          matmul_dtype = dtype
-          break
-  else:
-    matmul_dtype = x.dtype
-
-  x_quant_block_size = plan.x_quant_block_size
-  if x_quant_block_size is None and matmul_dtype != x.dtype:
-    # TODO: Choose different block size based on HW.
-    x_quant_block_size = 512
-
-  if plan.acc_dtype is None:
-    acc_dtype = jnp.bfloat16.dtype
-  else:
-    acc_dtype = jnp.dtype(plan.acc_dtype)
-  return matmul_dtype, acc_dtype, x_quant_block_size
-
-
+@dataclass_util.resolves_from(
+    RoutingGmmPlan,
+    dropped=("vmem_usage_fraction", "max_num_w_buffers"),
+)
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedGmmPlan:
   """Plan with None fields from user-provided plan resolved by heuristic."""
 
   tile_m: int
   tile_k: int
+  # It is None unless w2 is fused into the same kernel.
   tile_k2: int | None
   tile_n: int
   bucket_base: int
@@ -164,24 +131,16 @@ class ResolvedGmmPlan:
       cls,
       plan: RoutingGmmPlan | None,
       *,
-      x: arg.ActivationSpec,
-      w: arg.WeightSpec,
-      w2: arg.WeightSpec | None = None,
-      is_fused_act: bool = False,
-      out_dtype: jax.typing.DTypeLike | None = None,
-      size_out_m: int,
-      size_global_groups: int,
-      size_k: int,
-      size_k2: int | None = None,
-      size_out_n: int,
+      spec: gmm_spec_lib.RoutingGmmSpec,
+      out_format: out_format_lib.ResolvedActivationFormat,
       tpu_info: pltpu.TpuInfo,
   ) -> Self:
-    """Fills unset plan fields with heuristics."""
+    """Resolves unset plan fields into concrete execution parameters."""
     if plan is None:
       plan = RoutingGmmPlan()
 
     matmul_dtype, acc_dtype, x_quant_block_size = _resolve_dtypes(
-        plan, x=x, w=w, tpu_info=tpu_info
+        plan, x=spec.x, w=spec.w, tpu_info=tpu_info
     )
 
     live_group_walk = plan.live_group_walk
@@ -189,15 +148,15 @@ class ResolvedGmmPlan:
       # The walk pays off while most of this shard's groups are empty.
       # size_out_m counts the routed rows of all shards, i.e. (token, pick)
       # pairs, num_tokens * top-k. A shard gets size_out_m * group_size /
-      # size_global_groups of them on average, which is fewer than its
-      # group_size groups exactly when size_out_m < size_global_groups, under TP
+      # num_global_groups of them on average, which is fewer than its
+      # group_size groups exactly when size_out_m < num_global_groups, under TP
       # or EP alike. This also keeps row_group, one int32 per routed row in
       # SMEM, small.
-      live_group_walk = size_out_m < size_global_groups
+      live_group_walk = spec.size_out_m < spec.num_global_groups
 
-    if w2 is None and plan.tile_k2 is not None:
+    if spec.w2 is None and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires w2 to be set.")
-    if w2 is None and plan.fuse_up_and_down:
+    if spec.w2 is None and plan.fuse_up_and_down:
       raise ValueError("fuse_up_and_down=True requires w2 to be set.")
 
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
@@ -206,29 +165,23 @@ class ResolvedGmmPlan:
     tiling_fn = functools.partial(
         calculate_tiling,
         plan,
-        x=x,
-        w=w,
-        is_fused_act=is_fused_act,
+        spec=spec,
         matmul_dtype=matmul_dtype,
         acc_dtype=acc_dtype,
-        size_k=size_k,
-        size_k2=size_k2,
-        size_out_n=size_out_n,
+        out_dtype=out_format.dtype,
+        out_quant=out_format.quant,
         vmem_limit_bytes=capped_vmem_limit_bytes,
         tpu_info=tpu_info,
     )
     can_fuse = None
-    resolved_out_dtype = jnp.dtype(x.dtype if out_dtype is None else out_dtype)
-    if w2 is not None:
+    if spec.w2 is not None:
       can_fuse = functools.partial(
           can_fuse_up_and_down,
-          x=x,
-          w=w,
-          w2=w2,
-          is_fused_act=is_fused_act,
+          spec=spec,
           matmul_dtype=matmul_dtype,
           acc_dtype=acc_dtype,
-          out_dtype=resolved_out_dtype,
+          out_dtype=out_format.dtype,
+          out_quant=out_format.quant,
           vmem_limit_bytes=capped_vmem_limit_bytes,
           tpu_info=tpu_info,
       )
@@ -246,6 +199,7 @@ class ResolvedGmmPlan:
     ) = tiling
     if not fuse_up_and_down and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires fuse_up_and_down=True.")
+
     return cls(
         tile_m=tile_m,
         tile_k=tile_k,
@@ -273,6 +227,49 @@ def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
       # represent.
       and float(d.smallest_subnormal) <= float(s.smallest_subnormal)
   )
+
+
+def _resolve_dtypes(
+    plan: RoutingGmmPlan,
+    *,
+    x: tensor_spec.ActivationSpec,
+    w: tensor_spec.WeightSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> tuple[jnp.dtype, jnp.dtype, int | None]:
+  """Resolves execution dtypes and `x` quantization block size."""
+  # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
+  # dtype is used so that both operands enter the MXU in the same dtype.
+  if plan.matmul_dtype is not None:
+    matmul_dtype = jnp.dtype(plan.matmul_dtype)
+  elif x.quant is None and w.quant is not None:
+    matmul_dtype = w.dtype
+    # matmul_dtype is the dtype x is converted to right before it goes
+    # into the MXU. See RoutingGmmConfig.create(). compute.py converts the
+    # weight dtype to matmul_dtype before the matmul if
+    # is_matmul_supported(matmul_dtype, w.dtype) is false.
+    # We pick the narrowest x dtype that satisfies is_matmul_supported.
+    if jnp.issubdtype(w.dtype, jnp.floating):
+      for dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz):
+        dtype = jnp.dtype(dtype)
+        if tpu_info.is_matmul_supported(dtype, w.dtype) or (
+            _fits_in(w.dtype, dtype)
+            and tpu_info.is_matmul_supported(dtype, dtype)
+        ):
+          matmul_dtype = dtype
+          break
+  else:
+    matmul_dtype = x.dtype
+
+  x_quant_block_size = plan.x_quant_block_size
+  if x_quant_block_size is None and matmul_dtype != x.dtype:
+    # TODO: Choose different block size based on HW.
+    x_quant_block_size = 512
+
+  if plan.acc_dtype is None:
+    acc_dtype = jnp.bfloat16.dtype
+  else:
+    acc_dtype = jnp.dtype(plan.acc_dtype)
+  return matmul_dtype, acc_dtype, x_quant_block_size
 
 
 def _choose_tiling_and_fusion(
@@ -327,13 +324,14 @@ def _choose_tiling_and_fusion(
 
 def _vmem_estimate(
     *,
-    x: arg.ActivationSpec,
-    w: arg.WeightSpec,
-    w2: arg.WeightSpec | None = None,
+    x: tensor_spec.ActivationSpec,
+    w: tensor_spec.WeightSpec,
+    w2: tensor_spec.WeightSpec | None = None,
     is_fused_act: bool = False,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
+    out_quant: out_format_lib.ResolvedQuantFormat | None = None,
     tile_m: int,
     tile_k: int,
     tile_k2: int | None = None,
@@ -350,14 +348,20 @@ def _vmem_estimate(
   # Chunk size equals the bytes of a single sublane.
   chunk_bytes = 4 * tpu_info.num_lanes
   # NOTE: x_chunk size stays as-is since we don't support K tiling yet.
-  x_chunks = layout_util.to_bank_conflict_aware_stride(x.compact_shape[1])
-  out_shape = layout_util.to_compact_shape((tile_m, tile_n), out_dtype)
-  out_chunks = layout_util.to_bank_conflict_aware_stride(out_shape[1])
+  x_chunks = layout_util.to_bank_conflict_aware_stride(x.num_physical_chunks)
+  out_chunk_cols = layout_util.get_packing(out_dtype) * tpu_info.num_lanes
+  out_logical_chunks = pl.cdiv(tile_n, out_chunk_cols)
+  out_physical_chunks = out_logical_chunks + (1 if out_quant is not None else 0)
+  out_chunks = layout_util.to_bank_conflict_aware_stride(out_physical_chunks)
   x_vmem = num_xo_buffers * tile_m * x_chunks * chunk_bytes
   out_vmem = num_xo_buffers * tile_m * out_chunks * chunk_bytes
+  if out_quant is not None:
+    stash_ratio = max(layout_util.get_packing(out_dtype) // 2, 1)
+    out_vmem += 2 * tile_m * tile_n * 2
+    out_vmem += 2 * (1 + stash_ratio) * tile_m * tpu_info.num_lanes * 4
 
   def _matmul_vmem(
-      weight: arg.WeightSpec, k_tile: int, n_tile: int, num_w_refs: int
+      weight: tensor_spec.WeightSpec, k_tile: int, n_tile: int, num_w_refs: int
   ) -> int:
     w_bits = jax.dtypes.itemsize_bits(weight.dtype)
     w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
@@ -386,7 +390,7 @@ def _vmem_estimate(
 def _resolve_bucket_base(
     plan: RoutingGmmPlan,
     *,
-    w: arg.WeightSpec,
+    w: tensor_spec.WeightSpec,
     matmul_dtype: jnp.dtype,
     max_group_rows: int,
 ) -> int:
@@ -489,14 +493,11 @@ def _grow_num_w_buffers(
 def calculate_tiling(
     plan: RoutingGmmPlan,
     *,
-    x: arg.ActivationSpec,
-    w: arg.WeightSpec,
-    is_fused_act: bool = False,
+    spec: gmm_spec_lib.RoutingGmmSpec,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
-    size_k: int,
-    size_k2: int | None = None,
-    size_out_n: int,
+    out_dtype: jnp.dtype | None = None,
+    out_quant: out_format_lib.ResolvedQuantFormat | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
     allow_vmem_growth: bool = True,
@@ -505,14 +506,11 @@ def calculate_tiling(
 
   Args:
     plan: User plan. Fields that are set are kept.
-    x: Activation spec.
-    w: Weight spec of the first (or only) projection.
-    is_fused_act: Whether w holds both gate and up projections.
+    spec: Validated input specifications and operator semantics.
     matmul_dtype: Dtype in which inputs are fed to the MXU.
     acc_dtype: Accumulator dtype.
-    size_k: Contraction size of w.
-    size_k2: Contraction size of w2, or None without w2.
-    size_out_n: Output size of the layer.
+    out_dtype: Output dtype of the kernel, or None to default to `spec.x.dtype`.
+    out_quant: Optional output quantization format.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
     allow_vmem_growth: Whether heuristics may pick settings that use more VMEM
@@ -522,8 +520,7 @@ def calculate_tiling(
     (tile_m, tile_k, tile_k2, tile_n, bucket_base, num_xo_buffers,
     num_w_buffers).
   """
-  # Slightly lower vmem limit than total required amount to be conservative.
-
+  x, w = spec.x, spec.w
   # Step 1: Set default values.
   # A group gets at most one row per input token, so a tile never needs more
   # rows than there are tokens (e.g. decode). Tiles stay a whole number of
@@ -536,30 +533,36 @@ def calculate_tiling(
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
-  tile_k = plan.tile_k or size_k
+  tile_k = plan.tile_k or spec.size_k
   bucket_base = _resolve_bucket_base(
       plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
   )
 
   # Size w's output tile against size_k2 when w2 is present, or size_out_n when
   # w is the only weight.
-  w_out_n = size_out_n if size_k2 is None else size_k2
-  w_plan_tile_n = plan.tile_n if size_k2 is None else plan.tile_k2
+  if spec.size_k2 is None:
+    w_out_n = spec.size_out_n
+    w_plan_tile_n = plan.tile_n
+    w_out_dtype = x.dtype if out_dtype is None else out_dtype
+    w_out_quant = out_quant
+  else:
+    w_out_n = spec.size_k2
+    w_plan_tile_n = plan.tile_k2
+    w_out_dtype = x.dtype
+    w_out_quant = None
 
-  # out_dtype is not known to the plan, so x's dtype is used as the estimate.
-  # TODO: Add ability to pass out_dtype.
-  out_shape = layout_util.to_compact_shape((1, w_out_n), x.dtype)
-  out_chunk_cols = out_shape[2] * out_shape[3]
+  out_chunk_cols = layout_util.get_packing(w_out_dtype) * tpu_info.num_lanes
 
   # Step 2: Bind VMEM calculation function to static problem parameters.
   estimate_vmem = functools.partial(
       _vmem_estimate,
       x=x,
       w=w,
-      is_fused_act=is_fused_act,
+      is_fused_act=spec.is_fused_act,
       matmul_dtype=matmul_dtype,
       acc_dtype=acc_dtype,
-      out_dtype=x.dtype,
+      out_dtype=w_out_dtype,
+      out_quant=w_out_quant,
       tile_k=tile_k,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
@@ -605,12 +608,12 @@ def calculate_tiling(
         f" {estimate} bytes of VMEM, exceeding the budget of {vmem_limit_bytes}"
     )
 
-  if size_k2 is None:
+  if spec.size_k2 is None:
     tile_k2 = None
     tile_n = w_tile_n
   else:
     tile_k2 = w_tile_n
-    tile_n = plan.tile_n or size_out_n
+    tile_n = plan.tile_n or spec.size_out_n
 
   return (
       tile_m,
@@ -625,13 +628,11 @@ def calculate_tiling(
 
 def can_fuse_up_and_down(
     *,
-    x: arg.ActivationSpec,
-    w: arg.WeightSpec,
-    w2: arg.WeightSpec,
-    is_fused_act: bool = True,
+    spec: gmm_spec_lib.RoutingGmmSpec,
     matmul_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
+    out_quant: out_format_lib.ResolvedQuantFormat | None = None,
     tile_m: int,
     tile_k: int,
     tile_k2: int,
@@ -642,6 +643,8 @@ def can_fuse_up_and_down(
     tpu_info: pltpu.TpuInfo,
 ) -> bool:
   """Whether gate/up and down projections should run as one fused kernel."""
+  x, w, w2 = spec.x, spec.w, spec.w2
+  assert w2 is not None
   if w.dtype != w2.dtype or (w.quant is None) != (w2.quant is None):
     return False
   # Fused execution does not support weight tiling along K, K2, or N.
@@ -651,10 +654,11 @@ def can_fuse_up_and_down(
       x=x,
       w=w,
       w2=w2,
-      is_fused_act=is_fused_act,
+      is_fused_act=spec.is_fused_act,
       matmul_dtype=matmul_dtype,
       acc_dtype=acc_dtype,
       out_dtype=out_dtype,
+      out_quant=out_quant,
       tile_m=tile_m,
       tile_k=tile_k,
       tile_k2=tile_k2,

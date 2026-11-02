@@ -238,10 +238,10 @@ def reference_moe(
   group_sizes = jnp.bincount(flat, length=num_experts)
 
   x_sorted = moe.hidden_states[sorted_to_flat // topk]
-  w1 = arg.make_weight_wrapper(
+  w1 = arg.SingleWeightWrapper.create(
       moe.w1, moe.w1_scale, moe.w1_bias, fused_gate_up=True
   )
-  w2 = arg.make_weight_wrapper(moe.w2, moe.w2_scale, moe.w2_bias)
+  w2 = arg.SingleWeightWrapper.create(moe.w2, moe.w2_scale, moe.w2_bias)
   out_sorted = reference_gmm(
       x_sorted, w1, group_sizes, w2=w2, fuse_act=shape.activation
   )

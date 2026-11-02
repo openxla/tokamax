@@ -371,12 +371,12 @@ class Routing:
   @property
   def gather(self) -> arg.RoutingWrapper[jax.Array]:
     """Routing wrapper for gathering token rows into sorted order."""
-    return arg.make_routing_wrapper(self.gather_indices)
+    return arg.RoutingWrapper.create(self.gather_indices)
 
   @property
   def scatter(self) -> arg.RoutingWrapper[jax.Array]:
     """Routing wrapper for scattering sorted rows back to flat slots."""
-    return arg.make_routing_wrapper(self.sorted_to_flat)
+    return arg.RoutingWrapper.create(self.sorted_to_flat)
 
   @property
   def kernel_kwargs(self) -> dict[str, jax.Array]:

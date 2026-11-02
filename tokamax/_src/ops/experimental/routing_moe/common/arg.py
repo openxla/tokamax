@@ -13,120 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Static specifications and PyTree wrappers of kernel inputs and outputs.
-
-A spec describes the shape, dtype, and layout of a tensor and is defined by the
-tensor's producer. A wrapper pairs the tensor data with its spec as static
-PyTree metadata.
-"""
+"""PyTree wrappers pairing kernel tensor data with static specifications."""
 
 import dataclasses
+from typing import Self
 
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import layout_util
-
-
-@dataclasses.dataclass(frozen=True)
-class QuantSpec:
-  """Granularity of the scales that accompany a quantized tensor."""
-
-  # Contracting-dim elements sharing one scale value.
-  block_size: int
-  # Column stride between elements sharing a scale (1 for contiguous).
-  stride: int = 1
-
-
-@dataclasses.dataclass(frozen=True)
-class ActivationSpec:
-  """Static description of an activation tensor stored in compact layout."""
-
-  row_size: int
-  # Logical column size; physical column size is `col_size + quant_col_size`.
-  col_size: int
-  dtype: jnp.dtype
-  quant: QuantSpec | None = None
-
-  def __post_init__(self) -> None:
-    if self.quant is not None and self.col_size % self.quant.block_size != 0:
-      raise ValueError(
-          f"quant block_size ({self.quant.block_size}) must divide col_size"
-          f" ({self.col_size})."
-      )
-
-  @property
-  def quant_col_size(self) -> int:
-    if self.quant is None:
-      return 0
-    if self.quant.stride != 128:
-      raise NotImplementedError(
-          "Only per-lane strided quantization (stride=128) is supported, got"
-          f" stride={self.quant.stride}."
-      )
-    num_scales = self.col_size // self.quant.block_size
-    return num_scales * layout_util.get_packing(self.dtype)
-
-  @property
-  def compact_shape(self) -> tuple[int, int, int, int]:
-    return layout_util.to_compact_shape(
-        (self.row_size, self.col_size + self.quant_col_size), self.dtype
-    )
-
-  @property
-  def large_shape(self) -> tuple[int, int]:
-    return (self.row_size, self.col_size)
-
-
-@dataclasses.dataclass(frozen=True)
-class WeightSpec:
-  """Static description of a grouped expert weight tensor."""
-
-  group_size: int
-  in_size: int
-  out_size: int
-  dtype: jnp.dtype
-  quant: QuantSpec | None = None
-  has_bias: bool = False
-  # Columns hold the gate and up weights concatenated, each out_size // 2 wide.
-  fused_gate_up: bool = False
-
-  def __post_init__(self) -> None:
-    if self.quant is not None and self.in_size % self.quant.block_size != 0:
-      raise ValueError(
-          f"quant block_size ({self.quant.block_size}) must divide in_size"
-          f" ({self.in_size})."
-      )
-    if self.fused_gate_up and self.out_size % 2 != 0:
-      raise ValueError(
-          f"Fused gate/up weight needs an even out_size. Got {self.out_size}."
-      )
-
-  @property
-  def has_scale(self) -> bool:
-    return self.quant is not None
-
-  @property
-  def shape(self) -> tuple[int, int, int]:
-    return (self.group_size, self.in_size, self.out_size)
-
-  @property
-  def scale_shape(self) -> tuple[int, int, int, int]:
-    assert self.quant is not None
-    num_blocks = self.in_size // self.quant.block_size
-    return (self.group_size, num_blocks, 1, self.out_size)
-
-  @property
-  def bias_shape(self) -> tuple[int, int, int]:
-    return (self.group_size, 1, self.out_size)
-
-
-@dataclasses.dataclass(frozen=True)
-class RoutingSpec:
-  """Static description of a row-index map."""
-
-  num_indices: int
-  # When set, output will be sharded on batch dim along this mesh axis.
-  remote_axis: str | None = None
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 
 
 @jax.tree_util.register_dataclass
@@ -136,16 +30,16 @@ class ActivationWrapper[T]:
 
   data: T
   scale: T | None
-  spec: ActivationSpec = dataclasses.field(metadata=dict(static=True))
+  spec: spec_lib.ActivationSpec = dataclasses.field(metadata=dict(static=True))
 
   def __post_init__(self) -> None:
     # Skip validation for non jax.Array.
     if not isinstance(self.data, jax.Array):
       return
-    if self.data.shape != self.spec.compact_shape:
+    if self.data.shape != self.spec.physical_compact_shape:
       raise ValueError(
-          f"Activation data must have shape {self.spec.compact_shape}. Got"
-          f" {self.data.shape}."
+          "Activation data must have shape"
+          f" {self.spec.physical_compact_shape}. Got {self.data.shape}."
       )
     if self.data.dtype != self.spec.dtype:
       raise ValueError(
@@ -167,7 +61,7 @@ class SingleWeightWrapper[T]:
   weight: T
   scale: T | None
   bias: T | None
-  spec: WeightSpec = dataclasses.field(metadata=dict(static=True))
+  spec: spec_lib.WeightSpec = dataclasses.field(metadata=dict(static=True))
 
   def __post_init__(self) -> None:
     if not isinstance(self.weight, jax.Array):
@@ -205,6 +99,31 @@ class SingleWeightWrapper[T]:
             f" {self.bias.shape}."
         )
 
+  @classmethod
+  def create(
+      cls,
+      weight: jax.Array,  # [group, in, out]
+      scale: jax.Array | None = None,  # [group, num_blocks, 1, out]
+      bias: jax.Array | None = None,  # [group, 1, out]
+      *,
+      fused_gate_up: bool = False,
+  ) -> Self:
+    """Builds a weight wrapper whose spec is derived from the given arrays."""
+    group_size, in_size, out_size = weight.shape
+    quant = None
+    if scale is not None:
+      quant = spec_lib.SubchannelQuantSpec(block_size=in_size // scale.shape[1])
+    weight_spec = spec_lib.WeightSpec(
+        group_size=group_size,
+        in_size=in_size,
+        out_size=out_size,
+        dtype=weight.dtype,
+        quant=quant,
+        has_bias=bias is not None,
+        fused_gate_up=fused_gate_up,
+    )
+    return cls(weight=weight, scale=scale, bias=bias, spec=weight_spec)
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -212,51 +131,30 @@ class RoutingWrapper[T]:
   """Row indices together with the spec of the map they define."""
 
   indices: T
-  spec: RoutingSpec = dataclasses.field(metadata=dict(static=True))
+  spec: spec_lib.RoutingSpec = dataclasses.field(metadata=dict(static=True))
 
   def __post_init__(self) -> None:
     if not isinstance(self.indices, jax.Array):
       return
     if self.indices.ndim != 1 or self.indices.shape[0] != self.spec.num_indices:
       raise ValueError(
-          f"Routing indices must be 1D with at least {self.spec.num_indices}"
-          f" entries. Got shape {self.indices.shape}."
+          f"Routing indices must be 1D of length {self.spec.num_indices}. Got"
+          f" shape {self.indices.shape}."
       )
     if self.indices.dtype != jnp.int32:
       raise ValueError(
           f"Routing indices must be int32. Got {self.indices.dtype}."
       )
 
-
-def make_weight_wrapper(
-    weight: jax.Array,  # [group, in, out]
-    scale: jax.Array | None = None,  # [group, num_blocks, 1, out]
-    bias: jax.Array | None = None,  # [group, 1, out]
-    *,
-    fused_gate_up: bool = False,
-) -> SingleWeightWrapper[jax.Array]:
-  """Builds a weight wrapper whose spec is derived from the given arrays."""
-  group_size, in_size, out_size = weight.shape
-  quant = None
-  if scale is not None:
-    quant = QuantSpec(block_size=in_size // scale.shape[1])
-  spec = WeightSpec(
-      group_size=group_size,
-      in_size=in_size,
-      out_size=out_size,
-      dtype=weight.dtype,
-      quant=quant,
-      has_bias=bias is not None,
-      fused_gate_up=fused_gate_up,
-  )
-  return SingleWeightWrapper(weight=weight, scale=scale, bias=bias, spec=spec)
-
-
-def make_routing_wrapper(
-    indices: jax.Array,  # [num_indices]
-    *,
-    remote_axis: str | None = None,
-) -> RoutingWrapper[jax.Array]:
-  """Builds a routing wrapper for a row-index map, local unless remote_axis."""
-  spec = RoutingSpec(num_indices=indices.shape[0], remote_axis=remote_axis)
-  return RoutingWrapper(indices=indices, spec=spec)
+  @classmethod
+  def create(
+      cls,
+      indices: jax.Array,  # [num_indices]
+      *,
+      remote_axis: str | None = None,
+  ) -> Self:
+    """Builds a routing wrapper whose spec is derived from indices."""
+    routing_spec = spec_lib.RoutingSpec(
+        num_indices=indices.shape[0], remote_axis=remote_axis
+    )
+    return cls(indices=indices, spec=routing_spec)

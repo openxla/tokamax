@@ -260,9 +260,8 @@ def _reduce(out: jax.Array, *, mesh: Mesh, layout: WeightLayout) -> jax.Array:
         "shape",
         "layout",
         "mesh",
-        "remote_scatter",
-        "scatter_dtype",
         "reduce_output",
+        "moe_plan",
         "gmm_plan",
     )
 )
@@ -273,9 +272,8 @@ def _run_moe(
     shape: test_shapes.MoEShape,
     layout: WeightLayout,
     mesh: Mesh,
-    remote_scatter: bool = False,
-    scatter_dtype: jax.typing.DTypeLike | None = None,
     reduce_output: bool = True,
+    moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
 ) -> jax.Array:
   """Runs execution mode on routed and optional shared experts, then reduces."""
@@ -292,10 +290,8 @@ def _run_moe(
       ep_axis=layout.sharding.ep_axis,
       use_sp=layout.use_sp,
       reduce_output=reduce_output,
+      moe_plan=moe_plan,
       gmm_plan=gmm_plan,
-  )
-  moe_plan = moe_plan_lib.RoutingMoEPlan(
-      remote_scatter=remote_scatter, scatter_dtype=scatter_dtype
   )
 
   match mode:
@@ -307,7 +303,6 @@ def _run_moe(
           topk=shape.top_k,
           renormalize=shape.renormalize,
           scoring_fn="softmax",
-          moe_plan=moe_plan,
           **routed_kwargs,
       )
     case "modular":
@@ -318,7 +313,6 @@ def _run_moe(
           moe.hidden_states,
           topk_weights,
           topk_indices,
-          moe_plan=moe_plan,
           **routed_kwargs,
       )
 
@@ -357,9 +351,8 @@ class MoECase:
       self,
       mode: Mode,
       *,
-      remote_scatter: bool = False,
-      scatter_dtype: jax.typing.DTypeLike | None = None,
       reduce_output: bool = True,
+      moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
       gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
   ) -> jax.Array:
     """Runs `mode` on `sharded` and blocks until the output is ready."""
@@ -369,9 +362,8 @@ class MoECase:
         shape=self.shape,
         layout=self.layout,
         mesh=self.mesh,
-        remote_scatter=remote_scatter,
-        scatter_dtype=scatter_dtype,
         reduce_output=reduce_output,
+        moe_plan=moe_plan,
         gmm_plan=gmm_plan,
     )
     return jax.block_until_ready(out)
@@ -380,13 +372,18 @@ class MoECase:
       self,
       actual: jax.Array,
       *,
-      scatter_dtype: jax.typing.DTypeLike | None = None,
+      moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
   ) -> None:
     """Asserts that `actual` matches `reference_moe` on `raw`."""
     expected = test_reference.reference_moe(
         self.raw, self.shape, fold_shared_expert=self.layout.fold_shared_expert
     )
-    is_quant = self.shape.w_dtype is not None or scatter_dtype is not None
+    is_scatter_quant = (
+        moe_plan is not None
+        and moe_plan.scatter_format is not None
+        and moe_plan.scatter_format.quant is not None
+    )
+    is_quant = self.shape.w_dtype is not None or is_scatter_quant
     rtol = 5e-2 if is_quant else 2e-2
     atol = rtol * float(jnp.abs(expected).max())
     test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
@@ -397,7 +394,7 @@ class MoECase:
       case: test_cases.Case,
       layout: WeightLayout | None = None,
       *,
-      remote_scatter: bool = False,
+      moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
       seed: int = 1234,
   ) -> Self:
     """Builds and shards the layer inputs of `case` for `layout`."""
@@ -405,6 +402,7 @@ class MoECase:
       layout = WeightLayout(case.sharding)
     else:
       case = dataclasses.replace(case, sharding=layout.sharding)
+    remote_scatter = moe_plan is not None and bool(moe_plan.remote_scatter)
     test_util.check_moe_supported(case, remote_scatter=remote_scatter)
     aligned = dataclasses.replace(
         case.shape,

@@ -28,11 +28,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import pipeline
 from tokamax._src.ops.experimental.routing_moe.gmm import plan
+from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 
 
 def _padded_indices(
@@ -99,11 +101,11 @@ def _prepare_kernel_args(
 
   inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
   metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
-  out = pltpu.HBM(cfg.out.spec.compact_shape, cfg.out.spec.dtype)
+  out = pltpu.HBM(cfg.out.spec.physical_compact_shape, cfg.out.spec.dtype)
   return metadata_in, metadata_scratch, inputs, out
 
 
-@jax.jit(static_argnames=("fuse_act", "out_dtype", "custom_plan"))
+@jax.jit(static_argnames=("fuse_act", "out_format", "custom_plan"))
 def routing_gmm(
     x: arg.ActivationWrapper[jax.Array],
     w: arg.SingleWeightWrapper[jax.Array],
@@ -115,7 +117,7 @@ def routing_gmm(
     gather: arg.RoutingWrapper[jax.Array] | None = None,
     scatter: arg.RoutingWrapper[jax.Array] | None = None,
     fuse_act: str | None = None,
-    out_dtype: jax.typing.DTypeLike | None = None,
+    out_format: out_format_lib.ActivationFormatLike | None = None,
     custom_plan: plan.RoutingGmmPlan | None = None,
 ) -> arg.ActivationWrapper[jax.Array]:
   """Computes grouped matrix multiplication with pipelined routing.
@@ -130,7 +132,8 @@ def routing_gmm(
     gather: Optional input row-index map. Reads x contiguously when None.
     scatter: Optional output row-index map. Writes contiguously when None.
     fuse_act: Optional gated activation applied after the w projection.
-    out_dtype: Optional output dtype. Defaults to x.spec.dtype when None.
+    out_format: Optional target output format. Defaults to unquantized
+      x.spec.dtype when None.
     custom_plan: Optional execution plan overriding heuristic defaults.
 
   Returns:
@@ -140,33 +143,32 @@ def routing_gmm(
   scatter_spec = None if scatter is None else scatter.spec
   w2_spec = None if w2 is None else w2.spec
 
-  # Step 1: Derive sizes, resolve the plan, and construct the config.
+  # Step 1: Build problem spec, resolve format and plan, and assemble config.
   tpu_info = pltpu.get_tpu_info()
   size_ep = 1
   if scatter_spec is not None and scatter_spec.remote_axis is not None:
     size_ep = jax.lax.axis_size(scatter_spec.remote_axis)
-  dim = config.Dimension.create(
+  gmm_spec = gmm_spec_lib.RoutingGmmSpec(
       x=x.spec,
       w=w.spec,
       w2=w2_spec,
-      num_global_groups=group_sizes.size,
       gather=gather_spec,
       scatter=scatter_spec,
+      num_global_groups=group_sizes.size,
       fuse_act=fuse_act,
       size_ep=size_ep,
   )
+  resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
+      out_format,
+      default_dtype=x.spec.dtype,
+      default_quant=out_format_lib.ResolvedLaneStrided(
+          block_col_size=out_format_lib.tile_size
+      ),
+  )
   resolved_plan = plan.ResolvedGmmPlan.create(
       custom_plan,
-      x=x.spec,
-      w=w.spec,
-      w2=w2_spec,
-      is_fused_act=fuse_act is not None,
-      out_dtype=out_dtype,
-      size_out_m=dim.size_out_m,
-      size_global_groups=dim.size_global_groups,
-      size_k=dim.size_k,
-      size_k2=dim.size_k2,
-      size_out_n=dim.size_out_n,
+      spec=gmm_spec,
+      out_format=resolved_out_format,
       tpu_info=tpu_info,
   )
   if w2 is not None and not resolved_plan.fuse_up_and_down:
@@ -187,20 +189,14 @@ def routing_gmm(
         row_group=row_group,
         group_offset=group_offset,
         scatter=scatter,
-        out_dtype=out_dtype,
+        out_format=resolved_out_format,
         custom_plan=custom_plan,
     )
 
   cfg = config.RoutingGmmConfig.create(
-      x=x.spec,
-      w=w.spec,
-      w2=w2_spec,
-      dim=dim,
+      spec=gmm_spec,
+      out_format=resolved_out_format,
       plan=resolved_plan,
-      gather=gather_spec,
-      scatter=scatter_spec,
-      fuse_act=fuse_act,
-      out_dtype=out_dtype,
       tpu_info=tpu_info,
   )
 

@@ -19,7 +19,9 @@ import dataclasses
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
+from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
 from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
 from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
@@ -31,6 +33,10 @@ _UNIT_SHARDINGS = (
     test_cases.MoESharding(ep=2),
     test_cases.MoESharding(tp=2),
     test_cases.MoESharding(ep=2, tp=2),
+)
+_FP8_SCATTER_FORMAT = out_format.ActivationFormat(
+    dtype=jnp.float8_e4m3fn,
+    quant=out_format.auto_quant,
 )
 
 
@@ -48,40 +54,33 @@ class MoETestCase(parameterized.TestCase):
       case: test_cases.Case,
       layout: moe_test_lib.WeightLayout | None = None,
       *,
-      remote_scatter: bool = False,
-      scatter_dtype: jax.typing.DTypeLike | None = None,
       reduce_output: bool = True,
       capture_xprof: bool = False,
+      moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
       gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
   ) -> None:
     """Checks that the execution mode matches numerics on `case`."""
     sharding = case.sharding if layout is None else layout.sharding
     test_util.skip_unless_supported(self, min_devices=sharding.num_cores)
-    moe_case = moe_test_lib.MoECase.make_case(
-        case, layout, remote_scatter=remote_scatter
-    )
+    moe_case = moe_test_lib.MoECase.make_case(case, layout, moe_plan=moe_plan)
     actual = moe_case.run(
         self.mode,
-        remote_scatter=remote_scatter,
-        scatter_dtype=scatter_dtype,
         reduce_output=reduce_output,
+        moe_plan=moe_plan,
         gmm_plan=gmm_plan,
     )
-    moe_case.assert_close(actual, scatter_dtype=scatter_dtype)
+    moe_case.assert_close(actual, moe_plan=moe_plan)
     if capture_xprof:
       _, topk_indices = test_reference.compute_topk(moe_case.raw, case.shape)
       routing = test_inputs.Routing.make_routing(
           topk_indices, case.shape.num_experts
       )
-      test_util.log_expert_load(
-          case.name, routing.group_sizes, ep=sharding.ep
-      )
+      test_util.log_expert_load(case.name, routing.group_sizes, ep=sharding.ep)
       with test_util.XprofTrace():
         moe_case.run(
             self.mode,
-            remote_scatter=remote_scatter,
-            scatter_dtype=scatter_dtype,
             reduce_output=reduce_output,
+            moe_plan=moe_plan,
             gmm_plan=gmm_plan,
         )
 
@@ -91,17 +90,15 @@ class MoETestCase(parameterized.TestCase):
       layout: moe_test_lib.WeightLayout = moe_test_lib.WeightLayout(),
       *,
       num_tokens: int = 256,
-      remote_scatter: bool = False,
-      scatter_dtype: jax.typing.DTypeLike | None = None,
       reduce_output: bool = True,
+      moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
   ) -> None:
     """Checks that the execution mode matches numerics on `shape`."""
     self.check_case(
         test_cases.Case(shape.name, shape, num_tokens),
         layout,
-        remote_scatter=remote_scatter,
-        scatter_dtype=scatter_dtype,
         reduce_output=reduce_output,
+        moe_plan=moe_plan,
     )
 
 
@@ -134,31 +131,30 @@ class MoEUnitTest(MoETestCase):
     layout = moe_test_lib.WeightLayout(
         test_cases.MoESharding(ep=2, tp=2), use_sp=use_sp
     )
-    self.check_matches_reference(shape, layout, remote_scatter=remote_scatter)
+    moe_plan = moe_plan_lib.RoutingMoEPlan(remote_scatter=remote_scatter)
+    self.check_matches_reference(shape, layout, moe_plan=moe_plan)
 
   @parameterized.product(
       use_sp=[True, False],
-      scatter_dtype=[None, jnp.float8_e4m3fn],
+      scatter_format=[None, _FP8_SCATTER_FORMAT],
   )
   def test_remote_scatter(
-      self, use_sp: bool, scatter_dtype: jax.typing.DTypeLike | None
+      self, use_sp: bool, scatter_format: out_format.ActivationFormat | None
   ):
+    """Checks EP remote scatter across SP and scatter quantization."""
     layout = moe_test_lib.WeightLayout(
         test_cases.MoESharding(ep=2), use_sp=use_sp
     )
-    self.check_matches_reference(
-        test_shapes.BASIC,
-        layout,
-        remote_scatter=True,
-        scatter_dtype=scatter_dtype,
+    moe_plan = moe_plan_lib.RoutingMoEPlan(
+        remote_scatter=True, scatter_format=scatter_format
     )
+    self.check_matches_reference(test_shapes.BASIC, layout, moe_plan=moe_plan)
 
   @parameterized.product(sharding=_UNIT_SHARDINGS, use_sp=[True, False])
   def test_fp8_scatter(self, sharding: test_cases.MoESharding, use_sp: bool):
     layout = moe_test_lib.WeightLayout(sharding, use_sp=use_sp)
-    self.check_matches_reference(
-        test_shapes.BASIC, layout, scatter_dtype=jnp.float8_e4m3fn
-    )
+    moe_plan = moe_plan_lib.RoutingMoEPlan(scatter_format=_FP8_SCATTER_FORMAT)
+    self.check_matches_reference(test_shapes.BASIC, layout, moe_plan=moe_plan)
 
   @parameterized.product(sharding=_UNIT_SHARDINGS, use_sp=[True, False])
   def test_unreduced_output(
@@ -180,13 +176,16 @@ class MoEUnitTest(MoETestCase):
       self.check_matches_reference(
           test_shapes.BASIC,
           moe_test_lib.WeightLayout(test_cases.MoESharding(ep=2)),
-          remote_scatter=True,
           reduce_output=False,
+          moe_plan=moe_plan_lib.RoutingMoEPlan(remote_scatter=True),
       )
 
   def test_remote_scatter_without_ep_raises(self):
     with self.assertRaisesRegex(ValueError, "remote_scatter requires ep_axis"):
-      self.check_matches_reference(test_shapes.BASIC, remote_scatter=True)
+      self.check_matches_reference(
+          test_shapes.BASIC,
+          moe_plan=moe_plan_lib.RoutingMoEPlan(remote_scatter=True),
+      )
 
   @parameterized.product(activation=["silu", "swigluoai"])
   def test_activation(self, activation: str):

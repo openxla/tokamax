@@ -86,14 +86,14 @@ def _quantized_block_matmul(
 ) -> jax.Array:
   """Computes one dynamically quantized K-block matmul over weight blocks."""
   assert cfg.dynamic_quant is not None
-  x_q_dtype = cfg.dynamic_quant.dtype
+  x_q_dtype = cfg.matmul_dtype
   block_k = block_x.shape[1]
 
   # Perform lhs quantization. Note that for every block_lhs,
   # same computation will be performed tiles_n//mxu_size times.
   # But we can let compiler perform CSE and avoid recomputation.
   block_scale, block_scale_inv = quant_util.compute_scale(
-      block_x, cfg.dynamic_quant
+      block_x, x_q_dtype, cfg.dynamic_quant
   )
   block_x_q = quant_util.quantize(block_x, block_scale_inv, x_q_dtype)
 
@@ -140,8 +140,9 @@ def _quantized_matmul(
   mxu_size = cfg.tpu_info.mxu_column_size
   tile_k, tile_n = w.shape
   num_w_blocks = w_scale.shape[0]
-  x_q_dtype = cfg.dynamic_quant.dtype
+  x_q_dtype = cfg.matmul_dtype
   x_q_block_size = cfg.dynamic_quant.block_size
+  assert x_q_block_size is not None
   assert tile_k % num_w_blocks == 0, f"{num_w_blocks=} must divide {tile_k=}."
   w_q_block_size = tile_k // num_w_blocks
   # TODO: I think current code assumes x_q_block_size is always
@@ -222,26 +223,26 @@ def quantize_rows(
     scale: jax.Array,
     inv_scale: jax.Array,
     load_chunk: Callable[[int], jax.Array],
-    out: config.OutputConfig,
+    out: config.ActivationConfig,
 ) -> None:
-  """Quantizes `scale.shape[0]` rows and writes payload and scale chunks.
+  """Quantizes `scale.shape[0]` rows and writes logical and scale chunks.
 
   Args:
     dst: Destination compact output VMEM slot.
     first_row: Starting row index in `dst` for this `scale.shape[0]`-row slice.
     scale: Per-lane scales of shape `f32[rows, lanes]`.
     inv_scale: Broadcastable reciprocal scales matching `load_chunk` outputs.
-    load_chunk: Callable returning the unquantized values for payload chunk `c`.
-    out: Output configuration describing payload chunks and quantization dtype.
+    load_chunk: Callable returning the unquantized values for logical chunk `c`.
+    out: Output configuration describing logical chunks and quantization dtype.
   """
-  assert out.dynamic_quant is not None
-  num_chunks = out.num_payload_chunks
+  assert out.spec.quant is not None
+  num_chunks = out.spec.num_logical_chunks
   layout_util.store_compact_chunk(
       dst, first_row, num_chunks, pltpu.bitcast(scale, jnp.uint32)
   )
   for chunk in range(num_chunks):
-    payload = quant_util.quantize(
-        load_chunk(chunk), inv_scale, out.dynamic_quant.dtype
+    q_chunk = quant_util.quantize(
+        load_chunk(chunk), inv_scale, out.spec.dtype
     )
-    words = pltpu.bitcast(payload, jnp.uint32)
+    words = pltpu.bitcast(q_chunk, jnp.uint32)
     layout_util.store_compact_chunk(dst, first_row, chunk, words)

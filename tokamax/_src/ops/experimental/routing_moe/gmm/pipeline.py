@@ -81,14 +81,14 @@ def _inner_pipeline(
 
     # Step 4: Perform computation.
     weight = in_ref.w.get_weight()
-    weight_scale = in_ref.w.get_scale() if cfg.w.has_scale else None
+    weight_scale = in_ref.w.get_scale() if cfg.spec.w.has_scale else None
     act = compute.matmul(cfg.compute, act, weight, weight_scale, None)
-    act = compute.apply_act_fn(act, cfg.fuse_act)
-    if cfg.w2 is not None:
+    act = compute.apply_act_fn(act, cfg.spec.fuse_act)
+    if cfg.spec.w2 is not None:
       assert in_ref.w2 is not None and cfg.compute2 is not None
       act = act.astype(x_ref.dtype)
       weight2 = in_ref.w2.get_weight()
-      weight2_scale = in_ref.w2.get_scale() if cfg.w2.has_scale else None
+      weight2_scale = in_ref.w2.get_scale() if cfg.spec.w2.has_scale else None
       act = compute.matmul(cfg.compute2, act, weight2, weight2_scale, None)
 
     # Start output DMA for previous step slot after the loads because a remote

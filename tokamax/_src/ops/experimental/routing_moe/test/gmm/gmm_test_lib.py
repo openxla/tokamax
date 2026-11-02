@@ -22,6 +22,7 @@ from jax import sharding
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
@@ -49,7 +50,7 @@ def _local_weight(
     w, scale = test_inputs.sub_channel_quantize(
         w, quant_dtype or jnp.float8_e4m3fn, quant_block_size
     )
-  return arg.make_weight_wrapper(w, scale, fused_gate_up=fused_gate_up)
+  return arg.SingleWeightWrapper.create(w, scale, fused_gate_up=fused_gate_up)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -224,15 +225,23 @@ def sharded_gmm_unpermute(
       offset: jax.Array,
       scatter_indices: jax.Array,
   ) -> jax.Array:
+    out_format = None
+    if out_dtype is not None:
+      quant = (
+          out_format_lib.LaneStrided()
+          if jnp.dtype(out_dtype).itemsize == 1
+          else None
+      )
+      out_format = out_format_lib.ActivationFormat(dtype=out_dtype, quant=quant)
     out = kernel.routing_gmm(
         x,
-        arg.make_weight_wrapper(w),
+        arg.SingleWeightWrapper.create(w),
         group_sizes,
         group_offset=offset,
-        scatter=arg.make_routing_wrapper(
+        scatter=arg.RoutingWrapper.create(
             scatter_indices, remote_axis=remote_axis
         ),
-        out_dtype=out_dtype,
+        out_format=out_format,
     ).data
     if remote_scatter or not all_to_all:
       return out

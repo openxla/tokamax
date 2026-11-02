@@ -15,30 +15,11 @@
 
 """Dynamic activation quantization shared across routing_moe kernels."""
 
-import dataclasses
 import functools
 
 import jax
 import jax.numpy as jnp
-
-
-@dataclasses.dataclass(frozen=True)
-class DynamicQuantConfig:
-  """Dynamic quantization parameters for an activation tensor.
-
-  Each scale covers `block_size` elements of a row spaced `stride` columns
-  apart (`stride=1` for contiguous blocks, `stride=num_lanes` for per-lane
-  scales).
-
-  Attributes:
-    dtype: Target quantized element dtype.
-    block_size: Number of elements along the row sharing a single scale.
-    stride: Column stride between elements sharing a scale.
-  """
-
-  dtype: jnp.dtype
-  block_size: int
-  stride: int = 1
+from tokamax._src.ops.experimental.routing_moe.common import spec
 
 
 def dtype_max(dtype: jax.typing.DTypeLike) -> float:
@@ -49,31 +30,35 @@ def dtype_max(dtype: jax.typing.DTypeLike) -> float:
 
 
 def compute_scale(
-    x: jax.Array, quant: DynamicQuantConfig
+    x: jax.Array, dtype: jax.typing.DTypeLike, quant: spec.QuantSpec
 ) -> tuple[jax.Array, jax.Array]:
   """Computes the scales of one quantization block and their reciprocals.
 
-  Scale `l` maps the maximum magnitude of columns `l, l + stride, ...` of `x` to
-  the largest finite value of `quant.dtype`. All-zero groups get scale 0 and
+  Scale `i` maps the maximum magnitude of the elements sharing scale `i` in `x`
+  to the largest finite value of `dtype`. All-zero scale blocks get scale 0 and
   reciprocal 0, so they quantize and dequantize to 0.
 
   Args:
-    x: Unquantized `[..., cols]` values of one block. With `stride > 1`, `cols`
-      is `block_size * stride`. With `stride == 1`, `cols` is at most
-      `block_size`, which allows a shorter last block.
-    quant: Dynamic quantization configuration.
+    x: Unquantized `[..., cols]` values of one block. For
+      `LaneStridedQuantSpec`, `cols` must equal `quant.block_col_size`. For
+      `SubchannelQuantSpec`, `cols` is at most `quant.block_size`, which allows
+      a shorter last block.
+    dtype: Target quantized dtype.
+    quant: Quantization spec specifying subchannel or lane-strided grouping.
 
   Returns:
-    A `(scale, inv_scale)` pair of `[..., stride]` arrays.
+    A `(scale, inv_scale)` pair of `[..., 1]` or `[..., 128]` arrays.
   """
-  if quant.stride == 1:
-    assert x.shape[-1] <= quant.block_size
-    absmax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-  else:
-    assert x.shape[-1] == quant.block_size * quant.stride
-    chunks = jnp.split(x, quant.block_size, axis=-1)
-    absmax = functools.reduce(jnp.maximum, [jnp.abs(c) for c in chunks])
-  scale = absmax / dtype_max(quant.dtype)
+  match quant:
+    case spec.SubchannelQuantSpec(block_size=block_size):
+      assert x.shape[-1] <= block_size
+      absmax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+    case spec.LaneStridedQuantSpec(block_col_size=block_col_size):
+      lanes = 128
+      assert x.shape[-1] == block_col_size
+      chunks = jnp.split(x, block_col_size // lanes, axis=-1)
+      absmax = functools.reduce(jnp.maximum, [jnp.abs(c) for c in chunks])
+  scale = absmax / dtype_max(dtype)
   # 1 / 0 is inf, which would turn 0 into NaN when quantizing.
   inv_scale = jnp.where(scale == 0, 0, 1 / scale)
   return scale, inv_scale

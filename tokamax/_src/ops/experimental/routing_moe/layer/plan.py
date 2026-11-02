@@ -15,49 +15,69 @@
 
 """Tunable parameters of the routing MoE layer.
 
-Plan fields affect performance but not the output value, shape, dtype, or
-sharding. Unset fields are resolved by heuristics.
+`RoutingMoEPlan` exposes optional overrides where `None` delegates to
+heuristics, while `ResolvedMoEPlan` holds the concrete parameters consumed by
+layer config construction. Plan fields affect performance without changing the
+output value, shape, dtype, or sharding of MoE.
 """
 
 import dataclasses
 from typing import Self
 import jax
-import jax.numpy as jnp
-from tokamax._src.ops.experimental.routing_moe.common import plan_util
+from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 
 
-@plan_util.require_none_default
+@dataclass_util.require_none_default
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingMoEPlan:
-  """User-provided plan where `None` fields are resolved by heuristics.
+  """User-provided plan where None fields will be determined by heuristic."""
 
-  Attributes:
-    remote_scatter: Whether `routing_gmm` scatters output rows directly to the
-      device that owns each token.
-    scatter_dtype: Optional dtype for `routing_gmm` scatter output rows.
-  """
-
+  # Whether routing_gmm scatters output rows directly to each token's owner.
   remote_scatter: bool | None = None
-  scatter_dtype: jax.typing.DTypeLike | None = None
+  # Output format of input_pack fed into routing_gmm's gather input.
+  gather_format: out_format.ActivationFormat | None = None
+  # Output format of routing_gmm fed into output_reduce_unpack.
+  scatter_format: out_format.ActivationFormat | None = None
 
 
+@dataclass_util.resolves_from(RoutingMoEPlan)
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedMoEPlan:
-  """Plan with `None` fields from user-provided plan resolved by heuristics."""
+  """Plan with None fields from user-provided plan resolved by heuristic."""
 
   remote_scatter: bool
-  scatter_dtype: jnp.dtype | None = None
+  gather_format: out_format.ResolvedActivationFormat
+  scatter_format: out_format.ResolvedActivationFormat
 
   @classmethod
-  def create(cls, plan: RoutingMoEPlan | None) -> Self:
-    """Fills unset plan fields with heuristics."""
+  def create(
+      cls,
+      plan: RoutingMoEPlan | None,
+      *,
+      x_dtype: jax.typing.DTypeLike,
+  ) -> Self:
+    """Resolves unset plan fields into concrete execution parameters."""
     if plan is None:
       plan = RoutingMoEPlan()
 
     remote_scatter = plan.remote_scatter
     if remote_scatter is None:
       remote_scatter = False
-    scatter_dtype = (
-        None if plan.scatter_dtype is None else jnp.dtype(plan.scatter_dtype)
+    gather_format = out_format.ResolvedActivationFormat.create(
+        plan.gather_format,
+        default_dtype=x_dtype,
     )
-    return cls(remote_scatter=remote_scatter, scatter_dtype=scatter_dtype)
+    scatter_format = out_format.ResolvedActivationFormat.create(
+        plan.scatter_format,
+        default_dtype=x_dtype,
+        default_quant=out_format.ResolvedLaneStrided(
+            block_col_size=out_format.tile_size
+        ),
+    )
+
+    return cls(
+        remote_scatter=remote_scatter,
+        gather_format=gather_format,
+        scatter_format=scatter_format,
+    )

@@ -20,6 +20,8 @@ import enum
 from typing import Self
 
 from jax import sharding
+from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
 
 Mesh = sharding.Mesh
@@ -35,18 +37,10 @@ class OutputCollective(enum.StrEnum):
   ALL_REDUCE = enum.auto()
 
 
+@dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
 class RoutingMoEConfig:
-  """Compile-time static configuration of the routing MoE layer.
-
-  Attributes:
-    tp_axis: Tensor parallelism mesh axis name, or `None` if disabled.
-    ep_axis: Expert parallelism mesh axis name, or `None` if disabled.
-    use_sp: Whether inputs are sequence-parallel along the reduction axis.
-    reduce_output: Whether to reduce the output across devices.
-    activation: Activation function applied to the gate/up projection.
-    plan: Resolved execution plan for the MoE layer.
-  """
+  """Compile-time static configuration of the routing MoE layer."""
 
   tp_axis: str | None
   ep_axis: str | None
@@ -116,15 +110,26 @@ class RoutingMoEConfig:
     return tuple(ax for ax in (self.ep_axis, self.tp_axis) if ax is not None)
 
   @property
-  def act_spec(self) -> P:
+  def act_pspec(self) -> P:
     """The PartitionSpec of the input activations and top-k routing tensors."""
     return P(self.reduction_axis) if self.use_sp else P(None)
 
   @property
-  def out_spec(self) -> P:
+  def gmm_in_format(self) -> out_format.ResolvedActivationFormat:
+    """The ResolvedActivationFormat produced by input_pack for routing_gmm."""
+    # TODO: Add support for gather quantization.
+    return self.plan.gather_format
+
+  @property
+  def gmm_out_format(self) -> out_format.ResolvedActivationFormat:
+    """The ResolvedActivationFormat produced by routing_gmm."""
+    return self.plan.scatter_format
+
+  @property
+  def out_pspec(self) -> P:
     """The PartitionSpec of the layer output."""
     if self.reduce_output:
-      return self.act_spec
+      return self.act_pspec
     # Ideally, we want to use P(unreduced={axis}) but that is only supported in
     # explicit mesh mode. Instead, we create an axis where output is unreduced.
     # TODO: Make gmm work in explicit mesh mode.
@@ -140,7 +145,7 @@ class RoutingMoEConfig:
       output_spec = P(None, unreduced=unreduced)
 
     if self.reduce_output:
-      expected_out_spec = self.act_spec
+      expected_out_spec = self.act_pspec
     else:
       expected_out_spec = P(None, unreduced=unreduced)
 

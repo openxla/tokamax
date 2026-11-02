@@ -21,7 +21,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce as kernel
 from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
@@ -193,13 +193,13 @@ class OutputReduceUnitTest(parameterized.TestCase):
       kernel.output_reduce_unpack(rows_i8, weights)
 
   def test_non_strided_activation_quant_raises(self):
-    spec = arg.ActivationSpec(
+    spec = spec_lib.ActivationSpec(
         row_size=16,
         col_size=512,
         dtype=jnp.dtype(jnp.float8_e4m3fn),
-        quant=arg.QuantSpec(block_size=512, stride=1),
+        quant=spec_lib.SubchannelQuantSpec(block_size=512),
     )
-    with self.assertRaisesRegex(NotImplementedError, "stride=128"):
+    with self.assertRaisesRegex(NotImplementedError, "LaneStridedQuantSpec"):
       _ = spec.quant_col_size
 
 
