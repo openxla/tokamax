@@ -24,6 +24,9 @@ class Platform(enum.StrEnum):
   TPU = "tpu"
 
 
+_ACCELERATORS = frozenset({Platform.GPU, Platform.TPU})
+
+
 def _check_name(owner: object, name: object) -> None:
   if not isinstance(name, str) or not name:
     raise ValueError(
@@ -50,6 +53,8 @@ CUDNN = Backend("cudnn", frozenset({Platform.GPU}))
 
 @dataclasses.dataclass(frozen=True)
 class Impl:
+  """Kernel implementation metadata."""
+
   name: str
   backend: Backend
   module: str
@@ -60,6 +65,13 @@ class Impl:
   def __post_init__(self) -> None:
     _check_name(self, self.name)
 
+  @property
+  def accelerator_platforms(self) -> frozenset[Platform]:
+    """GPU/TPU platforms for non-XLA implementations, else empty."""
+    if self.backend == XLA:
+      return frozenset()
+    return self.backend.platforms & _ACCELERATORS
+
 
 @dataclasses.dataclass(frozen=True)
 class Op:
@@ -68,9 +80,16 @@ class Op:
   name: str
   apis: tuple[str, ...]
   impls: tuple[Impl, ...]
+  # Ops that use this op's api or base; it is also tested on their platforms.
+  dependent_ops: tuple[str, ...] = ()
 
   def __post_init__(self) -> None:
     _check_name(self, self.name)
+    for dep in self.dependent_ops:
+      if not isinstance(dep, str) or not dep or dep == self.name:
+        raise ValueError(
+            f"Op '{self.name}' has invalid dependent_ops entry {dep!r}"
+        )
 
   @property
   def op_dir(self) -> str:
@@ -349,6 +368,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/attention/triton.py",
             ),
         ),
+        dependent_ops=("flex_attention",),
     ),
     Op(
         name="kda",
@@ -395,6 +415,8 @@ OPS: tuple[Op, ...] = (
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla/pallas_mosaic_tpu.py",
+                kernel_dirs=(
+                ),
             ),
         ),
     ),
@@ -706,6 +728,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/gated_linear_unit/cutedsl.py",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="normalization",
@@ -727,6 +750,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/normalization/triton.py",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="triangle_multiplication",
@@ -815,3 +839,13 @@ OPS: tuple[Op, ...] = (
         ),
     ),
 )
+
+
+def _check_dependent_ops(ops: tuple[Op, ...]) -> None:
+  op_names = frozenset(op.name for op in ops)
+  for op in ops:
+    if unknown := sorted(set(op.dependent_ops) - op_names):
+      raise ValueError(f"Op '{op.name}' lists unknown dependent_ops: {unknown}")
+
+
+_check_dependent_ops(OPS)
