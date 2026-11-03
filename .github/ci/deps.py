@@ -22,7 +22,7 @@ module, directly or transitively -- so this builds the import graph of the
 What the graph cannot see is handled by triggering a full run.
 
 Usage:
-  python3 .github/ci/deps.py tokamax/_src/pallas/block.py  # explain a change
+  python3 .github/ci/deps.py tokamax/_src/triton_utils.py  # explain a change
   python3 .github/ci/deps.py --graph                       # fan-in summary
 """
 

@@ -20,12 +20,9 @@ import math
 import jax
 import jax.numpy as jnp
 from tokamax._src import precision as precision_lib
-from tokamax._src.pallas import grid
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
-
-get_cheapest_grid_grouping = grid.get_cheapest_grid_grouping
 
 
 def vmap_kernel(launch_fn, batch_shape=(), batched=()):
@@ -94,6 +91,54 @@ def _get_grid_pids_n(
   return pid_m, pid_n
 
 
+def _get_group_size_cost(
+    group_size_m: int,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> int:
+  """Returns the total cost for the given group size."""
+  num_live_groups = triton.cdiv(jax.devices()[0].core_count, group_size_m)
+  num_live_blocks_m = triton.cdiv(num_live_groups, grid_n) * group_size_m
+  num_live_blocks_m = min(num_live_blocks_m, grid_m)
+  num_live_blocks_n = min(num_live_groups, grid_n)
+  return num_live_blocks_m * block_m_cost + num_live_blocks_n * block_n_cost
+
+
+def get_cheapest_grid_grouping(
+    *,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> tuple[int, bool]:
+  """Returns (group_size, group_by_m) that minimizes total cache cost."""
+  num_live_progs = jax.devices()[0].core_count
+
+  def group_size_m_usage(group_size_m):
+    return _get_group_size_cost(
+        group_size_m, grid_m, grid_n, block_m_cost, block_n_cost
+    )
+
+  group_size_m = min(
+      range(1, min(num_live_progs, grid_m) + 1), key=group_size_m_usage
+  )
+
+  def group_size_n_usage(group_size_n):
+    return _get_group_size_cost(
+        group_size_n, grid_n, grid_m, block_n_cost, block_m_cost
+    )
+
+  group_size_n = min(
+      range(1, min(num_live_progs, grid_n) + 1), key=group_size_n_usage
+  )
+
+  if group_size_m_usage(group_size_m) <= group_size_n_usage(group_size_n):
+    return group_size_m, True
+  return group_size_n, False
+
+
 def get_cheapest_grid_pids(
     *,
     grid_m: int,
@@ -102,7 +147,7 @@ def get_cheapest_grid_pids(
     block_n_cost: int,
 ) -> tuple[int, triton.runtime.jit.JITFunction]:
   """Returns (group_size, get_pids_fn) that minimizes total cache cost."""
-  group_size, group_by_m = grid.get_cheapest_grid_grouping(
+  group_size, group_by_m = get_cheapest_grid_grouping(
       grid_m=grid_m,
       grid_n=grid_n,
       block_m_cost=block_m_cost,

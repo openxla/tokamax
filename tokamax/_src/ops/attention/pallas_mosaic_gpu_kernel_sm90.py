@@ -32,7 +32,6 @@ from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
-from tokamax._src.pallas import block
 
 
 # pylint: disable=cell-var-from-loop
@@ -340,7 +339,7 @@ def flash_attention_kernel(
         def prologue():
           @pl.when(wg == 0)
           def load_q():
-            qs = block.ds(qi, 2 * block_q)
+            qs = pl.ds(qi * (2 * block_q), 2 * block_q)
             plgpu.copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_produced)
 
           for si in range(num_stages):
@@ -392,14 +391,16 @@ def flash_attention_kernel(
           ks = cast(pl.Slice, pl.ds(k_base, block_kv))
 
           def compute_qk(acc):
-            plgpu.wgmma(acc, q_smem.at[block.ds(wg, block_q)], k_smem.at[si].T)
+            plgpu.wgmma(
+                acc, q_smem.at[pl.ds(wg * block_q, block_q)], k_smem.at[si].T
+            )
             schedule_barrier_arrive()
             if bias_gmem is None:
               bias = None
             elif bias_smem is None:
               bias = _load_bcast(bias_gmem, (hi, qs, ks), layout=_WGMMA)
             else:
-              bias = bias_smem[si, block.ds(wg, block_q)]
+              bias = bias_smem[si, pl.ds(wg * block_q, block_q)]
             mask = (q_base + iota(0) >= k_base + iota(1)) if do_causal else None
             return acc[...], bias, mask
 
@@ -448,7 +449,7 @@ def flash_attention_kernel(
                 mask = plgpu.load(mask_smem.at[si], layout=_WGMMA_COL)
                 mask = lax.broadcast_in_dim(mask, s.shape, [1])
               else:
-                mask = mask_smem[si, block.ds(wg, block_q)]
+                mask = mask_smem[si, pl.ds(wg * block_q, block_q)]
               mgpu_lib.bar_arrive(mask_consumed_barrier + si, num_threads=288)
             s = jnp.where(mask, s, -jnp.inf)
 
@@ -580,7 +581,7 @@ def flash_attention_kernel(
       def memory_wg():
         plgpu.set_max_registers(40, action="decrease")
         hi_kv = lax.div(hi, q_heads_per_kv_head)
-        qs = block.ds(qi, 2 * block_q)
+        qs = pl.ds(qi * (2 * block_q), 2 * block_q)
 
         if bias_smem is None:
           bias_gmem_ = None
@@ -609,7 +610,7 @@ def flash_attention_kernel(
             @pl.loop(lb, ub)
             def kv_loop(ki):
               si = lax.rem(prev_iters + ki - lb, num_stages)
-              ks = block.ds(ki, block_kv)
+              ks = pl.ds(ki * block_kv, block_kv)
               mgpu_lib.bar_sync(k_consumed_barrier + si, num_threads=288)
               cp(k_gmem.at[ks, hi_kv], k_smem, k_bias_produced, si)
               if bias_gmem_ is not None:
