@@ -2909,7 +2909,21 @@
       "peak_memory_mb": 3275.509788
     }
   },
-  "{\"x\":\"f32[2048,5120]\",\"labels\":\"i32[2048]\",\"w\":\"bf16[5120,151936]\",\"reduction\":\"sum\",\"return_residuals\":true}": {},
+  "{\"x\":\"f32[2048,5120]\",\"labels\":\"i32[2048]\",\"w\":\"bf16[5120,151936]\",\"reduction\":\"sum\",\"return_residuals\":true}": {
+    "{\"b_block_size\":1024,\"v_block_size\":2048}": {
+      "compile_time_ms": 1254.4855360000042,
+      "lower_time_ms": 50.94135599999561,
+      "evaluation_times_ms": [
+        17.320057,
+        17.324228,
+        17.282155,
+        17.293616,
+        17.270334
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3275.517996
+    }
+  },
   "{\"x\":\"bf16[8192,7168]\",\"labels\":\"i32[8192]\",\"w\":\"bf16[7168,128256]\",\"reduction\":\"mean\",\"return_residuals\":false}": {
     "{\"b_block_size\":1024,\"v_block_size\":2048}": {
       "compile_time_ms": 786.1900610150769,
