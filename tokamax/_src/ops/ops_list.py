@@ -68,9 +68,16 @@ class Op:
   name: str
   apis: tuple[str, ...]
   impls: tuple[Impl, ...]
+  # Ops that use this op's api or base; it is also tested on their platforms.
+  dependent_ops: tuple[str, ...] = ()
 
   def __post_init__(self) -> None:
     _check_name(self, self.name)
+    for dep in self.dependent_ops:
+      if not isinstance(dep, str) or not dep or dep == self.name:
+        raise ValueError(
+            f"Op '{self.name}' has invalid dependent_ops entry {dep!r}"
+        )
 
   @property
   def op_dir(self) -> str:
@@ -349,6 +356,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/attention/triton.py",
             ),
         ),
+        dependent_ops=("flex_attention",),
     ),
     Op(
         name="kda",
@@ -395,6 +403,8 @@ OPS: tuple[Op, ...] = (
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla/pallas_mosaic_tpu.py",
+                kernel_dirs=(
+                ),
             ),
         ),
     ),
@@ -706,6 +716,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/gated_linear_unit/cutedsl.py",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="normalization",
@@ -727,6 +738,7 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/normalization/triton.py",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="triangle_multiplication",
@@ -815,3 +827,13 @@ OPS: tuple[Op, ...] = (
         ),
     ),
 )
+
+
+def _check_dependent_ops(ops: tuple[Op, ...]) -> None:
+  op_names = frozenset(op.name for op in ops)
+  for op in ops:
+    if unknown := sorted(set(op.dependent_ops) - op_names):
+      raise ValueError(f"Op '{op.name}' lists unknown dependent_ops: {unknown}")
+
+
+_check_dependent_ops(OPS)

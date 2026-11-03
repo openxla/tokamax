@@ -218,6 +218,10 @@ class FailOpenTest(DepsTestCase):
   def test_conftest(self):
     self.assert_full_run('tokamax/conftest.py')
 
+  def test_ops_list(self):
+    self.add('tokamax/_src/ops/ops_list.py', 'OPS = ()\n')
+    self.assert_full_run('tokamax/_src/ops/ops_list.py')
+
   def test_package_data(self):
     # The autotuning JSON decides which kernel configuration runs and is read
     # by path, so no import edge covers it.
