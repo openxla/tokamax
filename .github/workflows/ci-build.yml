@@ -207,6 +207,9 @@ jobs:
           printf '%s tokamax' "${PYTEST_FLAGS}" \
             | xargs pytest --collect-only -q
 
+      - name: Check ops_list
+        run: pytest tokamax/_src/ops/ops_list_test.py
+
   shard-tests:
     name: ${{ matrix.shard_name && format('shard-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'shard-tests (no shard selected)' }}
     needs: shard-matrix
