@@ -47,8 +47,12 @@ def _make_config(
     out_format: out_format_lib.ActivationFormat | None = None,
     size_ep: int = 1,
     size_n: int = 1280,
+    tpu_info: pltpu.TpuInfo | None = None,
+    w_dtype: jnp.dtype | None = None,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a config for a 512-expert, top-10 MoE layer."""
+  if tpu_info is None:
+    tpu_info = _tpu_info()
   num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
   if with_down:
     # The fused kernel needs the intermediate size to be a multiple of 256.
@@ -59,7 +63,11 @@ def _make_config(
       dtype=jnp.dtype(jnp.bfloat16),
       quant=None,
   )
-  w_dtype = jnp.dtype(jnp.float8_e4m3fn if quantized else jnp.bfloat16)
+  w_dtype = (
+      w_dtype
+      if w_dtype is not None
+      else jnp.dtype(jnp.float8_e4m3fn if quantized else jnp.bfloat16)
+  )
 
   def weight_spec(
       in_size: int, out_size: int, *, fused_gate_up: bool = False
@@ -107,13 +115,13 @@ def _make_config(
       custom_plan,
       spec=gmm_spec,
       out_format=resolved_out_format,
-      tpu_info=_tpu_info(),
+      tpu_info=tpu_info,
   )
   return gmm_config.RoutingGmmConfig.create(
       spec=gmm_spec,
       out_format=resolved_out_format,
       plan=resolved_plan,
-      tpu_info=_tpu_info(),
+      tpu_info=tpu_info,
   )
 
 
@@ -168,6 +176,19 @@ class TileMTest(parameterized.TestCase):
   def test_explicit_tile_m_is_kept(self):
     custom_plan = gmm_plan.RoutingGmmPlan(tile_m=128)
     self.assertEqual(_resolve(8, custom_plan).tile_m, 128)
+
+
+class MatmulDtypeTest(parameterized.TestCase):
+  """Checks the matmul dtype the planner picks."""
+
+  def test_fp8_weights_without_supported_fp8_activation_raises(self):
+    # TPU v6e has no matmul for float8_e4m3fn, and float8_e4m3b11fnuz cannot
+    # hold every float8_e4m3fn value.
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+    with self.assertRaisesRegex(
+        NotImplementedError, "No supported fp8 activation dtype"
+    ):
+      _make_config(8, tpu_info=tpu_info, w_dtype=jnp.dtype(jnp.float8_e4m3fn))
 
 
 class NumWBuffersTest(parameterized.TestCase):

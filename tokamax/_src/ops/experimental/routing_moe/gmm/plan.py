@@ -257,6 +257,11 @@ def _resolve_dtypes(
         ):
           matmul_dtype = dtype
           break
+      else:
+        raise NotImplementedError(
+            f"No supported fp8 activation dtype for {w.dtype} weights on"
+            f" {tpu_info.chip_version}"
+        )
   else:
     matmul_dtype = x.dtype
 
