@@ -64,6 +64,7 @@ AUTOTUNING_CACHE_TEST: Final[str] = (
     f'{PACKAGE_ROOT}/_src/autotuning/cache_test.py'
 )
 _OPS_ROOT: Final[str] = f'{PACKAGE_ROOT}/_src/ops/'
+OPS_LIST_FILE: Final[str] = f'{_OPS_ROOT}ops_list.py'
 # Checks `ops_list.OPS` against the op directories and the `tokamax.ops`
 # exports by reading source files, so no import reaches it from an op change.
 # Selected for any change under these prefixes other than an inert one, e.g. a
@@ -398,6 +399,8 @@ def full_run_reason(
       return f'{path} is outside {PACKAGE_ROOT}/'
     if os.path.basename(path) == 'conftest.py':
       return f'{path} configures every test in the package'
+    if path == OPS_LIST_FILE:
+      return f'{path} defines runner platforms for every op'
     if ops is not None and (name := autotuning_op_name(path)):
       if not ops.get(name):
         return (
