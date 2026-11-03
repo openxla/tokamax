@@ -14,12 +14,13 @@
 # ==============================================================================
 """Triangle multiplication op."""
 
-from collections.abc import Sequence
-from typing import Any, Literal, override
+from collections.abc import Hashable, Sequence
+from typing import Any, Literal, TypedDict, override
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import ad
 from tokamax._src import jaxtyping
 from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
@@ -28,8 +29,24 @@ from tokamax._src.ops.normalization import api as norm_api
 
 type AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 type Implementation = Literal["xla", "triton"]
-type Residuals = None
+type Residuals = tuple[
+    Float[Array, "H N N"],
+    Float[Array, "H N N"],
+    Float[Array, "N N H"] | Float[Array, "H N N"],
+]
 CanonicalPrecision = precision_lib.CanonicalPrecision
+
+
+class Grads(TypedDict):
+  x: Float[Array, "N N C"]
+  projection_in_weights: Float[Array, "C 2 H"]
+  gate_in_weights: Float[Array, "C 2 H"]
+  projection_out_weights: Float[Array, "H D"]
+  gate_out_weights: Float[Array, "C D"]
+  layernorm_in_scale: Float[Array, "C"]
+  layernorm_in_offset: Float[Array, "C"]
+  layernorm_out_scale: Float[Array, "H"]
+  layernorm_out_offset: Float[Array, "H"]
 
 
 class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
@@ -95,7 +112,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       return_residuals: bool,
       implementation: Implementation | Sequence[Implementation] | None,
       config: C,
-  ) -> tuple[Float[Array, "N N D"], Residuals]:
+  ) -> tuple[Float[Array, "N N D"], Residuals | None]:
     """Triangle multiplicative update.
 
     Implements Supplementary Algorithm 11 and 12 of 'Highly accurate protein
@@ -123,7 +140,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     Returns:
       The result of triangle multiplication of shape `[N, N, D]`.
     """
-    del config, return_residuals  # Unused.
+    del config  # Unused.
 
     h_dim = layernorm_out_scale.shape[0]
 
@@ -157,6 +174,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     act = jnp.einsum(
         equation, left_proj_act, right_proj_act, precision=precision
     )
+    residuals = (left_proj_act, right_proj_act, act)
 
     act = norm_api.layer_norm(
         act,
@@ -172,5 +190,71 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     gate_values = jnp.dot(left_act, gate_out_weights, precision=precision)
     act *= jax.nn.sigmoid(gate_values)
 
-    return act, None
+    return act, (residuals if return_residuals else None)
 
+
+class TriangleMultiplicationVjp[C, K: Hashable](
+    op.Op[Any, Grads, None, C, K]
+):
+  """Triangle multiplicative update VJP."""
+
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      residuals: Residuals,
+      out: Float[Array, "N N D"],
+      dout: Float[Array, "N N D"],
+      x: Float[Array, "N N C"],
+      mask: Bool[Array, "N N"],
+      projection_in_weights: Float[Array, "C 2 H"],
+      gate_in_weights: Float[Array, "C 2 H"],
+      projection_out_weights: Float[Array, "H D"],
+      gate_out_weights: Float[Array, "C D"],
+      layernorm_in_scale: Float[Array, "C"],
+      layernorm_in_offset: Float[Array, "C"],
+      layernorm_out_scale: Float[Array, "H"],
+      layernorm_out_offset: Float[Array, "H"],
+      triangle_type: Literal["incoming", "outgoing"],
+      *,
+      precision: CanonicalPrecision,
+      epsilon: float,
+      return_residuals: bool,
+      implementation: Implementation | Sequence[Implementation] | None = None,
+      config: C,
+  ) -> tuple[Grads, None]:
+    """Computes triangle multiplication VJP."""
+    del out, config  # Unused.
+
+    if return_residuals:
+      raise NotImplementedError("`return_residuals` not supported.")
+
+    weights = dict(
+        projection_in_weights=projection_in_weights,
+        gate_in_weights=gate_in_weights,
+        projection_out_weights=projection_out_weights,
+        gate_out_weights=gate_out_weights,
+        layernorm_in_scale=layernorm_in_scale,
+        layernorm_in_offset=layernorm_in_offset,
+        layernorm_out_scale=layernorm_out_scale,
+        layernorm_out_offset=layernorm_out_offset,
+    )
+
+    def fn(x, weights):
+      out, residuals = TriangleMultiplication()._fwd(  # pylint: disable=protected-access
+          x,
+          mask,
+          **weights,
+          triangle_type=triangle_type,
+          precision=precision,
+          epsilon=epsilon,
+          return_residuals=True,
+          implementation=implementation,
+          config=None,
+      )
+      return out, (x, weights, residuals)
+
+    vjp = ad.get_vjp_taking_residuals(fn, x, weights)
+    assert vjp is not None
+    dx, dweights = vjp((x, weights, residuals), dout)
+    return Grads(x=dx, **dweights), None

@@ -15,6 +15,7 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import numerics
@@ -46,50 +47,57 @@ class TriangleMultiplicationTest(parameterized.TestCase):
   )
   def test_triangle_multiplication(self, triangle_type, dtype, precision):
     n = 8
+    c = 16
+    h = 32
     d = 64
-    params = _get_params(n=n, c=16, h=32, d=d, dtype=dtype)
+    params = _get_params(n=n, c=c, h=h, d=d, dtype=dtype)
 
     @jax.jit
     def f(params):
-      y = base.TriangleMultiplication()(
-          **params, triangle_type=triangle_type, precision=precision
+      return base.TriangleMultiplication()(
+          **params,
+          triangle_type=triangle_type,
+          precision=precision,
+          return_residuals=True,
       )
-      return y
 
-    out = f(params)
+    out, residuals = f(params)
     self.assertEqual(out.shape, (n, n, d))
     self.assertEqual(out.dtype, dtype)
+    self.assertLen(residuals, 3)
+    for res in residuals[:2]:
+      self.assertEqual(res.shape, (h, n, n))
+      self.assertEqual(res.dtype, dtype)
+    self.assertEqual(residuals[2].shape, (n, n, h))
+    self.assertEqual(residuals[2].dtype, dtype)
 
   @parameterized.product(
       triangle_type=['incoming', 'outgoing'],
-      dtype=[jnp.bfloat16],
-      precision=[jax.lax.Precision.HIGH],
+      dtype=[jnp.bfloat16, jnp.float32],
+      precision=[jax.lax.Precision.HIGHEST],
   )
   def test_triangle_multiplication_grad(self, triangle_type, dtype, precision):
     n = 8
     d = 64
     params = _get_params(n=n, c=16, h=32, d=d, dtype=dtype)
+    mask = params.pop('mask')
+    op_default = base.TriangleMultiplication()
+    op_vjp = base.TriangleMultiplication(vjp=base.TriangleMultiplicationVjp())
 
-    def f(x):
-      y = base.TriangleMultiplication()(
-          x=x,
-          mask=params['mask'],
-          projection_in_weights=params['projection_in_weights'],
-          gate_in_weights=params['gate_in_weights'],
-          projection_out_weights=params['projection_out_weights'],
-          gate_out_weights=params['gate_out_weights'],
-          layernorm_in_scale=params['layernorm_in_scale'],
-          layernorm_in_offset=params['layernorm_in_offset'],
-          layernorm_out_scale=params['layernorm_out_scale'],
-          layernorm_out_offset=params['layernorm_out_offset'],
+    def loss(p, fn):
+      y = fn(
+          **p,
+          mask=mask,
           triangle_type=triangle_type,
           precision=precision,
       )
       return jnp.sum(y)
 
-    grad_fn = jax.grad(f)
-    grads = grad_fn(params['x'])
-    self.assertFalse(jnp.isnan(grads).any())
+    grads_default = jax.jit(jax.grad(lambda p: loss(p, op_default)))(params)
+    grads_vjp = jax.jit(jax.grad(lambda p: loss(p, op_vjp)))(params)
+    for k in params:
+      self.assertFalse(jnp.isnan(grads_default[k]).any())
+    chex.assert_trees_all_close(grads_vjp, grads_default, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == '__main__':
