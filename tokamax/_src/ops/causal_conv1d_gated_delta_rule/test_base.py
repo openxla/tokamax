@@ -547,6 +547,89 @@ class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, "kernel_act_dtype"):
       gdn_fn(**_continuing_batch_kwargs())
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="mixed_prefill_bf16_weights",
+          decode_only=False,
+          recurrent_state_dtype=jnp.bfloat16,
+          conv_weight_dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="mixed_prefill_f32_weights",
+          decode_only=False,
+          recurrent_state_dtype=jnp.float32,
+          conv_weight_dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="decode_only_bf16_weights",
+          decode_only=True,
+          recurrent_state_dtype=jnp.bfloat16,
+          conv_weight_dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="decode_only_f32_weights",
+          decode_only=True,
+          recurrent_state_dtype=jnp.float32,
+          conv_weight_dtype=jnp.float32,
+      ),
+  )
+  def test_mixed_input_dtypes_match_reference(
+      self, decode_only, recurrent_state_dtype, conv_weight_dtype
+  ):
+    """Exercises mixed storage dtypes from `arg_specs.make_gdn_spec`."""
+    kwargs = _continuing_batch_kwargs()
+    if decode_only:
+      num_decodes = 8
+      q_loc = jnp.arange(num_decodes + 1, dtype=jnp.int32)
+      kwargs.update(
+          qkv=kwargs["qkv"][:num_decodes],
+          b=kwargs["b"][:num_decodes],
+          a=kwargs["a"][:num_decodes],
+          conv_state=kwargs["conv_state"][: num_decodes + 1],
+          recurrent_state=kwargs["recurrent_state"][: num_decodes + 1],
+          query_start_loc=q_loc,
+          state_indices=jnp.arange(1, num_decodes + 1, dtype=jnp.int32),
+          distribution=jnp.array([num_decodes] * 3, dtype=jnp.int32),
+          seq_lens=jnp.full((num_decodes,), 17, dtype=jnp.int32),
+      )
+
+    kwargs.update(
+        qkv=kwargs["qkv"].astype(jnp.bfloat16),
+        b=kwargs["b"].astype(jnp.bfloat16),
+        a=kwargs["a"].astype(jnp.bfloat16),
+        conv_state=kwargs["conv_state"].astype(jnp.float32),
+        recurrent_state=kwargs["recurrent_state"].astype(recurrent_state_dtype),
+        conv_weight=kwargs["conv_weight"].astype(conv_weight_dtype),
+        conv_bias=kwargs["conv_bias"].astype(conv_weight_dtype),
+        a_log=kwargs["a_log"].astype(jnp.float32),
+        dt_bias=kwargs["dt_bias"].astype(jnp.bfloat16),
+    )
+
+    run_ref = jax.jit(
+        base.CausalConv1dGatedDeltaRule(),
+        static_argnames=list(OP_STATIC_ARGNAMES),
+    )
+    states_ref, output_ref = run_ref(**kwargs)
+    gdn_fn = jax.jit(
+        functools.partial(
+            self._gdn_fn,
+            kernel_conv_weight_dtype=jnp.dtype(conv_weight_dtype),
+        ),
+        static_argnames=self._static_argnames,
+    )
+    states, output = gdn_fn(**kwargs)
+
+    self.assertEqual(output_ref.dtype, jnp.bfloat16)
+    self.assertEqual(output.dtype, output_ref.dtype)
+    self.assertEqual(states_ref[0].dtype, jnp.float32)
+    self.assertEqual(states_ref[1].dtype, jnp.dtype(recurrent_state_dtype))
+    self.assertEqual(states[0].dtype, states_ref[0].dtype)
+    self.assertEqual(states[1].dtype, states_ref[1].dtype)
+
+    np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+    for state, state_ref in zip(states, states_ref, strict=True):
+      np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
+
 
 class CausalConv1dGatedDeltaRuleSecurityTestBase(absltest.TestCase):
   """Base class for Causal Conv1D Gated Delta Rule isolation tests."""
