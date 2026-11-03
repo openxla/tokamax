@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import typing
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -31,7 +32,7 @@ PartitionSpec = jax.sharding.PartitionSpec
 class ApiShardingTest(parameterized.TestCase):
 
   @parameterized.product(
-      implementation=list(api.IMPLEMENTATIONS),
+      implementation=typing.get_args(api.Implementation.__value__),
       shard_axis=[0, 2],
   )
   def test_dot_product_attention_sharding(self, implementation, shard_axis):
