@@ -31,6 +31,8 @@ from tokamax._src.ops.lightning_indexer.kernel import (
     config,
     dcp_sc_compact,
     metadata,
+    tc_streamindex_topk,
+    tc_topk,
 )
 from tokamax._src.ops.topk import pallas_mosaic_tpu_kernel
 
@@ -1076,6 +1078,31 @@ def streamindex_topk(
   """
   # Scale factors for the FP8 index cache format are packed directly inside
   # `cache_kv`, keeping HBM transactions fused.
+  if not tc_topk.has_full_sparsecore_topk():
+    return tc_streamindex_topk.tc_streamindex_topk(
+        q,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        k=k,
+        compression_ratio=compression_ratio,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        buffer_count=buffer_count,
+        vmem_limit_bytes=vmem_limit_bytes,
+        decode_req_batch_size=decode_req_batch_size,
+        enable_early_exit=enable_early_exit,
+        kv_layout=kv_layout,
+        chunk_tokens=chunk_tokens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        interleave_size=interleave_size,
+        return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
+    )
 
   kv_layout = KVLayout.parse(kv_layout)
 
@@ -1667,6 +1694,10 @@ def streamindex_topk_dcp(
        ownership is decided in exactly one place. The ranks' outputs form an
        exact partition of the global top-k.
 
+  On TPUs with fewer than 32 SparseCore subcores, steps 3 and 4 run as a single
+  TensorCore kernel, `tc_topk.dcp_merge_and_compact_tc`, with the same
+  tie-breaking and output contract.
+
   By gathering candidates along axis 1 upfront rather than partitioning tokens
   over an `all_to_all`, all communication is consolidated into a single upfront
   collective phase, avoiding the barrier latency of a multi-phase pipeline and
@@ -1767,6 +1798,16 @@ def streamindex_topk_dcp(
 
     # Stage 1. All-gather the scores; the indices stay home.
     scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
+
+    if not tc_topk.has_full_sparsecore_topk():
+      return tc_topk.dcp_merge_and_compact_tc(
+          scores,
+          idxs,
+          k=k,
+          dcp_rank=dcp_rank,
+          dcp_size=dcp_size,
+          inputs_sorted=True,
+      )
 
     # Stage 2. Full width as the row length: -inf entries (unfilled local
     # slots, padding tokens) are never selected, so they need no masking.
