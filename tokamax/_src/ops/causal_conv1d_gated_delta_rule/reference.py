@@ -53,32 +53,45 @@ def _recurrent_gated_delta_rule_step(
   d_v = value.shape[-1]
 
   if state is None:
-    state = jnp.zeros((batch_size, num_heads, d_k, d_v), dtype=query.dtype)
+    state = jnp.zeros((batch_size, num_heads, d_k, d_v), dtype=jnp.float32)
+  else:
+    state = state.astype(jnp.float32)
 
-  q = query[:, :, 0]
-  k = key[:, :, 0]
-  v = value[:, :, 0]
-  beta_val = beta[:, :, 0]
-  g_val = g[:, :, 0]
+  q = query[:, :, 0].astype(jnp.float32)
+  k = key[:, :, 0].astype(jnp.float32)
+  v = value[:, :, 0].astype(jnp.float32)
+  beta_val = beta[:, :, 0].astype(jnp.float32)
+  g_val = g[:, :, 0].astype(jnp.float32)
 
   scale = d_k**-0.5
   q = q * scale
 
+  # Even with fp32 inputs, TPU MXU defaults (`Precision.DEFAULT`) to a single
+  # pass that truncates fp32 operands to bf16 (~3 decimal digits), giving the
+  # reference the same bf16 rounding error as the kernel under test.
+  # `Precision.HIGHEST` decomposes each fp32 operand into bf16 high/low slices
+  # across 6 MXU passes accumulated in fp32 to preserve full fp32 accuracy.
   # v_diff = v - e^g * (k @ state)
-  k_state = jnp.einsum("bhd, bhdm -> bhm", k, state)
+  k_state = jnp.einsum(
+      "bhd, bhdm -> bhm", k, state, precision=lax.Precision.HIGHEST
+  )
   v_diff = v - jnp.exp(g_val)[..., None] * k_state
 
   # v_new = beta * v_diff
   v_new = beta_val[..., None] * v_diff
 
   # out = e^g * (q @ state) + (q . k) * v_new
-  q_state = jnp.einsum("bhd, bhdm -> bhm", q, state)
+  q_state = jnp.einsum(
+      "bhd, bhdm -> bhm", q, state, precision=lax.Precision.HIGHEST
+  )
   q_k = jnp.sum(q * k, axis=-1, keepdims=True)
 
   out = jnp.exp(g_val)[..., None] * q_state + q_k * v_new
 
   # s_new = state * exp(g) + k outer v_new
-  k_v_new = jnp.einsum("bhd, bhm -> bhdm", k, v_new)
+  k_v_new = jnp.einsum(
+      "bhd, bhm -> bhdm", k, v_new, precision=lax.Precision.HIGHEST
+  )
   new_state = state * jnp.exp(g_val)[..., None, None] + k_v_new
 
   return out[:, :, None, :], new_state
