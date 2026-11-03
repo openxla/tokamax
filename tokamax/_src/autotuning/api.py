@@ -290,6 +290,9 @@ def autotune(
     ValueError: If `autotuning_result` has a different device kind than the ops
       being autotuned.
   """
+  # Avoid the more pythonic `instanceof`` to avoid an import of torch.
+  if f.__class__.__module__.startswith("torch."):
+    raise NotImplementedError("Autotuning pytorch ops is not yet supported.")
 
   if isinstance(f, (list, tuple)) and isinstance(f[0], op_lib.BoundArguments):
     if args:
