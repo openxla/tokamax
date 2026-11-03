@@ -18,6 +18,7 @@ from typing import Annotated, ClassVar, override
 
 import jax
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
@@ -75,9 +76,18 @@ def _rank_2_quant(ba: op.BoundArguments) -> bool:
   return ba.arguments["mode"] == "rope_quant" and ba.arguments["x"].ndim == 2
 
 
-def _default_tile_n(num_tokens: int, mode: base.Mode) -> int:
+def _rank_2_sublane_multiple(x: jax.Array) -> int:
+  return 8 * max(1, 4 // jnp.dtype(x.dtype).itemsize)
+
+
+def _default_tile_n(x: jax.Array, mode: base.Mode) -> int:
   # Upstream's choice: the largest divisor of the number of tokens up to 128,
   # or up to 64 for `qnorm_rope`, which buffers whole heads.
+  num_tokens = x.shape[0]
+  if mode == "rope" and x.ndim == 2:
+    return pallas_mosaic_tpu_kernel.largest_divisor(
+        num_tokens, cap=128, multiple_of=_rank_2_sublane_multiple(x)
+    )
   cap = 64 if mode == "qnorm_rope" else 128
   return pallas_mosaic_tpu_kernel.largest_divisor(num_tokens, cap=cap)
 
@@ -157,7 +167,7 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
       case "rope_quant":
         assert quant_dtype is not None  # Canonicalized by `bind`.
         if tile_n is None:
-          tile_n = _default_tile_n(x.shape[0], mode)
+          tile_n = _default_tile_n(x, mode)
         if x.ndim == 2 and tile_n % _LANE:
           raise NotImplementedError(
               "rope_quant with a rank 2 x requires tile_n to be a multiple of"
@@ -177,12 +187,15 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    num_tokens = ba.arguments["x"].shape[0]
-    return Config(tile_n=_default_tile_n(num_tokens, ba.arguments["mode"]))
+    return Config(
+        tile_n=_default_tile_n(ba.arguments["x"], ba.arguments["mode"])
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    num_tokens = ba.arguments["x"].shape[0]
+    x = ba.arguments["x"]
+    num_tokens = x.shape[0]
+    mode = ba.arguments["mode"]
     configs = {
         Config(
             tile_n=pallas_mosaic_tpu_kernel.largest_divisor(num_tokens, cap=cap)
@@ -193,6 +206,11 @@ class PallasTpuDeepseekRope(base.DeepseekRope[Config]):
     if _rank_2_quant(ba):
       # Smaller tiles fail to lower (see the class docstring).
       configs = {c for c in configs if c.tile_n % _LANE == 0}
+    elif mode == "rope" and x.ndim == 2:
+      align = _rank_2_sublane_multiple(x)
+      configs = {
+          c for c in configs if c.tile_n == num_tokens or c.tile_n % align == 0
+      }
     # Always keep upstream's heuristic.
     return configs | {self._get_heuristics_config(ba)}
 
