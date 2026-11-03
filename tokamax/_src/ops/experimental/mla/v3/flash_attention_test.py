@@ -40,11 +40,30 @@ def _ref_mla_attention(
     scale_k: float | None = None,
     scale_v: float | None = None,
 ) -> jax.Array:
-  """Delegates single-sequence MLA attention to `reference.mla_attention`."""
+  """Single-sequence MLA attention reference.
+
+  Causal attention delegates to `reference.mla_attention`. That reference is
+  causal-only, so non-causal attention (every query row sees all `kv_len` keys)
+  is computed densely here.
+  """
   n_q, d_nope = q_nope.shape
   d_pe = q_pe.shape[-1]
   n_tokens = n_q // num_q_heads
   kv_len = k_nope.shape[-1]
+
+  if not causal:
+    s = (
+        q_nope.astype(jnp.float32) @ k_nope.astype(jnp.float32)
+        + q_pe.astype(jnp.float32) @ k_pe.astype(jnp.float32)
+    ) * sm_scale
+    if scale_k is not None:
+      s *= scale_k
+    if scale_q is not None:
+      s *= scale_q
+    out = jax.nn.softmax(s, axis=-1) @ k_nope.T.astype(jnp.float32)
+    if scale_v is not None:
+      out *= scale_v
+    return out
 
   ql_nope_3d = q_nope.reshape(n_tokens, num_q_heads, d_nope).astype(jnp.float32)
   q_pe_3d = q_pe.reshape(n_tokens, num_q_heads, d_pe).astype(jnp.float32)
@@ -66,7 +85,7 @@ def _ref_mla_attention(
       cache_kv,
       kv_lens=jnp.array([kv_len], dtype=jnp.int32),
       page_indices=jnp.array([0], dtype=jnp.int32),
-      cu_q_lens=jnp.array([0, n_tokens if causal else 0], dtype=jnp.int32),
+      cu_q_lens=jnp.array([0, n_tokens], dtype=jnp.int32),
       distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
       sm_scale=sm_scale,
       q_scale=scale_q,
