@@ -84,6 +84,35 @@ class FlexAttentionApiTest(parameterized.TestCase):
     out_flex = f_flex(**inputs)
     chex.assert_trees_all_close(out_ref, out_flex, atol=1e-5, rtol=1e-5)
 
+  @parameterized.product(local_window_size=((32, 16), 32))
+  def test_against_dot_product_attention_local_window_size(
+      self, local_window_size
+  ):
+    precision = jax.lax.Precision.HIGHEST
+    inputs = _make_inputs(dtype=jnp.float32)
+
+    f_ref = jax.jit(
+        functools.partial(
+            attention_api.dot_product_attention,
+            local_window_size=local_window_size,
+            precision=precision,
+            implementation='xla',
+        )
+    )
+    f_flex = jax.jit(
+        functools.partial(
+            api.flex_attention,
+            mask_mod=example_masks.generate_local_window_mask(
+                local_window_size
+            ),
+            precision=precision,
+            implementation='xla',
+        )
+    )
+    out_ref = f_ref(**inputs)
+    out_flex = f_flex(**inputs)
+    chex.assert_trees_all_close(out_ref, out_flex, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == '__main__':
   absltest.main()
