@@ -137,3 +137,12 @@ def splash_attention(
       errors.append(e)
 
   raise ExceptionGroup("All implementations failed.", errors)
+
+
+splash_attention.Mask = mask_lib.Mask  # pyrefly: ignore[missing-attribute]
+splash_attention.LocalMask = mask_lib.LocalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.CausalMask = mask_lib.CausalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.ChunkedCausalMask = mask_lib.ChunkedCausalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.FullMask = mask_lib.FullMask  # pyrefly: ignore[missing-attribute]
+splash_attention.NumpyMask = mask_lib.NumpyMask  # pyrefly: ignore[missing-attribute]
+
