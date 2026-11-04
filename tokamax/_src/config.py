@@ -124,3 +124,15 @@ disable_multi_core_mode = _ConfigOption(
         " version.",
     )
 )
+
+kda_chain_precision = _ConfigOption(
+    flags.DEFINE_enum(
+        "tokamax_kda_chain_precision",
+        "highest",
+        ("highest", "high", "default"),
+        "Matmul precision for the two matmuls on the serial recurrent chain of"
+        " the KDA Pallas Mosaic TPU forward kernel (`w @ h` and"
+        " `kg^T @ v_new`). Lower precision uses fewer MXU passes, but errors"
+        " compound across chunks, so validate accuracy on TPU.",
+    )
+)

@@ -1751,5 +1751,17 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
         np.testing.assert_array_equal(start[:n], np.array(exp_start)[:n])
         np.testing.assert_array_equal(end[:n], np.array(exp_end)[:n])
 
+  def test_dkv_q_blocks_are_contiguous(self):
+    # Causal dkv grids visit q blocks kv-major: 2x2 -> [0, 1, 1] (contiguous),
+    # 3x3 -> [0, 1, 2, 1, 2, 2] (q blocks 1 and 2 are revisited).
+    for blocks, expected in ((1, True), (2, True), (3, False)):
+      with self.subTest(blocks=blocks):
+        mask = mask_lib.CausalMask((blocks * 128, blocks * 128))
+        info, _ = mask_info_lib.process_mask_dkv(mask, (128, 128))
+        self.assertEqual(
+            mask_info_lib.dkv_q_blocks_are_contiguous(info, blocks), expected
+        )
+
+
 if __name__ == "__main__":
   absltest.main()

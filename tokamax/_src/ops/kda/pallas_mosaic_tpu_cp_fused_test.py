@@ -23,7 +23,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.kda import pallas_mosaic_tpu as mosaic
 from tokamax._src.ops.kda.cp_utils import ContextParallelMetadata
 from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_fused_test as f
-from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as kernels
+from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_optimized as kernels
 
 interpret_on_cpu = f.interpret_on_cpu
 

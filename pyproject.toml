@@ -69,7 +69,11 @@ cuda = [
     "nvidia-cudnn-cu13>=9.23.0.39",
     "cuequivariance-jax>=0.10.0",
     "cuequivariance-ops-jax-cu13>=0.10.0",
-    "triton",
+    # Triton 3.9 emits PTX 9.4 on every GPU, which needs a CUDA 13.4 ptxas. In
+    # CI, JAX assembles `jax_triton` kernels with the image's CUDA 13.2 ptxas
+    # rather than the 13.4 one from pip `nvidia-cuda-nvcc`, so they fail.
+    # Lift the cap once that ptxas is CUDA 13.4 or newer.
+    "triton<3.9",
     "nvidia-cudnn-frontend>=1.28.0",
     "jax-triton"
 ]

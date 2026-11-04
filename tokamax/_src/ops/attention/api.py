@@ -19,9 +19,9 @@ from typing import Any, Final, Literal
 import immutabledict
 import jax
 from jax.extend import backend
-import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
+from tokamax._src import jaxtyping
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
@@ -44,9 +44,9 @@ _IMPLEMENTATIONS = dict(
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
 
 try:
-  from tokamax._src.ops.attention import pallas_triton as pl_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.attention import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS["triton"] = pl_triton.PallasTritonFlashAttention()
+  _IMPLEMENTATIONS["triton"] = triton.TritonFlashAttention()
   _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
@@ -78,6 +78,7 @@ IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
 del _IMPLEMENTATIONS
 
 
+@jaxtyping.jaxtyped
 def dot_product_attention(
     query: Float[Array | QArray, "*B T N H"],
     key: Float[Array | QArray, "*B S K H"],

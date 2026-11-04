@@ -14,11 +14,11 @@
 # ==============================================================================
 """Splash Attention Op API."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, Final, Literal
 import immutabledict
 import jax
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
@@ -47,44 +47,52 @@ del _IMPLEMENTATIONS
 
 
 def splash_attention(
-    q: Float[Array, "num_q_heads q_seq_len head_dim_qk"],
-    k: Float[Array, "..."],
-    v: Float[Array, "..."],
-    mask: (
-        base.Mask | mask_lib.Mask | Bool[Array, "q_seq_len kv_seq_len"] | None
+    q: Float[Array, "*B H T D"],
+    k: Float[Array, "*B h t D"] | Float[Array, "*B t D"],
+    v: Float[Array, "*B h t d"] | Float[Array, "*B t d"],
+    mask: base.Mask | mask_lib.Mask | Bool[Array, "*#B T t"] | None = None,
+    segment_ids: (
+        base.SegmentIds
+        | tuple[Int[Array, "*#B T"], Int[Array, "*#B t"]]
+        | Int[Array, "*#B T"]
+        | None
     ) = None,
-    segment_ids: base.SegmentIds | reference.SegmentIds | None = None,
-    sinks: Float[Array, "..."] | None = None,
+    sinks: Float[Array, "*#B H"] | None = None,
     *,
     is_mqa: bool = False,
     mask_value: float = reference.DEFAULT_MASK_VALUE,
+    is_causal: bool = False,
     attn_logits_soft_cap: float | None = None,
     dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
-) -> jax.Array:
+    q_sharding: jax.sharding.NamedSharding | None = None,
+    k_sharding: jax.sharding.NamedSharding | None = None,
+) -> Float[Array, "*B H T d"]:
   """Splash Attention.
 
   Args:
-    q: Query array of shape (num_q_heads, q_seq_len, head_dim_qk).
-    k: Key array of shape (num_kv_heads, kv_seq_len, head_dim_qk) or
-      (kv_seq_len, head_dim_qk) if is_mqa=True.
-    v: Value array of shape (num_kv_heads, kv_seq_len, head_dim_v) or
-      (kv_seq_len, head_dim_v) if is_mqa=True.
+    q: Query array.
+    k: Key array.
+    v: Value array.
     mask: Optional attention mask (base.Mask, splash mask, boolean array, etc.).
     segment_ids: Optional document segment IDs.
     sinks: Optional attention sinks tensor.
     is_mqa: Whether to use Multi-Query Attention format.
     mask_value: Additive mask value for masked-out positions (defaults to -1e30)
+    is_causal: Boolean indicating whether the mask is a causal mask
     attn_logits_soft_cap: Optional logits soft cap.
     dropout_rate: Dropout probability in [0, 1).
     prng_key: PRNG key for generating dropout masks when dropout_rate > 0.
     implementation: The implementation to use ('mosaic_tpu', 'base', or None for
       automatic selection). If a sequence is passed, the first implementation
       that doesn't raise a NotImplementedError is used.
+    q_sharding: NamedSharding for q. Sharding information for the other tensors
+      is inferred from this if k_sharding is not provided.
+    k_sharding: NamedSharding for k and v.
 
   Returns:
-    Attention output array of shape (num_q_heads, q_seq_len, head_dim_v).
+    Attention output array.
 
   Raises:
     ExceptionGroup: If multiple implementations are provided and all of them
@@ -116,9 +124,12 @@ def splash_attention(
           sinks=sinks,
           is_mqa=is_mqa,
           mask_value=mask_value,
+          is_causal=is_causal,
           attn_logits_soft_cap=attn_logits_soft_cap,
           dropout_rate=dropout_rate,
           prng_key=prng_key,
+          q_sharding=q_sharding,
+          k_sharding=k_sharding,
       )
     except NotImplementedError as e:
       if len(implementations) == 1:
@@ -126,3 +137,12 @@ def splash_attention(
       errors.append(e)
 
   raise ExceptionGroup("All implementations failed.", errors)
+
+
+splash_attention.Mask = mask_lib.Mask  # pyrefly: ignore[missing-attribute]
+splash_attention.LocalMask = mask_lib.LocalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.CausalMask = mask_lib.CausalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.ChunkedCausalMask = mask_lib.ChunkedCausalMask  # pyrefly: ignore[missing-attribute]
+splash_attention.FullMask = mask_lib.FullMask  # pyrefly: ignore[missing-attribute]
+splash_attention.NumpyMask = mask_lib.NumpyMask  # pyrefly: ignore[missing-attribute]
+

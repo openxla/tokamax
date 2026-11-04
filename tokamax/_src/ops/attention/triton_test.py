@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import sys
 from typing import override
 from unittest import mock
 import pytest
@@ -67,37 +66,35 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
     super()._run_test(q_shape, *args, **kwargs)
 
+  def test_tf32_rounding(self):
+    assert fa is not None
+    tf32 = jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    fn = fa.TritonFlashAttention()
+    x = jnp.full((1, 16, 1, 16), 1.0 + 3 * 2**-12, dtype=jnp.float32)
+    out, vjp_fn = jax.vjp(lambda q, k, v: fn(q, k, v, precision=tf32), x, x, x)
+    _, _, dv = vjp_fn(x)
+    self.assertTrue(jnp.allclose(out, 1.0 + 2**-10, atol=1e-6, rtol=0))
+    self.assertTrue(jnp.allclose(dv, 1.0 + 2**-10, atol=1e-6, rtol=0))
+    self._run_test(
+        (2, 128, 2, 64),
+        dtype=jnp.float32,
+        impl=fn,
+        impl_kwargs=dict(precision=tf32),
+        ref_kwargs=dict(precision=tf32),
+        atol=5e-4,
+        atol_grads=2e-3,
+    )
+
   @override
-  @absltest.skip("Not implemented yet.")
   def _test_quantized_int8(self, channelwise_axes, quantize_q):
-    expected_int8_dots = int(quantize_q and 3 not in channelwise_axes)
-    actual_int8_dots = 0
-
-    lax = sys.modules["jax._src.lax"]
-    orig_dot_general = lax.dot_general
-
-    def my_dot_general(
-        lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None
-    ):
-      nonlocal actual_int8_dots
-      a_dt, b_dt, acc_dt = lhs.dtype, rhs.dtype, preferred_element_type
-      is_int8 = a_dt == jnp.int8 and b_dt == jnp.int8 and acc_dt == jnp.int32
-      actual_int8_dots += int(is_int8)
-      return orig_dot_general(
-          lhs, rhs, dimension_numbers, precision, preferred_element_type
-      )
-
-    with mock.patch.object(lax, "dot_general", my_dot_general):
+    assert jt is not None
+    with mock.patch.object(jt, "triton_call", wraps=jt.triton_call) as call:
       super()._test_quantized_int8(channelwise_axes, quantize_q)
 
-    self.assertEqual(expected_int8_dots, actual_int8_dots)
+    expected = quantize_q and 3 not in channelwise_axes
+    actual = {c.kwargs["quantize_qk_dot"] for c in call.call_args_list}
+    self.assertEqual(actual, {expected})
 
-  @override
-  @absltest.skip("Not implemented yet.")
-  def _test_quantized_int4(self, subchannel_size):
-    super()._test_quantized_int4(subchannel_size)
-
-  @absltest.skip("Not implemented yet.")
   def test_block_d(self):
     """Tests `block_d != None` with quantization and different head_dim_out."""
     assert fa is not None
@@ -146,6 +143,40 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         test_vjp=False,
     )
 
+  @parameterized.product(qtype=(jnp.int4, jnp.int8), quantize_q=(False, True))
+  def test_subchannel_quant_non_pow2_head_dim(self, qtype, quantize_q):
+    tiled_axes = {0: 1, 1: 1, 2: 1, 3: 32}
+    quantize = lambda x: qwix.quantize(x, qtype, tiled_axes=tiled_axes)
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
+
+    def impl(q, k, v, **kwargs):
+      q = quantize(q) if quantize_q else q
+      k, v = map(quantize, (k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      q = quant_dequant(q) if quantize_q else q
+      k, v = map(quant_dequant, (k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test(
+        (2, 128, 4, 96), impl=impl, ref_impl=ref_impl, test_vjp=False
+    )
+
+  def test_quantized_int8_small_head_dim(self):
+    quantize = lambda x: qwix.quantize(x, jnp.int8, channelwise_axes=(0, 1, 2))
+    quant_dequant = lambda x: qwix.dequantize(quantize(x))
+
+    def impl(q, k, v, **kwargs):
+      q, k, v = map(quantize, (q, k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      q, k, v = map(quant_dequant, (q, k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test((2, 64, 2, 5), impl=impl, ref_impl=ref_impl, test_vjp=False)
+
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
     assert fa is not None
@@ -183,6 +214,37 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     self._run_test(
         (2, seq_len_q, 2, 64),
         kv_shape=(2, seq_len_k, 2, 64),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(seq_len_q, seq_len_k)),
+        test_vjp=False,
+    )
+
+  @parameterized.parameters(False, True)
+  def test_k_start_end_padding_with_nans(self, scalar_k_start):
+    seq_len_q, seq_len_k = 100, 128
+    k_start = jnp.array([64]) if scalar_k_start else jnp.full((seq_len_q,), 64)
+    k_end = (
+        jnp.arange(seq_len_q) + 32
+        if scalar_k_start
+        else jnp.full((seq_len_q,), seq_len_k)
+    )
+    mask = base.Mask(k_start=k_start, k_end=k_end)
+    k_valid = jnp.arange(seq_len_k) >= 64
+
+    def impl(q, k, v, **kwargs):
+      return self._attention_fn(
+          q,
+          jnp.where(k_valid[None, :, None, None], k, float("nan")),
+          jnp.where(
+              k_valid[None, :, None, None], v, jnp.finfo(jnp.float32).max
+          ),
+          **kwargs,
+      )
+
+    self._run_test(
+        (2, seq_len_q, 4, 64),
+        kv_shape=(2, seq_len_k, 4, 64),
+        impl=impl,
         impl_kwargs=dict(mask=mask),
         ref_kwargs=dict(mask=mask.as_array(seq_len_q, seq_len_k)),
         test_vjp=False,
@@ -241,8 +303,31 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         test_vjp=False,
     )
 
+  def test_auto_stable_softmax_f16_precision_with_soft_cap(self):
+    # Soft-capped logits only reach 30, but the F16_F16_F32 preset casts the
+    # unshifted `exp(30)` weights to float16, where they overflow.
+    def ref_impl(q, k, v, **kwargs):
+      del kwargs
+      logits_scale = 1.0 / (q.shape[-1] ** 0.5)
+      logits = jnp.einsum("...qhd,...khd->...hqk", q, k) * logits_scale
+      logits = 30.0 * jnp.tanh(logits / 30.0)
+      weights = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
+      return jnp.einsum("...hqk,...khd->...qhd", weights, v)
+
+    self._run_test_with_inputs(
+        jnp.ones((1, 32, 2, 32), dtype=jnp.bfloat16) * 4.0,
+        jnp.ones((1, 32, 2, 32), dtype=jnp.bfloat16) * 4.0,
+        jnp.ones((1, 32, 2, 32), dtype=jnp.bfloat16),
+        impl_kwargs=dict(
+            logits_soft_cap=30.0,
+            precision=jax.lax.DotAlgorithmPreset.F16_F16_F32,
+        ),
+        ref_impl=ref_impl,
+        atol=1e-2,
+        test_vjp=False,
+    )
+
   @parameterized.parameters(2, 3, 4)
-  @absltest.skip("Not implemented yet.")
   def test_split_k(self, split_k):
     self.skipTest("Too slow for OSS")
     assert fa is not None
@@ -291,6 +376,42 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
         impl=self._attention_fn.replace(config=config),
         impl_kwargs=dict(mask=mask),
         ref_kwargs=dict(mask=mask.as_array(seq_len, seq_len)),
+        test_vjp=False,
+    )
+
+  def test_split_k_with_q_and_k_start_end(self):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    config = fa.Config(
+        block_q=16, block_k=32, num_warps=4, num_stages=2, split_k=2
+    )
+    mask = base.Mask(
+        q_start=jnp.array([16]),
+        q_end=jnp.array([48]),
+        k_start=jnp.array([16]),
+        k_end=jnp.array([96]),
+    )
+    self._run_test(
+        (2, 64, 4, 64),
+        kv_shape=(2, 128, 4, 64),
+        impl=self._attention_fn.replace(config=config),
+        impl_kwargs=dict(mask=mask),
+        ref_kwargs=dict(mask=mask.as_array(64, 128)),
+        test_vjp=False,
+    )
+
+  def test_split_k_seq_len_k_1_unsupported(self):
+    assert fa is not None
+    assert isinstance(self._attention_fn, fa.TritonFlashAttention)
+    # `vmap_split` would broadcast a size-1 key axis rather than split it.
+    config = fa.Config(
+        block_q=64, block_k=32, num_warps=4, num_stages=2, split_k=2
+    )
+    self._run_test(
+        (2, 64, 4, 64),
+        kv_shape=(2, 1, 4, 64),
+        impl=self._attention_fn.replace(config=config),
+        expect_supported=False,
         test_vjp=False,
     )
 

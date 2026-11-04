@@ -29,6 +29,13 @@ from tokamax._src.ops.attention import base as attention_base
 from tokamax._src.ops.normalization import base as normalization_base
 
 try:
+  from tokamax._src.ops.attention import triton as attention_triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.attention import triton_vjp as attention_triton_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  attention_triton = None  # pyrefly: ignore[assignment]
+  attention_triton_vjp = None  # pyrefly: ignore[assignment]
+
+try:
   from tokamax._src.ops.normalization import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   triton = None  # pyrefly: ignore[assignment]
@@ -57,6 +64,24 @@ class CacheTest(parameterized.TestCase):
           else (
               ("NVIDIA H100 80GB HBM3", triton.TritonNormalization),
               ("not_a_real_device", triton.TritonNormalization),
+          )
+      ),
+      *(
+          ()
+          if attention_triton is None
+          else (
+              ("NVIDIA A100-SXM4-40GB", attention_triton.TritonFlashAttention),
+              ("NVIDIA H100 80GB HBM3", attention_triton.TritonFlashAttention),
+          )
+      ),
+      *(
+          ()
+          if attention_triton_vjp is None
+          else (
+              (
+                  "NVIDIA H100 80GB HBM3",
+                  attention_triton_vjp.TritonFlashAttentionVjp,
+              ),
           )
       ),
   )

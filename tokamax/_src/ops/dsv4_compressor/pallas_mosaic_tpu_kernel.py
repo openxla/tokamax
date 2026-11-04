@@ -38,6 +38,7 @@ _SAL_MAX_WAVE = 128
 
 
 def inner_kernel(
+    step: pltpu.PipelineStep,
     cos_sin_vmem,
     out_vmem,
     page_buffer_vmem,
@@ -57,7 +58,7 @@ def inner_kernel(
   window = cfgs.window
   head_tiles = cfgs.head_tiles
 
-  pid = pl.program_id(0)
+  pid = step.index[0]
   global_idx = pid * tile_n
 
   # Per-token window start = position - window + 1
@@ -261,6 +262,7 @@ def kernel_fn(
       grid=(grid_size,),
       in_specs=in_specs,
       out_specs=[],
+      _explicit_indices=True,
   )
 
   scratches = (

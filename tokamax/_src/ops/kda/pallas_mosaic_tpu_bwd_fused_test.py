@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from tokamax._src.ops.kda import api
 from tokamax._src.ops.kda import pallas_mosaic_tpu as mosaic
-from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_kernel as kernels
+from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_optimized as kernels
 from tokamax._src.ops.kda import pallas_mosaic_tpu_fwd_fused_test as forward_tests
 
 interpret_on_cpu = forward_tests.interpret_on_cpu

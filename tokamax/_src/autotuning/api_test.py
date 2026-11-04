@@ -22,7 +22,6 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.experimental
-from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import benchmarking
@@ -32,14 +31,7 @@ from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.gated_linear_unit import base as glu_base
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import api as lsce_api
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import base as lsce_base
-from tokamax._src.ops.normalization import api as norm_api
-from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import api as ragged_dot_api
-from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu as pl_ragged_dot_mosaic_tpu
-from tokamax._src.ops.triangle_multiplication import api as tri_mul_api
-from tokamax._src.ops.triangle_multiplication import base as tri_mul_base
 
 try:
   from tokamax._src.ops.gated_linear_unit import triton as triton_glu  # pylint: disable=g-import-not-at-top
@@ -50,11 +42,6 @@ try:
   from tokamax._src.ops.normalization import triton as triton_norm  # pylint: disable=g-import-not-at-top
 except ImportError:
   triton_norm = None
-
-try:
-  from tokamax._src.ops.ragged_dot import triton as triton_ragged_dot  # pylint: disable=g-import-not-at-top
-except ImportError:
-  triton_ragged_dot = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +63,10 @@ class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
 
   def _get_heuristics_config(self, ba: op_lib.BoundArguments) -> _FakeOpConfig:
     return _HEURISTICS_CONFIG
+
+
+class _OtherFakeOp(_FakeOp):
+  pass
 
 
 def get_fn_and_args_and_expected_bound_args(x_shape, vmap=False):
@@ -120,53 +111,6 @@ def _slow_fn_factory(config):
 
 
 class AutotuningTest(parameterized.TestCase):
-
-  def test_get_op_implementations(self):
-    self.assertDictEqual(
-        api.get_op_implementations(norm_base.Normalization()),
-        dict(norm_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(glu_base.GatedLinearUnit()),
-        dict(glu_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(lsce_base.LinearSoftmaxCrossEntropyLoss()),
-        dict(lsce_api.IMPLEMENTATIONS),
-    )
-    self.assertDictEqual(
-        api.get_op_implementations(tri_mul_base.TriangleMultiplication()),
-        dict(tri_mul_api.IMPLEMENTATIONS),
-    )
-
-    if jax.default_backend() != "tpu":
-      assert triton_norm is not None
-      self.assertDictEqual(
-          api.get_op_implementations(triton_norm.TritonNormalization()),
-          dict(norm_api.IMPLEMENTATIONS),
-      )
-      assert triton_glu is not None
-      self.assertDictEqual(
-          api.get_op_implementations(triton_glu.TritonGatedLinearUnit()),
-          dict(glu_api.IMPLEMENTATIONS),
-      )
-
-    with self.subTest("current_device_only"):
-      if jax.default_backend() == "tpu" and triton_norm is not None:
-        tpu_norm_impls = api.get_op_implementations(
-            triton_norm.TritonNormalization(),
-            device=backend.get_default_device(),
-        )
-        self.assertNotIn(triton_norm.TritonNormalization(), tpu_norm_impls)
-      elif jax.default_backend() == "gpu" and triton_ragged_dot is not None:
-        ragged_dot_impls = api.get_op_implementations(
-            triton_ragged_dot.TritonRaggedDot(),
-            device=backend.get_default_device(),
-        )
-        self.assertNotIn(
-            pl_ragged_dot_mosaic_tpu.PallasMosaicTpuRaggedDot(),
-            ragged_dot_impls,
-        )
 
   def test_get_bound_args_from_callable(self):
     if jax.default_backend() == "tpu":
@@ -233,12 +177,12 @@ class AutotuningTest(parameterized.TestCase):
       self.skipTest("Currently only supported on GPU.")
 
     f, args, expected = get_fn_and_args_and_expected_bound_args((64, 128))
-    result = api.autotune(f, *args, all_implementations=False)
+    result = api.autotune(f, *args)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
 
     f_lowered = jax.jit(f).lower(*args)
-    result = api.autotune(f_lowered, all_implementations=False)
+    result = api.autotune(f_lowered)
     self.assertEqual(result.device_kind, jax.devices()[0].device_kind)
     self.assertEqual(tuple(x[0] for x in result.data), expected)
 
@@ -434,7 +378,7 @@ class AutotuningTest(parameterized.TestCase):
         num_experts=8, m=128, k=128, n=128
     )
     ragged_dot_lowered = f.lower(lhs, rhs, group_sizes=group_sizes)
-    result = api.autotune(ragged_dot_lowered, all_implementations=False)
+    result = api.autotune(ragged_dot_lowered)
     self.assertNotEmpty(result.data)
     for _, data in result.data:
       for _, benchmark in data.items():
@@ -483,8 +427,10 @@ class AutotuningTest(parameterized.TestCase):
 
   @parameterized.parameters(True, False)
   def test_autotuning_ignore_cache(self, ignore_cache):
-    f = jax.jit(lambda x: _FakeOp()(x, x))
-    x = jnp.zeros((3, 7))
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    # Use a shape not used by other tests, as the autotuning cache is global.
+    x = jnp.zeros((2, 11))
 
     res = api.autotune(f, x, ignore_cache=ignore_cache)
     self.assertLen(res.data, 1)
@@ -492,11 +438,279 @@ class AutotuningTest(parameterized.TestCase):
     res = api.autotune(f, x, ignore_cache=ignore_cache)
     self.assertLen(res.data, 1)
 
-    with res:
-      res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+    # Populate the autotuning cache via `BoundArguments.autotune`.
+    ba, _ = res.data[0]
+    ba.autotune(cache_results=True)
+    # `get_autotuning_cache` returns the live cache dict, so remove the entry
+    # afterwards to avoid leaking state into other tests.
+    self.addCleanup(
+        op.get_autotuning_cache(res.device_kind).pop,
+        ba.autotuning_cache_key,
+        None,
+    )
 
-      expected_len = 1 if ignore_cache else 0
-      self.assertLen(res_new.data, expected_len)
+    res_new = api.autotune(f, x, ignore_cache=ignore_cache)
+    expected_len = 1 if ignore_cache else 0
+    self.assertLen(res_new.data, expected_len)
+
+  @parameterized.parameters(True, False)
+  def test_autotuning_result_context_append(self, ignore_cache):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    z = jnp.zeros((5, 9))
+
+    res_x = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res_x.data, 1)
+    ba_x, data_x = res_x.data[0]
+
+    with res_x:
+      res_same = api.autotune(f, x, ignore_cache=ignore_cache)
+      self.assertLen(res_same.data, 1)
+      self.assertIs(res_same.data[0][1], data_x)
+
+      f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+      res_xy = api.autotune(f_xy, x, y, ignore_cache=ignore_cache)
+
+    # Original context manager object remains immutable.
+    self.assertLen(res_x.data, 1)
+    self.assertLen(res_xy.data, 2)
+    self.assertEqual(res_xy.data[0], (ba_x, data_x))
+    self.assertIs(res_xy.data[0][1], data_x)
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+
+    # Stacked context managers should skip all existing results and merge them.
+    res_y = api.autotune(f, y, ignore_cache=ignore_cache)
+    _, data_y = res_y.data[0]
+    f_xyz = jax.jit(lambda a, b, c: (op(a, a), op(b, b), op(c, c)))
+    with res_x:
+      with res_y:
+        res_xyz = api.autotune(f_xyz, x, y, z, ignore_cache=ignore_cache)
+    self.assertLen(res_xyz.data, 3)
+    self.assertIs(res_xyz.data[0][1], data_x)
+    self.assertIs(res_xyz.data[1][1], data_y)
+    self.assertEqual(
+        res_xyz.data[2][0].autotuning_cache_key,
+        op.bind(z, z).autotuning_cache_key,
+    )
+
+  @parameterized.parameters(True, False)
+  def test_autotuning_result_param_append(self, ignore_cache):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+
+    res_x = api.autotune(f, x, ignore_cache=ignore_cache)
+    self.assertLen(res_x.data, 1)
+    ba_x, data_x = res_x.data[0]
+
+    res_same = api.autotune(
+        f, x, ignore_cache=ignore_cache, autotuning_result=res_x
+    )
+    self.assertLen(res_same.data, 1)
+    self.assertIs(res_same.data[0][1], data_x)
+
+    f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+    res_xy = api.autotune(
+        f_xy, x, y, ignore_cache=ignore_cache, autotuning_result=res_x
+    )
+    self.assertLen(res_x.data, 1)
+    self.assertLen(res_xy.data, 2)
+    self.assertEqual(res_xy.data[0], (ba_x, data_x))
+    self.assertIs(res_xy.data[0][1], data_x)
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+
+  def test_autotuning_result_param_and_context_append(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    z = jnp.zeros((5, 9))
+    res_x = api.autotune(f, x)
+    res_y = api.autotune(f, y)
+    _, data_x = res_x.data[0]
+    _, data_y = res_y.data[0]
+
+    f_xyz = jax.jit(lambda a, b, c: (op(a, a), op(b, b), op(c, c)))
+    with res_x:
+      res_xyz = api.autotune(f_xyz, x, y, z, autotuning_result=res_y)
+
+    self.assertLen(res_xyz.data, 3)
+    self.assertIs(res_xyz.data[0][1], data_x)
+    self.assertIs(res_xyz.data[1][1], data_y)
+    self.assertEqual(
+        res_xyz.data[2][0].autotuning_cache_key,
+        op.bind(z, z).autotuning_cache_key,
+    )
+
+  def test_autotuning_result_param_device_kind_mismatch(self):
+    f = jax.jit(lambda x: _FakeOp()(x, x))
+    x = jnp.zeros((3, 7))
+    res_x = api.autotune(f, x)
+    other_res_x = dataclasses.replace(res_x, device_kind="fake_device_kind")
+
+    with self.assertRaisesRegex(ValueError, "does not match the device kind"):
+      api.autotune(f, x, autotuning_result=other_res_x)
+
+  def test_autotuning_result_context_ignores_other_device_kinds(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    y = jnp.zeros((4, 8))
+    res_x = api.autotune(f, x)
+    res_y = api.autotune(f, y)
+    _, data_x = res_x.data[0]
+    _, data_y = res_y.data[0]
+    other_res_x = dataclasses.replace(res_x, device_kind="fake_device_kind")
+    other_res_y = dataclasses.replace(res_y, device_kind="fake_device_kind")
+
+    f_xy = jax.jit(lambda a, b: (op(a, a), op(b, b)))
+    with other_res_y:
+      with res_x:
+        with other_res_x:
+          res_xy = api.autotune(f_xy, x, y)
+
+    self.assertEqual(res_xy.device_kind, res_x.device_kind)
+    self.assertLen(res_xy.data, 2)
+    # `x` is taken from the result with the matching device kind.
+    self.assertIs(res_xy.data[0][1], data_x)
+    # `y` is only in a result with a different device kind, so is re-autotuned.
+    self.assertEqual(
+        res_xy.data[1][0].autotuning_cache_key,
+        op.bind(y, y).autotuning_cache_key,
+    )
+    self.assertIsNot(res_xy.data[1][1], data_y)
+
+  def test_autotuning_result_context_exit_restores_state(self):
+    op = _FakeOp()
+    f = jax.jit(lambda x: op(x, x))
+    x = jnp.zeros((3, 7))
+    res_x = api.autotune(f, x)
+    _, data_x = res_x.data[0]
+
+    with self.assertRaisesRegex(RuntimeError, "Fake error"):
+      with res_x:
+        raise RuntimeError("Fake error")
+
+    # After exiting the context, `res_x` is no longer used for appending.
+    res_new = api.autotune(f, x)
+    self.assertLen(res_new.data, 1)
+    self.assertIsNot(res_new.data[0][1], data_x)
+
+  def test_autotuning_result_merge_distinct_ops_same_cache_key(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op0 = _FakeOp()
+    op1 = _OtherFakeOp()
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    y_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+
+    bound_arg0 = op0.bind(x_struct, y_struct)
+    bound_arg1 = op1.bind(x_struct, y_struct)
+
+    self.assertEqual(
+        bound_arg0.autotuning_cache_key,
+        bound_arg1.autotuning_cache_key,
+    )
+    self.assertNotEqual(bound_arg0.op, bound_arg1.op)
+
+    config0 = _FakeOpConfig(101)
+    config1 = _FakeOpConfig(102)
+    data0 = autotuner.AutotuningData({config0: bmark_data})
+    data1 = autotuner.AutotuningData({config1: bmark_data})
+
+    result0 = api.AutotuningResult(device_kind, ((bound_arg0, data0),))
+    result1 = api.AutotuningResult(device_kind, ((bound_arg1, data1),))
+
+    merged = result0 | result1
+    self.assertLen(merged.data, 2)
+    merged_ops = [entry[0].op for entry in merged.data]
+    self.assertIn(op0, merged_ops)
+    self.assertIn(op1, merged_ops)
+
+  def test_autotuning_result_merge_empty_preserves_distinct_ops(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op0 = _FakeOp()
+    op1 = _OtherFakeOp()
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    y_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+
+    bound_arg0 = op0.bind(x_struct, y_struct)
+    bound_arg1 = op1.bind(x_struct, y_struct)
+
+    config0 = _FakeOpConfig(201)
+    config1 = _FakeOpConfig(202)
+    data0 = autotuner.AutotuningData({config0: bmark_data})
+    data1 = autotuner.AutotuningData({config1: bmark_data})
+
+    combined_initial = api.AutotuningResult(
+        device_kind,
+        ((bound_arg0, data0), (bound_arg1, data1)),
+    )
+    empty_result = api.AutotuningResult(device_kind, ())
+
+    merged_with_empty = combined_initial | empty_result
+    self.assertLen(merged_with_empty.data, 2)
+    merged_ops = [entry[0].op for entry in merged_with_empty.data]
+    self.assertIn(op0, merged_ops)
+    self.assertIn(op1, merged_ops)
+
+  def test_autotuning_result_merge_same_op(self):
+    device_kind = jax.devices()[0].device_kind
+    bmark_data = benchmarking.BenchmarkData(
+        compile_time_ms=0.0,
+        lower_time_ms=0.0,
+        evaluation_times_ms=(0.0,),
+        metadata={},
+        peak_memory_mb=0.0,
+    )
+    op = _FakeOp()
+
+    x_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+    y_struct = jax.ShapeDtypeStruct((8, 16), dtype=jnp.float32)
+
+    bound_arg_first = op.bind(x_struct, y_struct)
+    bound_arg_second = op.bind(x_struct, y_struct)
+
+    config_first = _FakeOpConfig(301)
+    config_second = _FakeOpConfig(302)
+    data_first = autotuner.AutotuningData({config_first: bmark_data})
+    data_second = autotuner.AutotuningData({config_second: bmark_data})
+
+    result_first = api.AutotuningResult(
+        device_kind, ((bound_arg_first, data_first),)
+    )
+    result_second = api.AutotuningResult(
+        device_kind, ((bound_arg_second, data_second),)
+    )
+
+    merged = result_first | result_second
+    self.assertLen(merged.data, 1)
+    self.assertEqual(merged.data[0][0].op, op)
+    self.assertEqual(merged.data[0][1], data_first | data_second)
 
 
 if __name__ == "__main__":

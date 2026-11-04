@@ -170,6 +170,13 @@ class PydanticTest(parameterized.TestCase):
               vmap_axes=((0, 5), (B_SYMBOLIC, 7)),  # pyrefly: ignore[bad-argument-type]
           ),
       ),
+      (
+          batching.BatchedShapeDtype(
+              (1, 2, 3),
+              jnp.int8,
+              vmap_axes=((0, B_SYMBOLIC), (0, 5)),  # pyrefly: ignore[bad-argument-type]
+          ),
+      ),
   )
   def test_symbolic_shape_serialization(self, shape):
     ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
@@ -177,6 +184,8 @@ class PydanticTest(parameterized.TestCase):
     adapter.dump_python(shape)
     json_bytes = adapter.dump_json(shape)
     json.loads(json_bytes)
+    with self.assertRaises(pydantic.ValidationError):
+      adapter.validate_json(json_bytes)
 
   @parameterized.parameters(jax._src.dtypes._jax_types)
   def test_shape_dtype_short_names(self, dtype):

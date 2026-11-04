@@ -43,12 +43,13 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 import fnmatch
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tomllib
 from typing import TypedDict
@@ -124,8 +125,9 @@ IGNORED_GLOBS = tuple(
 # that the name in a job title, in `--durations` output, and in this table are
 # the same string, and there is nothing to keep in agreement. Within a theme,
 # `build_matrix` orders by `minutes`, longest first: the top of each group is
-# the job that sets that theme's wall clock. Shards with no timing sort last,
-# because an absent number is an unknown, not a zero.
+# the job that sets that theme's wall clock. Shards with no timing sort as
+# though they took `UNMEASURED_MINUTES`, because an absent number is an
+# unknown, not a zero.
 THEMES = (
     'attention',
     'splash',
@@ -138,7 +140,20 @@ THEMES = (
 )
 
 # Test files intentionally run by no shard.
-EXCLUDED_TESTS = ()
+#
+# The routing MoE `test/common/` modules are shared helpers -- cases, inputs,
+# reference implementations, shapes and timing utilities -- that the real test
+# files import. They declare no tests, but their `test_*.py` names match
+# pytest's `python_files`, so without this they land in the catch-all, where
+# pytest collects nothing from them, and every change that reaches them selects
+# the catch-all.
+EXCLUDED_TESTS = (
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_cases.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_inputs.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_reference.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_shapes.py',
+    'tokamax/_src/ops/experimental/routing_moe/test/common/test_util.py',
+)
 
 # The JAX versions CI tests. `latest_jax()` is what every ordinary shard job
 # installs; every version in `older_jaxs()` gets a compat rerun
@@ -157,6 +172,26 @@ COMPAT_RUNNERS = ('linux-x86-tpu7x-56-1tpu',)
 # each bin once. Sized against `compat_minutes` where a shard has one, and its
 # full `minutes` otherwise, which over-estimates and so errs toward more bins.
 COMPAT_BIN_MINUTES = 20
+
+# Repo-relative path of this module, as `git diff --name-only` reports it.
+SHARDS_PATH = '.github/ci/shards.py'
+
+# Maximum number and fraction of shards a table-only edit in `shards.py` may
+# touch before selection falls back to running every shard. Small edits (adding
+# a shard, moving a test file, splitting by `::Class`, or updating `minutes`)
+# run only the affected shards; a broad rebalance runs the full suite.
+MAX_DIFF_SHARDS = 10
+MAX_DIFF_FRACTION = 0.25
+
+# What `shard_order` assumes a shard with no `minutes` takes. Only the job
+# order reads it: the table, `list` and `explain` still show such a shard as
+# unmeasured, and `compat_size` packs it as a whole bin. Not a zero, because a
+# shard usually lands here new, out of the catch-all, before anyone has timed
+# it -- and the catch-all is where unscheduled files that turned out slow were
+# found. Ordered last, as if instant, one of those would start once every
+# measured shard had a runner and could set the run's wall clock on its own;
+# 10 starts it alongside the mid-sized shards instead.
+UNMEASURED_MINUTES = 10
 
 
 class _RequiredSpec(TypedDict):
@@ -215,9 +250,10 @@ MatrixEntry = dict[str, str]
 #            model below.
 #   minutes  measured wall clock, worst case across the runners the shard is
 #            scheduled on. Set it only from a real run: omitting it means no
-#            number yet, which is not the same as fast. The one exception is
-#            the catch-all shard, where it is a target rather than a
-#            measurement -- see its entry.
+#            number yet, which is not the same as fast -- `shard_order`
+#            schedules such a shard as `UNMEASURED_MINUTES`. The one
+#            exception is the catch-all shard, where it is a target rather
+#            than a measurement -- see its entry.
 #   compat_minutes
 #            measured wall clock of the shard's tests in compat smoke mode on
 #            a compat runner, which `compat_bins` packs by. Like `minutes`, it
@@ -374,11 +410,6 @@ SHARDS: ShardMap = {
         paths=('tokamax/_src/ops/attention/xla_chunked_test.py',),
         minutes=6,
         compat_minutes=3,
-    ),
-    'attention-pallas-triton': Spec(
-        paths=('tokamax/_src/ops/attention/pallas_triton_test.py',),
-        minutes=5,
-        compat_minutes=1,
     ),
     # GPU only: `TritonFlashAttentionTest` skips itself on TPU. Its forward
     # tests run since openxla/tokamax#1706 (2026-10-22), 3.4-4.0m on h100.
@@ -607,9 +638,7 @@ SHARDS: ShardMap = {
     # `base_test.py` runs all 20 everywhere, so pinning them together would
     # either waste a GPU job or drop the CUDA coverage.
     'experimental-kda-kernel': Spec(
-        paths=(
-            'tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',
-        ),
+        paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
         minutes=16,
         compat_minutes=1,
     ),
@@ -641,16 +670,41 @@ SHARDS: ShardMap = {
         minutes=10,
     ),
     # Unmeasured until now. Slow only on tpu7x, against well under a minute on
-    # h100 and tpu6e: 10m there (`gmm_test.py` 5.7m, `moe_test.py` 4.4m)
+    # h100 and tpu6e: 10m there (`gmm_prod_test.py` 5.7m, `moe_prod_test.py` 4.4m)
     # until the gmm-up/gmm-down fusion change of 2026-10-21, and 14-15m in
     # each of the three runs since.
     'experimental-routing-moe': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/routing_moe/test/gmm_test.py',
-            'tokamax/_src/ops/experimental/routing_moe/test/moe_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
         ),
         minutes=15,
         compat_minutes=1,
+    ),
+    # The routing MoE unit tests, out of the catch-all, where they have been
+    # since they landed on 2026-10-28 (openxla/tokamax@20d5afc787). The
+    # catch-all measured 20-30m on tpu7x from then on (runs 40727130450
+    # through 40929382681), against about a minute on h100 and tpu6e, and ran
+    # for every routing MoE change. Split three ways, by the kernel each group
+    # tests (with the `test/common/*_unit_test.py` tests in the GMM shard), so
+    # the three run in parallel and a change that reaches only one kernel's
+    # tests can select only that shard.
+    #
+    # The catch-all's job logs need repository admin rights to read, so the
+    # per-file times the other catch-all exits were split by are not available
+    # here. These `minutes` are estimates instead: the catch-all's ~28m on
+    # tpu7x, apportioned by each group's share of summed test time in an
+    # internal TPU run: GMM 66m, layer 47m and output reduce 43m of 156m.
+    # Re-measure them from the first green runs.
+    'experimental-routing-moe-gmm-unit': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/common/test_inputs_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/metadata_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/plan_unit_test.py',
+        ),
+        minutes=12,
     ),
     # The masked dense MLA op. Its 1 was an estimate, from a catch-all run
     # that held it together with `sparse_mla`; timed on its own it is 10m on
@@ -666,6 +720,26 @@ SHARDS: ShardMap = {
         ),
         minutes=10,
         compat_minutes=3,
+    ),
+    # Routing MoE layer unit tests; see `experimental-routing-moe-gmm-unit` for
+    # where they came from and how `minutes` was estimated.
+    'experimental-routing-moe-layer-unit': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',
+        ),
+        minutes=9,
+    ),
+    # Routing MoE output reduce tests, the unit and the prod one together:
+    # the prod test is one kernel's, unlike the two in `experimental-routing-moe`,
+    # and adding it there would lengthen that shard's 15m. See
+    # `experimental-routing-moe-gmm-unit` for how `minutes` was estimated.
+    'experimental-routing-moe-output-reduce': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_unit_test.py',
+        ),
+        minutes=8,
     ),
     # The DeepSeek-V4 compressor projection. Out of the catch-all, where it
     # was the largest single op at 7.7m on tpu6e, nearly all of it
@@ -876,6 +950,22 @@ SHARDS: ShardMap = {
         minutes=1,
         compat_minutes=1,
     ),
+    # The MLA v3 kernel, out of the catch-all. TPU-only, and quick today:
+    # `flash_attention_test.py` and `schedule_test.py` take 0.7m and 0.1m in
+    # an internal TPU run, and `mla_kernel_v3_test.py` skips itself on every
+    # case, since the JAX that CI installs (0.11.2) has no
+    # `pltpu.BufferedRef.in_buffer_count` (see `bref_override.py`). Once it
+    # does, the kernel test is a full `MlaRaggedPagedAttentionTestBase` sweep,
+    # like `experimental-mla-v2-kernel`'s 35m, and should get a shard and a
+    # measurement of its own.
+    'experimental-mla-v3': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/mla/v3/flash_attention_test.py',
+            'tokamax/_src/ops/experimental/mla/v3/mla_kernel_v3_test.py',
+            'tokamax/_src/ops/experimental/mla/v3/schedule_test.py',
+        ),
+        minutes=1,
+    ),
     # The topk tests that are not the kernel. Separate from
     # `experimental-topk-kernel` because that one is TPU-pinned and these two
     # run everywhere; merging them would drop the CUDA coverage.
@@ -928,10 +1018,8 @@ SHARDS: ShardMap = {
             'tokamax/_src/hlo_utils_test.py',
             'tokamax/_src/jaxtyping_test.py',
             'tokamax/_src/mosaic_gpu_test.py',
-            'tokamax/_src/mosaic_tpu_test.py',
             'tokamax/_src/numerics_test.py',
             'tokamax/_src/ops/op_test.py',
-            'tokamax/_src/pallas/block_test.py',
             'tokamax/_src/precision_test.py',
             'tokamax/_src/pydantic_test.py',
             'tokamax/_src/shape_test.py',
@@ -1185,6 +1273,7 @@ def _matches(test_files: Iterable[str], globs: Iterable[str]) -> set[str]:
 
 def resolve_shards(
     test_files: Collection[str] | None = None,
+    shard_map: Mapping[str, Spec] | None = None,
 ) -> tuple[ShardMap, list[str], set[str], set[str]]:
   """Fills in the catch-all shard and partitions the tree it sharded against.
 
@@ -1196,6 +1285,7 @@ def resolve_shards(
     test_files: The tree to shard, as from `all_test_files`. Defaults to walking
       the real one, and is a parameter so the checks can run against a tree that
       does not exist on disk.
+    shard_map: Shard table to resolve, defaulting to `SHARDS`.
 
   Returns:
     `(shards, catch_all, excluded, ignored)`. `shards` is a deep-enough copy of
@@ -1203,9 +1293,24 @@ def resolve_shards(
     shard picked up, empty in the ordinary case. `excluded` and `ignored` are
     the files left out by design and the ones pytest never collects, returned
     so `check_consistency` can be handed the same partitions.
+
+  Raises:
+    ValueError: If the table has no catch-all shard, gives it `paths` other
+      than `None`, or gives any other shard `paths=None`.
   """
   test_files = all_test_files() if test_files is None else test_files
-  shards = {n: dict(s) for n, s in SHARDS.items()}
+  source = SHARDS if shard_map is None else shard_map
+  if (
+      _CATCH_ALL_SHARD not in source
+      or source[_CATCH_ALL_SHARD].get('paths') is not None
+  ):
+    raise ValueError(
+        f'{_CATCH_ALL_SHARD!r} shard must be present with paths=None'
+    )
+  for name, spec in source.items():
+    if name != _CATCH_ALL_SHARD and spec.get('paths') is None:
+      raise ValueError(f'shard {name!r} must not have paths=None')
+  shards = {n: dict(s) for n, s in source.items()}
 
   claimed = set()
   for spec in shards.values():
@@ -1438,7 +1543,7 @@ def shard_theme(name: str) -> tuple[int, str] | None:
   return None
 
 
-def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
+def shard_order(item: tuple[str, Spec]) -> tuple[bool, float, int, str]:
   """Sorts shards: catch-all first, then longest first, then by theme, then by name.
 
   The catch-all shard always runs first so newly added or unscheduled tests run
@@ -1450,17 +1555,16 @@ def shard_order(item: tuple[str, Spec]) -> tuple[bool, bool, float, int, str]:
     item: A `(shard name, spec)` pair, as from `dict.items`.
 
   Returns:
-    A sort key: catch-all shard first, then measured shards before unmeasured
-    ones, then descending `minutes`, then theme in `THEMES` order with themeless
-    shards last, then the name.
+    A sort key: catch-all shard first, then descending `minutes` -- with
+    `UNMEASURED_MINUTES` standing in for a shard that has none -- then theme in
+    `THEMES` order with themeless shards last, then the name.
   """
   name, spec = item
   theme = shard_theme(name)
   minutes = spec.get('minutes')
   return (
       name != _CATCH_ALL_SHARD,
-      minutes is None,  # unmeasured last, since absent is not zero
-      -(minutes or 0),
+      -(UNMEASURED_MINUTES if minutes is None else minutes),
       len(THEMES) if theme is None else theme[0],
       name,
   )
@@ -1689,6 +1793,269 @@ def read_changed(path: str) -> list[str]:
     return [p for p in f.read().split('\0') if p]
 
 
+def _assigns_shards(node: ast.stmt) -> bool:
+  """Returns whether `node` is a statement that assigns to `SHARDS`."""
+  if isinstance(node, ast.AnnAssign):
+    return isinstance(node.target, ast.Name) and node.target.id == 'SHARDS'
+  if isinstance(node, ast.Assign):
+    return any(
+        isinstance(t, ast.Name) and t.id == 'SHARDS' for t in node.targets
+    )
+  return False
+
+
+def _literal_spec(node: ast.expr) -> Spec:
+  """Reads one `SHARDS` value without executing it.
+
+  Args:
+    node: The value side of one table entry.
+
+  Returns:
+    The spec it spells.
+
+  Raises:
+    ValueError: If the value is anything but `Spec(...)`, `dict(...)` or a dict
+      display whose values are all literals, or has no well-formed `paths`.
+  """
+  try:
+    if isinstance(node, ast.Dict):
+      spec = ast.literal_eval(node)
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ('Spec', 'dict')
+        and not node.args
+        and all(k.arg is not None for k in node.keywords)
+    ):
+      spec = {k.arg: ast.literal_eval(k.value) for k in node.keywords}
+      if len(spec) != len(node.keywords):
+        raise ValueError('a shard spec repeats a keyword')
+    else:
+      raise ValueError(f'not a literal shard spec: {ast.unparse(node)}')
+  except TypeError as exc:
+    raise ValueError(f'not a literal shard spec: {ast.unparse(node)}') from exc
+  if not isinstance(spec, dict) or 'paths' not in spec:
+    raise ValueError(f'shard spec has no paths: {ast.unparse(node)}')
+  paths = spec['paths']
+  if paths is not None and not (
+      isinstance(paths, tuple) and all(isinstance(p, str) for p in paths)
+  ):
+    raise ValueError(f'shard paths is not a tuple of strings: {paths!r}')
+  return spec
+
+
+def _split_shards_table(source: str) -> tuple[str, ShardMap]:
+  """Separates a version of this file into its `SHARDS` table and the rest.
+
+  The table is read as literals, never executed: the base version comes out of
+  git, and nothing about deciding which shards to run should depend on running
+  it.
+
+  Args:
+    source: The text of some version of `shards.py`.
+
+  Returns:
+    `(rest, table)`. `rest` is the module's AST dump with the table's value
+    replaced by `None`, so two versions whose `rest` agree differ only in the
+    table. It is a dump of the syntax tree rather than of the text, so comments
+    and formatting -- which are most of what this file is -- do not count as a
+    change anywhere.
+
+  Raises:
+    SyntaxError: If `source` does not parse.
+    ValueError: If there is not exactly one module-level `SHARDS` assignment, or
+      its value is not a dict display of literal specs with distinct names.
+  """
+  tree = ast.parse(source)
+  assignments = [node for node in tree.body if _assigns_shards(node)]
+  if len(assignments) != 1:
+    raise ValueError(f'{len(assignments)} assignments to SHARDS, expected 1')
+  (statement,) = assignments
+  if not isinstance(statement.value, ast.Dict):
+    raise ValueError('SHARDS is not a dict display')
+
+  table = {}
+  for key, value in zip(
+      statement.value.keys, statement.value.values, strict=True
+  ):
+    # A `None` key is `**other` unpacking, which would make the table depend
+    # on something outside it.
+    if key is None:
+      raise ValueError('SHARDS unpacks another mapping')
+    try:
+      name = ast.literal_eval(key)
+    except TypeError as exc:
+      raise ValueError(
+          f'shard name is not a string: {ast.unparse(key)}'
+      ) from exc
+    if not isinstance(name, str):
+      raise ValueError(f'shard name is not a string: {name!r}')
+    # Python keeps the last of two equal keys without a word, so a duplicate
+    # would hide a shard from every check that reads the resolved table.
+    if name in table:
+      raise ValueError(f'shard {name!r} is declared twice')
+    spec = _literal_spec(value)
+    if name != _CATCH_ALL_SHARD and spec['paths'] is None:
+      raise ValueError(f'shard {name!r} must not have paths=None')
+    table[name] = spec
+
+  statement.value = ast.Constant(value=None)
+  return ast.dump(tree), table
+
+
+def read_base_shards() -> str:
+  """Reads this file as it is on the branch the change is diffed against.
+
+  The same base `ci-build.yml` diffs against to write the changed-file list:
+  the merge base of `origin/<base>` and `HEAD`, so a change that landed on the
+  base branch after this one forked is not read as part of this one.
+
+  Returns:
+    The base version's text.
+
+  Raises:
+    OSError: If git cannot be run.
+    subprocess.SubprocessError: If git fails, e.g. because the base ref was
+      not fetched or the file did not exist there.
+  """
+  base = os.environ.get('BASE_REF') or os.environ.get('GITHUB_BASE_REF')
+  ref = f'origin/{base or "main"}'
+  fork = subprocess.run(
+      ['git', 'merge-base', ref, 'HEAD'],
+      capture_output=True,
+      text=True,
+      check=True,
+  ).stdout.strip()
+  return subprocess.run(
+      ['git', 'show', f'{fork}:{SHARDS_PATH}'],
+      capture_output=True,
+      text=True,
+      check=True,
+  ).stdout
+
+
+def read_head_shards() -> str:
+  """Reads this file as it is being run, which is the change's version."""
+  with open(__file__, encoding='utf-8') as f:
+    return f.read()
+
+
+def shards_from_table_diff(
+    test_files: Collection[str],
+    base_source: str | None = None,
+    head_source: str | None = None,
+    class_reader: Callable[[str], list[str]] = declared_test_classes,
+) -> tuple[set[str] | None, str]:
+  """Decides which shards an edit to this file has to run.
+
+  Most edits here only move test files between shards -- adding one, moving
+  one, splitting one by `::Class`, renaming a shard or retiming one -- and run
+  nothing that was not already passing except the shards whose test paths
+  changed. Anything else in this file decides what every job runs, so an edit
+  outside the table, or one too broad to call small, runs every shard.
+
+  Args:
+    test_files: The tree to resolve both tables against, as from
+      `all_test_files`: the change's tree, since that is what will run.
+    base_source: The base version's text, or None to read it from git.
+    head_source: The change's version, or None to read this file.
+    class_reader: As in `check_consistency`.
+
+  Returns:
+    `(names, reason)`. `names` is the change's shards whose resolved test paths
+    are in no shard of the base table, or None meaning every shard. A shard
+    whose paths match a base shard of any name -- a retimed or renamed one --
+    is not among them. `reason` is one line for the log.
+  """
+  try:
+    base_source = read_base_shards() if base_source is None else base_source
+  except (OSError, subprocess.SubprocessError):
+    return None, 'shards.py: could not load the base version'
+  try:
+    head_source = read_head_shards() if head_source is None else head_source
+  except OSError:
+    return None, 'shards.py: could not load the head version'
+
+  try:
+    base_rest, base_table = _split_shards_table(base_source)
+    head_rest, head_table = _split_shards_table(head_source)
+  except (SyntaxError, TypeError, ValueError) as exc:
+    return None, f'shards.py: could not read the SHARDS table ({exc})'
+  if base_rest != head_rest:
+    return None, 'shards.py: changes outside the SHARDS table'
+
+  try:
+    base, *_ = resolve_shards(test_files, base_table)
+    head, _, excluded, ignored = resolve_shards(test_files, head_table)
+  except (KeyError, TypeError, ValueError) as exc:
+    return None, f'shards.py: could not resolve the SHARDS table ({exc})'
+  # The JAX floor is not part of the table, and `rest` agreeing already says
+  # it did not change.
+  if errors := check_consistency(
+      head, test_files, excluded, ignored, class_reader, pyproject=None
+  ):
+    return None, f'shards.py: head table fails check_consistency: {errors[0]}'
+
+  # Compared as sets of `paths` entries, `::Class` suffixes included, so a
+  # re-split selects both sides of it. The catch-all is compared only with
+  # itself: its paths are whatever no one else claims, and a file moving out
+  # of it into a new shard must select that shard, not match it away.
+  before = {
+      frozenset(s['paths']) for n, s in base.items() if n != _CATCH_ALL_SHARD
+  }
+  base_catch_all = frozenset(base.get(_CATCH_ALL_SHARD, {}).get('paths', ()))
+  names = set()
+  for name, spec in head.items():
+    paths = frozenset(spec['paths'])
+    if name == _CATCH_ALL_SHARD:
+      if paths != base_catch_all:
+        names.add(name)
+    elif paths not in before:
+      names.add(name)
+
+  if len(names) > MAX_DIFF_SHARDS or len(names) > MAX_DIFF_FRACTION * len(head):
+    return None, (
+        f'shards.py: table diff touches {len(names)} of {len(head)} shards,'
+        ' over the diff-aware bound'
+    )
+  return names, (
+      f"shards.py: table-only change; {len(names)} of {len(head)} shards'"
+      ' test paths changed'
+  )
+
+
+def _table_diff(
+    shards: ShardMap, test_files: Collection[str], changed: Sequence[str]
+) -> tuple[list[str], set[str] | None, str | None]:
+  """Takes an edit to this file out of a change list and selects for it.
+
+  Args:
+    shards: Shard name to spec, as `resolve_shards` returns it.
+    test_files: The universe to select from, as from `all_test_files`.
+    changed: The changed paths.
+
+  Returns:
+    `(others, names, reason)`. `others` is `changed` without this file, for
+    `deps` to trace as usual. `names` is the shards the table edit selects,
+    empty if the file did not change and None meaning every shard. `reason`
+    describes the table edit, None if there was none.
+  """
+  if SHARDS_PATH not in changed:
+    return list(changed), set(), None
+  others = [p for p in changed if p != SHARDS_PATH]
+  names, why = shards_from_table_diff(test_files)
+  # The head table is this module's own `SHARDS`, which `shards` was resolved
+  # from, so this cannot happen in CI. If it ever does, a name the matrix does
+  # not have would select nothing rather than the shard that changed.
+  if names is not None and (unknown := sorted(names - set(shards))):
+    return (
+        others,
+        None,
+        f'shards.py: table diff names unknown shard {unknown[0]}',
+    )
+  return others, names, why
+
+
 def select(
     shards: ShardMap, test_files: Collection[str], changed_from: str | None
 ) -> tuple[set[str] | None, str]:
@@ -1698,6 +2065,10 @@ def select(
   a rule in `deps.full_run_reason`, or an affected test no shard claims. The
   asymmetry is deliberate -- running too much costs runner minutes, running
   too little reports a change green that was never tested.
+
+  An edit to this file is the one path outside the package `deps` does not
+  get to rule on: `shards_from_table_diff` decides it, and what it selects is
+  added to whatever the rest of the change reaches.
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
@@ -1717,9 +2088,17 @@ def select(
   if not changed:
     return None, 'changed-file list is empty: every shard runs'
 
-  affected, why = deps.affected_tests(changed)
-  if affected is None:
-    return None, f'every shard runs: {why}'
+  others, table_names, table_why = _table_diff(shards, test_files, changed)
+  if table_names is None:
+    return None, f'every shard runs: {table_why}'
+
+  # Only the table changed: nothing for `deps` to trace, and asking it would
+  # walk the whole package for an empty answer.
+  affected = set()
+  if others:
+    affected, why = deps.affected_tests(others)
+    if affected is None:
+      return None, f'every shard runs: {why}'
 
   # Defensive check: if any affected test is not covered by the shard map,
   # fall back to running all shards.
@@ -1729,11 +2108,12 @@ def select(
         f' shard, first {sorted(orphans)[0]}'
     )
 
-  names = shards_for_tests(shards, test_files, affected)
-  return names, (
+  names = shards_for_tests(shards, test_files, affected) | table_names
+  reason = (
       f'{len(changed)} changed file(s) reach {len(affected)} test file(s)'
       f' in {len(names)} of {len(shards)} shards'
   )
+  return names, f'{reason} ({table_why})' if table_why else reason
 
 
 def explain(
@@ -1743,7 +2123,8 @@ def explain(
 
   Lists the changed files, the affected test files, and which shards collect
   those tests. Tests are tagged as `edited` (directly modified) or `import`
-  (reached via dependency graph).
+  (reached via dependency graph), and a shard an edit to the `SHARDS` table
+  selected is tagged `table`.
 
   Args:
     shards: Shard name to spec, as `resolve_shards` returns it.
@@ -1757,9 +2138,15 @@ def explain(
   if not changed:
     return ['changed-file list is empty: every shard runs']
 
-  affected, why = deps.affected_tests(changed)
-  if affected is None:
-    return [f'every shard runs: {why}']
+  others, table_names, table_why = _table_diff(shards, test_files, changed)
+  if table_names is None:
+    return [f'every shard runs: {table_why}']
+
+  affected = set()
+  if others:
+    affected, why = deps.affected_tests(others)
+    if affected is None:
+      return [f'every shard runs: {why}']
 
   # The change itself, before any graph, so the log says what was edited as
   # well as what that dragged in. The `Decide which files changed` step logs
@@ -1768,7 +2155,7 @@ def explain(
   edited = set(changed)
   tests_edited = {f for f in edited if deps.is_test_file(f)}
   affected = set(affected)
-  names = shards_for_tests(shards, test_files, affected)
+  names = shards_for_tests(shards, test_files, affected) | table_names
   noun = 'a test file' if len(tests_edited) == 1 else 'test files'
   out = [f'{len(changed)} changed file(s), {len(tests_edited)} of them {noun}:']
   out += [f'      {f}' for f in sorted(changed)]
@@ -1778,6 +2165,10 @@ def explain(
           f'reaching {len(affected)} test file(s) in {len(names)} of'
           f' {len(shards)} shards.'
       ),
+  ]
+  if table_why:
+    out.append(f'  {table_why}; those shards are marked `table`.')
+  out += [
       '  `edited` was changed directly, `import` reaches one that was.',
       (
           '  the clock is measured wall time: what shards are sized on, not'
@@ -1791,7 +2182,8 @@ def explain(
       continue
     files = collected_by(spec['paths'], test_files)
     claimed |= files
-    if not (reached := sorted(files & affected)):
+    reached = sorted(files & affected)
+    if not reached and name not in table_names:
       continue
     # Which classes of a file this shard runs, for the shards that split one
     # by node ID. Empty for every other shard, which names whole files.
@@ -1805,6 +2197,8 @@ def explain(
         f'  {name:32s} {f"{minutes}m" if minutes else "-":>4}'
         f'  {len(reached)} of {len(files)} file(s) reached'
     )
+    if name in table_names:
+      out.append(f'      table   test paths changed in {SHARDS_PATH}')
     for file in reached:
       tag = 'edited' if file in edited else 'import'
       # The file is the unit the graph works in -- it cannot see classes, so a
@@ -1941,8 +2335,9 @@ def main(argv: Sequence[str] | None = None) -> int:
   compat = build_compat_matrix(shards)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
   print(f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs')
-  # Longest first, shards without a number last. An absent `minutes` is an
-  # unknown, so it sorts to the bottom rather than being read as a zero.
+  # Longest first, shards without a number placed as if they took
+  # `UNMEASURED_MINUTES`: an absent `minutes` is an unknown, so it is not read
+  # as a zero and sorted to the bottom.
   order = sorted(shards.items(), key=shard_order)
   for name, spec in order:
     print(f'  {name:32s} x{per_shard[name]}')

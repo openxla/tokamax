@@ -25,6 +25,13 @@ def align_to(a, b):
     return pl.cdiv(a, b) * b
 
 
+def align_span(start, size, align):
+    """Returns (aligned_start, lead, aligned_size) for [start, start + size)."""
+    # Grows the span out to 'align'; an 'align' of 1 is the identity.
+    lead = start % align
+    return start - lead, lead, align_to(lead + size, align)
+
+
 def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
     """Number of cache tokens owned by this CP rank.
 

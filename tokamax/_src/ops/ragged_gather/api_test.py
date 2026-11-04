@@ -54,10 +54,12 @@ class ApiTest(parameterized.TestCase):
 
     @jax.jit
     def f(x, indices, start, end):
-      return api.ragged_gather(x, indices, start, end, implementation=impl)
+      return (
+          api.ragged_gather(x, indices, start, end, implementation=impl) + 1.0
+      )
 
     actual = f(x, indices, start_arr, end_arr)
-    desired = x[indices]
+    desired = np.asarray(x)[np.asarray(indices)] + 1.0
 
     with self.subTest("value"):
       np.testing.assert_allclose(
