@@ -46,9 +46,8 @@ def strided_load_bkv(
     kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
     kv_ref = kv_u32_ref.reshape(-1, cfgs.aligned_kv_head_dim)
 
-    # kv_ref must be annotated with no_hazard_no_deps so XLA knows not to add a
-    # dependency between the HBM->VMEM DMA copy-in from stage n - 1 and the vld
-    # instructions for matmuls at stage n.
+    # Avoids false dependency between prior stage DMA copy-in and current
+    # stage matmul loads.
     if jax.__version_info__ >= (0, 11, 2):
         kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
 
@@ -244,8 +243,7 @@ def _compute_valid_kv_mask(
     step_meta: ComputeMetadata,
 ) -> jax.Array:
     """Builds a boolean mask for valid token slices before PV."""
-    # PV reduces over the whole tile: zero probabilities do not isolate NaNs
-    # from stale VMEM or another request in a fetched new-KV page.
+    # Zero softmax probabilities do not isolate NaNs during the PV reduction.
     valid = token < (
         stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
     )
@@ -291,8 +289,7 @@ def fetch_stitch_metadata(
         kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
         q_end = jnp.where(is_valid, cu_q_lens_ref[s_idx + 1], 0)
 
-        # KV stitch boundaries: where the cached tokens end and the newly arrived
-        # tokens begin, which is what `stitch_utils.stitch_new_kv_lane` merges on.
+        # Boundaries where cached tokens end and newly arrived tokens begin.
         total_kv_len = kv_cache_len_val + kv_new_len_val
         kv_left = jnp.maximum(total_kv_len - k_id, 0)
         if cfgs.serve.skip_kv_update:
@@ -433,8 +430,7 @@ def rpa_body(
     kv_new_lens_ref: jax.Ref,
     # Configs.
     cfgs: configs.RpaConfigs,
-    # DMA-issue hooks. Both only start copies; the matching waits live in
-    # `pipeline.py`
+    # Starts asynchronous DMAs; matching waits live in pipeline.py.
     start_next_fetch: Callable[[], None],
     start_kv_writeback: Callable[[], None],
 ):
@@ -444,8 +440,7 @@ def rpa_body(
     if jax.__version_info__ >= (0, 11, 2):
         kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
 
-    # Step 1: Fetch the metadata the stitch needs. Everything the mask needs is
-    # deferred until after the fence below, so it does not gate the writeback.
+    # Fetch stitch metadata before the fence so it does not gate writeback.
     stitch_meta = fetch_stitch_metadata(
         step,
         schedule_ref,
@@ -457,12 +452,8 @@ def rpa_body(
 
     always_true = kv_cache_lens_ref[0] >= 0
 
-    # This conditional always executes. We create a basic block boundary here so:
-    # 1. We force our KV writeback to be scheduled at the beginning of the
-    #    compute region (as soon as stitching completes).
-    # 2. We guarantee our stitching is correct: with `no_hazard_no_deps=True`, the
-    #    boundary ensures VMEM writes from stitching finish before subsequent
-    #    loads read the updated KV cache.
+    # Basic block fence: schedules KV writeback early in compute and ensures
+    # stitching writes finish before subsequent loads under no_hazard_no_deps.
 
     @pl.when(always_true)
     @jax.named_scope("stitch_and_issue_writeback")
@@ -491,8 +482,7 @@ def rpa_body(
 
     start_next_fetch()
 
-    # Step 2a: Fetch mask metadata after the fence to overlap with compute and
-    # in-flight writeback.
+    # Fetch mask metadata after the fence to overlap with compute and writeback.
     step_meta = fetch_compute_metadata(
         step,
         schedule_ref,
@@ -501,7 +491,6 @@ def rpa_body(
         cfgs=cfgs,
     )
 
-    # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
     q_loaded = utils.strided_load(
@@ -729,8 +718,7 @@ def create_allocs(
     bref_override.BatchingORef,
     bref_override.BatchingLSERef | None,
 ]:
-    # `use_lookahead` is disabled everywhere: slot rotation and prefetch depth are
-    # driven explicitly by `pipeline.run_manual_triple_buffer`.
+    # Slot rotation and prefetch depth are driven by run_manual_triple_buffer.
     in_slots = configs.NUM_INPUT_SLOTS
     out_slots = configs.NUM_OUTPUT_SLOTS
     kv_cache_spec = pl.BlockSpec(
