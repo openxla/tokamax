@@ -28,6 +28,7 @@ from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-i
 
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.utils import (  # pylint: disable=g-multiple-import,g-importing-member,unused-import
+    _bounded_chunk_boundaries,
     RCP_LN2,
     align_up,
     cdiv,
@@ -213,8 +214,13 @@ def _chunk_gated_delta_rule_fwd_varlen_kernel(
   i_c = pl.program_id(2)
   seq_idx = chunk_to_seq_ref[i_b, i_c]
 
-  bos = seqlens_ref[i_b, seq_idx]
-  eos = seqlens_ref[i_b, seq_idx + 1]
+  if seqlens_ref.ndim == 1:
+    offset = 2 * (i_b * chunk_to_seq_ref.shape[1] + i_c)
+    bos = seqlens_ref[offset]
+    eos = seqlens_ref[offset + 1]
+  else:
+    bos = seqlens_ref[i_b, seq_idx]
+    eos = seqlens_ref[i_b, seq_idx + 1]
 
   BT = k_ref.shape[2]
   t0 = i_c * BT
@@ -477,7 +483,10 @@ def _chunk_gated_delta_rule_fwd_varlen(
     ),
     out_shape=[h_spec, v_new_spec, ht_spec],
     interpret=interpret,
-  )(seqlens, chunk_to_seq, k_t, v_t, w_t, g_t, gk_t, h0)
+  )(
+      _bounded_chunk_boundaries(seqlens, chunk_to_seq), chunk_to_seq,
+      k_t, v_t, w_t, g_t, gk_t, h0,
+  )
 
   h_out = h_out[:, :, :, :K, :V]
   v_new_out = (
