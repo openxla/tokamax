@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 import pytest
+from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
@@ -36,8 +37,6 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
-    if gpu_utils.is_sm80():
-      self._supports_vjp = False
     super().setUp()
 
   def __init__(
@@ -100,6 +99,8 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
           or getattr(impl, "rescale_threshold", 1.0) != 1.0
       ):
         kwargs["expect_supported"] = False
+      if (q.shape[-1] > 256 or v.shape[-1] > 256) and test_vjp:
+        kwargs["expect_supported"] = False
     if gpu_utils.is_sm100():
 
       impl = kwargs.get("impl", self._attention_fn)
@@ -127,7 +128,12 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
       super().test_causal_mask_cross_attention0()  # pyrefly: ignore[missing-attribute]
 
   def test_causal_mask_cross_attention1(self):
-    self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
+    if not gpu_utils.is_sm80():
+      self.skipTest("TODO: Support k-sequence non-multiple of block_kv.")
+    with test_base.override_test_args(
+        atol={1.0: 0.008, 0.99: 0.006}, atol_grads={1.0: 0.02, 0.99: 0.012}
+    ):
+      super().test_causal_mask_cross_attention1()  # pyrefly: ignore[missing-attribute]
 
   def test_padding_mask_with_nans(self):
     self.skipTest("TODO: Fix.")
@@ -388,6 +394,234 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         super()._test_vmap(vmap_in_axes)
     else:
       super()._test_vmap(vmap_in_axes)
+
+  def test_sm80_seq_lengths_decomposition_and_vjp(self):
+    if not gpu_utils.is_sm80():
+      self.skipTest("SM80-specific sequence length optimization test.")
+    q, k, v, bias, _, _ = test_base._create_inputs(
+        q_shape=(2, 512, 8, 128),
+        kv_shape=(2, 512, 2, 128),
+        bias_shape=(1, 8, 512, 512),
+        dtype=jnp.bfloat16,
+    )
+    q_len = jnp.array([70, 390], dtype=jnp.int32)
+    kv_len = jnp.array([135, 450], dtype=jnp.int32)
+    mask = base.Mask(
+        is_causal=True,
+        q_end=q_len[:, None, None],
+        k_end=kv_len[:, None, None],
+    )
+    # Verify `extract_q_range` + `decompose_mask` produces no dense bool mask.
+    rem_mask, q_start, q_end = fa.common.extract_q_range(
+        mask, q.ndim, None, None
+    )
+    bool_mask, _, _, k_end = fa.common.decompose_mask(
+        rem_mask, q, k, None, None
+    )
+    self.assertIsNone(bool_mask)
+    self.assertIsNone(q_start)
+    self.assertIsNotNone(q_end)
+    self.assertIsNotNone(k_end)
+
+    ref_fn = lambda q_, k_, v_, b_: jax.nn.dot_product_attention(
+        q_.astype(jnp.float32),
+        jnp.repeat(k_.astype(jnp.float32), 4, axis=2),
+        jnp.repeat(v_.astype(jnp.float32), 4, axis=2),
+        bias=b_.astype(jnp.float32),
+        is_causal=True,
+        query_seq_lengths=q_len,
+        key_value_seq_lengths=kv_len,
+        implementation="xla",
+    ).astype(jnp.bfloat16)
+    ans_fn = lambda q_, k_, v_, b_: self._attention_fn(
+        q_, k_, v_, bias=b_, mask=mask
+    )
+    dout = jnp.ones_like(q)
+    out_ref, vjp_ref = jax.vjp(ref_fn, q, k, v, bias)
+    out_ans, vjp_ans = jax.vjp(ans_fn, q, k, v, bias)
+    dq_ref, dk_ref, dv_ref, db_ref = vjp_ref(dout)
+    dq_ans, dk_ans, dv_ans, db_ans = vjp_ans(dout)
+
+    test_base.test_utils.assert_trees_all_close(
+        out_ans, out_ref, atol=0.02, rtol=0.02
+    )
+    test_base.test_utils.assert_trees_all_close(
+        (dq_ans, dk_ans, dv_ans),
+        (dq_ref, dk_ref, dv_ref),
+        atol=0.04,
+        rtol=0.04,
+    )
+    test_base.test_utils.assert_trees_all_close(
+        db_ans, db_ref, atol=0.08, rtol=0.08
+    )
+
+  def test_sm80_alphafold_and_deepseek_shapes(self):
+    if not gpu_utils.is_sm80():
+      self.skipTest("SM80-specific shape coverage test.")
+    # AlphaFold head_dim=16 and head_dim=32 (both forward + VJP).
+    self._run_test(
+        q_shape=(4, 256, 4, 16),
+        kv_shape=(4, 256, 4, 16),
+        bias_shape=(1, 4, 256, 256),
+        mask_shape=(4, 1, 1, 256),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.06,
+    )
+    self._run_test(
+        q_shape=(4, 384, 4, 32),
+        kv_shape=(4, 384, 4, 32),
+        bias_shape=(1, 4, 384, 384),
+        mask_shape=(4, 1, 1, 384),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.06,
+    )
+    # DeepSeek-V2 asymmetric head_dim=(192, 128) causal forward + VJP.
+    q, k, _, _, _, ss = test_base._create_inputs(
+        q_shape=(2, 256, 4, 192), dtype=jnp.bfloat16
+    )
+    _, _, v, _, _, _ = test_base._create_inputs(
+        q_shape=(2, 256, 4, 128), dtype=jnp.bfloat16
+    )
+    self._run_test_with_inputs(
+        q,
+        k,
+        v,
+        is_causal=True,
+        ref_impl=base.DotProductAttention(),
+        seed_seq=ss,
+        atol=0.02,
+        atol_grads=0.04,
+    )
+
+  def test_sm80_arg_specs_and_edge_cases(self):
+    if not gpu_utils.is_sm80():
+      self.skipTest("SM80-specific arg_specs and edge-case test.")
+
+    # 1. Verify all specs in `arg_specs.ARG_SPECS` bind & fit SM80 SMEM.
+    attn_fn = cast(fa.PallasMosaicGpuFlashAttention, self._attention_fn)
+    vjp_fn = cast(fa_vjp.PallasMosaicGpuFlashAttentionVjp, attn_fn.vjp)
+    self.assertNotEmpty(arg_specs.ARG_SPECS)
+    for spec in arg_specs.ARG_SPECS:
+      with self.subTest(spec=spec.full_name):
+        ba = attn_fn.bind(**spec.args)
+        cfg = attn_fn._get_heuristics_config(ba)
+        self.assertIsInstance(cfg, fa.ConfigSM80)
+        smem_bytes = fa.sm80._estimate_shared_mem_usage_bytes(ba, cfg)
+        self.assertLessEqual(smem_bytes, fa.sm80._MAX_SMEM)
+        if "forward_only" not in spec.tags:
+          vjp_ba = vjp_fn.bind(**ba.vjp_arg_spec)
+          vjp_cfg = vjp_fn._get_heuristics_config(vjp_ba)
+          self.assertLessEqual(
+              fa_vjp.sm80._estimate_dq_smem_bytes(
+                  vjp_ba,
+                  vjp_cfg.block_q_dq,
+                  vjp_cfg.block_kv_dq,
+                  vjp_cfg.num_stages,
+                  None if spec.args.get("bias") is None else jnp.float32,
+                  vjp_cfg.compute_wgs,
+              ),
+              fa_vjp.sm80._SMEM_SIZE_BYTES,
+          )
+
+    # 2. `jax.vmap` over non-leading axis (`in_axes=3`) forward + VJP.
+    q5 = test_base.numerics.random_initialize(
+        jax.ShapeDtypeStruct((2, 128, 4, 3, 64), jnp.bfloat16)
+    )
+    vmapped_ans = jax.vmap(
+        lambda x: self._attention_fn(x, x, x, is_causal=True),
+        in_axes=3,
+        out_axes=3,
+    )
+    vmapped_ref = jax.vmap(
+        lambda x: jax.nn.dot_product_attention(
+            x.astype(jnp.float32),
+            x.astype(jnp.float32),
+            x.astype(jnp.float32),
+            is_causal=True,
+            implementation="xla",
+        ).astype(jnp.bfloat16),
+        in_axes=3,
+        out_axes=3,
+    )
+    out_v_ans, vjp_v_ans = jax.vjp(vmapped_ans, q5)
+    out_v_ref, vjp_v_ref = jax.vjp(vmapped_ref, q5)
+    test_base.test_utils.assert_trees_all_close(
+        out_v_ans, out_v_ref, atol=0.015, rtol=0.015
+    )
+    test_base.test_utils.assert_trees_all_close(
+        vjp_v_ans(jnp.ones_like(q5)),
+        vjp_v_ref(jnp.ones_like(q5)),
+        atol=0.03,
+        rtol=0.03,
+    )
+
+    # 3. Zero-length and single-token `q_end` / `k_end` boundary + VJP.
+    q_b, k_b, v_b, bias_b, _, _ = test_base._create_inputs(
+        q_shape=(2, 128, 4, 64),
+        kv_shape=(2, 128, 4, 64),
+        bias_shape=(1, 4, 128, 128),
+        dtype=jnp.bfloat16,
+    )
+    q_len_b = jnp.array([0, 1], dtype=jnp.int32)
+    kv_len_b = jnp.array([1, 65], dtype=jnp.int32)
+    mask_b = base.Mask(
+        is_causal=True,
+        q_end=q_len_b[:, None, None],
+        k_end=kv_len_b[:, None, None],
+    )
+
+    def _b_ans(q_, k_, v_, b_):
+      out = self._attention_fn(q_, k_, v_, bias=b_, mask=mask_b)
+      valid_q = (jnp.arange(128)[None, :] < q_len_b[:, None])[:, :, None, None]
+      return out * valid_q
+
+    def _b_ref(q_, k_, v_, b_):
+      return jax.nn.dot_product_attention(
+          q_.astype(jnp.float32),
+          k_.astype(jnp.float32),
+          v_.astype(jnp.float32),
+          bias=b_.astype(jnp.float32),
+          is_causal=True,
+          query_seq_lengths=q_len_b,
+          key_value_seq_lengths=kv_len_b,
+          implementation="xla",
+      ).astype(jnp.bfloat16)
+
+    dout_b = jnp.ones_like(q_b)
+    out_ba, vjp_ba = jax.vjp(_b_ans, q_b, k_b, v_b, bias_b)
+    out_br, vjp_br = jax.vjp(_b_ref, q_b, k_b, v_b, bias_b)
+    test_base.test_utils.assert_trees_all_close(
+        out_ba, out_br, atol=0.02, rtol=0.02
+    )
+    test_base.test_utils.assert_trees_all_close(
+        vjp_ba(dout_b), vjp_br(dout_b), atol=0.04, rtol=0.04
+    )
+
+    # 4. `fold_q_sequence_heads=True` forward + VJP.
+    fold_impl = fa.PallasMosaicGpuFlashAttention(
+        config=fa.ConfigSM80(
+            block_q=64, block_kv=64, num_stages=2, num_wgs=1,
+            fold_q_sequence_heads=True,
+        ),
+        vjp=vjp_fn,
+    )
+    self._run_test(
+        q_shape=(2, 64, 8, 64),
+        kv_shape=(2, 128, 2, 64),
+        dtype=jnp.bfloat16,
+        impl=fold_impl,
+        ref_impl=base.DotProductAttention(),
+        atol=0.02,
+        atol_grads=0.04,
+    )
+
+    # 5. `head_dim > 256` VJP raises `NotImplementedError`.
+    q_512 = jnp.ones((1, 64, 2, 512), jnp.bfloat16)
+    with self.assertRaises(NotImplementedError):
+      _, vjp_512 = jax.vjp(self._attention_fn, q_512, q_512, q_512)
+      vjp_512(q_512)
 
 
 # TODO: Add manual partitioning test.

@@ -1,0 +1,262 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Per-shard input preparation and sharded runner for routing_gmm tests."""
+
+import dataclasses
+from typing import Self
+
+import jax
+from jax import sharding
+import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.gmm import kernel
+from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
+from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
+from tokamax._src.ops.experimental.routing_moe.test.common import test_util
+
+P = sharding.PartitionSpec
+FP8 = jnp.float8_e4m3fn
+
+
+def _local_weight(
+    w: jax.Array,
+    *,
+    group_offset: int,
+    num_local_experts: int,
+    quantize: bool,
+    fused_gate_up: bool = False,
+    quant_block_size: int | None = None,
+    quant_dtype: jnp.dtype | None = None,
+) -> arg.SingleWeightWrapper[jax.Array]:
+  """Slices this shard's experts from `w` and optionally quantizes them."""
+  w = w[group_offset : group_offset + num_local_experts]
+  scale = None
+  if quantize:
+    w, scale = test_inputs.sub_channel_quantize(
+        w, quant_dtype or jnp.float8_e4m3fn, quant_block_size
+    )
+  return arg.SingleWeightWrapper.create(w, scale, fused_gate_up=fused_gate_up)
+
+
+@dataclasses.dataclass(frozen=True)
+class GmmCase:
+  """Inputs of a gate/up then down routing_gmm pair on one shard.
+
+  Attributes:
+    x: `[num_tokens, size_k]` activations in token order.
+    w1: `[num_local_experts, size_k, size_n]` fused gate/up weights.
+    w2: `[num_local_experts, size_n // 2, size_k]` down weights.
+    routing: Routing of the rows, restricted to this shard's experts.
+  """
+
+  x: jax.Array
+  w1: arg.SingleWeightWrapper[jax.Array]
+  w2: arg.SingleWeightWrapper[jax.Array]
+  routing: test_inputs.Routing
+
+  @property
+  def x_sorted(self) -> jax.Array:
+    """`x` permuted into sorted-row order."""
+    return self.x[self.routing.gather_indices]
+
+  @property
+  def x_compact(self) -> arg.ActivationWrapper[jax.Array]:
+    """`x` in the compact layout."""
+    return input_pack.input_pack(self.x)
+
+  @property
+  def x_sorted_compact(self) -> arg.ActivationWrapper[jax.Array]:
+    """`x_sorted` in the compact layout."""
+    return input_pack.input_pack(self.x_sorted)
+
+  @classmethod
+  def make_case(
+      cls,
+      case: test_cases.Case,
+      *,
+      quant_w1: bool = False,
+      quant_w2: bool = False,
+      group_offset: int = 0,
+      num_skipped: int = 0,
+      balanced_ep: int | None = None,
+  ) -> Self:
+    """Builds the layer inputs of `case` for the shard at `group_offset`."""
+    test_util.check_gmm_supported(case)
+    shape = dataclasses.replace(
+        case.shape, intermediate_size=case.local_intermediate_size
+    )
+    quant_shape = shape.w_dtype is not None
+    layer_inputs = test_inputs.MoEInputs.generate(
+        shape,
+        case.num_tokens,
+        max_to_mean_load=case.max_to_mean_load,
+        num_skipped=num_skipped,
+        force_expert=None if num_skipped or balanced_ep else group_offset,
+    )
+    if balanced_ep is not None:
+      topk_indices = test_inputs.balanced_topk_indices(
+          jax.random.key(1),
+          case.num_tokens,
+          shape.top_k,
+          shape.num_experts,
+          balanced_ep,
+      )
+    else:
+      _, topk_indices = test_inputs.top_k(
+          layer_inputs.gating_output, shape.top_k
+      )
+    local = dict(
+        group_offset=group_offset,
+        num_local_experts=case.num_local_experts,
+    )
+    return cls(
+        x=layer_inputs.hidden_states,
+        w1=_local_weight(
+            layer_inputs.w1,
+            quantize=quant_w1 or quant_shape,
+            fused_gate_up=True,
+            **local,
+            quant_block_size=shape.w_quant_block_size,
+            quant_dtype=shape.w_dtype,
+        ),
+        w2=_local_weight(
+            layer_inputs.w2,
+            quantize=quant_w2 or quant_shape,
+            **local,
+            quant_block_size=shape.w_quant_block_size,
+            quant_dtype=shape.w_dtype,
+        ),
+        routing=test_inputs.Routing.make_routing(
+            topk_indices, shape.num_experts, **local
+        ),
+    )
+
+
+def to_large_layout(out: arg.ActivationWrapper[jax.Array]) -> jax.Array:
+  """Reshapes `out` to the `[rows, cols]` layout."""
+  return out.data.reshape(out.spec.large_shape)
+
+
+def split_scaled_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+  """Splits compact quantized output rows into payload values and f32 scales.
+
+  Args:
+    x: Compact output array of shape `[m, chunks + 1, 4, lanes]` from
+      `routing_gmm`.
+
+  Returns:
+    A `(payload, scales)` pair where `payload` has shape `[m, chunks * 4 *
+    lanes]` with dtype `x.dtype` and `scales` has shape `f32[m, lanes]`.
+  """
+  # The scale bytes are not fp8 values: moved as fp8, a NaN-pattern byte may
+  # come back canonicalized, so they are bytes from the start.
+  scale_bytes = jax.lax.bitcast_convert_type(x, jnp.uint8)[:, -1]
+  scales = jax.lax.bitcast_convert_type(
+      jnp.swapaxes(scale_bytes, 1, 2), jnp.float32
+  )
+  payload = x[:, :-1]
+  return payload.reshape(layout_util.to_large_shape(payload.shape)), scales
+
+
+def dequantize_rows(x: jax.Array) -> jax.Array:
+  """Dequantizes compact `routing_gmm` output rows to `f32[m, cols]`.
+
+  Args:
+    x: Compact output array of shape `[m, chunks + 1, 4, lanes]` from
+      `routing_gmm`.
+
+  Returns:
+    Dequantized `f32[m, cols]` array where column `c` is scaled by lane
+    `c % lanes`.
+  """
+  payload, scales = split_scaled_rows(x)
+  m, lanes = scales.shape
+  chunks = payload.astype(jnp.float32).reshape(m, -1, lanes)
+  return (chunks * scales[:, None, :]).reshape(m, -1)
+
+
+@jax.jit(
+    static_argnames=(
+        "mesh",
+        "topk",
+        "remote_scatter",
+        "all_to_all",
+        "out_dtype",
+    )
+)
+def sharded_gmm_unpermute(
+    x: arg.ActivationWrapper[jax.Array],
+    w: jax.Array,
+    group_sizes: jax.Array,
+    scatter_indices: jax.Array,
+    *,
+    mesh: sharding.Mesh,
+    topk: int | None = None,
+    remote_scatter: bool = True,
+    all_to_all: bool = False,
+    out_dtype: jax.typing.DTypeLike | None = None,
+) -> jax.Array:
+  """Runs EP-sharded `routing_gmm` scatter, with fused or unfused all-to-all."""
+  axis = test_cases.EP_AXIS
+  ep_size = mesh.shape[axis]
+  num_experts = w.shape[0]
+  group_offset = jnp.arange(0, num_experts, num_experts // ep_size)
+  remote_axis = axis if remote_scatter else None
+
+  def unpermute(
+      x: arg.ActivationWrapper[jax.Array],
+      w: jax.Array,
+      group_sizes: jax.Array,
+      offset: jax.Array,
+      scatter_indices: jax.Array,
+  ) -> jax.Array:
+    out_format = None
+    if out_dtype is not None:
+      quant = (
+          out_format_lib.LaneStrided()
+          if jnp.dtype(out_dtype).itemsize == 1
+          else None
+      )
+      out_format = out_format_lib.ActivationFormat(dtype=out_dtype, quant=quant)
+    out = kernel.routing_gmm(
+        x,
+        arg.SingleWeightWrapper.create(w),
+        group_sizes,
+        group_offset=offset,
+        scatter=arg.RoutingWrapper.create(
+            scatter_indices, remote_axis=remote_axis
+        ),
+        out_format=out_format,
+    ).data
+    if remote_scatter or not all_to_all:
+      return out
+    assert topk is not None
+    num_tokens, topk_per_shard = x.spec.row_size // topk, topk // ep_size
+    row_shape = out.shape[1:]
+    out = out[: num_tokens * topk_per_shard]
+    out = out.reshape((num_tokens, topk_per_shard) + row_shape)
+    out = jax.lax.all_to_all(out, axis, split_axis=0, concat_axis=1, tiled=True)
+    return out.reshape((-1,) + row_shape)
+
+  return jax.shard_map(
+      unpermute,
+      mesh=mesh,
+      in_specs=(P(), P(axis), P(), P(axis), P()),
+      out_specs=P(axis),
+      check_vma=False,
+  )(x, w, group_sizes, group_offset, scatter_indices)

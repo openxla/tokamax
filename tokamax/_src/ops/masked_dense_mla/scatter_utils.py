@@ -100,7 +100,7 @@ def _scatter_kernel(
   def block_index(step):
     return step * plan.blocks_per_round + block_slot
 
-  def body(dst_ref, src_buf):
+  def body(unused_step, dst_ref, src_buf):
     dst_rows = dst_ref[...]
     copies = []
     for i in range(plan.lanes_per_block):
@@ -140,6 +140,7 @@ def _scatter_kernel(
               lambda r: (block_index(r), 0),
           ),
       ),
+      _explicit_indices=True,
   )(dst_hbm_ref, src_words)
 
 

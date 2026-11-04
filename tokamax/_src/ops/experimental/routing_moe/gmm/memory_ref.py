@@ -16,9 +16,10 @@
 """Module that encapsulates memory references, BlockSpecs, and DMA logic."""
 
 import abc
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, override
+from typing import Any, ClassVar, Self, override
 
 import jax
 from jax import lax
@@ -27,6 +28,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
+from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 
@@ -34,7 +38,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
 
-def map_memory_constraint(obj, memory_space):
+def map_memory_constraint[T](obj: T, memory_space: pltpu.MemorySpace) -> T:
   return jax.tree.map(
       lambda x: pltpu.with_memory_space_constraint(x, memory_space), obj
   )
@@ -60,7 +64,7 @@ class AbstractWeightRef(abc.ABC):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SingleWeightRef[T](AbstractWeightRef):
-  """Dataclass for a single weights."""
+  """Weight, optional scale, and optional bias references for one projection."""
 
   weight: T
   scale: T | None
@@ -87,7 +91,7 @@ class SingleWeightRef[T](AbstractWeightRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class FusedWeightsRef[T](AbstractWeightRef):
-  """Dataclass for gate and up weights used in fused activation."""
+  """Gate and up weight references for a fused gated activation."""
 
   gate: SingleWeightRef[T]
   up: SingleWeightRef[T]
@@ -114,7 +118,7 @@ class _BypassBufferedRef(pltpu.BufferedRef):
   # NOTE: This is extremely hacky and only here until JAX version update
   # arrives which WILL eliminate the need for this hack.
   # TODO: Remove this after JAX version update.
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     # pallas doesn't allow you to set buffer_count > 2 for output refs, so
     # we override to bypass this check.
     pass
@@ -133,7 +137,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
 
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
-  def bind_idx_ref(self, idx_bref):
+  def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
     return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
 
   @classmethod
@@ -142,8 +146,8 @@ class RoutingBufferedRef(_BypassBufferedRef):
       *args: Any,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
-      **kwargs,
-  ):
+      **kwargs: Any,
+  ) -> Self:
     standard_ref = _BypassBufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
@@ -153,6 +157,41 @@ class RoutingBufferedRef(_BypassBufferedRef):
             for f in dataclasses.fields(pltpu.BufferedRef)
         },
     )
+
+  def read_vmem(
+      self,
+      vmem_ref: hijax.TransformedRef,
+      grid_indices: GridIndices,
+  ) -> jax.Array:
+    """Loads the input tile at `grid_indices` from VMEM into the large layout.
+
+    Args:
+      vmem_ref: VMEM slot reference for the tile's active rows.
+      grid_indices: Grid coordinates `(n_id, gm_id, k_id)` of the tile.
+
+    Returns:
+      The loaded activation tile in `[rows, tile_k]` large layout.
+    """
+    del grid_indices
+    return layout_util.load_compact_to_large(vmem_ref, self.cfg.plan.tile_k)
+
+  def write_vmem(
+      self,
+      vmem_ref: hijax.TransformedRef,
+      value: jax.Array,
+      grid_indices: GridIndices,
+  ) -> None:
+    """Stores the computed tile at `grid_indices` into VMEM for copy-out.
+
+    The written tile is copied out to HBM at the next pipeline step.
+
+    Args:
+      vmem_ref: VMEM slot reference for the tile's `value.shape[0]` active rows.
+      value: Computed tile result in `[rows, tile_n]` large layout.
+      grid_indices: Grid coordinates `(n_id, gm_id, k_id)` of the tile.
+    """
+    del grid_indices
+    layout_util.store_large_to_compact(vmem_ref, value.astype(vmem_ref.dtype))
 
   @abc.abstractmethod
   def branchless_copy_in(
@@ -270,8 +309,8 @@ class IndexBufferedRef(pltpu.BufferedRef):
       cfg: config.RoutingGmmConfig,
       metadata_ref: metadata.AbstractMetadataRef,
       fetch_offset: int,
-      **kwargs,
-  ):
+      **kwargs: Any,
+  ) -> Self:
     standard_ref = pltpu.BufferedRef.create(*args, **kwargs)
     return cls(
         metadata_ref=metadata_ref,
@@ -313,7 +352,9 @@ class IndexBufferedRef(pltpu.BufferedRef):
     return aligned_start, aligned_buffer_start, aligned_end - aligned_start
 
   @override
-  def copy_in(self, idx_hbm_ref, grid_indices):
+  def copy_in(
+      self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.is_input
     assert len(grid_indices) == 3
     sem_recvs = self.sem_recvs
@@ -333,7 +374,9 @@ class IndexBufferedRef(pltpu.BufferedRef):
     ).start()
 
   @override
-  def wait_in(self, idx_hbm_ref, grid_indices):
+  def wait_in(
+      self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     assert self.is_input
     assert len(grid_indices) == 3
     sem_recvs = self.sem_recvs
@@ -420,6 +463,19 @@ class BranchlessBufferedRef(RoutingBufferedRef):
           sem=sem,
       ).start()
 
+  def _copy_out_slot_ref(self, slot: jax.Array | int) -> hijax.TransformedRef:
+    """Returns the VMEM slot reference read by `branchless_copy_out`."""
+    return pltpu.annotate(self._window_ref_at(slot), no_hazard_no_deps=True)
+
+  def _prepare_copy_out_row(
+      self,
+      vmem_src: hijax.TransformedRef,
+      grid_indices: GridIndices,
+      row: int,
+  ) -> None:
+    """Runs immediately before row `row`'s output DMA is issued."""
+    del vmem_src, grid_indices, row
+
   @override
   def branchless_copy_out(
       self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
@@ -430,10 +486,11 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
     rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
     sem = self.sem_sends.at[slot]
-    vmem_src = pltpu.annotate(self._window_ref_at(slot), no_hazard_no_deps=True)
+    vmem_src = self._copy_out_slot_ref(slot)
     offset = self._idx_offset(grid_indices, rows_ds)
 
     for r in range(self.cfg.plan.tile_m):
+      self._prepare_copy_out_row(vmem_src, grid_indices, r)
       live = r < rows_ds.size
       size = jnp.where(live, 1, 0)
       src = vmem_src.at[pl.ds(r, size), pl.ds(0, cols_ds.size)]
@@ -450,7 +507,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       live: jax.Array,
       sem: Any,
   ) -> None:
-    """Starts the DMA of one VMEM row `src` to output row `idx`."""
+    """Starts the DMA of one VMEM row src to output row idx."""
     del live
     pltpu.make_async_copy(
         src_ref=src_ref,
@@ -462,12 +519,15 @@ class BranchlessBufferedRef(RoutingBufferedRef):
   def branchless_wait_in(
       self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
   ) -> None:
+    del src_ref
     assert self.sem_recvs is not None
 
     slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
     rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
-    # Only the byte count matters to the wait, so src_ref stands in for both.
-    copied = src_ref.at[pl.ds(0, rows_ds.size), cols_ds]
+    # Only the byte count matters to the wait.
+    copied = self._window_ref_at(slot).at[
+        pl.ds(0, rows_ds.size), pl.ds(0, cols_ds.size)
+    ]
     pltpu.make_async_copy(copied, copied, self.sem_recvs.at[slot]).wait()
 
   @override
@@ -481,7 +541,9 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     copied = dst_ref.at[pl.ds(0, rows_ds.size), cols_ds]
     pltpu.make_async_copy(copied, copied, self.sem_sends.at[slot]).wait()
 
-  def _no_op(self, ref, grid_indices):
+  def _no_op(
+      self, ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
     del ref, grid_indices
 
   copy_in = copy_out = wait_in = wait_out = _no_op
@@ -510,8 +572,8 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
       live: jax.Array,
       sem: Any,
   ) -> None:
-    assert self.cfg.scatter is not None
-    axis = self.cfg.scatter.remote_axis
+    assert self.cfg.spec.scatter is not None
+    axis = self.cfg.spec.scatter.remote_axis
     assert axis is not None
     assert self.recv_sem is not None
     # Unsigned lax div/rem skip the sign fixups of int32 jnp.divmod.
@@ -532,8 +594,8 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
   @override
   def prologue(self) -> None:
     # Every peer's output buffer must exist before the first row lands.
-    assert self.cfg.scatter is not None
-    axis, ep = self.cfg.scatter.remote_axis, self.cfg.dim.size_ep
+    assert self.cfg.spec.scatter is not None
+    axis, ep = self.cfg.spec.scatter.remote_axis, self.cfg.spec.size_ep
     assert axis is not None
 
     def signal_all(sem):
@@ -549,6 +611,191 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
     # Wait for every row owned here before the output is read.
     recv = dst_ref.at[pl.ds(0, self.cfg.out.spec.row_size)]
     pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class QuantizedBufferedRef(BranchlessBufferedRef):
+  """BufferedRef that quantizes output tiles right before copying them out.
+
+  `write_vmem` computes per-lane scales as the result leaves the MXU and
+  stashes the result (in `stash_dtype`) and scales in VMEM. At the next step,
+  `branchless_copy_out` quantizes the stashed tile into the output slot
+  `num_sublanes` rows at a time, immediately before issuing those rows' DMAs.
+
+  Each output chunk is stashed as its own compact `stash_dtype` tile, so
+  loading `num_sublanes` rows of it and casting them packs them into
+  `num_sublanes` compact output rows.
+
+  Attributes:
+    stash_count: Number of tiles stashed at once. A tile is quantized one step
+      after it is computed, so tiles alternate between two stash slots.
+    stash_dtype: Dtype in which results wait to be quantized.
+    acc: VMEM buffer `[stash_count, num_logical_chunks, tile_m, ratio, packing,
+      lanes]` of `stash_dtype` results, one compact tile per output chunk.
+    scale: VMEM buffer `f32[stash_count, tile_m, lanes]` of per-lane scales.
+    inv_scale: VMEM buffer `u32[stash_count, ratio * tile_m, lanes]` of
+      `ratio` packed `stash_dtype` copies of `1 / scale` per row.
+  """
+
+  stash_count: ClassVar[int] = 2
+  stash_dtype: ClassVar[jnp.dtype] = jnp.dtype(jnp.bfloat16)
+
+  acc: hijax.TransformedRef | None = None
+  scale: hijax.TransformedRef | None = None
+  inv_scale: hijax.TransformedRef | None = None
+
+  @classmethod
+  @override
+  def create(
+      cls,
+      *args: Any,
+      metadata_ref: metadata.AbstractMetadataRef,
+      cfg: config.RoutingGmmConfig,
+      **kwargs: Any,
+  ) -> Self:
+    """Creates a `QuantizedBufferedRef` and allocates VMEM for outputs."""
+    bref = super().create(*args, metadata_ref=metadata_ref, cfg=cfg, **kwargs)
+    if not bref.is_output:
+      return bref
+    lanes, tile_m = cfg.tpu_info.num_lanes, cfg.plan.tile_m
+    ratio = bref._stash_ratio
+    chunk_shape = layout_util.to_compact_shape(
+        (tile_m, layout_util.get_packing(cfg.out.spec.dtype) * lanes),
+        cls.stash_dtype,
+    )
+    count, num_chunks = cls.stash_count, cfg.out.spec.num_logical_chunks
+    return dataclasses.replace(
+        bref,
+        acc=pltpu.VMEM((count, num_chunks, *chunk_shape), cls.stash_dtype),
+        scale=pltpu.VMEM((count, tile_m, lanes), jnp.float32),
+        inv_scale=pltpu.VMEM((count, ratio * tile_m, lanes), jnp.uint32),
+    )
+
+  @override
+  def branchless_copy_in(
+      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> None:
+    del src_ref, grid_indices
+    # TODO: Support pre-quantized inputs.
+    raise AssertionError(
+        "QuantizedBufferedRef does not support branchless_copy_in yet."
+    )
+
+  @override
+  def read_vmem(
+      self, vmem_ref: hijax.TransformedRef, grid_indices: GridIndices
+  ) -> jax.Array:
+    del vmem_ref, grid_indices
+    # TODO: Support pre-quantized inputs.
+    raise AssertionError("QuantizedBufferedRef does not support read_vmem yet.")
+
+  @override
+  def write_vmem(
+      self,
+      vmem_ref: hijax.TransformedRef,
+      value: jax.Array,
+      grid_indices: GridIndices,
+  ) -> None:
+    del vmem_ref
+    assert (
+        self.acc is not None
+        and self.scale is not None
+        and self.inv_scale is not None
+        and self.cfg.out.spec.quant is not None
+    )
+    # Compute per-lane scales immediately as the result leaves the MXU.
+    value = value.astype(jnp.float32)
+    scale, inv_scale = quant_util.compute_scale(
+        value, self.cfg.out.spec.dtype, self.cfg.out.spec.quant
+    )
+    slot = self._stash_slot(grid_indices[1])
+    rows = value.shape[0]
+    stash = value.astype(self.stash_dtype)
+    for chunk, chunk_value in enumerate(
+        jnp.split(stash, self.cfg.out.spec.num_logical_chunks, axis=-1)
+    ):
+      layout_util.store_large_to_compact(
+          self.acc.at[slot, chunk, :rows], chunk_value
+      )
+    self.scale[slot, :rows] = scale
+    packed_inv = pltpu.pack_elementwise(
+        [inv_scale, inv_scale], packed_dtype=self.stash_dtype
+    )
+    ratio = self._stash_ratio
+    for word in range(ratio):
+      self.inv_scale[slot, pl.ds(word, rows, stride=ratio)] = packed_inv
+
+  @override
+  def _copy_out_slot_ref(self, slot: jax.Array | int) -> hijax.TransformedRef:
+    # Row DMAs read the rows quantized just before them, so preserve store
+    # ordering instead of annotating no_hazard_no_deps.
+    return self._window_ref_at(slot)
+
+  @override
+  def _prepare_copy_out_row(
+      self,
+      vmem_src: hijax.TransformedRef,
+      grid_indices: GridIndices,
+      row: int,
+  ) -> None:
+    if row % self.cfg.tpu_info.num_sublanes != 0:
+      return
+    gm_id = grid_indices[1]
+    inv_scale, scale = self._load_scales(gm_id, row)
+    compute.quantize_rows(
+        vmem_src,
+        row,
+        scale,
+        inv_scale,
+        functools.partial(self._load_chunk, gm_id, row),
+        self.cfg.out,
+    )
+
+  @property
+  def _stash_ratio(self) -> int:
+    """Returns u32 words of `stash_dtype` per u32 word of the output dtype."""
+    packing = layout_util.get_packing(self.cfg.out.spec.dtype)
+    return packing // layout_util.get_packing(self.stash_dtype)
+
+  def _stash_slot(self, gm_id: jax.Array | int) -> jax.Array:
+    # Tiles cycle through the stash slots; adding stash_count keeps gm_id
+    # non-negative.
+    return lax.rem(gm_id + self.stash_count, self.stash_count)
+
+  def _load_scales(
+      self, gm_id: jax.Array | int, first_row: int
+  ) -> tuple[jax.Array, jax.Array]:
+    """Loads `num_sublanes` rows of `1 / scale` and f32 `scale`."""
+    assert self.scale is not None and self.inv_scale is not None
+    slot = self._stash_slot(gm_id)
+    ratio, sublanes = self._stash_ratio, self.cfg.tpu_info.num_sublanes
+    inv_scale = pltpu.bitcast(
+        self.inv_scale[slot, pl.ds(ratio * first_row, ratio * sublanes)],
+        self.stash_dtype,
+    )
+    return inv_scale, self.scale[slot, pl.ds(first_row, sublanes)]
+
+  def _load_chunk(
+      self, gm_id: jax.Array | int, first_row: int, chunk: int
+  ) -> jax.Array:
+    """Loads `num_sublanes` rows of stashed values for `chunk`."""
+    assert self.acc is not None
+    slot = self._stash_slot(gm_id)
+    ratio, sublanes = self._stash_ratio, self.cfg.tpu_info.num_sublanes
+    words = self.acc.at[slot, chunk].bitcast(jnp.uint32)
+    words = words.reshape(-1, self.cfg.tpu_info.num_lanes)
+    return pltpu.bitcast(
+        words[pl.ds(ratio * first_row, ratio * sublanes)], self.stash_dtype
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RemoteQuantizedBufferedRef(
+    QuantizedBufferedRef, RemoteBranchlessBufferedRef
+):
+  """Quantized output ref that DMAs each row to the device that owns it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -632,8 +879,12 @@ class PipelineBlockSpecs:
   index_map_provider: PipelineIndexMaps
 
   def _act_spec(
-      self, hbm_shape: tuple[int, ...], num_tiles: int, index_map
+      self,
+      hbm_shape: tuple[int, ...],
+      num_tiles: int,
+      index_map: Callable[..., tuple[pl.Slice, pl.Slice, int, int]],
   ) -> pl.BlockSpec:
+    """Builds the VMEM BlockSpec for a compact activation tensor."""
     tile_chunks = hbm_shape[1] // num_tiles
     num_tile_chunks = layout_util.to_bank_conflict_aware_stride(tile_chunks)
     block_shape = (
@@ -654,7 +905,7 @@ class PipelineBlockSpecs:
   def get_x_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the input activation tensor."""
     return self._act_spec(
-        self.cfg.x.spec.compact_shape,
+        self.cfg.x.spec.physical_compact_shape,
         self.cfg.num_k,
         self.index_map_provider.x_index,
     )
@@ -662,14 +913,14 @@ class PipelineBlockSpecs:
   def get_out_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the output activation tensor."""
     return self._act_spec(
-        self.cfg.out.spec.compact_shape,
+        self.cfg.out.spec.physical_compact_shape,
         self.cfg.num_n,
         self.index_map_provider.out_index,
     )
 
-  def get_weight_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+  def get_weight_spec(self, tile_k: int, tile_n: int) -> pl.BlockSpec:
     """Returns the BlockSpec for an expert weight tensor."""
-    block_shape = (None, cfg.tile_k, cfg.tile_n)
+    block_shape = (None, tile_k, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.weight_index,
@@ -681,9 +932,13 @@ class PipelineBlockSpecs:
         ),
     )
 
-  def get_scale_spec(self, cfg: config.SingleGmmConfig) -> pl.BlockSpec:
+  def get_scale_spec(
+      self, w_spec: spec_lib.WeightSpec, tile_k: int, tile_n: int
+  ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
-    block_shape = (None, 1, 1, cfg.tile_n)
+    assert w_spec.quant is not None
+    num_blocks = tile_k // w_spec.quant.block_size
+    block_shape = (None, num_blocks, 1, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
@@ -718,37 +973,34 @@ class PipelineInputs[T]:
   """Pipelined input parameter bundle for the routing GMM kernel.
 
   Devoid of stateful data management so emit_pipeline and inner_pipeline can
-  remains in the main orchestrators.
+  remain in the main orchestrators.
 
   Attributes:
     x: Input activation reference, BlockSpec, or BufferedRef.
-    w: Tuple of expert weight references, BlockSpec trees, or BufferedRef trees
-      per GMM stage.
+    w: Expert weight reference, BlockSpec tree, or BufferedRef tree.
+    w2: Optional second expert weight reference, BlockSpec tree, or BufferedRef
+      tree for fused gate/up and down execution.
     gather_idx: Row indices used by x. Set to None when DIRECT mode is used.
     scatter_idx: Row indices used by out. Set to None when DIRECT mode is used.
   """
 
   x: T
-  w: tuple[AbstractWeightRef, ...]
+  w: AbstractWeightRef
+  w2: AbstractWeightRef | None = None
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
-  def transform_for_pipeline(
-      self, cfg: config.RoutingGmmConfig
-  ):
+  def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
-
-    w_fused_list = []
-    for w_ref, stage in zip(self.w, cfg.stages, strict=True):
-      if stage.fuse_act is None:
-        w_fused_list.append(w_ref)
-      else:
-        assert isinstance(w_ref, SingleWeightRef)
-        w_up = jax.tree.map(
-            lambda ref, n=stage.size_out_n: ref.at[..., n:], w_ref
-        )
-        w_fused_list.append(FusedWeightsRef(gate=w_ref, up=w_up))
-    return dataclasses.replace(self, w=tuple(w_fused_list))
+    if not cfg.spec.is_fused_act:
+      return self
+    assert isinstance(self.w, SingleWeightRef)
+    n = cfg.spec.w.out_size // 2
+    w_fused = FusedWeightsRef(
+        gate=self.w,
+        up=jax.tree.map(lambda ref: ref.at[..., n:], self.w),
+    )
+    return dataclasses.replace(self, w=w_fused)
 
 
 @jax.tree_util.register_dataclass
@@ -757,7 +1009,7 @@ class PipelineAllocs:
   """BufferedRef allocations for the routing GMM pipeline.
 
   Devoid of stateful data management so emit_pipeline and inner_pipeline can
-  remains in the main orchestrators.
+  remain in the main orchestrators.
 
   Attributes:
     inputs: Pipelined input BufferedRef bundle.
@@ -774,7 +1026,7 @@ class PipelineAllocs:
       out_hbm_ref: hijax.TransformedRef,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
-  ):
+  ) -> Self:
     """Creates BufferedRef allocations for all pipeline inputs and outputs.
 
     Args:
@@ -790,41 +1042,73 @@ class PipelineAllocs:
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
     x_hbm_ref = in_hbm_ref.x
 
-    w_brefs = []
-    for w_hbm_ref, stage in zip(in_hbm_ref.w, cfg.stages, strict=True):
+    def _make_weight_bref(
+        w_hbm_ref: AbstractWeightRef,
+        w_spec: spec_lib.WeightSpec,
+        tile_k: int,
+        tile_n: int,
+        *,
+        fuse_act: bool = False,
+    ) -> AbstractWeightRef:
       assert isinstance(w_hbm_ref, SingleWeightRef)
       scale_bref = None
-      if stage.w.has_scale:
+      if w_spec.has_scale:
         assert w_hbm_ref.scale is not None
         scale_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_scale_spec(stage),
+            spec=pipeline_block_specs.get_scale_spec(w_spec, tile_k, tile_n),
             dtype_or_type=w_hbm_ref.scale.dtype,
             buffer_count=cfg.plan.num_w_buffers,
             use_lookahead=True,
             grid_rank=3,
         )
       weight_bref = pltpu.BufferedRef.input(
-          spec=pipeline_block_specs.get_weight_spec(stage),
+          spec=pipeline_block_specs.get_weight_spec(tile_k, tile_n),
           dtype_or_type=w_hbm_ref.weight.dtype,
           buffer_count=cfg.plan.num_w_buffers,
           use_lookahead=True,
           grid_rank=3,
       )
       w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=None)
-      if stage.fuse_act is not None:
+      if fuse_act:
         w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
-      w_brefs.append(w_bref)
+      return w_bref
 
-    def _get_buffered_ref(mode: config.RoutingMode) -> type[RoutingBufferedRef]:
-      match mode:
-        case config.RoutingMode.LOCAL:
+    w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
+    w_bref = _make_weight_bref(
+        in_hbm_ref.w,
+        cfg.spec.w,
+        cfg.plan.tile_k,
+        w_tile_n,
+        fuse_act=cfg.spec.is_fused_act,
+    )
+    w2_bref = None
+    if cfg.spec.w2 is not None:
+      assert in_hbm_ref.w2 is not None and cfg.plan.tile_k2 is not None
+      w2_bref = _make_weight_bref(
+          in_hbm_ref.w2,
+          cfg.spec.w2,
+          cfg.plan.tile_k2,
+          cfg.plan.tile_n,
+      )
+
+    def _get_buffered_ref(
+        mode: config.RoutingMode, *, quantized: bool = False
+    ) -> type[RoutingBufferedRef]:
+      match mode, quantized:
+        case config.RoutingMode.LOCAL, False:
           return BranchlessBufferedRef
-        case config.RoutingMode.REMOTE:
+        case config.RoutingMode.LOCAL, True:
+          return QuantizedBufferedRef
+        case config.RoutingMode.REMOTE, False:
           return RemoteBranchlessBufferedRef
-        case config.RoutingMode.DIRECT:
+        case config.RoutingMode.REMOTE, True:
+          return RemoteQuantizedBufferedRef
+        case config.RoutingMode.DIRECT, False:
           return BranchedBufferedRef
         case _:
-          raise NotImplementedError(f"Unsupported routing mode: {mode}.")
+          raise NotImplementedError(
+              f"Unsupported routing mode: {mode} ({quantized=})."
+          )
 
     x_bref = _get_buffered_ref(cfg.x.mode).input(
         spec=pipeline_block_specs.get_x_spec(),
@@ -834,7 +1118,9 @@ class PipelineAllocs:
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    out_bref = _get_buffered_ref(cfg.out.mode).output(
+    out_bref = _get_buffered_ref(
+        cfg.out.mode, quantized=cfg.out.spec.quant is not None
+    ).output(
         spec=pipeline_block_specs.get_out_spec(),
         dtype_or_type=out_hbm_ref.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
@@ -878,7 +1164,8 @@ class PipelineAllocs:
     return cls(
         inputs=PipelineInputs(
             x=x_bref,
-            w=tuple(w_brefs),
+            w=w_bref,
+            w2=w2_bref,
             gather_idx=gather_bref,
             scatter_idx=scatter_bref,
         ),
@@ -898,7 +1185,7 @@ class PipelineAllocs:
     return jax.tree.map(
         lambda bref: bref.spec,
         self.inputs,
-        is_leaf=lambda node: isinstance(node, pltpu.BufferedRefBase),
+        is_leaf=lambda node: isinstance(node, pltpu.BufferedRef),
     )
 
   @property

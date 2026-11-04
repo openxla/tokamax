@@ -33,6 +33,7 @@ from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import triton_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.triangle_multiplication import base
+from tokamax._src.ops.triangle_multiplication import triton_vjp as vjp
 import triton
 import triton.language as tl
 
@@ -70,14 +71,14 @@ class Config:
       constraints as `block_m`.
     epilogue_num_warps: Optional num_warps override for the epilogue kernel.
     epilogue_num_stages: Optional num_stages override for the epilogue kernel.
-    prologue_persistent: Whether to use the persistent TMA prologue kernel. If
-      `None`, it is used when supported. Ignored on GPUs other than SM90 (it
-      exceeds the SM100 tensor memory limit for H=128), or if M is not a
-      multiple of `block_m`, or if min(C, H) < 64.
-    epilogue_persistent: Whether to use the persistent TMA epilogue kernel. If
-      `None`, it is used on SM90 and SM100. Ignored on GPUs without TMA
-      (pre-SM90), or if M is not a multiple of the epilogue block size, or if
-      min(C, H, D) < 64.
+    prologue_persistent: Whether to use a persistent prologue kernel (TMA on
+      SM90/SM100 when M is a multiple of `block_m` and min(C, H) >= 64, or
+      persistent pointer loop when max(C, H) <= 64). If `None`, enabled by
+      default.
+    epilogue_persistent: Whether to use a persistent epilogue kernel (TMA on
+      SM90/SM100 when M is a multiple of the epilogue block size and
+      min(C, H, D) >= 64, or persistent pointer loop when max(C, H, D) <= 64).
+      If `None`, enabled by default.
     ctas_per_sm: Number of persistent CTAs per SM when persistent is enabled.
   """
 
@@ -110,7 +111,10 @@ def _layer_norm_2d(
   mean = tl.sum(x_f32, axis=1) * (1.0 / dim_size)
   centered = x_f32 - mean[:, None]
   var = tl.sum(centered * centered, axis=1) * (1.0 / dim_size)
-  rstd = tl.rsqrt(var + eps)
+  if eps <= 0.0:
+    rstd = tl.where(var > 0.0, tl.rsqrt(var), 0.0)
+  else:
+    rstd = tl.rsqrt(var + eps)
   normed = centered * rstd[:, None]
   return normed * scale.to(tl.float32)[None, :] + offset.to(tl.float32)[None, :]
 
@@ -131,12 +135,26 @@ def _load_param_matrix(
 
 
 @triton.jit
-def _load_glu_in_weights(w_proj_ptr, w_gate_ptr, c_dim, h_dim: tl.constexpr):
+def _load_glu_in_weights(
+    w_proj_ptr,
+    w_gate_ptr,
+    c_dim: tl.constexpr,
+    h_dim: tl.constexpr,
+    dot_dtype: tl.constexpr,
+):
   """Loads the (C, H) left/right slices of the (C, 2, H) GLU weights."""
-  w_proj_l = _load_param_matrix(w_proj_ptr, c_dim, h_dim, 2 * h_dim)
-  w_gate_l = _load_param_matrix(w_gate_ptr, c_dim, h_dim, 2 * h_dim)
-  w_proj_r = _load_param_matrix(w_proj_ptr + h_dim, c_dim, h_dim, 2 * h_dim)
-  w_gate_r = _load_param_matrix(w_gate_ptr + h_dim, c_dim, h_dim, 2 * h_dim)
+  w_proj_l = _load_param_matrix(w_proj_ptr, c_dim, h_dim, 2 * h_dim).to(
+      dot_dtype
+  )
+  w_gate_l = _load_param_matrix(w_gate_ptr, c_dim, h_dim, 2 * h_dim).to(
+      dot_dtype
+  )
+  w_proj_r = _load_param_matrix(w_proj_ptr + h_dim, c_dim, h_dim, 2 * h_dim).to(
+      dot_dtype
+  )
+  w_gate_r = _load_param_matrix(w_gate_ptr + h_dim, c_dim, h_dim, 2 * h_dim).to(
+      dot_dtype
+  )
   return w_proj_l, w_gate_l, w_proj_r, w_gate_r
 
 
@@ -261,50 +279,93 @@ def _prologue_kernel(
     h_dim: tl.constexpr,
     block_m: tl.constexpr,
     is_even_m: tl.constexpr,
+    persistent_loop: tl.constexpr,
     dot_dtype: tl.constexpr,
     input_precision: tl.constexpr,
 ):
   """Fused LayerNorm_in + GLU + Mask + Transpose to (H, M)."""
-  pid = tl.program_id(axis=0)
-  offs_m = pid * block_m + tl.arange(0, block_m)
-  if is_even_m:
-    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
-  mask_m = offs_m < m
-
-  x_ptrs = x_ptr + offs_m[:, None] * c_dim + tl.arange(0, c_dim)[None, :]
-  if is_even_m:
-    x = tl.load(x_ptrs, eviction_policy="evict_first")
-    mask_val = tl.load(mask_ptr + offs_m, eviction_policy="evict_first")
-  else:
-    x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
-    mask_val = tl.load(mask_ptr + offs_m, mask=mask_m, other=0)
-
   ln_scale = _load_param_vector(ln_scale_ptr, c_dim)
   ln_offset = _load_param_vector(ln_offset_ptr, c_dim)
   w_proj_l, w_gate_l, w_proj_r, w_gate_r = _load_glu_in_weights(
-      w_proj_ptr, w_gate_ptr, c_dim, h_dim
+      w_proj_ptr, w_gate_ptr, c_dim, h_dim, dot_dtype
   )
-  _prologue_tile(
-      x,
-      mask_val,
-      offs_m,
-      ln_scale,
-      ln_offset,
-      w_proj_l,
-      w_gate_l,
-      w_proj_r,
-      w_gate_r,
-      left_out_ptr,
-      right_out_ptr,
-      m,
-      eps,
-      c_dim,
-      h_dim,
-      is_even_m,
-      "",  # eviction_policy
-      dot_dtype,
-      input_precision,
-  )
+  offs_c = tl.arange(0, c_dim)[None, :]
+
+  if persistent_loop:
+    num_tiles: tl.constexpr = tl.cdiv(m, block_m)
+    for tile_id in tl.range(
+        tl.program_id(axis=0), num_tiles, tl.num_programs(axis=0)
+    ):
+      offs_m = tile_id * block_m + tl.arange(0, block_m)
+      if is_even_m:
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
+      mask_m = offs_m < m
+
+      x_ptrs = x_ptr + offs_m[:, None] * c_dim + offs_c
+      if is_even_m:
+        x = tl.load(x_ptrs, eviction_policy="evict_first")
+        mask_val = tl.load(mask_ptr + offs_m, eviction_policy="evict_first")
+      else:
+        x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+        mask_val = tl.load(mask_ptr + offs_m, mask=mask_m, other=0)
+
+      _prologue_tile(
+          x,
+          mask_val,
+          offs_m,
+          ln_scale,
+          ln_offset,
+          w_proj_l,
+          w_gate_l,
+          w_proj_r,
+          w_gate_r,
+          left_out_ptr,
+          right_out_ptr,
+          m,
+          eps,
+          c_dim,
+          h_dim,
+          is_even_m,
+          "evict_first",  # eviction_policy
+          dot_dtype,
+          input_precision,
+      )
+  else:
+    pid = tl.program_id(axis=0)
+    offs_m = pid * block_m + tl.arange(0, block_m)
+    if is_even_m:
+      offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
+    mask_m = offs_m < m
+
+    x_ptrs = x_ptr + offs_m[:, None] * c_dim + offs_c
+    if is_even_m:
+      x = tl.load(x_ptrs, eviction_policy="evict_first")
+      mask_val = tl.load(mask_ptr + offs_m, eviction_policy="evict_first")
+    else:
+      x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+      mask_val = tl.load(mask_ptr + offs_m, mask=mask_m, other=0)
+
+    _prologue_tile(
+        x,
+        mask_val,
+        offs_m,
+        ln_scale,
+        ln_offset,
+        w_proj_l,
+        w_gate_l,
+        w_proj_r,
+        w_gate_r,
+        left_out_ptr,
+        right_out_ptr,
+        m,
+        eps,
+        c_dim,
+        h_dim,
+        is_even_m,
+        "",  # eviction_policy
+        dot_dtype,
+        input_precision,
+    )
 
 
 @triton.jit
@@ -332,14 +393,14 @@ def _prologue_tma_kernel(
   ln_scale = _load_param_vector(ln_scale_ptr, c_dim)
   ln_offset = _load_param_vector(ln_offset_ptr, c_dim)
   w_proj_l, w_gate_l, w_proj_r, w_gate_r = _load_glu_in_weights(
-      w_proj_ptr, w_gate_ptr, c_dim, h_dim
+      w_proj_ptr, w_gate_ptr, c_dim, h_dim, dot_dtype
   )
-
   num_tiles: tl.constexpr = m // block_m
   for tile_id in tl.range(tl.program_id(0), num_tiles, tl.num_programs(0)):
-    offs_m = tile_id * block_m + tl.arange(0, block_m)
+    row_offset = tile_id * block_m
+    offs_m = row_offset + tl.arange(0, block_m)
     offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
-    x = x_desc.load([tile_id * block_m, 0])
+    x = x_desc.load([row_offset, 0])
     mask_val = tl.load(mask_ptr + offs_m, eviction_policy="evict_first")
     _prologue_tile(
         x,
@@ -382,50 +443,104 @@ def _epilogue_kernel(
     d_dim: tl.constexpr,
     block_m: tl.constexpr,
     is_even_m: tl.constexpr,
+    persistent_loop: tl.constexpr,
     dot_dtype: tl.constexpr,
     input_precision: tl.constexpr,
 ):
   """Fused LayerNorm_in(x) + Gate + Transpose(t3) + LayerNorm_out + Proj."""
-  pid = tl.program_id(axis=0)
-  offs_m = pid * block_m + tl.arange(0, block_m)
-  if is_even_m:
-    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
-  mask_m = offs_m < m
-  offs_d = tl.arange(0, d_dim)
+  ln_in_scale = _load_param_vector(ln_in_scale_ptr, c_dim)
+  ln_in_offset = _load_param_vector(ln_in_offset_ptr, c_dim)
+  ln_out_scale = _load_param_vector(ln_out_scale_ptr, h_dim)
+  ln_out_offset = _load_param_vector(ln_out_offset_ptr, h_dim)
+  w_gate_out = _load_param_matrix(w_gate_out_ptr, c_dim, d_dim, d_dim).to(
+      dot_dtype
+  )
+  w_proj_out = _load_param_matrix(w_proj_out_ptr, h_dim, d_dim, d_dim).to(
+      dot_dtype
+  )
+  offs_c = tl.arange(0, c_dim)[None, :]
+  offs_h = tl.arange(0, h_dim)[:, None]
+  offs_d = tl.arange(0, d_dim)[None, :]
 
-  # Issue streaming loads of both x (BLOCK_M, C) and t3 (H, BLOCK_M) upfront
-  # so t3's global memory latency is hidden behind LayerNorm_in(x) and the
-  # gate projection dot.
-  x_ptrs = x_ptr + offs_m[:, None] * c_dim + tl.arange(0, c_dim)[None, :]
-  t3_ptrs = t3_ptr + tl.arange(0, h_dim)[:, None] * m + offs_m[None, :]
-  if is_even_m:
-    x = tl.load(x_ptrs, eviction_policy="evict_first")
-    t3 = tl.load(t3_ptrs, eviction_policy="evict_first")
+  if persistent_loop:
+    num_tiles: tl.constexpr = tl.cdiv(m, block_m)
+    for tile_id in tl.range(
+        tl.program_id(axis=0), num_tiles, tl.num_programs(axis=0)
+    ):
+      offs_m = tile_id * block_m + tl.arange(0, block_m)
+      if is_even_m:
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
+      mask_m = offs_m < m
+
+      x_ptrs = x_ptr + offs_m[:, None] * c_dim + offs_c
+      t3_ptrs = t3_ptr + offs_h * m + offs_m[None, :]
+      if is_even_m:
+        x = tl.load(x_ptrs, eviction_policy="evict_first")
+        t3 = tl.load(t3_ptrs, eviction_policy="evict_first")
+      else:
+        x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+        t3 = tl.load(t3_ptrs, mask=mask_m[None, :], other=0.0)
+
+      out = _epilogue_tile(
+          x,
+          t3,
+          ln_in_scale,
+          ln_in_offset,
+          ln_out_scale,
+          ln_out_offset,
+          w_gate_out,
+          w_proj_out,
+          eps,
+          c_dim,
+          h_dim,
+          dot_dtype,
+          input_precision,
+      ).to(out_ptr.dtype.element_ty)
+
+      out_ptrs = out_ptr + offs_m[:, None] * d_dim + offs_d
+      if is_even_m:
+        tl.store(out_ptrs, out, eviction_policy="evict_first")
+      else:
+        tl.store(
+            out_ptrs, out, mask=mask_m[:, None], eviction_policy="evict_first"
+        )
   else:
-    x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
-    t3 = tl.load(t3_ptrs, mask=mask_m[None, :], other=0.0)
+    pid = tl.program_id(axis=0)
+    offs_m = pid * block_m + tl.arange(0, block_m)
+    if is_even_m:
+      offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
+    mask_m = offs_m < m
 
-  out = _epilogue_tile(
-      x,
-      t3,
-      _load_param_vector(ln_in_scale_ptr, c_dim),
-      _load_param_vector(ln_in_offset_ptr, c_dim),
-      _load_param_vector(ln_out_scale_ptr, h_dim),
-      _load_param_vector(ln_out_offset_ptr, h_dim),
-      _load_param_matrix(w_gate_out_ptr, c_dim, d_dim, d_dim),
-      _load_param_matrix(w_proj_out_ptr, h_dim, d_dim, d_dim),
-      eps,
-      c_dim,
-      h_dim,
-      dot_dtype,
-      input_precision,
-  ).to(out_ptr.dtype.element_ty)
+    x_ptrs = x_ptr + offs_m[:, None] * c_dim + offs_c
+    t3_ptrs = t3_ptr + offs_h * m + offs_m[None, :]
+    if is_even_m:
+      x = tl.load(x_ptrs, eviction_policy="evict_first")
+      t3 = tl.load(t3_ptrs, eviction_policy="evict_first")
+    else:
+      x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+      t3 = tl.load(t3_ptrs, mask=mask_m[None, :], other=0.0)
 
-  out_ptrs = out_ptr + offs_m[:, None] * d_dim + offs_d[None, :]
-  if is_even_m:
-    tl.store(out_ptrs, out)
-  else:
-    tl.store(out_ptrs, out, mask=mask_m[:, None])
+    out = _epilogue_tile(
+        x,
+        t3,
+        ln_in_scale,
+        ln_in_offset,
+        ln_out_scale,
+        ln_out_offset,
+        w_gate_out,
+        w_proj_out,
+        eps,
+        c_dim,
+        h_dim,
+        dot_dtype,
+        input_precision,
+    ).to(out_ptr.dtype.element_ty)
+
+    out_ptrs = out_ptr + offs_m[:, None] * d_dim + offs_d
+    if is_even_m:
+      tl.store(out_ptrs, out)
+    else:
+      tl.store(out_ptrs, out, mask=mask_m[:, None])
 
 
 @triton.jit
@@ -457,15 +572,20 @@ def _epilogue_tma_kernel(
   ln_in_offset = _load_param_vector(ln_in_offset_ptr, c_dim)
   ln_out_scale = _load_param_vector(ln_out_scale_ptr, h_dim)
   ln_out_offset = _load_param_vector(ln_out_offset_ptr, h_dim)
-  w_gate_out = _load_param_matrix(w_gate_out_ptr, c_dim, d_dim, d_dim)
-  w_proj_out = _load_param_matrix(w_proj_out_ptr, h_dim, d_dim, d_dim)
-
+  w_gate_out = _load_param_matrix(w_gate_out_ptr, c_dim, d_dim, d_dim).to(
+      dot_dtype
+  )
+  w_proj_out = _load_param_matrix(w_proj_out_ptr, h_dim, d_dim, d_dim).to(
+      dot_dtype
+  )
+  out_dtype: tl.constexpr = out_ptr.dtype.element_ty
   num_tiles = m // block_m
   for tile_id in tl.range(tl.program_id(0), num_tiles, tl.num_programs(0)):
-    offs_m = tile_id * block_m + tl.arange(0, block_m)
+    row_offset = tile_id * block_m
+    offs_m = row_offset + tl.arange(0, block_m)
     offs_m = tl.max_contiguous(tl.multiple_of(offs_m, block_m), block_m)
-    x = x_desc.load([tile_id * block_m, 0])
-    t3 = t3_desc.load([0, tile_id * block_m])
+    x = x_desc.load([row_offset, 0])
+    t3 = t3_desc.load([0, row_offset])
     out = _epilogue_tile(
         x,
         t3,
@@ -480,7 +600,7 @@ def _epilogue_tma_kernel(
         h_dim,
         dot_dtype,
         input_precision,
-    ).to(out_ptr.dtype.element_ty)
+    ).to(out_dtype)
     out_ptrs = out_ptr + offs_m[:, None] * d_dim + offs_d[None, :]
     tl.store(out_ptrs, out, eviction_policy="evict_first")
 
@@ -502,6 +622,7 @@ def _prologue(
     num_warps: int,
     num_stages: int,
     persistent: bool,
+    has_tma: bool,
     max_grid_size: int,
     **common_kwargs,
 ) -> tuple[jax.Array, jax.Array]:
@@ -511,11 +632,12 @@ def _prologue(
   out_shape = jax.ShapeDtypeStruct((h, m), x_flat.dtype)
   num_tiles = triton.cdiv(m, block_m)
   is_even_m = m % block_m == 0
+  small_ch = max(c, h) <= 64
   kwargs: dict[str, Any] = dict(
       out_type=(out_shape, out_shape),
       name="triton_triangle_mult_prologue",
       num_warps=num_warps,
-      num_stages=num_stages,
+      num_stages=num_stages if small_ch else min(num_stages, 2),
       m=m,
       h_dim=h,
       block_m=block_m,
@@ -528,7 +650,15 @@ def _prologue(
       layernorm_in_offset,
   )
 
-  if persistent and is_even_m and min(c, h) >= _MIN_TMA_CHANNEL_DIM:
+  can_use_tma = has_tma and (
+      not gpu_utils.is_sm100() or (small_ch and block_m <= 128)
+  )
+  if (
+      can_use_tma
+      and persistent
+      and is_even_m
+      and min(c, h) >= _MIN_TMA_CHANNEL_DIM
+  ):
     x_desc = jt.TensorDescriptor.from_array(x_flat, block_shape=[block_m, c])
     return jt.triton_call(
         x_desc,  # pyrefly: ignore[bad-argument-type]
@@ -538,13 +668,15 @@ def _prologue(
         grid=(min(num_tiles, max_grid_size),),
         **kwargs,
     )
+  persistent_loop = persistent and small_ch and block_m <= 128
   return jt.triton_call(
       x_flat,
       mask_flat,
       *weights,
       kernel=_prologue_kernel,
-      grid=(num_tiles,),
+      grid=(min(num_tiles, max_grid_size) if persistent_loop else num_tiles,),
       is_even_m=is_even_m,
+      persistent_loop=persistent_loop,
       **kwargs,
   )
 
@@ -579,6 +711,7 @@ def _epilogue(
     num_warps: int,
     num_stages: int,
     persistent: bool,
+    has_tma: bool,
     max_grid_size: int,
     **common_kwargs,
 ) -> jax.Array:
@@ -587,11 +720,12 @@ def _epilogue(
   h, d = projection_out_weights.shape
   num_tiles = triton.cdiv(m, block_m)
   is_even_m = m % block_m == 0
+  small_ch = max(c, h, d) <= 64
   kwargs: dict[str, Any] = dict(
       out_type=jax.ShapeDtypeStruct((m, d), x_flat.dtype),
       name="triton_triangle_mult_epilogue",
       num_warps=num_warps,
-      num_stages=num_stages,
+      num_stages=num_stages if small_ch else min(num_stages, 2),
       h_dim=h,
       d_dim=d,
       block_m=block_m,
@@ -606,7 +740,12 @@ def _epilogue(
       layernorm_out_offset,
   )
 
-  if persistent and is_even_m and min(c, h, d) >= _MIN_TMA_CHANNEL_DIM:
+  if (
+      has_tma
+      and persistent
+      and is_even_m
+      and min(c, h, d) >= _MIN_TMA_CHANNEL_DIM
+  ):
     t3_desc = jt.TensorDescriptor.from_array(t3_flat, block_shape=[h, block_m])
     x_desc = jt.TensorDescriptor.from_array(x_flat, block_shape=[block_m, c])
     return jt.triton_call(
@@ -618,73 +757,26 @@ def _epilogue(
         grid=(min(num_tiles, max_grid_size),),
         **kwargs,
     )
+  persistent_loop = persistent and small_ch and block_m <= 128
   return jt.triton_call(
       t3_flat,
       x_flat,
       *weights,
       kernel=_epilogue_kernel,
-      grid=(num_tiles,),
+      grid=(min(num_tiles, max_grid_size) if persistent_loop else num_tiles,),
       m=m,
       is_even_m=is_even_m,
+      persistent_loop=persistent_loop,
       **kwargs,
   )
-
-
-def _xla_recompute_vjp(
-    residuals: Residuals,
-    out: jax.Array,
-    dout: jax.Array,
-    *args,
-    precision: base.CanonicalPrecision,
-    epsilon: float,
-    implementation: base.Implementation | Sequence[base.Implementation] | None,
-) -> tuple[jax.Array | None, ...]:
-  """Computes gradients by differentiating an XLA recomputation of the forward.
-
-  `jt.triton_call` has no autodiff rule, so the backward pass rematerializes
-  the forward pass with the XLA reference implementation and differentiates it.
-
-  Args:
-    residuals: Unused (the Triton forward returns no residuals).
-    out: Unused.
-    dout: The output cotangent, shape `[N, N, D]`.
-    *args: The positional op arguments, `(x, mask, ..., triangle_type)`.
-    precision: The canonical dot precision.
-    epsilon: The LayerNorm epsilon.
-    implementation: Unused; the recomputation always uses XLA.
-
-  Returns:
-    A gradient for every positional argument. The op's VJP machinery requires
-    an entry for each positional argument, so `mask` gets zeros and
-    `triangle_type` gets `None`.
-  """
-  del residuals, out, implementation  # Unused.
-  x, mask, *weights, triangle_type = args
-  xla_op = base.TriangleMultiplication()
-
-  def fwd(x, *weights):
-    return xla_op(
-        x,
-        mask,
-        *weights,
-        triangle_type,
-        precision=precision,
-        epsilon=epsilon,
-        implementation="xla",
-    )
-
-  _, fwd_vjp = jax.vjp(fwd, x, *weights)
-  dx, *dweights = fwd_vjp(dout)
-  return (dx, jnp.zeros_like(mask), *dweights, None)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
   """Triton triangle multiplicative update.
 
-  The forward pass is computed by two fused Triton kernels around an XLA
-  batched matmul. By default, gradients are computed by recomputing the forward
-  pass in XLA (see `_xla_recompute_vjp`).
+  Both the forward pass and the backward pass (`vjp`) are computed by fused
+  Triton kernels (prologue and epilogue) around an XLA batched matmul.
   """
 
   config_cls: ClassVar[type[Config]] = Config
@@ -692,7 +784,7 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
 
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(self, "vjp", _xla_recompute_vjp)
+      object.__setattr__(self, "vjp", vjp.TritonTriangleMultiplicationVjp())
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -721,9 +813,8 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
           base.Implementation | Sequence[base.Implementation] | None
       ) = None,
       config: Config,
-  ) -> tuple[Float[Array, "N N D"], Residuals]:
-    # There are no residuals; the VJP recomputes the forward pass.
-    del return_residuals, implementation  # Unused.
+  ) -> tuple[Float[Array, "N N D"], Residuals | None]:
+    del implementation  # Unused.
 
     if not gpu_utils.has_triton_support():
       raise NotImplementedError("Triton is not supported on this platform.")
@@ -767,7 +858,12 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
     if n == 0:
       raise NotImplementedError("Empty inputs are not supported.")
     m = n * n
-    if m * max(c, h, d) - 1 > _MAX_INT32:
+    epi_bm = config.epilogue_block_m or config.block_m
+    max_m_pad = max(
+        triton.cdiv(m, config.block_m) * config.block_m,
+        triton.cdiv(m, epi_bm) * epi_bm,
+    )
+    if max_m_pad * max(c, h, d) - 1 > _MAX_INT32:
       raise NotImplementedError(
           f"N={n} with max(C, H, D)={max(c, h, d)} would overflow the int32"
           " offsets used by the Triton kernels."
@@ -783,16 +879,9 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
         input_precision=input_precision,
     )
 
-    # On SM100, the persistent prologue needs more than the 512 available tensor
-    # memory columns for H=128 or BLOCK_M=256 and fails to compile, so it is
-    # only used on SM90.
-    pro_persistent = (
-        gpu_utils.is_sm90()
-        and config.prologue_persistent is not False  # pylint: disable=g-bool-id-comparison
-    )
-    epi_persistent = (
-        gpu_utils.is_sm90() or gpu_utils.is_sm100()
-    ) and config.epilogue_persistent is not False  # pylint: disable=g-bool-id-comparison
+    has_tma = gpu_utils.is_sm90() or gpu_utils.is_sm100()
+    pro_persistent = config.prologue_persistent is not False  # pylint: disable=g-bool-id-comparison
+    epi_persistent = config.epilogue_persistent is not False  # pylint: disable=g-bool-id-comparison
     max_grid_size = backend.get_default_device().core_count * config.ctas_per_sm
 
     x_flat = lax.collapse(x, 0, 2)
@@ -807,16 +896,14 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
         num_warps=config.num_warps,
         num_stages=config.num_stages,
         persistent=pro_persistent,
+        has_tma=has_tma,
         max_grid_size=max_grid_size,
         **common_kwargs,
     )
 
-    t3 = _contract(
-        left_flat.reshape(h, n, n),
-        right_flat.reshape(h, n, n),
-        triangle_type,
-        precision,
-    )
+    left = left_flat.reshape(h, n, n)
+    right = right_flat.reshape(h, n, n)
+    t3 = _contract(left, right, triangle_type, precision)
 
     out_flat = _epilogue(
         t3.reshape(h, m),
@@ -831,10 +918,12 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
         num_warps=config.epilogue_num_warps or config.num_warps,
         num_stages=config.epilogue_num_stages or config.num_stages,
         persistent=epi_persistent,
+        has_tma=has_tma,
         max_grid_size=max_grid_size,
         **common_kwargs,
     )
-    return out_flat.reshape(n, n, d), None
+    residuals = (left, right, t3) if return_residuals else None
+    return out_flat.reshape(n, n, d), residuals
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
@@ -843,9 +932,9 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
           block_m=128,
           num_warps=8,
           num_stages=2,
-          epilogue_block_m=64,
+          epilogue_block_m=128,
           epilogue_num_warps=4,
-          epilogue_num_stages=4,
+          epilogue_num_stages=3,
           prologue_persistent=False,
           epilogue_persistent=True,
           ctas_per_sm=2,
@@ -868,23 +957,23 @@ class TritonTriangleMultiplication(base.TriangleMultiplication[Config, Key]):
         num_stages=2,
         prologue_persistent=False,
         epilogue_persistent=False,
+        ctas_per_sm=2,
     )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
-      # Without TMA, only the pointer kernels are used. They have no loops, so
-      # `num_stages` and the persistence options have no effect.
       return {  # pylint: disable=g-complex-comprehension
           Config(
               block_m=block_m,
               num_warps=num_warps,
               num_stages=2,
-              prologue_persistent=False,
-              epilogue_persistent=False,
+              prologue_persistent=persistent,
+              epilogue_persistent=persistent,
           )
           for block_m in (64, 128)
           for num_warps in (4, 8)
+          for persistent in (True, False)
       }
     configs = {
         self._get_heuristics_config(ba),

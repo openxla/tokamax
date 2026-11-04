@@ -19,14 +19,12 @@ from typing import Any
 
 # pylint: disable=g-importing-member,useless-import-alias
 from tokamax._src.ops.experimental.mla_swa.api import mla_swa as mla_swa
-from tokamax._src.ops.splash_attention.api import splash_attention as splash_attention
 
 # pylint: enable=g-importing-member,useless-import-alias
 
 # pylint: disable=undefined-all-variable
 __all__ = (
     "mla_swa",
-    "splash_attention",
     "tpu",
 )
 # pylint: enable=undefined-all-variable

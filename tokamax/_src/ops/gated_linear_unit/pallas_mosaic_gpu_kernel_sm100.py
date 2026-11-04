@@ -241,6 +241,11 @@ def gated_linear_unit(
           plgpu.wait_smem_to_gmem(2, wait_read_only=True)
         plgpu.barrier_arrive(store_done_barrier.at[acc_slot])
 
+    @pl.when(wg_idx == 1)
+    def _():
+      # Await all transfers before we exit.
+      plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
   barrier_kwargs = dict(
       num_arrivals=1,
       num_barriers=2,

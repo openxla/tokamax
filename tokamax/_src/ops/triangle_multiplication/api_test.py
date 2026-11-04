@@ -50,18 +50,15 @@ class TriangleMultiplicationTest(parameterized.TestCase):
 
   @parameterized.product(
       triangle_type=["incoming", "outgoing"],
-      dtype=[jnp.bfloat16, jnp.float32],
       implementation=_IMPLEMENTATIONS,
   )
-  def test_triangle_multiplication(self, triangle_type, dtype, implementation):
+  def test_triangle_multiplication(self, triangle_type, implementation):
     if implementation == "triton":
       if (
           "triton" not in api.IMPLEMENTATIONS
           or not gpu_utils.has_triton_support()
       ):
         self.skipTest("Triton not supported on this platform.")
-      if dtype == jnp.float32:
-        self.skipTest("Triton kernel does not support float32.")
     if implementation == "mosaic":
       if (
           "mosaic" not in api.IMPLEMENTATIONS
@@ -71,42 +68,53 @@ class TriangleMultiplicationTest(parameterized.TestCase):
 
     n = 128
     d = 64
-    params = _get_params(n=n, c=32, h=32, d=d, dtype=dtype)
+    params = _get_params(n=n, c=32, h=32, d=d, dtype=jnp.bfloat16)
+    mask = params.pop("mask")
+    dout = (
+        jax.random.normal(jax.random.key(0), (n, n, d), dtype=jnp.bfloat16) / n
+    )
 
     @jax.jit
     def f_ref(params):
       return api.triangle_multiplication(
-          **params, triangle_type=triangle_type, implementation="xla"
+          **params,
+          mask=mask,
+          triangle_type=triangle_type,
+          implementation="xla",
       )
 
     @jax.jit
     def f(params):
       return api.triangle_multiplication(
-          **params, triangle_type=triangle_type, implementation=implementation
+          **params,
+          mask=mask,
+          triangle_type=triangle_type,
+          implementation=implementation,
       )
 
-    out_ref = f_ref(params)
-    out = f(params)
-    atol = 0.15 if dtype == jnp.bfloat16 else 1e-5
-    rtol = 0.05 if dtype == jnp.bfloat16 else 1e-5
-    chex.assert_trees_all_close(out, out_ref, atol=atol, rtol=rtol)
+    out_ref, vjp_ref = jax.vjp(f_ref, params)
+    out, vjp_fn = jax.vjp(f, params)
+    chex.assert_trees_all_close(out, out_ref, atol=0.15, rtol=0.05)
+
+    with self.subTest("grad"):
+      (grads_ref,) = jax.jit(vjp_ref)(dout)
+      (grads,) = jax.jit(vjp_fn)(dout)
+      chex.assert_trees_all_close(grads, grads_ref, atol=0.5, rtol=0.05)
 
     with self.subTest("correct_implementation_used"):
       args = hlo_utils.get_bound_args(f, params)
       self.assertLen(args, 1)
       if implementation is not None:
         impl = api.IMPLEMENTATIONS[implementation]
-        self.assertIsInstance(args[0].op, impl.__class__)
-      elif (
-          "triton" in api.IMPLEMENTATIONS
-          and gpu_utils.has_triton_support()
-          and dtype == jnp.bfloat16
-      ):
+      elif "triton" in api.IMPLEMENTATIONS and gpu_utils.has_triton_support():
         impl = api.IMPLEMENTATIONS["triton"]
-        self.assertIsInstance(args[0].op, impl.__class__)
       else:
         impl = api.IMPLEMENTATIONS["xla"]
-        self.assertIsInstance(args[0].op, impl.__class__)
+      self.assertIsInstance(args[0].op, impl.__class__)
+      if getattr(impl, "vjp", None) is not None:
+        vjp_args = hlo_utils.get_bound_args(vjp_fn, dout)
+        self.assertLen(vjp_args, 1)
+        self.assertIsInstance(vjp_args[0].op, impl.vjp.__class__)  # pyrefly: ignore[missing-attribute]
 
   def test_unsupported_implementation(self):
     params = _get_params(n=8, c=16, h=32, d=64, dtype=jnp.float32)

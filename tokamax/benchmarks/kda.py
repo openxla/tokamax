@@ -163,6 +163,10 @@ class KdaBenchmark(parameterized.TestCase):
               compact_sorted_segments=implementation == "mosaic_compact",
           )
       )
+    if implementation == "xla_chunked" and not example.get(
+        "per_channel_gate", True
+    ):
+      self.skipTest("xla_chunked does not support scalar gates.")
     fn, args = tokamax.standardize_function(
         attention,
         kwargs=example,

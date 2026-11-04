@@ -483,8 +483,10 @@ def kernel(
       ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
     return jnp.concatenate(ret, axis=0)
 
-  def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
-    p_id = pl.program_id(0)
+  def step_body(
+      step, q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None
+  ):
+    p_id = step.index[0]
     bkv_idx = bkv_block(p_id)
 
     if q_hm_ref is not None:
@@ -543,11 +545,12 @@ def kernel(
     scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
 
   def blocked_prefill_step(
-      q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
+      step, q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
   ):
     """Scores one (q block, kv block) step of the multi-token path.
 
     Args:
+      step: Pipeline step.
       q_vmem: [bq, H, D] query block.
       weights_vmem: [bq, H] indexer weights.
       bkv_vmem: the packed key block of this step.
@@ -558,7 +561,7 @@ def kernel(
       wb_ref: [num_tok_blks, H, tok_blk, 128] cache of the indexer weights,
         broadcast along lanes; bf16 for FP8 queries, f32 otherwise.
     """
-    bkv_idx = bkv_block(pl.program_id(0))
+    bkv_idx = bkv_block(step.index[0])
     tok_blk = prefill_cfg.tok_blk
     num_tok_blks = prefill_cfg.num_tok_blks
     num_head_groups = prefill_cfg.num_head_groups
@@ -729,6 +732,7 @@ def kernel(
           grid=(metadata_ref.num_steps[chunk_idx],),
           in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
           out_specs=o_buf.spec,
+          _explicit_indices=True,
       )
 
       window_refs = (cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref)

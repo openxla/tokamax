@@ -41,7 +41,7 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     kv_cache = jnp.zeros(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
     )
     kv_lens = jnp.array([8, 8], dtype=jnp.int32)
@@ -91,7 +91,7 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     kv_cache = jnp.zeros(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
     )
     # Sequence 0: decode (q_len = 1, kv_len = 8)
@@ -134,7 +134,7 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
     kv_cache = jnp.zeros(
-        (total_pages, page_size, num_kv_heads * 2, head_dim_aligned),
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
     )
     kv_lens = jnp.array([8, 8], dtype=jnp.int32)

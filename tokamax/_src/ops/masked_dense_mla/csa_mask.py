@@ -49,7 +49,7 @@ def mask_kernel(
   padded_chunk_size = topk_indices_hbm_ref.shape[0]
   rows_per_core = padded_chunk_size // num_cores
 
-  def _body(topk_indices_vmem_ref, mask_out_vmem_ref):
+  def _body(unused_step, topk_indices_vmem_ref, mask_out_vmem_ref):
     mask_out_vmem_ref[pl.ds(0, 1), pl.ds(0, max_kv_len)] = jnp.zeros(
         (1, max_kv_len), dtype=jnp.int32
     )
@@ -91,6 +91,7 @@ def mask_kernel(
           (1, max_kv_len),
           lambda r: (r * num_cores + core_index, 0),
       ),
+      _explicit_indices=True,
   )(topk_indices_hbm_ref, mask_out_hbm_ref)
 
 

@@ -140,8 +140,12 @@ def main_kernel_v2(
           )
         out_ref[pl.ds(i, 1), col_slice] = packed_row
 
-  def inner_pipeline(gather_ref, out_ref, idx_ref, unpack_col_chunk):
-    row_slice = pl.ds(pl.program_id(0) * row_subchunk_size, row_subchunk_size)
+  def inner_pipeline(
+      inner_step, gather_ref, out_ref, idx_ref, unpack_col_chunk
+  ):
+    row_slice = pl.ds(
+        inner_step.index[0] * row_subchunk_size, row_subchunk_size
+    )
     subchunk_idxs = idx_ref[row_slice]
     if packing > 1:
       # Equivalent to `subchunk_idxs % packing`
@@ -158,8 +162,8 @@ def main_kernel_v2(
     )
     plsc.parallel_loop(0, num_phys_cols, step=unpack_col_chunk)(col_loop_fn)
 
-  def outer_pipeline(idx_ref):
-    b = pl.program_id(0)
+  def outer_pipeline(outer_step, idx_ref):
+    b = outer_step.index[0]
     b_global = b + block_start
 
     unpack_col_chunk = 128
@@ -187,6 +191,7 @@ def main_kernel_v2(
                 col_id,
             ),
         ),
+        _explicit_indices=True,
     )(in_hbm_i32, out_hbm_i32)
 
   pltpu.emit_pipeline(
@@ -196,6 +201,7 @@ def main_kernel_v2(
           (row_chunk_size,),
           lambda b: ((b + block_start) * num_cores + core_index,),
       ),
+      _explicit_indices=True,
   )(indices_hbm_ref)
 
 

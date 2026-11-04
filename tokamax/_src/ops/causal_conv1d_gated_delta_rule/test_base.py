@@ -21,6 +21,8 @@ under test. Every implementation is compared against
 """
 
 from collections.abc import Sequence
+import functools
+from typing import Any
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -121,6 +123,50 @@ def skip_if_unsupported(test_case: absltest.TestCase) -> None:
       test_case.skipTest("Pallas TPU kernel requires TPU v6 or newer.")
   except Exception:  # pylint: disable=broad-except
     test_case.skipTest("Failed to get TPU info.")
+
+
+def _continuing_batch_kwargs() -> dict[str, Any]:
+  """A mixed decode + prefill batch whose sequences continue a prior context.
+
+  `seq_lens` exceeds the query lengths, so the kernel reads the conv and
+  recurrent states from their slots instead of starting from zero. Inputs are
+  float32 so that the kernel's own storage casts are what gets exercised.
+  """
+  kq_head_dim, v_head_dim, n_kq, n_v, kernel_size = 128, 128, 2, 8, 4
+  lengths = [1] * 8 + [128, 128, 256]
+  num_decodes = 8
+  max_reqs = len(lengths)
+  num_tokens = sum(lengths)
+  dim = 2 * n_kq * kq_head_dim + n_v * v_head_dim
+  # Slot 0 is the null block for padded tokens.
+  num_blocks = max_reqs + 1
+
+  rngs = iter(jax.random.split(jax.random.key(5), 10))
+  normal = lambda *shape: jax.random.normal(next(rngs), shape)
+  q_loc = jnp.array(np.cumsum([0] + lengths), dtype=jnp.int32)
+  query_lens = q_loc[1:] - q_loc[:-1]
+
+  return dict(
+      qkv=normal(num_tokens, dim),
+      b=normal(num_tokens, n_v),
+      a=normal(num_tokens, n_v),
+      conv_state=normal(num_blocks, kernel_size - 1, dim) * 0.5,
+      recurrent_state=normal(num_blocks, n_v, kq_head_dim, v_head_dim) * 0.1,
+      conv_weight=normal(dim, 1, kernel_size),
+      conv_bias=normal(dim),
+      a_log=normal(n_v),
+      dt_bias=normal(n_v),
+      query_start_loc=q_loc,
+      state_indices=jnp.arange(1, max_reqs + 1, dtype=jnp.int32),
+      distribution=jnp.array([num_decodes, max_reqs, max_reqs], jnp.int32),
+      # context_len = 16 for every sequence, so has_initial_state is True.
+      seq_lens=(query_lens + 16).astype(jnp.int32),
+      n_kq=n_kq,
+      n_v=n_v,
+      d_k=kq_head_dim,
+      d_v=v_head_dim,
+      kernel_size=kernel_size,
+  )
 
 
 # pylint: disable=missing-function-docstring
@@ -462,6 +508,127 @@ class CausalConv1dGatedDeltaRuleTestBase(parameterized.TestCase):
     np.testing.assert_allclose(
         output_b, output_ref[half:], rtol=2e-2, atol=2e-2
     )
+
+  # The storage dtypes the Qwen 3.8 arg specs use. The reference op accepts
+  # and ignores the kernel dtype arguments, so it is run without them.
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="conv_weight_bf16",
+          kernel_conv_weight_dtype=jnp.bfloat16,
+      ),
+  )
+  def test_kernel_storage_dtypes_match_reference(self, **kernel_dtypes):
+    kwargs = _continuing_batch_kwargs()
+    run_ref = jax.jit(
+        base.CausalConv1dGatedDeltaRule(),
+        static_argnames=list(OP_STATIC_ARGNAMES),
+    )
+    states_ref, output_ref = run_ref(**kwargs)
+
+    kernel_dtypes = {k: jnp.dtype(v) for k, v in kernel_dtypes.items()}
+    gdn_fn = jax.jit(
+        functools.partial(self._gdn_fn, **kernel_dtypes),
+        static_argnames=self._static_argnames,
+    )
+    states, output = gdn_fn(**kwargs)
+
+    np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+    for state, state_ref in zip(states, states_ref, strict=True):
+      np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
+
+  def test_kernel_act_dtype_must_be_float32(self):
+    """The kernel's activation loads only handle 32-bit elements."""
+    gdn_fn = jax.jit(
+        functools.partial(
+            self._gdn_fn, kernel_act_dtype=jnp.dtype(jnp.bfloat16)
+        ),
+        static_argnames=self._static_argnames,
+    )
+    with self.assertRaisesRegex(ValueError, "kernel_act_dtype"):
+      gdn_fn(**_continuing_batch_kwargs())
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="mixed_prefill_bf16_weights",
+          decode_only=False,
+          recurrent_state_dtype=jnp.bfloat16,
+          conv_weight_dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="mixed_prefill_f32_weights",
+          decode_only=False,
+          recurrent_state_dtype=jnp.float32,
+          conv_weight_dtype=jnp.float32,
+      ),
+      dict(
+          testcase_name="decode_only_bf16_weights",
+          decode_only=True,
+          recurrent_state_dtype=jnp.bfloat16,
+          conv_weight_dtype=jnp.bfloat16,
+      ),
+      dict(
+          testcase_name="decode_only_f32_weights",
+          decode_only=True,
+          recurrent_state_dtype=jnp.float32,
+          conv_weight_dtype=jnp.float32,
+      ),
+  )
+  def test_mixed_input_dtypes_match_reference(
+      self, decode_only, recurrent_state_dtype, conv_weight_dtype
+  ):
+    """Exercises mixed storage dtypes from `arg_specs.make_gdn_spec`."""
+    kwargs = _continuing_batch_kwargs()
+    if decode_only:
+      num_decodes = 8
+      q_loc = jnp.arange(num_decodes + 1, dtype=jnp.int32)
+      kwargs.update(
+          qkv=kwargs["qkv"][:num_decodes],
+          b=kwargs["b"][:num_decodes],
+          a=kwargs["a"][:num_decodes],
+          conv_state=kwargs["conv_state"][: num_decodes + 1],
+          recurrent_state=kwargs["recurrent_state"][: num_decodes + 1],
+          query_start_loc=q_loc,
+          state_indices=jnp.arange(1, num_decodes + 1, dtype=jnp.int32),
+          distribution=jnp.array([num_decodes] * 3, dtype=jnp.int32),
+          seq_lens=jnp.full((num_decodes,), 17, dtype=jnp.int32),
+      )
+
+    kwargs.update(
+        qkv=kwargs["qkv"].astype(jnp.bfloat16),
+        b=kwargs["b"].astype(jnp.bfloat16),
+        a=kwargs["a"].astype(jnp.bfloat16),
+        conv_state=kwargs["conv_state"].astype(jnp.float32),
+        recurrent_state=kwargs["recurrent_state"].astype(recurrent_state_dtype),
+        conv_weight=kwargs["conv_weight"].astype(conv_weight_dtype),
+        conv_bias=kwargs["conv_bias"].astype(conv_weight_dtype),
+        a_log=kwargs["a_log"].astype(jnp.float32),
+        dt_bias=kwargs["dt_bias"].astype(jnp.bfloat16),
+    )
+
+    run_ref = jax.jit(
+        base.CausalConv1dGatedDeltaRule(),
+        static_argnames=list(OP_STATIC_ARGNAMES),
+    )
+    states_ref, output_ref = run_ref(**kwargs)
+    gdn_fn = jax.jit(
+        functools.partial(
+            self._gdn_fn,
+            kernel_conv_weight_dtype=jnp.dtype(conv_weight_dtype),
+        ),
+        static_argnames=self._static_argnames,
+    )
+    states, output = gdn_fn(**kwargs)
+
+    self.assertEqual(output_ref.dtype, jnp.bfloat16)
+    self.assertEqual(output.dtype, output_ref.dtype)
+    self.assertEqual(states_ref[0].dtype, jnp.float32)
+    self.assertEqual(states_ref[1].dtype, jnp.dtype(recurrent_state_dtype))
+    self.assertEqual(states[0].dtype, states_ref[0].dtype)
+    self.assertEqual(states[1].dtype, states_ref[1].dtype)
+
+    np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+    for state, state_ref in zip(states, states_ref, strict=True):
+      np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
 
 
 class CausalConv1dGatedDeltaRuleSecurityTestBase(absltest.TestCase):

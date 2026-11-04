@@ -19,8 +19,10 @@ from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-  norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps)
-  return x / norm
+  """L2-normalize along the last dim, accumulating in float32."""
+  x_f32 = x.astype(jnp.float32)
+  norm = jnp.sqrt(jnp.sum(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
+  return (x_f32 / norm).astype(x.dtype)
 
 
 def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:

@@ -17,21 +17,31 @@
 
 import jax
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 
 
-@jax.jit
-def input_pack(x: jax.Array) -> arg.ActivationWrapper[jax.Array]:
+@jax.jit(static_argnames=("out_format",))
+def input_pack(
+    x: jax.Array,
+    out_format: out_format_lib.ActivationFormatLike | None = None,
+) -> arg.ActivationWrapper[jax.Array]:
   """Placeholder for input_pack kernel from large to compact layout."""
   # TODO: Replace with custom Pallas input_pack kernel.
-  assert x.ndim == 2
+  resolved_format = out_format_lib.ResolvedActivationFormat.create(
+      out_format,
+      default_dtype=x.dtype,
+  )
+  if resolved_format.dtype != x.dtype:
+    raise NotImplementedError(
+        "input_pack does not support dtype conversion yet."
+    )
+  if resolved_format.quant is not None:
+    raise NotImplementedError("input_pack does not support quantization yet.")
   row_size, col_size = x.shape
-  spec = arg.ActivationSpec(
-      row_size=row_size,
-      col_size=col_size,
-      dtype=x.dtype,
+  spec = spec_lib.ActivationSpec(
+      row_size=row_size, col_size=col_size, dtype=x.dtype, quant=None
   )
   return arg.ActivationWrapper(
-      data=x.reshape(spec.compact_shape),
-      scale=None,
-      spec=spec,
+      data=x.reshape(spec.physical_compact_shape), scale=None, spec=spec
   )
