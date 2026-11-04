@@ -29,7 +29,7 @@ against a numpy gather, not tolerances, and the bias in the fixtures is large
 enough to REORDER the selection rather than perturb it -- a test whose bias
 changed nothing would pass against a kernel that ignored the bias entirely.
 
-`interpret=True` runs the kernel body on the host, which is what lets the
+`interpret=pltpu.InterpretParams()` runs the kernel body on the host, which is what lets the
 selection rule be gated without a chip, the same way `tests/kernels/
 test_router_topk.py` gates the sibling selector. It does not gate Mosaic
 lowering: `tests/kernels/fused_moe/test_fused_ep_moe_v2.py` is what runs this
@@ -58,7 +58,7 @@ def _select(scores, weight_scores=None, topk=TOPK, block_rows=None):
         topk=topk,
         block_rows=rows if block_rows is None else block_rows,
         weight_scores=None if weight_scores is None else jnp.asarray(weight_scores),
-        interpret=True,
+        interpret=pltpu.InterpretParams(),
     )
     return np.asarray(w), np.asarray(i)
 
