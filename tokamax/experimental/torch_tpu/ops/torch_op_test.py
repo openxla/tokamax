@@ -142,7 +142,7 @@ class _FakeTorchOp(torch_op.TorchOp[_FakeOpConfig]):
       output: Any,
   ) -> None:
     del inputs  # Unused.
-    ctx.saved_tensors = output
+    ctx.save_for_backward(*output)
 
   def backward(self, *args: Any, **kwargs: Any) -> Any:
     return args
@@ -276,7 +276,7 @@ class _FakeTorchOpWithBackward(torch_op.TorchOp[_FakeOpConfig]):
       output: Any,
   ) -> None:
     del inputs
-    ctx.saved_tensors = tuple(output)
+    ctx.save_for_backward(*output)
 
   def backward(self, *args: Any, **kwargs: Any) -> Any:
     assert self.backward_op_torch is not None
@@ -507,11 +507,55 @@ class TorchOpTest(parameterized.TestCase):
         self.saved_tensors = tensors
 
     op = torch_op.TorchOp()
-    ctx = DummyCtx()
-    t1 = torch.tensor([1.0])
-    t2 = torch.tensor([2.0])
-    op.setup_context(ctx, [t1], (t2,))
-    self.assertEqual(ctx.saved_tensors, (t1, t2))
+    t1, t2, t3 = torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])
+    for inputs, output, expected in (
+        ([t1, [t2], True, (1, 2), None], (t3, None), (t1, t2, t3)),
+        ([t1, 42], t2, (t1, t2)),
+        ([True, None], (), ()),
+    ):
+      ctx = DummyCtx()
+      op.setup_context(ctx, inputs, output)
+      self.assertEqual(ctx.saved_tensors, expected)
+
+  def test_autograd_backward_with_default_setup_context(self):
+    class _SingleOutputGradOp(torch_op.TorchOp[_FakeOpConfig]):
+
+      def __init__(self):
+        super().__init__()
+        self.jax_op_name = f"single_out_grad_{uuid.uuid4().hex[:8]}"
+        self.op_impl_jax = _FakeJaxMultiOutputOp()
+        self.backward_op_torch = _FakeTorchVjpOp()
+
+      def __call__(
+          self, x: torch.Tensor, y: torch.Tensor, scale: int = 2
+      ) -> torch.Tensor:
+        assert self._torch_tokamax_op is not None
+        return self._torch_tokamax_op(x, y, scale)
+
+      def op_impl_call(
+          self, x: jax.Array, y: jax.Array, scale: int = 2
+      ) -> jax.Array:
+        assert self.op_impl_jax is not None
+        out, _ = self.op_impl_jax._fwd(
+            x, y, return_residuals=False, config=_HEURISTICS_CONFIG
+        )
+        return out * scale
+
+      def backward(self, ctx: Any, grad_out: torch.Tensor) -> Any:
+        assert self.backward_op_torch is not None
+        sx, sy, sout = ctx.saved_tensors
+        s = (sout / (sx + sy)).detach()
+        return grad_out * s, grad_out * s, None
+
+    op = _SingleOutputGradOp()
+    _custom_op(op).register_kernel("cpu")(lambda x, y, scale=2: (x + y) * scale)
+    x = torch.tensor([1.0, 2.0], requires_grad=True)
+    y = torch.tensor([3.0, 4.0], requires_grad=True)
+    out = op(x, y, scale=3)
+    out.sum().backward()
+    torch.testing.assert_close(out, torch.tensor([12.0, 18.0]))
+    torch.testing.assert_close(x.grad, torch.tensor([3.0, 3.0]))
+    torch.testing.assert_close(y.grad, torch.tensor([3.0, 3.0]))
 
   def test_backward_not_implemented(self):
     op = torch_op.TorchOp()
@@ -941,6 +985,9 @@ class TorchOpTest(parameterized.TestCase):
 
       def __init__(self):
         self.saved_tensors = ()
+
+      def save_for_backward(self, *tensors):
+        self.saved_tensors = tensors
 
     op = _FakeTorchOp()
     ctx = DummyCtx()

@@ -132,9 +132,18 @@ class _PallasMosaicTpuFusedMoe(
     ), "Forward class not set. self.op_impl_jax was not set in the constructor."
     assert config is not None, "Forward config not set."
     kernel_config = self.reconstruct_config(config)
-    mesh = jax.sharding.Mesh(
-        np.asarray(jax.devices()[:1]), axis_names=(jax_kernel.AXIS,)
-    )
+    abstract_mesh = jax.sharding.get_abstract_mesh()
+    if not abstract_mesh.empty:
+      if len(abstract_mesh.axis_names) != 1:
+        raise ValueError(
+            "PallasMosaicTpuFusedMoe requires a 1D mesh, got"
+            f" {abstract_mesh}."
+        )
+      mesh = abstract_mesh
+    else:
+      mesh = jax.sharding.Mesh(
+          np.asarray(jax.devices()[:1]), axis_names=(jax_kernel.AXIS,)
+      )
     out, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
         x,
         w1,

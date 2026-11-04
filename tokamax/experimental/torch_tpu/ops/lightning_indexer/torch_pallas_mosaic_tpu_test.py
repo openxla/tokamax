@@ -508,6 +508,40 @@ class PallasMosaicTpuLightningIndexerTest(parameterized.TestCase):
     with self.assertRaises(ValueError):
       op_pallas.reconstruct_config(None)
 
+  def test_tensor_cp_rank_under_torch_compile(self):
+    device = "tpu"
+    torch_inputs, _ = _make_torch_and_jax_inputs(
+        [1, 4], [256, 256], seed=37, device=device
+    )
+    op_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuLightningIndexer
+    cp_rank_tensor = torch.tensor([1], dtype=torch.int32, device=device)
+    cfg, _ = torch_utils.get_configs(
+        op_pallas,
+        *torch_inputs.values(),
+        16,
+        1,
+        "head_along_sublane",
+        2,
+        cp_rank_tensor,
+        128,
+        from_autotuning_cache=False,
+    )
+    self.assertIsNotNone(cfg)
+
+    compiled_fn = torch.compile(
+        lambda **kw: op_pallas(**kw, k=16, cp_size=2, interleave_size=128),
+        fullgraph=True,
+        dynamic=False,
+    )
+    actual = compiled_fn(**torch_inputs, cp_rank=cp_rank_tensor)
+    expected = op_pallas(
+        **torch_inputs, k=16, cp_size=2, cp_rank=1, interleave_size=128
+    )
+    torch.testing.assert_close(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

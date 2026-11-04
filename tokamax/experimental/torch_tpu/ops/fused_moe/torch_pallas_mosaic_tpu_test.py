@@ -14,6 +14,8 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU Fused MoE."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -288,6 +290,65 @@ class PallasMosaicTpuFusedMoeTest(parameterized.TestCase):
     meta = op_nodes[0].meta["val"]
     self.assertIsInstance(meta.shape[0], torch.SymInt)
     self.assertEqual(meta.shape[1], 512)
+
+  def test_op_impl_call_respects_abstract_mesh(self):
+    op_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuFusedMoe
+    config = op_pallas.deconstruct_config(
+        torch_pallas_mosaic_tpu.Config(
+            capacity=128,
+            block=128,
+            ragged_stride=1280,
+            sharded_plan=True,
+        )
+    )
+    abstract_device = jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
+    specs = (
+        jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((32, 512, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((32, 256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((256, 32), jnp.float32),
+    )
+    fn = jax.jit(
+        lambda x, w1, w2, gating: op_pallas.op_impl_call(
+            x,
+            w1,
+            w2,
+            gating,
+            topk=4,
+            renormalize=True,
+            act_fn="silu",
+            config=config,
+        )
+    )
+
+    for axis_sizes, axis_names, axis_types in (
+        ((1,), ("x",), (jax.sharding.AxisType.Auto,)),
+        ((2,), ("my_ep",), (jax.sharding.AxisType.Explicit,)),
+    ):
+      with self.subTest(axis_sizes=axis_sizes, axis_names=axis_names):
+        abstract_mesh = jax.sharding.AbstractMesh(
+            axis_sizes,
+            axis_names,
+            axis_types=axis_types,
+            abstract_device=abstract_device,
+        )
+        with (
+            jax.sharding.use_abstract_mesh(abstract_mesh),
+            mock.patch.object(
+                jax,
+                "devices",
+                side_effect=RuntimeError("jax.devices() should not be called"),
+            ),
+        ):
+          exported = jax.export.export(fn)(*specs)
+        self.assertEqual(exported.out_avals[0].shape, (256, 512))
+
+    bad_mesh = jax.sharding.AbstractMesh(
+        (1, 1), ("dp", "ep"), abstract_device=abstract_device
+    )
+    with jax.sharding.use_abstract_mesh(bad_mesh):
+      with self.assertRaisesRegex(ValueError, "requires a 1D mesh"):
+        jax.export.export(fn)(*specs)
 
 
 if __name__ == "__main__":
