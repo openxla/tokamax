@@ -59,10 +59,11 @@ class TriangleMultiplicationTest(parameterized.TestCase):
           or not gpu_utils.has_triton_support()
       ):
         self.skipTest("Triton not supported on this platform.")
+    mosaic_key = f"mosaic_{jax.default_backend()}"
     if implementation == "mosaic":
       if (
-          "mosaic" not in api.IMPLEMENTATIONS
-          or not gpu_utils.has_mosaic_gpu_support()
+          mosaic_key not in api.IMPLEMENTATIONS
+          or not api.IMPLEMENTATIONS[mosaic_key].supported_on(jax.devices()[0])  # pyrefly: ignore[missing-attribute]
       ):
         self.skipTest("Mosaic not supported on this platform.")
 
@@ -105,7 +106,13 @@ class TriangleMultiplicationTest(parameterized.TestCase):
       args = hlo_utils.get_bound_args(f, params)
       self.assertLen(args, 1)
       if implementation is not None:
-        impl = api.IMPLEMENTATIONS[implementation]
+        impl_key = mosaic_key if implementation == "mosaic" else implementation
+        impl = api.IMPLEMENTATIONS[impl_key]
+      elif (
+          mosaic_key in api.IMPLEMENTATIONS
+          and api.IMPLEMENTATIONS[mosaic_key].supported_on(jax.devices()[0])  # pyrefly: ignore[missing-attribute]
+      ):
+        impl = api.IMPLEMENTATIONS[mosaic_key]
       elif "triton" in api.IMPLEMENTATIONS and gpu_utils.has_triton_support():
         impl = api.IMPLEMENTATIONS["triton"]
       else:
@@ -125,6 +132,31 @@ class TriangleMultiplicationTest(parameterized.TestCase):
             triangle_type="incoming",
             implementation="unsupported",  # pyrefly: ignore[bad-argument-type]
         )
+
+  def test_default_fallback_on_cpu_device(self):
+    cpu_devices = jax.devices("cpu")
+    if not cpu_devices:
+      self.skipTest("No CPU device available.")
+    with jax.default_device(cpu_devices[0]):
+      params = jax.device_put(
+          _get_params(n=8, c=16, h=32, d=64, dtype=jnp.bfloat16), cpu_devices[0]
+      )
+      out_jit = jax.jit(
+          lambda p: api.triangle_multiplication(
+              **p, triangle_type="outgoing", implementation=None
+          )
+      )(params)
+      expected_jit = jax.jit(
+          lambda p: api.triangle_multiplication(
+              **p, triangle_type="outgoing", implementation="xla"
+          )
+      )(params)
+      chex.assert_trees_all_equal(out_jit, expected_jit)
+
+    out_eager = api.triangle_multiplication(
+        **params, triangle_type="outgoing", implementation=None
+    )
+    chex.assert_trees_all_close(out_eager, expected_jit)
 
 
 if __name__ == "__main__":
