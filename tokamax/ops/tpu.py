@@ -58,6 +58,8 @@ from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import Config as Splash
 from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import PallasMosaicTpuSplashAttention as SplashAttention
 from tokamax._src.ops.topk.pallas_mosaic_tpu import Config as TopKConfig
 from tokamax._src.ops.topk.pallas_mosaic_tpu import PallasTpuTopK as TopK
+from tokamax._src.ops.triangle_multiplication.pallas_mosaic_tpu import Config as TriangleMultiplicationConfig
+from tokamax._src.ops.triangle_multiplication.pallas_mosaic_tpu import PallasMosaicTpuTriangleMultiplication as TriangleMultiplication
 
 # pylint: enable=g-importing-member,useless-import-alias
 
@@ -103,6 +105,8 @@ __all__ = (
     "SplashAttentionConfig",
     "TopK",
     "TopKConfig",
+    "TriangleMultiplication",
+    "TriangleMultiplicationConfig",
     "V2RaggedDot",
     "V2RaggedDotConfig",
 )
