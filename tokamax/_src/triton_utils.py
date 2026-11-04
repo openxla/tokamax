@@ -20,12 +20,9 @@ import math
 import jax
 import jax.numpy as jnp
 from tokamax._src import precision as precision_lib
-from tokamax._src.pallas import grid
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
-
-get_cheapest_grid_grouping = grid.get_cheapest_grid_grouping
 
 
 def vmap_kernel(launch_fn, batch_shape=(), batched=()):
@@ -94,6 +91,54 @@ def _get_grid_pids_n(
   return pid_m, pid_n
 
 
+def _get_group_size_cost(
+    group_size_m: int,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> int:
+  """Returns the total cost for the given group size."""
+  num_live_groups = triton.cdiv(jax.devices()[0].core_count, group_size_m)
+  num_live_blocks_m = triton.cdiv(num_live_groups, grid_n) * group_size_m
+  num_live_blocks_m = min(num_live_blocks_m, grid_m)
+  num_live_blocks_n = min(num_live_groups, grid_n)
+  return num_live_blocks_m * block_m_cost + num_live_blocks_n * block_n_cost
+
+
+def get_cheapest_grid_grouping(
+    *,
+    grid_m: int,
+    grid_n: int,
+    block_m_cost: int,
+    block_n_cost: int,
+) -> tuple[int, bool]:
+  """Returns (group_size, group_by_m) that minimizes total cache cost."""
+  num_live_progs = jax.devices()[0].core_count
+
+  def group_size_m_usage(group_size_m):
+    return _get_group_size_cost(
+        group_size_m, grid_m, grid_n, block_m_cost, block_n_cost
+    )
+
+  group_size_m = min(
+      range(1, min(num_live_progs, grid_m) + 1), key=group_size_m_usage
+  )
+
+  def group_size_n_usage(group_size_n):
+    return _get_group_size_cost(
+        group_size_n, grid_n, grid_m, block_n_cost, block_m_cost
+    )
+
+  group_size_n = min(
+      range(1, min(num_live_progs, grid_n) + 1), key=group_size_n_usage
+  )
+
+  if group_size_m_usage(group_size_m) <= group_size_n_usage(group_size_n):
+    return group_size_m, True
+  return group_size_n, False
+
+
 def get_cheapest_grid_pids(
     *,
     grid_m: int,
@@ -102,7 +147,7 @@ def get_cheapest_grid_pids(
     block_n_cost: int,
 ) -> tuple[int, triton.runtime.jit.JITFunction]:
   """Returns (group_size, get_pids_fn) that minimizes total cache cost."""
-  group_size, group_by_m = grid.get_cheapest_grid_grouping(
+  group_size, group_by_m = get_cheapest_grid_grouping(
       grid_m=grid_m,
       grid_n=grid_n,
       block_m_cost=block_m_cost,
@@ -210,6 +255,29 @@ def get_dot_dtype_and_precision(
 
 
 @triton.jit
+def _round_f32_to_tf32(x):
+  return tl.inline_asm_elementwise(
+      'cvt.rna.tf32.f32 $0, $1;',
+      '=r,r',
+      [x],
+      dtype=tl.float32,
+      is_pure=True,
+      pack=1,
+  )
+
+
+@triton.jit
+def dot(a, b, acc=None, input_precision=None):
+  """Computes `tl.dot`, rounding `float32` operands to TF32."""
+  if input_precision == 'tf32':
+    if a.dtype == tl.float32:
+      a = _round_f32_to_tf32(a)
+    if b.dtype == tl.float32:
+      b = _round_f32_to_tf32(b)
+  return tl.dot(a, b, acc=acc, input_precision=input_precision)
+
+
+@triton.jit
 def advance_bcast_ptr(
     ptr, pid_b, batch_shape, batch_strides, pid_h, num_heads, shape
 ):
@@ -223,6 +291,15 @@ def advance_bcast_ptr(
     stride: tl.constexpr = shape[1] if len(shape) == 2 else shape[1] * shape[2]
     ptr += pid_h // (num_heads // shape[0]) * stride
   return ptr
+
+
+@triton.jit
+def row_offset(offs_r, bound_r, stride_r):
+  """Returns `offs_r[:, None] * stride_r`, using int64 only if needed."""
+  if (bound_r + offs_r.shape[0]) * stride_r >= 2**31:
+    return offs_r[:, None].to(tl.int64) * stride_r
+  else:
+    return offs_r[:, None] * stride_r
 
 
 @triton.jit
@@ -258,9 +335,9 @@ def load_2d_bcast(ptr, offs_r, offs_c, shape, other=0.0):
   block_r: tl.constexpr = offs_r.shape[0]
   block_c: tl.constexpr = offs_c.shape[0]
   # Broadcast dims still get a size-1 axis, so callers can transpose the block.
-  zero = tl.zeros((1, 1), dtype=tl.int64)
-  r = zero if bound_r == 1 else offs_r[:, None].to(tl.int64) * bound_c
-  c = zero if bound_c == 1 else offs_c[None, :].to(tl.int64)
+  zero = tl.zeros((1, 1), dtype=tl.int32)
+  r = zero if bound_r == 1 else row_offset(offs_r, bound_r, bound_c)
+  c = zero if bound_c == 1 else offs_c[None, :]
   check_r: tl.constexpr = bound_r > 1 and bound_r % block_r != 0
   check_c: tl.constexpr = bound_c > 1 and bound_c % block_c != 0
   mask = mask_2d(offs_r, bound_r, offs_c, bound_c, check_r, check_c)

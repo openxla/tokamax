@@ -26,6 +26,67 @@ from tokamax._src.ops.experimental.mla import utils
 jax.config.parse_flags_with_absl()
 
 
+def _per_token_reference(
+    ql_nope,
+    q_pe,
+    new_kv_c,
+    new_k_pe,
+    cache_kv,
+    seq_lens,
+    page_indices,
+    *,
+    sm_scale,
+):
+  """Causal MLA, one query token at a time, straight from the inputs.
+
+  Sequence i's keys are its `kv_len - q_len` cached tokens, read from its pages,
+  followed by its `q_len` new tokens. Rows of padding tokens are zero.
+
+  Args:
+    ql_nope: [tokens, heads, lkv_dim].
+    q_pe: [tokens, heads, r_dim].
+    new_kv_c: [tokens, lkv_dim].
+    new_k_pe: [tokens, r_dim].
+    cache_kv: [pages, page_size // packing, packing, kv_dim].
+    seq_lens: (q_len, kv_len) per sequence.
+    page_indices: [num_seqs * pages_per_seq].
+    sm_scale: Softmax scale.
+
+  Returns:
+    [tokens, heads, align_to(lkv_dim, 128)].
+  """
+  num_pages, _, _, kv_dim = cache_kv.shape
+  cache = cache_kv.reshape(num_pages, -1, kv_dim)
+  lkv_dim, r_dim = new_kv_c.shape[1], new_k_pe.shape[1]
+  aligned_lkv = utils.align_to(lkv_dim, 128)
+  pages_per_seq = page_indices.shape[0] // len(seq_lens)
+
+  out = np.zeros(ql_nope.shape[:2] + (aligned_lkv,), np.float32)
+  q_start = 0
+  for i, (q_len, kv_len) in enumerate(seq_lens):
+    num_cached = kv_len - q_len
+    pages = page_indices[i * pages_per_seq : (i + 1) * pages_per_seq]
+    cached = cache[pages[pages >= 0]].reshape(-1, kv_dim)[:num_cached]
+    c_kv = np.concatenate(
+        [cached[:, :lkv_dim], new_kv_c[q_start : q_start + q_len]]
+    )
+    k_pe = np.concatenate([
+        cached[:, aligned_lkv : aligned_lkv + r_dim],
+        new_k_pe[q_start : q_start + q_len],
+    ])
+    for j in range(q_len):
+      t = q_start + j
+      visible = num_cached + j + 1  # Causal.
+      s = (
+          ql_nope[t] @ c_kv[:visible].T + q_pe[t] @ k_pe[:visible].T
+      ) * sm_scale
+      p = np.exp(s - s.max(axis=-1, keepdims=True))
+      p /= p.sum(axis=-1, keepdims=True)
+      out[t, :, :lkv_dim] = p @ c_kv[:visible]
+    q_start += q_len
+  return out
+
+
 class BaselineMlaTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
@@ -125,6 +186,71 @@ class BaselineMlaTest(parameterized.TestCase):
 
     np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(updated_kv, kv_ref, rtol=1e-5, atol=1e-5)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="mixed",
+          seq_lens_list=[(1, 300), (7, 513), (1, 18), (40, 40), (3, 1000)],
+      ),
+      # `q_len` above the 256-row chunk, so a sequence spans several chunks.
+      dict(testcase_name="long_chunk", seq_lens_list=[(300, 700), (5, 9)]),
+      # A sequence with no new tokens between two that have some.
+      dict(testcase_name="empty_seq", seq_lens_list=[(4, 100), (0, 0), (2, 3)]),
+  )
+  def test_ragged_q_lens(self, seq_lens_list):
+    page_size, num_heads, lkv_dim, r_dim = 128, 4, 128, 64
+    total_kv_tokens = sum(s[1] for s in seq_lens_list)
+    num_pages = utils.cdiv(total_kv_tokens, page_size) + len(seq_lens_list)
+    (
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    ) = utils.generate_mla_inputs(
+        seq_lens_list,
+        num_heads,
+        lkv_dim,
+        r_dim,
+        page_size,
+        jnp.float32,
+        jnp.float32,
+        num_pages,
+        rng=np.random.default_rng(0),
+    )
+    sm_scale = 0.1
+    expected = _per_token_reference(
+        np.asarray(ql_nope),
+        np.asarray(q_pe),
+        np.asarray(new_kv_c),
+        np.asarray(new_k_pe),
+        np.asarray(cache_kv),
+        seq_lens_list,
+        np.asarray(page_indices),
+        sm_scale=sm_scale,
+    )
+
+    with jax.default_matmul_precision("highest"):
+      out, _ = base.MultiHeadLatentAttention()(
+          ql_nope,
+          q_pe,
+          new_kv_c,
+          new_k_pe,
+          cache_kv,
+          kv_lens,
+          page_indices,
+          cu_q_lens,
+          distribution,
+          sm_scale=sm_scale,
+          s_dtype=jnp.float32,
+      )
+
+    self.assertEqual(out.shape, expected.shape)
+    np.testing.assert_allclose(out, expected, rtol=1e-4, atol=1e-4)
 
   def test_shape_mismatch_validation(self):
     baseline_op = base.MultiHeadLatentAttention()

@@ -14,7 +14,6 @@
 # ==============================================================================
 """Common utilities for Mosaic GPU attention implementations."""
 
-import functools
 from typing import Annotated, Any
 
 import jax
@@ -24,6 +23,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import vector
 import numpy as np
 import pydantic
@@ -173,6 +174,34 @@ def _broadcast_to_rank(x, rank):
   return None if x is None else jax.lax.broadcast_to_rank(x, rank)
 
 
+def extract_q_range(
+    mask,
+    q_ndim: int,
+    q_indices,
+    k_indices,
+    *,
+    fold_q_sequence_heads: bool = False,
+):
+  """Extracts key-independent `q_start` and `q_end` from `mask`."""
+  if (
+      mask is None
+      or q_indices is not None
+      or k_indices is not None
+      or fold_q_sequence_heads
+  ):
+    return mask, None, None
+
+  q_start = None
+  q_end = None
+  if mask.q_start is not None and mask.q_start.shape[-1] == 1:
+    mask, q_start = mask.take("q_start")
+    q_start = _broadcast_to_rank(q_start, q_ndim - 1)
+  if mask.q_end is not None and mask.q_end.shape[-1] == 1:
+    mask, q_end = mask.take("q_end")
+    q_end = _broadcast_to_rank(q_end, q_ndim - 1)
+  return mask, q_start, q_end
+
+
 def prepare_inputs(
     q,
     k,
@@ -207,15 +236,36 @@ def prepare_inputs(
 
 
 def eval_input_shapes(
-    ba: op_lib.BoundArguments, *, fold_q_sequence_heads: bool, split_k: int
+    ba: op_lib.BoundArguments,
+    *,
+    fold_q_sequence_heads: bool,
+    split_k: int,
+    extract_q_range_flag: bool = False,
 ):
   """Evaluates the shape of the inputs after `prepare_inputs`."""
-  q, k, v, bias, mask, _, _, _ = jax.eval_shape(
-      functools.partial(
-          prepare_inputs,
-          precision=ba.kwargs["precision"],
+  def _prep(q, k, v, *, bias, mask, q_indices, k_indices):
+    if extract_q_range_flag:
+      mask, _, _ = extract_q_range(
+          mask,
+          q.ndim,
+          q_indices,
+          k_indices,
           fold_q_sequence_heads=fold_q_sequence_heads,
-      ),
+      )
+    return prepare_inputs(
+        q,
+        k,
+        v,
+        bias=bias,
+        mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
+        precision=ba.kwargs["precision"],
+        fold_q_sequence_heads=fold_q_sequence_heads,
+    )
+
+  q, k, v, bias, mask, _, _, _ = jax.eval_shape(
+      _prep,
       *ba.args,
       bias=ba.kwargs["bias"],
       mask=ba.kwargs["mask"],
@@ -342,3 +392,94 @@ def safe_downcast(
     return arr
   finfo = jnp.finfo(target_dtype)
   return jnp.clip(arr, finfo.min, finfo.max).astype(target_dtype)
+
+
+@plgpu.inline_mgpu()
+def commit_cp_async_group(_):
+  """Commits an empty `cp.async` group to keep wait_group counts constant."""
+  nvvm.cp_async_commit_group()
+
+
+def cp_async_gmem_to_smem(src, dst):
+  """Issues a 2D tiled `cp.async` from any strided GMEM slice into SMEM."""
+  swizzle = next(t.swizzle for t in dst.transforms if hasattr(t, "swizzle"))
+  tiling = next(t.tiling for t in dst.transforms if hasattr(t, "tiling"))
+  src_kw: dict[str, Any] = (
+      {"write": False} if hasattr(plgpu.RefType, "write") else {}
+  )
+  dst_kw: dict[str, Any] = (
+      {"read": False} if hasattr(plgpu.RefType, "read") else {}
+  )
+  src_ty = plgpu.RefType(**src_kw)
+  dst_ty = plgpu.RefType(
+      transforms=(
+          plgpu.TilingTransform(tiling),
+          plgpu.SwizzleTransform(swizzle),
+      ),
+      **dst_kw,
+  )
+
+  @plgpu.inline_mgpu(arg_types=(src_ty, dst_ty))
+  def _copy(_, gmem_view, smem_view):
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+    gmem_ref_ty = ir.MemRefType(gmem_view.type)
+    smem_ref_ty = ir.MemRefType(smem_view.type)
+    if gmem_ref_ty.rank != 2:
+      raise NotImplementedError(f"Expected 2D GMEM view, got {gmem_ref_ty}")
+    element_type = gmem_ref_ty.element_type
+    element_bitwidth = mgpu.bitwidth(element_type)
+    if element_bitwidth < 8:
+      raise NotImplementedError(
+          f"Sub-byte cp.async unsupported: {element_type}"
+      )
+    is_f8 = (
+        isinstance(element_type, ir.FloatType)
+        and ir.FloatType(element_type).width == 8
+    )
+    gep_type = ir.IntegerType.get_signless(8) if is_f8 else element_type
+    gmem_strides, _ = gmem_ref_ty.get_strides_and_offset()
+    if gmem_strides[-1] != 1:
+      raise NotImplementedError(
+          f"Expected contiguous minor GMEM stride, got {gmem_strides}"
+      )
+    layout = mgpu.fragmented_array.tiled_copy_smem_gmem_layout(
+        *smem_ref_ty.shape[-4:-2], swizzle, element_bitwidth  # pyrefly: ignore[bad-argument-count]
+    )
+    dst_tiled_strides = [
+        arith.constant(i32, s)
+        for s in layout.tiling.tile_strides(tuple(gmem_strides))[
+            gmem_ref_ty.rank :
+        ]
+    ]
+    lane_offset = mgpu.utils.dyn_dot(layout.lane_indices(), dst_tiled_strides)
+    warp_offset = mgpu.utils.dyn_dot(layout.warp_indices(), dst_tiled_strides)
+    dyn_offset = arith.extui(i64, arith.addi(lane_offset, warp_offset))
+    transfers = mgpu.FragmentedArray.transfer_tiled(
+        smem_view, swizzle, layout, tuple(gmem_ref_ty.shape), optimized=False
+    )
+    gmem_base_ptr = mgpu.utils.getelementptr(
+        mgpu.utils.memref_ptr(gmem_view), [dyn_offset], gep_type
+    )
+    gmem_base_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(address_space=1), gmem_base_ptr
+    )
+    bytes_per_transfer = layout.vector_length * element_bitwidth // 8
+    cache_modifier = (
+        nvvm.LoadCacheModifierKind.CG
+        if bytes_per_transfer == 16
+        else nvvm.LoadCacheModifierKind.CA
+    )
+    for _, _, get_base_idx, smem_ptr in transfers:
+      constant_offset = sum(
+          i * s for i, s in zip(get_base_idx(), gmem_strides, strict=True)
+      )
+      gmem_ptr = mgpu.utils.getelementptr(
+          gmem_base_ptr, [constant_offset], gep_type
+      )
+      nvvm.cp_async_shared_global(
+          smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
+      )
+    nvvm.cp_async_commit_group()
+
+  _copy(src, dst)

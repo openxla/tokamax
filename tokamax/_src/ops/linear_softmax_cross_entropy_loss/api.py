@@ -76,7 +76,8 @@ def linear_softmax_cross_entropy_loss(
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
     implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "mosaic_tpu", "xla" or "chunked_xla" explicitly.
+      backend. Can be set to "mosaic_tpu", "xla" or "chunked_xla" explicitly,
+      or a sequence of implementations/callables to try in order.
       The "mosaic_tpu" and "chunked_xla" implementations are memory efficient
       and have almost 0 additional buffer overhead while the "xla"
       implementation needs to materialize the full logits.
@@ -86,6 +87,7 @@ def linear_softmax_cross_entropy_loss(
     Otherwise, returns a scalar loss.
 
   Raises:
+    ValueError: If an unknown implementation or empty sequence is passed.
     NotImplementedError: If the implementation is not supported.
     ExceptionGroup: If all implementations failed.
   """
@@ -96,33 +98,29 @@ def linear_softmax_cross_entropy_loss(
         "Customization of precision is currently not supported."
     )
 
-  if implementation is not None:
-    if implementation in IMPLEMENTATIONS:
-      loss = IMPLEMENTATIONS[implementation](
-          x,
-          labels,
-          weights,
-          reduction=reduction,
-      )
-      return loss
-    else:
-      raise ValueError(f"Unsupported implementation: {implementation}")
+  if implementation is None:
+    implementation = _DEFAULT_IMPLEMENTATION
+  elif isinstance(implementation, str):
+    implementation = (implementation,)
+  elif not implementation:
+    raise ValueError("`implementation` must not be an empty sequence.")
 
-  # Find out the best implementation based on the hardware.
   errors = []
-  for impl in _DEFAULT_IMPLEMENTATION:
-    if impl not in IMPLEMENTATIONS:
-      continue
+  for impl in implementation:
+    if isinstance(impl, str):
+      if impl not in IMPLEMENTATIONS:
+        raise ValueError(f"Unsupported implementation: {impl}")
+      impl = IMPLEMENTATIONS[impl]
+
     try:
-      loss = IMPLEMENTATIONS[impl](
+      return impl(
           x,
           labels,
           weights,
           reduction=reduction,
       )
-      return loss
     except NotImplementedError as e:
-      if len(_DEFAULT_IMPLEMENTATION) == 1:
+      if len(implementation) == 1:
         raise
       errors.append(e)
 

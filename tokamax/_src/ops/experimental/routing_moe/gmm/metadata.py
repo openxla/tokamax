@@ -16,9 +16,10 @@
 """Module that encapsulates metadata used for DMA and scheduling."""
 
 import abc
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Callable
+from typing import Any, Self
 
 import jax
 from jax import lax
@@ -27,7 +28,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import config
-
 
 type WriteGroupFn = Callable[[jax.Array, jax.Array], jax.Array]
 
@@ -54,9 +54,7 @@ class AbstractMetadataRef(abc.ABC):
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
 
   @classmethod
-  def create_scratch_types(
-      cls, cfg: config.RoutingGmmConfig
-  ) -> Any:
+  def create_scratch_types(cls, cfg: config.RoutingGmmConfig) -> Self:
     """Creates SMEM scratch specs for the metadata tables."""
     return cls(
         gm_id_to_group_id=pltpu.SMEM((cfg.max_num_gm,), jnp.int32),
@@ -145,7 +143,7 @@ class SortedMetadataRef(AbstractMetadataRef):
     # offset issue that was found in GMM v2.
 
     group_start = metadata_in.group_offset[0]
-    group_end = group_start + self.cfg.dim.size_local_groups
+    group_end = group_start + self.cfg.spec.size_local_groups
     self.gm_id_to_group_id[self.sink_gm_id] = 0
     self.gm_id_to_m_offset[self.sink_gm_id] = 0
     self.gm_id_to_num_rows[self.sink_gm_id] = 0
@@ -156,8 +154,8 @@ class SortedMetadataRef(AbstractMetadataRef):
         offset: jax.Array,
         *,
         local_group_id: jax.Array,
-        end: jax.Array
-    ):
+        end: jax.Array,
+    ) -> jax.Array:
       num_rows = jnp.minimum(end - offset, self.cfg.plan.tile_m)
       self.gm_id_to_group_id[gm_id] = local_group_id
       self.gm_id_to_m_offset[gm_id] = offset
@@ -165,7 +163,7 @@ class SortedMetadataRef(AbstractMetadataRef):
       return offset + num_rows
 
     @jax.named_scope("write_group")
-    def write_group(group_id: jax.Array, num_gm: jax.Array):
+    def write_group(group_id: jax.Array, num_gm: jax.Array) -> jax.Array:
       start = metadata_in.group_cum_sum[group_id]
       end = metadata_in.group_cum_sum[group_id + 1]
       next_num_gm = num_gm + pl.cdiv(end - start, self.cfg.plan.tile_m)
@@ -190,32 +188,10 @@ class SortedMetadataRef(AbstractMetadataRef):
       group_start: jax.Array,
       group_end: jax.Array,
   ) -> jax.Array:
-    """Walks this shard's groups to lay out their tiles."""
-    # Walk the groups, but skip over "skip" consecutive empty elements.
-    skip = self.cfg.plan.skip_metadata_size
-
-    def step(carry):
-      group_id, num_gm = carry
-      ahead = jnp.minimum(group_id + skip + 1, group_end)
-      empty = (
-          metadata_in.group_cum_sum[ahead]
-          == metadata_in.group_cum_sum[group_id]
-      )
-      # If the cumulative sum hasn't changed, then we can skip these.
-      num_gm = write_group(
-          group_id, num_gm
-      )  # if the group is empty, nothing is written.
-      return jnp.where(empty, ahead, group_id + 1), num_gm
-
-    if skip == 0:
-      # There's overhead of our checks, so standard fori is better here.
-      return jax.lax.fori_loop(group_start, group_end, write_group, 0)
-    _, num_gm = jax.lax.while_loop(
-        lambda carry: carry[0] < group_end,
-        step,
-        (group_start, jnp.int32(0)),
-    )
-    return num_gm
+    """Walks every local group in order; empty groups write no tiles."""
+    # Used when most groups have rows or `row_group` is not given.
+    del metadata_in
+    return jax.lax.fori_loop(group_start, group_end, write_group, 0)
 
 
 @jax.tree_util.register_dataclass

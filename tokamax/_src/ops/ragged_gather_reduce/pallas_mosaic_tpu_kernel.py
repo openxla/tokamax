@@ -277,11 +277,16 @@ def main_kernel(
           pl.BlockSpec((TOKEN_SUBCHUNK,), metadata_block_index),
       ),
       out_specs=(),
+      _explicit_indices=True,
   )
   def token_block_pipeline(
-      route_metadata_ref, route_weights_ref, route_counts_ref, output_sem_ref
+      outer_step,
+      route_metadata_ref,
+      route_weights_ref,
+      route_counts_ref,
+      output_sem_ref,
   ):
-    block_id = pl.program_id(0)
+    block_id = outer_step.index[0]
     global_block_id = row_partition_id * blocks_per_row_partition + block_id
     valid_route_count = route_counts_ref[...][0]
     # The wrapper only reports exactly two routes per token when the routes of
@@ -319,9 +324,10 @@ def main_kernel(
               ),
           ),
           out_specs=(),
+          _explicit_indices=True,
       )
-      def route_pipeline(gather_ref):
-        route_chunk = pl.program_id(0)
+      def route_pipeline(inner_step, gather_ref):
+        route_chunk = inner_step.index[0]
         metadata_start = route_chunk * TOKEN_SUBCHUNK
         metadata_slice = pl.ds(metadata_start, TOKEN_SUBCHUNK)
         route_metadata = route_metadata_ref[metadata_slice]

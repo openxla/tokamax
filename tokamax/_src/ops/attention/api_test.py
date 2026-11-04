@@ -37,9 +37,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    if jax.default_backend() == 'gpu':
-      # TODO: Remove once Mosaic GPU support is fixed.
-      self.skipTest('Mosaic GPU support is broken.')
 
   # Tests derived from JAX `nn_test`.
   # pylint: disable=invalid-name
@@ -161,10 +158,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       ],
   )
   def testDotProductAttentionMask(self, mask_mode):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if isinstance(mask_mode, str):
       mask_mode = (mask_mode,)
 
@@ -259,10 +252,6 @@ class DotProductAttentionTest(parameterized.TestCase):
 
   @parameterized.product(batch_size=[1, 16], use_vmap=[False, True])
   def test_dot_product_attention_bias_gradient(self, batch_size, use_vmap):
-    # TODO: Fix test for 'xla_chunked' on TPU.
-    if jax.default_backend() == 'tpu' and self.IMPL in ('xla_chunked',):
-      self.skipTest(f'{self.IMPL} not supported on TPU')
-
     if jax.default_backend() == 'tpu' and self.IMPL == 'mosaic':
       # TODO: Remove once a learnable bias is supported on Mosaic
       # TPU attention.
@@ -326,11 +315,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       self.skipTest(
           'Memory scaling guarantees not made for this implementation'
       )
-    # TODO: Fwd+bwd pass for xla_chunked is O(N^2).
-    if self.IMPL == 'xla_chunked' and mode == 'fwd_bwd':
-      self.skipTest(
-          'Skip test. Memory scaling for fwd+bwd for xla_chunked is O(N^2).'
-      )
     # TODO: Fwd+bwd pass for mosaic TPU is O(N^2).
     if (
         jax.default_backend() == 'tpu'
@@ -374,13 +358,7 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
     super().setUp()
     match jax.default_backend():
       case 'gpu':
-        # TODO: Remove once Mosaic GPU support is fixed.
-        self.skipTest('Mosaic GPU support is broken.')
-        if not gpu_utils.has_mosaic_gpu_support() or gpu_utils.is_sm100():
-          self.skipTest(
-              'Skip test. Mosaic implementation is not supported on this'
-              ' platform.'
-          )
+        pass
       case 'tpu':
         pass
       case _:
@@ -388,6 +366,37 @@ class DotProductAttentionMosaicTest(DotProductAttentionTest):
             'Skip test. Mosaic implementation is not supported on this'
             ' platform.'
         )
+
+  @parameterized.parameters('fwd', 'fwd_bwd')
+  def test_sm80_seq_lengths_linear_memory_scaling(self, mode):
+    if jax.default_backend() != 'gpu' or not gpu_utils.is_sm80():
+      self.skipTest('SM80 sequence-length linear memory scaling test.')
+
+    seq_len = 1024
+    scale = 4
+    x0 = jax.ShapeDtypeStruct((2, seq_len, 16, 128), jnp.bfloat16)
+    x1 = jax.ShapeDtypeStruct((2, seq_len * scale, 16, 128), jnp.bfloat16)
+    q_len = jax.ShapeDtypeStruct((2,), jnp.int32)
+    kv_len = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def fwd_fn(x, ql, kvl):
+      return api.dot_product_attention(
+          x,
+          x,
+          x,
+          is_causal=True,
+          query_seq_lengths=ql,
+          key_value_seq_lengths=kvl,
+          implementation='mosaic',
+      )
+
+    bwd_fn = lambda x, ql, kvl: jax.vjp(fwd_fn, x, ql, kvl)[1](x)
+    f = jax.jit(fwd_fn) if mode == 'fwd' else jax.jit(bwd_fn)
+
+    assert (mem0 := f.lower(x0, q_len, kv_len).compile().memory_analysis())
+    assert (mem1 := f.lower(x1, q_len, kv_len).compile().memory_analysis())
+    mem_increase = mem1.peak_memory_in_bytes / mem0.peak_memory_in_bytes
+    self.assertBetween(mem_increase, minv=(scale * 0.25), maxv=(scale * 1.5))
 
 
 class DotProductAttentionTritonTest(DotProductAttentionTest):
@@ -475,6 +484,51 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
 
     chex.assert_trees_all_close(out, squeeze(out_b))
     chex.assert_trees_all_close(grads, tuple(map(squeeze, grads_b)))
+
+  def test_multidimensional_batch_seq_lengths(self):
+    batch_dim_0 = 2
+    batch_dim_1 = 3
+    seq_len = 16
+    num_heads = 2
+    head_dim = 32
+    total_batch = batch_dim_0 * batch_dim_1
+    shape_2d = (batch_dim_0, batch_dim_1, seq_len, num_heads, head_dim)
+    shape_1d = (total_batch, seq_len, num_heads, head_dim)
+
+    q_input = jax.random.normal(jax.random.key(10), shape_2d, dtype=jnp.float32)
+    k_input = jax.random.normal(jax.random.key(11), shape_2d, dtype=jnp.float32)
+    v_input = jax.random.normal(jax.random.key(12), shape_2d, dtype=jnp.float32)
+
+    query_seq_lengths = jnp.array([[4, 8, 12], [6, 10, 16]], dtype=jnp.int32)
+    kv_seq_lengths = jnp.array([[6, 10, 14], [8, 12, 16]], dtype=jnp.int32)
+
+    q_flat = jnp.reshape(q_input, shape_1d)
+    k_flat = jnp.reshape(k_input, shape_1d)
+    v_flat = jnp.reshape(v_input, shape_1d)
+    q_len_flat = jnp.reshape(query_seq_lengths, (total_batch,))
+    kv_len_flat = jnp.reshape(kv_seq_lengths, (total_batch,))
+
+    expected_out_flat = api.dot_product_attention(
+        q_flat,
+        k_flat,
+        v_flat,
+        query_seq_lengths=q_len_flat,
+        key_value_seq_lengths=kv_len_flat,
+        implementation='xla',
+    )
+    expected_out = jnp.reshape(expected_out_flat, shape_2d)
+
+    actual_out = api.dot_product_attention(
+        q_input,
+        k_input,
+        v_input,
+        query_seq_lengths=query_seq_lengths,
+        key_value_seq_lengths=kv_seq_lengths,
+        implementation='xla',
+    )
+    self.assertTrue(
+        jnp.allclose(actual_out, expected_out, atol=1e-3, rtol=1e-3)
+    )
 
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):

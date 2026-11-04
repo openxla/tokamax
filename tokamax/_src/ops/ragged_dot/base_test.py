@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import functools
 from typing import override
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import test_base
 
@@ -48,6 +50,37 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
     if "128_m16384" in self._testMethodName and jax.default_backend() == "gpu":
       self.skipTest("OOMs on MiG slice.")
     super()._test_bench(spec)
+
+  @parameterized.product(
+      rhs_dtype=(jnp.bfloat16, jnp.float32),
+      preferred_element_type=(None, jnp.bfloat16, jnp.float32),
+  )
+  def test_vjp_preferred_element_type(self, rhs_dtype, preferred_element_type):
+    num_groups, m, k, n = 8, 128, 64, 128
+    lhs, rhs, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16
+    )
+    rhs = rhs.astype(rhs_dtype)
+    f = functools.partial(
+        self._dot_fn,
+        group_sizes=group_sizes,
+        preferred_element_type=preferred_element_type,
+    )
+    out, f_vjp = jax.vjp(f, lhs, rhs)
+
+    if preferred_element_type:
+      expected_dtype = jnp.dtype(preferred_element_type)
+    else:
+      expected_dtype = jnp.result_type(lhs, rhs)
+
+    self.assertEqual(out.dtype, expected_dtype)
+
+    dlhs, drhs = f_vjp(jnp.ones_like(out))
+    # `dlhs` always follow `lhs`(primal)'s data type
+    self.assertEqual(dlhs.dtype, lhs.dtype)
+
+    # `drhs` follows user-stet `preferred_element_type` if set
+    self.assertEqual(drhs.dtype, expected_dtype)
 
 
 class GenerateGroupSizesTest(parameterized.TestCase):

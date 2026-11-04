@@ -70,11 +70,12 @@ def mhc_lite_pre(
     A tuple `(layer_input, context)` where `layer_input` feeds the wrapped
     model branch, and `context` is passed unchanged to `mhc_lite_post`.
   """
-  resolved = _resolve_implementation(implementation)
-  permutations = jax.lax.stop_gradient(permutations)
-  if resolved == "xla":
-    return mhc_xla.pre_xla(x, weights, permutations, config=config)
-  return mhc_kernels_fwd.pre(x, weights, permutations, config)
+  with jax.named_scope("mhc_lite_pre"):
+    resolved = _resolve_implementation(implementation)
+    permutations = jax.lax.stop_gradient(permutations)
+    if resolved == "xla":
+      return mhc_xla.pre_xla(x, weights, permutations, config=config)
+    return mhc_kernels_fwd.pre(x, weights, permutations, config)
 
 
 def mhc_lite_post(
@@ -99,13 +100,15 @@ def mhc_lite_post(
     Mixed output streams of shape `(batch, sequence, streams, embedding)` or
     `(tokens, streams * embedding)`.
   """
-  if context.implementation == "xla":
-    return mhc_xla.post_xla(layer_output, context)
-  if context.implementation != "mosaic_tpu":
-    raise ValueError(
-        f"Unsupported implementation in MHCContext: '{context.implementation}'"
-    )
-  return mhc_kernels_fwd.post(layer_output, context, config)
+  with jax.named_scope("mhc_lite_post"):
+    if context.implementation == "xla":
+      return mhc_xla.post_xla(layer_output, context)
+    if context.implementation != "mosaic_tpu":
+      raise ValueError(
+          "Unsupported implementation in MHCContext:"
+          f" '{context.implementation}'"
+      )
+    return mhc_kernels_fwd.post(layer_output, context, config)
 
 
 def mhc_lite_post_and_pre(
@@ -134,17 +137,18 @@ def mhc_lite_post_and_pre(
   Returns:
     A tuple `(next_layer_input, next_context)` for Stage 2.
   """
-  resolved = _resolve_implementation(
-      context.implementation if implementation is None else implementation
-  )
-  permutations = jax.lax.stop_gradient(permutations)
-  if resolved == "xla":
-    return mhc_xla.post_and_pre_xla(
-        layer_output, context, next_weights, permutations, config=config
+  with jax.named_scope("mhc_lite_post_and_pre"):
+    resolved = _resolve_implementation(
+        context.implementation if implementation is None else implementation
     )
-  return mhc_kernels_fwd.post_and_pre(
-      layer_output, context, next_weights, permutations, config
-  )
+    permutations = jax.lax.stop_gradient(permutations)
+    if resolved == "xla":
+      return mhc_xla.post_and_pre_xla(
+          layer_output, context, next_weights, permutations, config=config
+      )
+    return mhc_kernels_fwd.post_and_pre(
+        layer_output, context, next_weights, permutations, config
+    )
 
 
 def hc_pre(
@@ -162,7 +166,8 @@ def hc_pre(
     A tuple `(layer_input, context)` where `layer_input` feeds the wrapped
     model branch, and `context` is passed unchanged to `hc_post`.
   """
-  return hc_xla.pre_hc(x, weights)
+  with jax.named_scope("hc_pre"):
+    return hc_xla.pre_hc(x, weights)
 
 
 def hc_post(
@@ -180,12 +185,13 @@ def hc_post(
     Mixed output streams of shape `(batch, sequence, streams, embedding)` or
     `(tokens, streams * embedding)`.
   """
-  if context.implementation != "hc":
-    raise ValueError(
-        "Expected MHCContext with implementation='hc'; got"
-        f" '{context.implementation}'"
-    )
-  return hc_xla.post_hc(layer_output, context)
+  with jax.named_scope("hc_post"):
+    if context.implementation != "hc":
+      raise ValueError(
+          "Expected MHCContext with implementation='hc'; got"
+          f" '{context.implementation}'"
+      )
+    return hc_xla.post_hc(layer_output, context)
 
 
 def hc_post_and_pre(
@@ -206,9 +212,10 @@ def hc_post_and_pre(
   Returns:
     A tuple `(next_layer_input, next_context)` for Stage 2.
   """
-  if context.implementation != "hc":
-    raise ValueError(
-        "Expected MHCContext with implementation='hc'; got"
-        f" '{context.implementation}'"
-    )
-  return hc_xla.post_and_pre_hc(layer_output, context, next_weights)
+  with jax.named_scope("hc_post_and_pre"):
+    if context.implementation != "hc":
+      raise ValueError(
+          "Expected MHCContext with implementation='hc'; got"
+          f" '{context.implementation}'"
+      )
+    return hc_xla.post_and_pre_hc(layer_output, context, next_weights)

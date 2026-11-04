@@ -164,6 +164,41 @@ table.ops-table code {
       <td align="center" style="text-align: center;"></td>
       <td>Computes <a href="https://arxiv.org/abs/2405.04434">Multi-Head Latent Attention (MLA)</a> over compressed latent KV caches for DeepSeek-V2, DeepSeek-V3, and DeepSeek-R1 inference.</td>
     </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/moba"><code>moba</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Block-mean routed sparse causal attention for long-context sequences, implementing <a href="https://arxiv.org/abs/2502.13189">MoBA: Mixture of Block Attention for Long-Context LLMs</a>.</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/nsa"><code>nsa</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Hardware-aligned hierarchical sparse attention combining compressed-block, selected-block, and sliding-window branches, implementing <a href="https://arxiv.org/abs/2502.11089">Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</a>.</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/gdn2"><code>gdn2</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Chunkwise parallel gated delta-rule linear attention with decoupled write gating, implementing <a href="https://arxiv.org/abs/2412.06464">Gated Delta Networks: Improving Mamba2 with Delta Rule</a>.</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/rwkv7"><code>rwkv7</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Diagonal-plus-low-rank (DPLR) state-transition linear attention with vector log-decay and in-context learning rate, implementing <a href="https://arxiv.org/abs/2503.14456">RWKV-7 "Goose" with Expressive Dynamic State Evolution</a>.</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/raven"><code>raven</code></a> (experimental)</td>
+      <td>TPU</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td align="center" style="text-align: center;">✅</td>
+      <td>Two-stage bounded-slot linear attention with decoupled slot-axis and state-axis exponential decay, implementing <a href="https://arxiv.org/abs/2409.07146">Gated Slot Attention for Efficient Linear-Time Sequence Modeling</a>.</td>
+    </tr>
   </tbody>
 </table>
 

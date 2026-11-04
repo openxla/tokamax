@@ -84,9 +84,49 @@ def kimi_delta_attention(
     lower_bound: float | None,
     context_parallel_metadata: ContextParallelMetadataArg,
     max_num_segments: int | None,
+    conv_weight_q: jax.Array | None = None,
+    conv_weight_k: jax.Array | None = None,
+    conv_weight_v: jax.Array | None = None,
+    conv_bias_q: jax.Array | None = None,
+    conv_bias_k: jax.Array | None = None,
+    conv_bias_v: jax.Array | None = None,
+    use_conv1d_in_kernel: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
   q, k, v, g = query, key, value, gate
+  if use_conv1d_in_kernel:
+    assert (
+        conv_weight_q is not None
+        and conv_weight_k is not None
+        and conv_weight_v is not None
+    )
+
+    def _ref_conv(x_in, w_in, b_in):
+      W = w_in.shape[1]
+      x_f32 = x_in.astype(jnp.float32)
+      w_f32 = w_in.astype(jnp.float32)
+      acc = x_f32 * w_f32[:, None, W - 1 : W, :]
+      for lag in range(1, W):
+        x_lag = jnp.pad(
+            x_f32[:, :, :-lag, :], ((0, 0), (0, 0), (lag, 0), (0, 0))
+        )
+        if segment_ids is not None:
+          same_seg = (segment_ids[:, lag:] == segment_ids[:, :-lag]) & (
+              segment_ids[:, lag:] > 0
+          )
+          same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
+          x_lag = jnp.where(same_seg[None, :, :, None], x_lag, 0.0)
+        acc = acc + x_lag * w_f32[:, None, W - 1 - lag : W - lag, :]
+      if b_in is not None:
+        acc = acc + b_in.astype(jnp.float32)[:, None, None, :]
+      return jax.nn.silu(acc).astype(x_in.dtype)
+
+    q = _ref_conv(q, conv_weight_q, conv_bias_q)
+    k = _ref_conv(k, conv_weight_k, conv_bias_k)
+    v = _ref_conv(v, conv_weight_v, conv_bias_v)
+  # Broadcast scalar gates to key dimension width.
+  if g.shape[-1] != q.shape[-1]:
+    g = jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
   heads, batch, seq_len, key_dim = q.shape
   value_dim = v.shape[-1]
   acc_dtype = _accumulator_dtype(q.dtype)

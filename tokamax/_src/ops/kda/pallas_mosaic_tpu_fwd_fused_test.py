@@ -15,9 +15,9 @@
 """Fused forward equivalence and compatibility with the existing backward."""
 
 import functools
-import types
 
 import jax
+from jax._src import tpu_info
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -33,15 +33,10 @@ def interpret_on_cpu(monkeypatch):
     yield
     return
   monkeypatch.setenv("PALLAS_INTERPRET", "1")
-  monkeypatch.setattr(
-      common.pltpu,
-      "get_tpu_info",
-      lambda: types.SimpleNamespace(
-          vmem_capacity_bytes=32 * 1024**2,
-          num_sublanes=8,
-          num_lanes=128,
-      ),
-  )
+  hardware = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion.TPU_V5P, 1)
+  monkeypatch.setattr(common.pltpu, "get_tpu_info", lambda: hardware)
+  # Upstream's pipelined backward queries the internal hardware helper too.
+  monkeypatch.setattr(tpu_info, "get_tpu_info", lambda: hardware)
   monkeypatch.setattr(
       mosaic.PallasMosaicTpuKimiDeltaAttention,
       "supported_on",
@@ -120,7 +115,10 @@ def _assert_close(actual, expected, *, tolerance):
     assert np.isfinite(a).all()
     assert np.isfinite(b).all()
     np.testing.assert_allclose(
-        a, b, rtol=tolerance, atol=tolerance,
+        a,
+        b,
+        rtol=tolerance,
+        atol=tolerance,
         err_msg=f"KDA result leaf {jax.tree_util.keystr(path)}",
     )
 
@@ -306,3 +304,38 @@ def test_fixed_raw_gate_parameter_gradients(rematerialize):
   # against the unchanged staged custom VJP.
   _assert_close(results[1][3], expected[3], tolerance=0.05)
   _assert_close(results[1][6:], expected[6:], tolerance=0.05)
+
+
+@pytest.mark.parametrize("feature", ["scalar_gate", "conv1d", "mini_batch"])
+def test_opt_in_forward_preserves_new_upstream_features(feature):
+  args, _ = _inputs(jnp.bfloat16, False)
+  q, k, v, g, beta = args[:5]
+  kwargs = dict(output_final_state=False, use_gate_in_kernel=False)
+  config_kwargs = {}
+  if feature == "scalar_gate":
+    g = g[..., :1]
+    kwargs["per_channel_gate"] = False
+  elif feature == "conv1d":
+    weights = jnp.ones((1, 3, 128), jnp.float32) * 0.1
+    kwargs.update(
+        use_conv1d_in_kernel=True,
+        conv_weight_q=weights,
+        conv_weight_k=weights,
+        conv_weight_v=weights,
+    )
+  else:
+    config_kwargs["mini_batch"] = 1
+  outputs = []
+  for enabled in (False, True):
+    config_kwargs["fuse_forward"] = enabled
+    if "compact_forward" in mosaic.Config.__dataclass_fields__:
+      config_kwargs["compact_forward"] = enabled
+    op = mosaic.PallasMosaicTpuKimiDeltaAttention(
+        config=mosaic.Config(**config_kwargs)
+    )
+    outputs.append(
+        jax.jit(lambda q, k, v, g, beta: op(q, k, v, g, beta, **kwargs)[0])(
+            q, k, v, g, beta
+        )
+    )
+  np.testing.assert_array_equal(*outputs)

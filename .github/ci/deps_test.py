@@ -27,6 +27,7 @@ installed.
 
 import ast
 import os
+import re
 import tempfile
 import textwrap
 import unittest
@@ -174,10 +175,9 @@ class GraphTest(DepsTestCase):
   def test_importing_a_submodule_records_an_edge_to_the_package_init(self):
     # `from tokamax._src import core` executes `_src/__init__.py`, and the
     # graph does record that edge -- the package imported *from* is named by
-    # the statement. Asserted against the graph rather than through
-    # `affected_tests`, which fails a changed `__init__.py` open before it gets
-    # this far; the edge still has to be there, because it is what the
-    # ancestors of *other* files' imports are missing.
+    # the statement. Asserted against the plain graph rather than through
+    # `affected_tests`, which also adds the edges no statement names; this one
+    # has to be there without them.
     index = deps.dependents(self.edges, self.files)
     self.assertIn(
         'tokamax/_src/core_test.py', index['tokamax/_src/__init__.py']
@@ -251,6 +251,31 @@ class FailOpenTest(DepsTestCase):
     tests, _ = self.affected('tokamax/README.md', 'tokamax/data/tuning.json')
     self.assertIsNone(tests)
 
+  def test_workflows_other_than_ci_build_are_inert(self):
+    # CI-Build runs none of them, so every shard ran without testing them.
+    for path in (
+        '.github/workflows/ci-nightly.yml',
+        '.github/workflows/nightly_benchmarks.yml',
+        '.github/workflows/publish.yml',
+        '.github/workflows/run_benchmarks.yml',
+        '.github/workflows/a_new_workflow.yml',
+    ):
+      with self.subTest(path=path):
+        tests, reason = self.affected(path)
+        self.assertEqual(tests, set())
+        self.assertIsNone(reason)
+
+  def test_ci_build_and_its_scripts_still_force_a_full_run(self):
+    self.assert_full_run('.github/workflows/ci-build.yml')
+    self.assert_full_run('.github/ci/install_deps.sh')
+
+  def test_other_workflows_do_not_exempt_the_rest_of_the_changeset(self):
+    tests, reason = self.affected(
+        '.github/workflows/ci-nightly.yml', '.github/ci/install_deps.sh'
+    )
+    self.assertIsNone(tests)
+    self.assertIn('install_deps.sh', reason)
+
   def test_inert_files_do_not_exempt_the_rest_of_the_changeset(self):
     # Skipping an inert path must not skip the loop. The docs-only case is
     # cheap precisely because it is only reached when nothing else is there.
@@ -300,27 +325,11 @@ class FailOpenTest(DepsTestCase):
     self.assertIsNone(tests)
     self.assertIn('deleted', reason)
 
-  def test_edited_package_init(self):
-    # An edited `__init__.py` fails open for a different reason than a deleted
-    # one: nothing imports it by name, so its dependents are whatever happens
-    # to sit above the importer in the tree, which the graph does not record.
-    for path in (
-        'tokamax/__init__.py',
-        'tokamax/_src/__init__.py',
-        'tokamax/_src/ops/__init__.py',
-    ):
-      with self.subTest(path=path):
-        self.add(path, 'X = 1\n')
-        tests, reason = self.affected(path)
-        self.assertIsNone(tests, f'editing {path} should force a full run')
-        self.assertIn('__init__.py', reason)
-        self.assertNotIn('deleted', reason)
-
-  def test_an_init_forces_a_full_run_for_the_whole_changeset(self):
-    tests, reason = self.affected(
-        'tokamax/_src/core.py', 'tokamax/_src/ops/__init__.py'
-    )
-    self.assertIsNone(tests)
+  def test_package_init_without_the_file_list(self):
+    # Without `known`, an edited `__init__.py` cannot be told apart from a
+    # deleted one, so it has to take the deleted one's answer.
+    reason = deps.full_run_reason(['tokamax/_src/ops/__init__.py'])
+    self.assertIsNotNone(reason)
     self.assertIn('__init__.py', reason)
 
   def test_a_file_merely_named_init_elsewhere_is_not_special(self):
@@ -328,6 +337,106 @@ class FailOpenTest(DepsTestCase):
     tests, reason = self.affected('tokamax/_src/__init___helper.py')
     self.assertEqual(tests, set())
     self.assertIsNone(reason)
+
+
+class PackageInitTest(DepsTestCase):
+  """An edited or added `__init__.py` selects the tests that run it."""
+
+  ALL_TESTS = frozenset({
+      'tokamax/_src/op_test.py',
+      'tokamax/_src/core_test.py',
+      'tokamax/_src/ops/backend_test.py',
+      'tokamax/_src/ops/relative_test.py',
+      'tokamax/_src/ops/ragged_test.py',
+  })
+  OPS_TESTS = frozenset({
+      'tokamax/_src/ops/backend_test.py',
+      'tokamax/_src/ops/relative_test.py',
+      'tokamax/_src/ops/ragged_test.py',
+  })
+
+  def test_the_package_root_init_runs_for_every_test(self):
+    self.add('tokamax/__init__.py', 'from tokamax import api\nX = 1\n')
+    tests, reason = self.affected('tokamax/__init__.py')
+    self.assertIsNone(reason)
+    self.assertEqual(tests, self.ALL_TESTS)
+
+  def test_a_subpackage_init_runs_only_for_tests_inside_it(self):
+    # Nothing outside `_src/ops/` imports from it, so `op_test.py` and
+    # `core_test.py` never run `_src/ops/__init__.py`.
+    self.add('tokamax/_src/ops/__init__.py', 'X = 1\n')
+    tests, reason = self.affected('tokamax/_src/ops/__init__.py')
+    self.assertIsNone(reason)
+    self.assertEqual(tests, self.OPS_TESTS)
+
+  def test_a_test_runs_every_enclosing_init(self):
+    # `relative_test.py` imports nothing from `_src` by that name, but pytest
+    # imports it as `tokamax._src.ops.relative_test`, which runs
+    # `_src/__init__.py` first.
+    tests, _ = self.affected('tokamax/_src/__init__.py')
+    self.assertIn('tokamax/_src/ops/relative_test.py', tests)
+
+  def test_a_new_package_selects_only_its_own_tests(self):
+    # The new-op case: a new directory with an `__init__.py`, its modules and
+    # their tests. Nothing that existed before can import it.
+    self.add('tokamax/_src/ops/moba/__init__.py', '')
+    self.add('tokamax/_src/ops/moba/base.py', 'from tokamax._src import core\n')
+    self.add(
+        'tokamax/_src/ops/moba/base_test.py',
+        'from tokamax._src.ops.moba import base\n',
+    )
+    tests, reason = self.affected(
+        'tokamax/_src/ops/moba/__init__.py',
+        'tokamax/_src/ops/moba/base.py',
+        'tokamax/_src/ops/moba/base_test.py',
+    )
+    self.assertIsNone(reason)
+    self.assertEqual(tests, {'tokamax/_src/ops/moba/base_test.py'})
+
+  def test_follows_an_enclosing_init_that_imports_the_package(self):
+    # `core_test.py` never names `kern`, but `_src/__init__.py` imports it, and
+    # importing `tokamax._src.core` runs `_src/__init__.py` first.
+    self.add('tokamax/_src/ops/kern/__init__.py', 'X = 1\n')
+    self.add('tokamax/_src/__init__.py', 'from tokamax._src.ops import kern\n')
+    tests, _ = self.affected('tokamax/_src/ops/kern/__init__.py')
+    self.assertIn('tokamax/_src/core_test.py', tests)
+
+  def test_an_init_does_not_widen_the_rest_of_the_changeset(self):
+    # It used to force a full run for everything changed alongside it.
+    tests, reason = self.affected(
+        'tokamax/_src/orphan.py', 'tokamax/_src/ops/__init__.py'
+    )
+    self.assertIsNone(reason)
+    self.assertEqual(tests, self.OPS_TESTS)
+
+  def test_ordinary_edits_ignore_the_enclosing_init_edges(self):
+    # Selected over the plain graph, as before: `tokamax/__init__.py` imports
+    # `api`, which reaches `_src/op.py`, and every test runs
+    # `tokamax/__init__.py` -- over the execution graph, every test would
+    # select itself for any change to `op.py`.
+    tests, _ = self.affected('tokamax/_src/op.py')
+    self.assertEqual(tests, {'tokamax/_src/op_test.py'})
+
+  def test_enclosing_inits(self):
+    known = set(self.files)
+    self.assertEqual(
+        deps.enclosing_inits('tokamax/_src/ops/relative.py', known),
+        {
+            'tokamax/__init__.py',
+            'tokamax/_src/__init__.py',
+            'tokamax/_src/ops/__init__.py',
+        },
+    )
+    # An `__init__.py` is its package: only the packages above it run first.
+    self.assertEqual(
+        deps.enclosing_inits('tokamax/_src/ops/__init__.py', known),
+        {'tokamax/__init__.py', 'tokamax/_src/__init__.py'},
+    )
+    # A namespace package has no `__init__.py` to run.
+    self.assertEqual(
+        deps.enclosing_inits('tokamax/data/autotuning/x.py', known),
+        {'tokamax/__init__.py'},
+    )
 
 
 class DeletedFileTest(DepsTestCase):
@@ -567,6 +676,22 @@ class AutotuningTableTest(DepsTestCase):
     self.assert_full_run(self.TABLE, 'no class')
 
 
+class CiBuildWorkflowTest(unittest.TestCase):
+  """Keeps `deps.CI_BUILD_WORKFLOW` the only workflow CI-Build depends on."""
+
+  def test_ci_build_calls_no_local_workflow_or_action(self):
+    # Other workflows are inert only because CI-Build never runs them. A local
+    # `uses: ./...` -- a reusable workflow or a composite action -- would make
+    # one part of CI-Build, and a change to it would have to run every shard.
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+    )
+    path = os.path.join(root, deps.CI_BUILD_WORKFLOW)
+    with open(path, encoding='utf-8') as f:
+      local = re.findall(r'^\s*(?:-\s*)?uses:\s*[\'"]?\./.*$', f.read(), re.M)
+    self.assertEqual(local, [], f'{deps.CI_BUILD_WORKFLOW} calls local files')
+
+
 class LoaderAgreementTest(unittest.TestCase):
 
   @classmethod
@@ -660,8 +785,8 @@ class ClosureInvariantTest(DepsTestCase):
   algorithm, so agreement is evidence rather than a restatement.
   """
 
-  def naive_reach(self):
-    reach = {f: set(self.edges.get(f, ())) for f in self.files}
+  def naive_reach(self, edges):
+    reach = {f: set(edges.get(f, ())) for f in self.files}
     changed = True
     while changed:
       changed = False
@@ -672,13 +797,34 @@ class ClosureInvariantTest(DepsTestCase):
           changed = True
     return reach
 
+  def naive_execution_edges(self):
+    # Every package `__init__.py` whose directory encloses the file, computed
+    # by prefix rather than by walking up as `enclosing_inits` does.
+    inits = [f for f in self.files if os.path.basename(f) == '__init__.py']
+    edges = {f: set(self.edges.get(f, ())) for f in self.files}
+    for f in self.files:
+      for init in inits:
+        package = os.path.dirname(init) + '/'
+        if f != init and f.startswith(package):
+          edges[f].add(init)
+    return edges
+
   def test_no_affected_test_is_ever_missed(self):
-    reach = self.naive_reach()
+    # A changed `__init__.py` is selected over the graph with the enclosing
+    # package edges added; everything else over the plain graph. A nested
+    # package that imports a sibling gives the walk more than one level.
+    self.add(
+        'tokamax/_src/ops/kern/__init__.py',
+        'from tokamax._src.ops import triton\n',
+    )
+    reach = self.naive_reach(self.edges)
+    run_by = self.naive_reach(self.naive_execution_edges())
     tests = [f for f in self.files if deps.is_test_file(f)]
     for source in self.files:
       if source in self.unparsed:
         continue
-      expected = {t for t in tests if source in reach[t] or t == source}
+      closure = run_by if os.path.basename(source) == '__init__.py' else reach
+      expected = {t for t in tests if source in closure[t] or t == source}
       actual, reason = self.affected(source)
       if actual is None:
         continue  # fail-open is always allowed to be broader

@@ -27,10 +27,9 @@ from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_x8 as sm100_quant_x8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90_quant as sm90_quant
@@ -189,9 +188,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
               raise NotImplementedError(
                   "int8 x int4 MMA (.kind::i8) is not supported on sm103+."
               )
-            fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
+            fn = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
-            fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            fn = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
             # make sure output is bfloat16 since we may want to store lhs.scale
             # as float32 to avoid in-kernel conversion.
             if (
@@ -243,7 +242,9 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
 
     if self.int4_to_fp8_offline_permute:
       if (
-          fn is not sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+          fn is not sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
+          or not isinstance(lhs, QArray)
+          or lhs.qtype != jnp.float8_e4m3fn
           or not isinstance(rhs, QArray)
           or rhs.qtype != jnp.int4
       ):

@@ -34,8 +34,8 @@ ReferenceSplash = base.SplashAttention
 class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
 
   def setUp(self):
-    if jax.default_backend() != 'tpu':
-      self.skipTest('Only tested on TPU.')
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only tested on TPU.")
     super().setUp()
 
   def _test_attention(
@@ -87,19 +87,19 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     out, (dq, dk, dv) = f(q, k, v, do)
 
     atol = 0.05 if attn_logits_soft_cap else 0.1
-    with self.subTest('output'):
+    with self.subTest("output"):
       chex.assert_trees_all_close(out, out_base, atol=atol)
 
     atol = 0.35 if attn_logits_soft_cap else 1.5
-    with self.subTest('dq'):
+    with self.subTest("dq"):
       chex.assert_trees_all_close(dq, dq_base, atol=atol)
 
     atol = 0.3 if attn_logits_soft_cap else 1.2
-    with self.subTest('dk'):
+    with self.subTest("dk"):
       chex.assert_trees_all_close(dk, dk_base, atol=atol)
 
     atol = 0.05 if attn_logits_soft_cap else 0.15
-    with self.subTest('dv'):
+    with self.subTest("dv"):
       chex.assert_trees_all_close(dv, dv_base, atol=atol)
 
   @parameterized.parameters(
@@ -241,6 +241,46 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
     )
 
+  def test_custom_config_nonsquare_fwd_and_band_skip_vjp(self):
+    q_seq_len, kv_seq_len, head_dim = 512, 512, 64
+    num_heads = 2
+    dtype = jnp.float32
+
+    q = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+    k = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    v = jax.ShapeDtypeStruct((num_heads, kv_seq_len, head_dim), dtype)
+    do = jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim), dtype)
+
+    mask = base.CAUSAL_MASK
+
+    q, k, v, do = numerics.random_initialize((q, k, v, do))
+
+    config = pallas_mosaic_tpu.Config(
+        block_q=256,
+        block_kv=256,
+        block_kv_compute=128,
+        q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+        qk_diag_skip=True,
+        qk_diag_grid=2,
+        sv_diag_skip=False,
+    )
+    vjp_config = sp_vjp.Config(
+        block_q_dkv=256,
+        block_kv_dkv=256,
+        block_kv_dkv_compute=256,
+        use_base2_exp=True,
+        dq_reduction_steps=1,
+        qk_diag_skip=True,
+        qk_diag_grid=2,
+        diag_band_skip=True,
+    )
+    self._test_attention(
+        q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
+    )
+
   def test_autotune_configs(self):
     head_dim = 64
     q_seq_len = 256
@@ -262,7 +302,7 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     self.assertNotEmpty(configs)
 
     for config in configs:
-      with self.subTest(f'{config=}'):
+      with self.subTest(f"{config=}"):
         self._test_attention(
             q,
             k,
@@ -310,7 +350,7 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     self.assertNotEmpty(configs)
 
     for config in configs:
-      with self.subTest(f'{config=}'):
+      with self.subTest(f"{config=}"):
         self._test_attention(
             q,
             k,
@@ -428,6 +468,58 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         atol=1e-3,
     )
 
+  @parameterized.parameters(
+      (("x", None, None), False),
+      ((None, "x", None), False),
+      (("x", None, None), True),
+      ((None, "x", None), True),
+  )
+  def test_sharded(self, spec_tuple, is_mqa):
+    num_devices = min(jax.device_count(), 2)
+    devices = jax.devices()[:num_devices]
+    mesh = jax.sharding.Mesh(devices, ("x",))
+    sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(*spec_tuple)
+    )
 
-if __name__ == '__main__':
+    num_q_heads, q_seq_len, head_dim = 4, 512, 64
+    num_kv_heads, kv_seq_len = (1, 512) if is_mqa else (4, 512)
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype)
+    k_s = (
+        jax.ShapeDtypeStruct((kv_seq_len, head_dim), dtype)
+        if is_mqa
+        else jax.ShapeDtypeStruct((num_kv_heads, kv_seq_len, head_dim), dtype)
+    )
+    v_s = k_s
+    do_s = jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim), dtype)
+    q, k, v, do = numerics.random_initialize((q_s, k_s, v_s, do_s), seed=21)
+
+    kwargs = dict(
+        mask=base.CAUSAL_MASK,
+        is_mqa=is_mqa,
+    )
+    attention_impl = PallasTpuSplash()
+
+    out_base, f_vjp_base = jax.vjp(
+        functools.partial(attention_impl, **kwargs), q, k, v
+    )
+    dq_base, dk_base, dv_base = f_vjp_base(do)
+
+    out, f_vjp = jax.vjp(
+        functools.partial(attention_impl, q_sharding=sharding, **kwargs),
+        q,
+        k,
+        v,
+    )
+    dq, dk, dv = f_vjp(do)
+
+    chex.assert_trees_all_close(out, out_base, atol=1e-4)
+    chex.assert_trees_all_close(dq, dq_base, atol=1e-3)
+    chex.assert_trees_all_close(dk, dk_base, atol=1e-3)
+    chex.assert_trees_all_close(dv, dv_base, atol=1e-4)
+
+
+if __name__ == "__main__":
   absltest.main()

@@ -247,7 +247,9 @@ def load_and_select_states(
           is_first_tile, prev_conv_state, prev_tile_conv
       )
 
-    hbm_recurrent_state = recurrent_in_slot_ref[idx, 0]
+    hbm_recurrent_state = pltpu.bitcast(
+        recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+    ).astype(jnp.float32)
     prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
     if carry_recurrent_scratch_ref is not None:
@@ -276,7 +278,7 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Load activations from VMEM as a compact layout."""
 
-  qkv_vmem_ref[...] = qkv_vreg
+  qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
   q_compact, k_compact, v_compact = load_as_qkv_compact(qkv_vmem_ref, cfgs)
   b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
   if cfgs.is_kda:
@@ -299,7 +301,7 @@ def load_activation_as_large(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Load activations from VMEM as a large layout."""
 
-  qkv_vmem_ref[...] = qkv_vreg
+  qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
   q_large_list = []
   k_large_list = []
