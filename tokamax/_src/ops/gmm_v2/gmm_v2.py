@@ -1171,11 +1171,17 @@ def calculate_tiling(
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
+  tpu_info = pltpu.get_tpu_info()
+
   # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
-  # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
+  gen = getattr(tpu_info, "generation", None)
+  tpu_generation = gen if type(gen) is int else 0
+  if tpu_generation >= 8:
+    bf16_bf16_tile_m = 256
+  else:
+    bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1184,7 +1190,7 @@ def calculate_tiling(
 
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_limit = tpu_info.mxu_column_size * 2
   tile_n_limit = min(tile_n_limit, dims.size_n)
 
   size_n_per_rhs = dims.size_n
