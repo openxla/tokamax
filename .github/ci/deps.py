@@ -79,6 +79,14 @@ TEST_FILE_PREFIX: Final[str] = 'test_'
 # full run.
 INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
 
+# The workflow this module selects shards for. Every other workflow runs on its
+# own trigger (a schedule, `workflow_run`, or by hand), and CI-Build neither
+# calls nor executes it, so running every shard tests nothing about a change to
+# one; `deps_test.py` checks that `ci-build.yml` calls no local workflow or
+# action, which is what would make one matter.
+WORKFLOWS_DIR: Final[str] = '.github/workflows/'
+CI_BUILD_WORKFLOW: Final[str] = f'{WORKFLOWS_DIR}ci-build.yml'
+
 # `_src/autotuning/cache.py` reads `<device_kind>/<op_name>.json` for the op
 # whose snake-cased class name is `<op_name>`. Narrowed by op only, not runner.
 AUTOTUNING_DATA: Final[str] = f'{PACKAGE_ROOT}/data/autotuning'
@@ -409,7 +417,8 @@ def full_run_reason(
   """Why `changed` requires every shard, or `None` if it does not.
 
   The exception is `INERT_SUFFIXES`, checked before anything else: those files
-  cannot affect a test wherever they live (think documentation).
+  cannot affect a test wherever they live (think documentation). Nor can a
+  workflow other than `CI_BUILD_WORKFLOW`.
 
   `known` is the file set the graph was built from. Changed paths absent from
   `known` represent deleted files. Most deletions do not force a full run
@@ -448,6 +457,8 @@ def full_run_reason(
 
   for path in sorted(changed):
     if path.endswith(INERT_SUFFIXES):
+      continue
+    if path.startswith(WORKFLOWS_DIR) and path != CI_BUILD_WORKFLOW:
       continue
     if not path.startswith(f'{PACKAGE_ROOT}/'):
       return f'{path} is outside {PACKAGE_ROOT}/'

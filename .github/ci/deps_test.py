@@ -27,6 +27,7 @@ installed.
 
 import ast
 import os
+import re
 import tempfile
 import textwrap
 import unittest
@@ -249,6 +250,31 @@ class FailOpenTest(DepsTestCase):
   def test_documentation_next_to_data_still_yields_to_the_data(self):
     tests, _ = self.affected('tokamax/README.md', 'tokamax/data/tuning.json')
     self.assertIsNone(tests)
+
+  def test_workflows_other_than_ci_build_are_inert(self):
+    # CI-Build runs none of them, so every shard ran without testing them.
+    for path in (
+        '.github/workflows/ci-nightly.yml',
+        '.github/workflows/nightly_benchmarks.yml',
+        '.github/workflows/publish.yml',
+        '.github/workflows/run_benchmarks.yml',
+        '.github/workflows/a_new_workflow.yml',
+    ):
+      with self.subTest(path=path):
+        tests, reason = self.affected(path)
+        self.assertEqual(tests, set())
+        self.assertIsNone(reason)
+
+  def test_ci_build_and_its_scripts_still_force_a_full_run(self):
+    self.assert_full_run('.github/workflows/ci-build.yml')
+    self.assert_full_run('.github/ci/install_deps.sh')
+
+  def test_other_workflows_do_not_exempt_the_rest_of_the_changeset(self):
+    tests, reason = self.affected(
+        '.github/workflows/ci-nightly.yml', '.github/ci/install_deps.sh'
+    )
+    self.assertIsNone(tests)
+    self.assertIn('install_deps.sh', reason)
 
   def test_inert_files_do_not_exempt_the_rest_of_the_changeset(self):
     # Skipping an inert path must not skip the loop. The docs-only case is
@@ -648,6 +674,22 @@ class AutotuningTableTest(DepsTestCase):
         'class PallasMosaicTpuRaggedDot:\n  pass\n',
     )
     self.assert_full_run(self.TABLE, 'no class')
+
+
+class CiBuildWorkflowTest(unittest.TestCase):
+  """Keeps `deps.CI_BUILD_WORKFLOW` the only workflow CI-Build depends on."""
+
+  def test_ci_build_calls_no_local_workflow_or_action(self):
+    # Other workflows are inert only because CI-Build never runs them. A local
+    # `uses: ./...` -- a reusable workflow or a composite action -- would make
+    # one part of CI-Build, and a change to it would have to run every shard.
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+    )
+    path = os.path.join(root, deps.CI_BUILD_WORKFLOW)
+    with open(path, encoding='utf-8') as f:
+      local = re.findall(r'^\s*(?:-\s*)?uses:\s*[\'"]?\./.*$', f.read(), re.M)
+    self.assertEqual(local, [], f'{deps.CI_BUILD_WORKFLOW} calls local files')
 
 
 class LoaderAgreementTest(unittest.TestCase):
