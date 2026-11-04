@@ -96,7 +96,7 @@ EXCLUDED_TESTS = ()
 
 # JAX versions tested in CI: `latest_jax()` for the shard jobs, `older_jaxs()`
 # for compat-tests. The oldest must match the floor in pyproject.toml.
-JAX_VERSIONS = ('0.11.2', '0.11.1')
+JAX_VERSIONS = ('0.12.0', '0.11.2')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
@@ -323,6 +323,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/triangle_multiplication/api_test.py',
             'tokamax/_src/ops/triangle_multiplication/base_test.py',
             'tokamax/_src/ops/triangle_multiplication/pallas_mosaic_gpu_test.py',
+            'tokamax/_src/ops/triangle_multiplication/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/triangle_multiplication/triton_test.py',
         ),
         minutes=2,
@@ -589,16 +590,14 @@ SHARDS: ShardMap = {
         minutes=1,
         compat_minutes=1,
     ),
-    # mla_kernel_v3_test.py skips on JAX without
-    # pltpu.BufferedRef.in_buffer_count, such as 0.11.2, so `minutes` reflects
-    # the skip.
     'experimental-mla-v3': Spec(
         paths=(
             'tokamax/_src/ops/experimental/mla/v3/flash_attention_test.py',
             'tokamax/_src/ops/experimental/mla/v3/mla_kernel_v3_test.py',
             'tokamax/_src/ops/experimental/mla/v3/schedule_test.py',
         ),
-        minutes=1,
+        minutes=40,
+        compat_minutes=1,
     ),
     # Separated from experimental-topk-kernel to isolate TPU-only tests.
     'experimental-topk': Spec(
