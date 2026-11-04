@@ -92,32 +92,89 @@ def _make_spec(
   return arg_spec.ArgSpec(args=args, project=project, name=name, tags=tags)
 
 
-def _qwen3_5_397b_specs() -> tuple[arg_spec.ArgSpec, ...]:
-  """Qwen3.5-397B MoE layer with FP8 weights and EP=8."""
-  num_tokens = {
-      "decode_32": 32,
-      "decode_64": 64,
-      "decode_128": 128,
-      "decode_256": 256,
-      "decode_512": 512,
-      "decode_1024": 1024,
-      "prefill_8192": 8192,
-      "prefill_16384": 16384,
-  }
+# Tokens per MoE step in the InferenceX 8k/1k (ISL 8192, OSL 1024) serving
+# configurations: decode at concurrency 4 to 128 (DP1TP8, plus the per-chip
+# shape of concurrency 256 at DP8TP1), and chunked-prefill steps of one or two
+# 8192-token prompts.
+_INFERENCEX_8K1K_NUM_TOKENS: dict[str, int] = {
+    "decode_32": 32,
+    "decode_64": 64,
+    "decode_128": 128,
+    "decode_256": 256,
+    "decode_512": 512,
+    "decode_1024": 1024,
+    "prefill_8192": 8192,
+    "prefill_16384": 16384,
+}
+
+
+def _model_specs(
+    *,
+    project: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    tags: tuple[arg_spec.Tag, ...],
+) -> tuple[arg_spec.ArgSpec, ...]:
+  """Creates one model's specs over the InferenceX 8k/1k token counts, EP=8."""
   return tuple(
       _make_spec(
           name,
           num_tokens=t,
-          num_experts=512,
-          hidden_size=4096,
-          intermediate_size=1024,
-          top_k=10,
+          num_experts=num_experts,
+          hidden_size=hidden_size,
+          intermediate_size=intermediate_size,
+          top_k=top_k,
           ep=8,
-          project="qwen3.5_397b",
-          tags=("primary", "forward_only"),
+          project=project,
+          tags=tags,
       )
-      for name, t in num_tokens.items()
+      for name, t in _INFERENCEX_8K1K_NUM_TOKENS.items()
   )
 
 
-ARG_SPECS: tuple[arg_spec.ArgSpec, ...] = _qwen3_5_397b_specs()
+def _qwen3_5_397b_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Qwen3.5-397B MoE layer with FP8 weights and EP=8."""
+  return _model_specs(
+      project="qwen3.5_397b",
+      num_experts=512,
+      hidden_size=4096,
+      intermediate_size=1024,
+      top_k=10,
+      tags=("primary", "forward_only"),
+  )
+
+
+def _qwen3_8_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Qwen3.8 MoE layers with FP8 weights and EP=8.
+
+  Shapes are the HF configs, as mirrored in MaxText's
+  `qwen3.8-2.4t-a95b.yml` and `qwen3.8-flash-next.yml`. Neither is tagged
+  `primary`, so they stay off the daily dashboard until they are a P0.
+
+  Returns:
+    The argument specifications for Qwen3.8-Max and Qwen3.8-Flash-Next.
+  """
+  max_specs = _model_specs(
+      project="qwen3.8_max",
+      num_experts=512,
+      hidden_size=8192,
+      intermediate_size=2048,
+      top_k=10,
+      tags=("forward_only",),
+  )
+  flash_next_specs = _model_specs(
+      project="qwen3.8_flash_next",
+      num_experts=512,
+      hidden_size=2560,
+      intermediate_size=640,
+      top_k=10,
+      tags=("forward_only",),
+  )
+  return max_specs + flash_next_specs
+
+
+ARG_SPECS: tuple[arg_spec.ArgSpec, ...] = (
+    _qwen3_5_397b_specs() + _qwen3_8_specs()
+)

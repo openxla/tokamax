@@ -200,6 +200,14 @@ class RoutingGmmConfig:
         raise NotImplementedError(
             "Unquantized output dtype conversion is not supported yet."
         )
+      if self.plan.num_stash_buffers is not None:
+        raise ValueError(
+            "plan.num_stash_buffers has no effect when output is not quantized."
+        )
+      if self.plan.stash_dtype is not None:
+        raise ValueError(
+            "plan.stash_dtype has no effect when output is not quantized."
+        )
       return
 
     if self.spec.scatter is None:
@@ -211,6 +219,16 @@ class RoutingGmmConfig:
     if out_spec.dtype.itemsize != 1:
       raise ValueError(
           f"Quantized output requires a 1-byte dtype. Got {out_spec.dtype}."
+      )
+    if self.plan.num_stash_buffers != 2:
+      raise NotImplementedError(
+          "num_stash_buffers other than 2 is not supported yet. Got"
+          f" {self.plan.num_stash_buffers}."
+      )
+    if self.plan.stash_dtype != jnp.bfloat16.dtype:
+      raise NotImplementedError(
+          "stash_dtype other than bfloat16 is not supported yet. Got"
+          f" {self.plan.stash_dtype}."
       )
     chunk_cols = (
         layout_util.get_packing(out_spec.dtype) * self.tpu_info.num_lanes

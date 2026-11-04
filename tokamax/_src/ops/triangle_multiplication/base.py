@@ -141,6 +141,10 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
       The result of triangle multiplication of shape `[N, N, D]`.
     """
     del config  # Unused.
+    norm_impl = (
+        "xla" if implementation is None or return_residuals else implementation
+    )
+    glu_impl = "xla" if implementation is None else implementation
 
     h_dim = layernorm_out_scale.shape[0]
 
@@ -150,7 +154,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         offset=layernorm_in_offset,
         epsilon=epsilon,
         axis=-1,
-        implementation=implementation,
+        implementation=norm_impl,
     )
 
     channel_dim = len(gate_in_weights)
@@ -161,7 +165,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         (gate_weights, projection_weights),
         activation=jax.nn.sigmoid,
         precision=precision,
-        implementation=implementation,
+        implementation=glu_impl,
     )
     proj_act = proj_act.reshape(proj_act.shape[0], proj_act.shape[1], 2, h_dim)
     proj_act = jnp.transpose(proj_act, (2, 3, 0, 1))  # 2 C N N
@@ -182,7 +186,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         offset=layernorm_out_offset,
         epsilon=epsilon,
         axis=-1,
-        implementation=implementation,
+        implementation=norm_impl,
     )
 
     act = jnp.dot(act, projection_out_weights, precision=precision)
@@ -193,9 +197,7 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     return act, (residuals if return_residuals else None)
 
 
-class TriangleMultiplicationVjp[C, K: Hashable](
-    op.Op[Any, Grads, None, C, K]
-):
+class TriangleMultiplicationVjp[C, K: Hashable](op.Op[Any, Grads, None, C, K]):
   """Triangle multiplicative update VJP."""
 
   @jaxtyping.jaxtyped
@@ -224,7 +226,7 @@ class TriangleMultiplicationVjp[C, K: Hashable](
       config: C,
   ) -> tuple[Grads, None]:
     """Computes triangle multiplication VJP."""
-    del out, config  # Unused.
+    del out, config, implementation  # Unused.
 
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
@@ -249,7 +251,7 @@ class TriangleMultiplicationVjp[C, K: Hashable](
           precision=precision,
           epsilon=epsilon,
           return_residuals=True,
-          implementation=implementation,
+          implementation="xla",
           config=None,
       )
       return out, (x, weights, residuals)

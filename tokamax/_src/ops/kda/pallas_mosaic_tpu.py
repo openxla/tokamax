@@ -60,6 +60,7 @@ class Config:
   """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
+  mini_batch: Annotated[int, pydantic.Field(gt=0)] | None = None
   safe_gate: bool | None = None
   rematerialize_for_backward: bool = False
 
@@ -253,7 +254,26 @@ class PallasMosaicTpuKimiDeltaAttention(
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
   ) -> set[Config]:
-    return {Config(chunk_size=_requested_chunk_size(ba))}
+    args = getattr(ba, "arguments", None)
+    if not args:
+      return {Config(chunk_size=_requested_chunk_size(ba))}
+    q = args.get("query")
+    heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
+    per_channel_gate = args.get("per_channel_gate", True)
+    segment_ids = args.get("segment_ids")
+    chunk_sizes = (
+        (64,)
+        if (per_channel_gate or segment_ids is not None)
+        else (32, 64, 128)
+    )
+    mini_batches = tuple(
+        mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
+    ) or (None,)
+    configs = set()
+    for cs in chunk_sizes:
+      for mb in mini_batches:
+        configs.add(Config(chunk_size=cs, mini_batch=mb))
+    return configs
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -527,6 +547,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         conv_bias_v=conv_bias_v,
         use_conv1d_in_kernel=use_conv1d_in_kernel,
         use_qk_l2norm=use_qk_l2norm,
+        mini_batch=config.mini_batch,
     )
     value, final_state = output
     if final_state is not None and final_state.ndim == 4:
@@ -550,7 +571,26 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
   ) -> set[Config]:
-    return {Config(chunk_size=_requested_chunk_size(ba))}
+    args = getattr(ba, "arguments", None)
+    if not args:
+      return {Config(chunk_size=_requested_chunk_size(ba))}
+    q = args.get("query")
+    heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
+    per_channel_gate = args.get("per_channel_gate", True)
+    segment_ids = args.get("segment_ids")
+    chunk_sizes = (
+        (64,)
+        if (per_channel_gate or segment_ids is not None)
+        else (32, 64, 128)
+    )
+    mini_batches = tuple(
+        mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
+    ) or (None,)
+    configs = set()
+    for cs in chunk_sizes:
+      for mb in mini_batches:
+        configs.add(Config(chunk_size=cs, mini_batch=mb))
+    return configs
 
   def _fwd(
       self,
@@ -636,6 +676,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         residuals,
         dout,
         per_channel_gate=per_channel_gate,
+        mini_batch=config.mini_batch,
     )
 
     grads = {

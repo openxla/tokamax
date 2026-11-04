@@ -24,7 +24,7 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 from tokamax._src import benchmarking
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 
 
 def skip_unless_supported(
@@ -42,7 +42,7 @@ def skip_unless_supported(
 
 
 def check_gmm_supported(
-    case: test_cases.Case, *, live_group_walk: bool = False
+    case: helper_cases.Case, *, live_group_walk: bool = False
 ) -> None:
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
   if case.shape.has_bias:
@@ -60,7 +60,7 @@ def check_gmm_supported(
 
 
 def check_moe_supported(
-    case: test_cases.Case, *, remote_scatter: bool = False
+    case: helper_cases.Case, *, remote_scatter: bool = False
 ) -> None:
   """Skips the test if `case` or the mesh layout is unsupported."""
   check_gmm_supported(case)

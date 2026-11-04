@@ -1527,7 +1527,12 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     elif BT > 64:
       vmem_budget = (vmem_budget * 64) // BT
     MB = max(1, vmem_budget // per_head)
-    MB = min(MB, H, 16)
+    max_mb = (
+        32
+        if (per_channel_gate and hw.vmem_limit_bytes > 64 * 1024 * 1024)
+        else 16
+    )
+    MB = min(MB, H, max_mb)  # pylint: disable=invalid-name
     while H % MB != 0 and MB > 1:
       MB -= 1
   else:
@@ -2010,6 +2015,7 @@ def _conv1d_silu_bwd(
         "max_num_segments",
         "has_initial_state",
         "per_channel_gate",
+        "mini_batch",
     ],
 )
 @jaxtyping.jaxtyped
@@ -2030,6 +2036,7 @@ def chunk_kda_bwd_custom(
     ],
     *,
     per_channel_gate: bool = True,
+    mini_batch: int | None = None,
 ) -> tuple[
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG K"],
@@ -2398,6 +2405,7 @@ def chunk_kda_bwd_custom(
       use_exp2=True,
       return_dh0=initial_state is not None,
       max_num_segments=max_num_segments,
+      mini_batch=mini_batch,
       rstd_q=rstd_q if (use_qk_l2norm and _l2norm_in_kernel) else None,
       rstd_k=rstd_k if (use_qk_l2norm and _l2norm_in_kernel) else None,
   )

@@ -1119,6 +1119,248 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
   @parameterized.product(
+      batch_size=[128, 512],
+      in_size=[256, 512],
+      out_size=[256, 512],
+      group_offset=[0, 2],
+  )
+  def test_tgmm_partial_sum(self, batch_size, in_size, out_size, group_offset):
+    """Tests the fused partial-sum add into the TGMM output."""
+    num_groups = 16
+    num_local_groups = num_groups - group_offset
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = jax.random.normal(
+        k2, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.array(group_offset, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    ) + partial_sum
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  def test_tgmm_partial_sum_matches_unfused_add(self):
+    """A partial sum must be equivalent to adding it after an unfused TGMM."""
+    batch_size, in_size, out_size, num_groups = 256, 512, 512, 8
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = jax.random.normal(
+        k2, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    fused = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+    )
+    unfused = (
+        tgmm_v2.tgmm_v2(
+            lhs, grad, group_sizes, num_groups,
+            preferred_element_type=jnp.bfloat16,
+        )
+        + partial_sum
+    )
+    assert_arrays_all_close(fused, unfused)
+
+  def test_tgmm_partial_sum_empty_groups(self):
+    """Groups with no rows must return their partial sum unchanged."""
+    batch_size, in_size, out_size = 128, 128, 128
+    group_sizes = jnp.array([10, 0, 8, 0, 50, 2, 58, 0], dtype=jnp.int32)
+    num_groups = group_sizes.size
+    group_offset_val = 2
+    num_local_groups = num_groups - group_offset_val
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = jax.random.normal(
+        k2, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_offset = jnp.array(group_offset_val, dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+    ) + partial_sum
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=gmm_v2.TileSizes(
+            tile_m=32, tile_k=128, tile_n=128, bucket_base=32
+        ),
+    )
+    assert_arrays_all_close(actual, expected)
+    # Local groups 1 and 5 (global groups 3 and 7) are empty: exact passthrough.
+    for local_group in (1, 5):
+      chex.assert_trees_all_equal(
+          actual[local_group], partial_sum[local_group]
+      )
+
+  @parameterized.product(
+      in_size=[255, 500],
+      out_size=[255, 500],
+  )
+  def test_tgmm_partial_sum_unaligned(self, in_size, out_size):
+    """Covers padding of the partial sum along k and n."""
+    batch_size, num_groups = 128, 16
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = jax.random.normal(
+        k2, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = (
+        reference_tgmm(lhs.swapaxes(0, 1), grad, group_sizes, num_groups)
+        + partial_sum
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
+  def test_tgmm_partial_sum_with_rhs_scale(self):
+    """The partial sum is added after the per-N rhs scale is applied."""
+    batch_size, in_size, out_size, num_groups = 128, 256, 256, 16
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(
+        k0, (batch_size, in_size), dtype=jnp.bfloat16
+    ).astype(jnp.float8_e4m3fn)
+    grad = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.float32)
+    grad_q, grad_scale = quantize_tensor(
+        grad,
+        jnp.float8_e5m2,  # pyrefly: ignore[bad-argument-type]
+        axis=0,
+        block_size=batch_size,
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, N]
+    partial_sum = jax.random.normal(
+        k2, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad_q,
+        group_sizes,
+        num_groups,
+        rhs_scale=grad_scale,
+        out_dtype=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
+    ) + partial_sum
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad_q,
+        group_sizes,
+        num_groups,
+        rhs_scale=grad_scale,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+    )
+    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+
+  def test_tgmm_partial_sum_unsupported(self):
+    lhs = jnp.zeros((128, 256), jnp.bfloat16)
+    grad = jnp.zeros((128, 256), jnp.bfloat16)
+    group_sizes = get_group_sizes(128, 4)
+    partial_sum = jnp.zeros((4, 256, 256), jnp.bfloat16)
+
+    with config.disable_multi_core_mode(True):
+      with self.assertRaisesRegex(
+          NotImplementedError, "disable_multi_core_mode"
+      ):
+        tgmm_v2.tgmm_v2(
+            lhs,
+            grad,
+            group_sizes,
+            4,
+            partial_sum=partial_sum,
+            preferred_element_type=jnp.bfloat16,
+        )
+    with self.assertRaisesRegex(ValueError, "must match output dtype"):
+      tgmm_v2.tgmm_v2(
+          lhs,
+          grad,
+          group_sizes,
+          4,
+          partial_sum=partial_sum.astype(jnp.float32),
+          preferred_element_type=jnp.bfloat16,
+      )
+
+  def test_tgmm_partial_sum_is_accumulated_in_place(self):
+    """The partial sum must be aliased to the output rather than copied."""
+    m, k, n, num_groups = 512, 512, 512, 8
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
+    grad = jax.random.normal(k1, (m, n), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(m, num_groups)
+    partial_sum = jnp.zeros((num_groups, k, n), jnp.bfloat16)
+
+    fused = jax.jit(
+        lambda l, g, gs, p: tgmm_v2.tgmm_v2(
+            l, g, gs, num_groups, partial_sum=p,
+            preferred_element_type=jnp.bfloat16,
+        )
+    )
+    plain = jax.jit(
+        lambda l, g, gs: tgmm_v2.tgmm_v2(
+            l, g, gs, num_groups, preferred_element_type=jnp.bfloat16
+        )
+    )
+    fused_text = (
+        fused.lower(lhs, grad, group_sizes, partial_sum).compile().as_text()
+    )
+    plain_text = plain.lower(lhs, grad, group_sizes).compile().as_text()
+    assert fused_text is not None and plain_text is not None
+
+    self.assertEqual(
+        plain_text.count("output_to_operand_aliasing"),
+        0,
+        "control failed: a TGMM with no partial sum has nothing to alias, so "
+        "the counter is not measuring what this test claims",
+    )
+    self.assertGreater(
+        fused_text.count("output_to_operand_aliasing"),
+        0,
+        "the partial sum was not aliased to the output",
+    )
+
+  @parameterized.product(
       batch_size=[128],
       in_size=[512],
       out_size=[512],

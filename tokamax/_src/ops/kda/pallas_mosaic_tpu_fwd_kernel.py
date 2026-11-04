@@ -987,7 +987,9 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
   """
   elem_size = dtype.itemsize if dtype is not None else 4
   per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-  return estimate_mini_batch(per_head, H, max_mb=16)
+  hw = get_tpu_limits()
+  max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
+  return estimate_mini_batch(per_head, H, max_mb=max_mb)
 
 
 @functools.partial(
@@ -1360,6 +1362,7 @@ def kda_fwd_intra_fused(
     use_qk_l2norm: bool = False,
     return_conv_intermediates: bool = False,
     aligned_segment_ids: jax.Array | None = None,
+    mini_batch: int | None = None,
 ):
   """Fused gate cumsum + intra-chunk solve entry.
 
@@ -1400,6 +1403,7 @@ def kda_fwd_intra_fused(
       delta_time_bias=delta_time_bias,
       use_gate_in_kernel=use_gate_in_kernel,
       lower_bound=lower_bound,
+      mini_batch=mini_batch,
       conv_weight_q=conv_weight_q,
       conv_weight_k=conv_weight_k,
       conv_weight_v=conv_weight_v,
@@ -1644,7 +1648,8 @@ def chunk_kda_fwd_h_o_varlen(
     out_bytes = BT * V_ALIGNED * elem_size
     scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
     per_head = in_bytes + out_bytes + scratch_bytes
-    MB = estimate_mini_batch(per_head, H, max_mb=16)
+    max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
+    MB = estimate_mini_batch(per_head, H, max_mb=max_mb)  # pylint: disable=invalid-name
   else:
     MB = mini_batch
     assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
@@ -1904,6 +1909,7 @@ def chunk_kda_fwd_custom(
     conv_bias_v: Float[Array, "H V"] | None = None,
     use_conv1d_in_kernel: bool = False,
     use_qk_l2norm: bool = False,
+    mini_batch: int | None = None,
 ) -> tuple[
     tuple[
         Float[Array, "H B T V"],
@@ -1982,6 +1988,7 @@ def chunk_kda_fwd_custom(
       use_qk_l2norm=use_qk_l2norm,
       return_conv_intermediates=(use_conv1d_in_kernel and return_residuals),
       aligned_segment_ids=aligned_segment_ids,
+      mini_batch=mini_batch,
   )
   if use_conv1d_in_kernel:
     assert q_norm is not None
@@ -2071,6 +2078,7 @@ def chunk_kda_fwd_custom(
       chunk_size=BT,
       store_h=disable_recompute,
       store_v_new=disable_recompute,
+      mini_batch=mini_batch,
   )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]

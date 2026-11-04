@@ -66,7 +66,9 @@ def _kimi_linear_48b_a3b_spec(
       "key": ShapeDtype(qkv_shape, dtype),
       "value": ShapeDtype(qkv_shape, dtype),
       "gate": ShapeDtype(qkv_shape, dtype),
-      "beta": ShapeDtype((num_heads, batch_size, seq_len), dtype),
+      "beta": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len), dtype, minval=0.0, maxval=1.0
+      ),
       "a_log": ShapeDtype((num_heads,), jnp.float32),
       "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
       "output_final_state": False,
