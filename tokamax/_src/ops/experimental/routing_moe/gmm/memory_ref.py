@@ -1185,7 +1185,7 @@ class PipelineAllocs:
     return jax.tree.map(
         lambda bref: bref.spec,
         self.inputs,
-        is_leaf=lambda node: isinstance(node, pltpu.BufferedRefBase),
+        is_leaf=lambda node: isinstance(node, pltpu.BufferedRef),
     )
 
   @property
