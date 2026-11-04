@@ -45,8 +45,8 @@ def _pack_body(
   flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
   chunks = width // lanes
 
-  def pipeline_step(vals_vmem, out_vmem):
-    row = pl.program_id(0) * (num_cores * num_subcores) + flat
+  def pipeline_step(step, vals_vmem, out_vmem):
+    row = step.index[0] * (num_cores * num_subcores) + flat
 
     def fill(i):
       rowbuf_vmem[pl.ds(i * lanes, lanes)] = jnp.full((lanes,), -1, jnp.int32)
@@ -85,7 +85,11 @@ def _pack_body(
       pipeline_mode=pl.Buffered(buf_count),
   )
   pltpu.emit_pipeline(
-      pipeline_step, grid=(num_waves,), in_specs=in_specs, out_specs=out_specs
+      pipeline_step,
+      grid=(num_waves,),
+      in_specs=in_specs,
+      out_specs=out_specs,
+      _explicit_indices=True,
   )(vals_hbm, out_hbm)
 
 

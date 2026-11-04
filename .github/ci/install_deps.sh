@@ -79,3 +79,33 @@ python3.12 -m uv pip freeze
 got=$(python3.12 -c 'import jax; print(jax.__version__)')
 [[ "${got}" == "${JAX_PIN}" ]] || {
   echo "::error::asked for jax ${JAX_PIN}, got ${got}"; exit 1; }
+
+# XLA uses the first ptxas it finds, checking every `PATH` entry before the
+# ptxas that pip installs with `jax[cuda13]` (`nvidia-cuda-nvcc`), and does not
+# compare versions. The image puts its own CUDA toolkit's `bin` on `PATH`, so
+# XLA would assemble Triton's PTX with that ptxas even when pip's is newer, and
+# fail on PTX the older one does not support (e.g. Triton 3.9 emits PTX 9.4,
+# which needs CUDA 13.4). Put pip's ptxas first for the steps that follow.
+nvcc_bin=$(python3.12 - <<'EOF'
+import os
+try:
+  import nvidia
+except ImportError:
+  pass
+else:
+  for root in nvidia.__path__:
+    path = os.path.join(root, "cu13", "bin")
+    if os.access(os.path.join(path, "ptxas"), os.X_OK):
+      print(path)
+      break
+EOF
+)
+if [[ -n "${nvcc_bin}" ]]; then
+  echo "Using ptxas from ${nvcc_bin}:" \
+    "$("${nvcc_bin}/ptxas" --version | sed -n '/release/p')"
+  if [[ -n "${GITHUB_PATH:-}" ]]; then
+    echo "${nvcc_bin}" >> "${GITHUB_PATH}"
+  fi
+else
+  echo "No pip-installed ptxas found; XLA will search PATH."
+fi

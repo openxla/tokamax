@@ -87,11 +87,17 @@ class KdaBenchmark(parameterized.TestCase):
           f"Skipping implementation '{implementation}' as per"
           " --skip_implementations flag."
       )
-    if jax.default_backend() != "tpu" and implementation not in ("xla", "xla_chunked"):
+    if jax.default_backend() != "tpu" and implementation not in (
+        "xla",
+        "xla_chunked",
+    ):
       self.skipTest("Mosaic TPU implementation is only supported on TPU.")
 
     example = _make_example(
-        args_spec_name, implementation if implementation in ("xla", "xla_chunked", "mosaic") else "mosaic"
+        args_spec_name,
+        implementation
+        if implementation in ("xla", "xla_chunked", "mosaic")
+        else "mosaic",
     )
     attention = kda_api.kimi_delta_attention
     if implementation not in ("xla", "xla_chunked", "mosaic"):
@@ -104,6 +110,10 @@ class KdaBenchmark(parameterized.TestCase):
               packed_output=implementation == "mosaic_packed_outputs",
           )
       )
+    if implementation == "xla_chunked" and not example.get(
+        "per_channel_gate", True
+    ):
+      self.skipTest("xla_chunked does not support scalar gates.")
     fn, args = tokamax.standardize_function(
         attention,
         kwargs=example,

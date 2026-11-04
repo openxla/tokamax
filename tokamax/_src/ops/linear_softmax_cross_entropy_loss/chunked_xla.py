@@ -115,8 +115,16 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
           x_b, w_j, preferred_element_type=preferred_element_type
       )
 
+      logits_f32 = logits_bv.astype(jnp.float32)
+      if v_pad > 0:
+        # Mask out padded vocab columns so exp(-inf) = 0 in logsumexp.
+        v_idx = v_start + jnp.arange(v_block_sz)
+        logits_f32 = jnp.where(
+            (v_idx >= v_dim)[None, :], -jnp.inf, logits_f32
+        )
+
       lse_b__ = jnp.logaddexp(
-          lse_b_, jax.nn.logsumexp(logits_bv.astype(jnp.float32), axis=-1)
+          lse_b_, jax.nn.logsumexp(logits_f32, axis=-1)
       )
       # If labels_b - v_start < 0 or labels_b - v_start >= v_block_sz, then
       # one_hot will be all zeros.
@@ -272,6 +280,15 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
       )
       if reduction == "none":
         s_bv = (s_bv * dout_b[:, None]).astype(logits_bv.dtype)
+
+      if v_pad > 0:
+        # Zero out gradients for padded vocab columns.
+        v_idx = v_start + jnp.arange(v_block_sz)
+        s_bv = jnp.where(
+            (v_idx >= v_dim)[None, :],
+            jnp.array(0.0, dtype=logits_bv.dtype),
+            s_bv,
+        )
 
       dx_b += jnp.dot(
           s_bv, w_v.T, preferred_element_type=preferred_element_type

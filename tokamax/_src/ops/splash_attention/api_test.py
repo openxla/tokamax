@@ -223,6 +223,28 @@ class SplashAttentionApiTest(parameterized.TestCase):
     chex.assert_shape(out, (num_heads, seq_len, head_dim))
     chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
 
+  def test_is_causal_and_segment_ids(self):
+    num_heads, seq_len, head_dim = 4, 128, 64
+    q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    k_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    v_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=5)
+
+    half_seq = seq_len // 2
+    q_seg = jnp.array([0] * half_seq + [1] * (seq_len - half_seq), jnp.int32)
+
+    out = api.splash_attention(
+        q, k, v, segment_ids=q_seg, is_causal=True, implementation="base"
+    )
+    ref_out = base.SplashAttention()(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        segment_ids=base.SegmentIds(q=q_seg, kv=q_seg),
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
+
   def test_bound_args_and_hlo(self):
     num_heads, seq_len, head_dim = 2, 64, 32
     q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
@@ -246,6 +268,52 @@ class SplashAttentionApiTest(parameterized.TestCase):
     self.assertEqual(
         args[0].arguments["v"].shape, (num_heads, seq_len, head_dim)
     )
+
+  @parameterized.parameters(
+      ((2,), 4, 4, False, False),
+      ((2,), 4, 1, True, True),
+      ((2,), 4, 1, True, False),
+      ((2, 3), 4, 2, False, False),
+  )
+  def test_batched_splash_attention(
+      self, batch_shape, num_q_heads, num_kv_heads, is_mqa, mqa_2d
+  ):
+    seq_len, head_dim = 64, 32
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct(
+        (*batch_shape, num_q_heads, seq_len, head_dim), dtype
+    )
+    if mqa_2d:
+      k_s = jax.ShapeDtypeStruct((*batch_shape, seq_len, head_dim), dtype)
+      v_s = jax.ShapeDtypeStruct((*batch_shape, seq_len, head_dim), dtype)
+    else:
+      k_s = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, seq_len, head_dim), dtype
+      )
+      v_s = jax.ShapeDtypeStruct(
+          (*batch_shape, num_kv_heads, seq_len, head_dim), dtype
+      )
+
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=8)
+    out = api.splash_attention(
+        q, k, v, mask=base.CAUSAL_MASK, is_mqa=is_mqa, implementation="base"
+    )
+    chex.assert_shape(out, (*batch_shape, num_q_heads, seq_len, head_dim))
+
+    ref_fn = functools.partial(
+        reference.attention_reference,
+        mask=base.CAUSAL_MASK.as_array(seq_len, seq_len),
+        is_mqa=is_mqa,
+    )
+    for _ in batch_shape:
+      ref_fn = jax.vmap(ref_fn)
+    ref_out = ref_fn(
+        q=q,
+        k=k if not (is_mqa and not mqa_2d) else jnp.squeeze(k, axis=-3),
+        v=v if not (is_mqa and not mqa_2d) else jnp.squeeze(v, axis=-3),
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-5)
 
   @parameterized.parameters(
       (4, 4, False, None),
@@ -365,6 +433,50 @@ class SplashAttentionApiTest(parameterized.TestCase):
     elif jax.default_backend() != "tpu":
       with self.assertRaises(NotImplementedError):
         api.splash_attention(q, k, v, implementation="mosaic_tpu")
+
+  @parameterized.product(
+      implementation=["base", "mosaic_tpu"],
+      shard_axis=[0, 1],
+  )
+  def test_splash_attention_sharding(self, implementation, shard_axis):
+    if implementation == "mosaic_tpu" and jax.default_backend() != "tpu":
+      self.skipTest("mosaic_tpu only runs on TPU.")
+
+    num_devices = min(jax.device_count(), 2)
+    devices = jax.devices()[:num_devices]
+    mesh = jax.sharding.Mesh(devices, ("x",))
+    spec: list[str | None] = [None, None, None]
+    spec[shard_axis] = "x"
+    sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(*spec)
+    )
+
+    num_heads = 4
+    seq_len = 512
+    head_dim = 64
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    k_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    v_s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), dtype)
+    q, k, v = numerics.random_initialize((q_s, k_s, v_s), seed=99)
+
+    ref_out = api.splash_attention(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        implementation=implementation,
+    )
+    out = api.splash_attention(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        implementation=implementation,
+        q_sharding=sharding,
+    )
+    chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

@@ -53,32 +53,45 @@ def _recurrent_gated_delta_rule_step(
   d_v = value.shape[-1]
 
   if state is None:
-    state = jnp.zeros((batch_size, num_heads, d_k, d_v), dtype=query.dtype)
+    state = jnp.zeros((batch_size, num_heads, d_k, d_v), dtype=jnp.float32)
+  else:
+    state = state.astype(jnp.float32)
 
-  q = query[:, :, 0]
-  k = key[:, :, 0]
-  v = value[:, :, 0]
-  beta_val = beta[:, :, 0]
-  g_val = g[:, :, 0]
+  q = query[:, :, 0].astype(jnp.float32)
+  k = key[:, :, 0].astype(jnp.float32)
+  v = value[:, :, 0].astype(jnp.float32)
+  beta_val = beta[:, :, 0].astype(jnp.float32)
+  g_val = g[:, :, 0].astype(jnp.float32)
 
   scale = d_k**-0.5
   q = q * scale
 
+  # Even with fp32 inputs, TPU MXU defaults (`Precision.DEFAULT`) to a single
+  # pass that truncates fp32 operands to bf16 (~3 decimal digits), giving the
+  # reference the same bf16 rounding error as the kernel under test.
+  # `Precision.HIGHEST` decomposes each fp32 operand into bf16 high/low slices
+  # across 6 MXU passes accumulated in fp32 to preserve full fp32 accuracy.
   # v_diff = v - e^g * (k @ state)
-  k_state = jnp.einsum("bhd, bhdm -> bhm", k, state)
+  k_state = jnp.einsum(
+      "bhd, bhdm -> bhm", k, state, precision=lax.Precision.HIGHEST
+  )
   v_diff = v - jnp.exp(g_val)[..., None] * k_state
 
   # v_new = beta * v_diff
   v_new = beta_val[..., None] * v_diff
 
   # out = e^g * (q @ state) + (q . k) * v_new
-  q_state = jnp.einsum("bhd, bhdm -> bhm", q, state)
+  q_state = jnp.einsum(
+      "bhd, bhdm -> bhm", q, state, precision=lax.Precision.HIGHEST
+  )
   q_k = jnp.sum(q * k, axis=-1, keepdims=True)
 
   out = jnp.exp(g_val)[..., None] * q_state + q_k * v_new
 
   # s_new = state * exp(g) + k outer v_new
-  k_v_new = jnp.einsum("bhd, bhm -> bhdm", k, v_new)
+  k_v_new = jnp.einsum(
+      "bhd, bhm -> bhdm", k, v_new, precision=lax.Precision.HIGHEST
+  )
   new_state = state * jnp.exp(g_val)[..., None, None] + k_v_new
 
   return out[:, :, None, :], new_state
@@ -267,12 +280,15 @@ def _depthwise_conv1d_loop_and_bias(x, conv_weight, conv_bias):
       if conv_bias is None:
         out = x_slice * weight_slice
       else:
-        out = x_slice * weight_slice + conv_bias[jnp.newaxis, :]
+        out = (
+            x_slice * weight_slice
+            + conv_bias.astype(jnp.float32)[jnp.newaxis, :]
+        )
     else:
       out += x_slice * weight_slice
 
   assert out is not None
-  return out.astype(x.dtype)
+  return out
 
 
 def ragged_conv1d_mixed_prefill(
@@ -310,11 +326,13 @@ def ragged_conv1d_mixed_prefill(
       jnp.zeros_like(gathered_state),
   )
 
-  combined_tokens = jnp.concatenate([gathered_state, x_first], axis=1)
+  combined_tokens = jnp.concatenate(
+      [gathered_state.astype(jnp.float32), x_first.astype(jnp.float32)], axis=1
+  )
 
   b_out = lax.conv_general_dilated(
       combined_tokens,
-      conv_weight,
+      conv_weight.astype(jnp.float32),
       window_strides=(1,),
       padding="VALID",
       dimension_numbers=("NWC", "OIW", "NWC"),
@@ -322,10 +340,10 @@ def ragged_conv1d_mixed_prefill(
       precision=lax.Precision.HIGHEST,
   ).reshape(-1, x.shape[-1])
   if conv_bias is not None:
-    b_out += conv_bias[jnp.newaxis, :]
+    b_out += conv_bias.astype(jnp.float32)[jnp.newaxis, :]
 
   out = out.at[scatter_indices.flatten()].set(
-      b_out.astype(out.dtype), mode="drop", wrap_negative_indices=False
+      b_out, mode="drop", wrap_negative_indices=False
   )
   total_valid_tokens = query_start_loc[num_valid_seqs]
   valid_token_mask = jnp.arange(num_tokens) < total_valid_tokens
@@ -336,7 +354,7 @@ def ragged_conv1d_mixed_prefill(
       query_start_loc, kernel_size, num_tokens
   )
 
-  x_tokens = x[safe_idx_x]
+  x_tokens = x[safe_idx_x].astype(conv_state.dtype)
   r_grid = jnp.arange(max_blocks)[:, None]
   state_tokens = gathered_state[r_grid, idx_g]
 
@@ -352,7 +370,7 @@ def ragged_conv1d_mixed_prefill(
       )
   )
 
-  return out.astype(x.dtype), updated_conv_state
+  return out, updated_conv_state
 
 
 def ragged_conv1d_decode_only(
@@ -374,22 +392,32 @@ def ragged_conv1d_decode_only(
   req_state_indices = state_indices[token_idx]
   gathered_state = conv_state[req_state_indices]
 
-  lhs = jnp.concatenate([gathered_state, x[:, jnp.newaxis, :]], axis=1)
+  lhs = jnp.concatenate(
+      [
+          gathered_state.astype(jnp.float32),
+          x[:, jnp.newaxis, :].astype(jnp.float32),
+      ],
+      axis=1,
+  )
 
   out = jnp.einsum(
       "nkd,dk->nd",
       lhs,
-      conv_weight[:, 0, :],
+      conv_weight[:, 0, :].astype(jnp.float32),
       precision=lax.Precision.HIGHEST,
   )
 
   if conv_bias is not None:
-    out = out + conv_bias
+    out = out + conv_bias.astype(jnp.float32)
 
   num_valid_seqs = distribution[2]
 
   new_state_extracted = jnp.concatenate(
-      [gathered_state[:, 1:, :], x[:, jnp.newaxis, :]], axis=1
+      [
+          gathered_state[:, 1:, :],
+          x[:, jnp.newaxis, :].astype(conv_state.dtype),
+      ],
+      axis=1,
   )
 
   token_idx = jnp.arange(num_tokens)
@@ -404,7 +432,7 @@ def ragged_conv1d_decode_only(
 
   out = jnp.where(valid_mask[:, jnp.newaxis], out, 0.0)
 
-  return out.astype(x.dtype), updated_conv_state
+  return out, updated_conv_state
 
 
 def ragged_conv1d_jax(
@@ -530,4 +558,4 @@ def run_jax_gdn_attention_local_ref(
       distribution,
   )
 
-  return (new_conv_state, new_recurrent_state), output
+  return (new_conv_state, new_recurrent_state), output.astype(qkv.dtype)

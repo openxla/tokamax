@@ -68,6 +68,7 @@ class PallasTpuDeepseekRopeTest(test_base.DeepseekRopeTestBase):
   @parameterized.parameters(
       ("rope", (256, 64, 512), jnp.float32),
       ("rope", (1024, 512), jnp.float32),
+      ("rope", (368, 256), jnp.float32),
       ("rope", (96, 8, 256), jnp.bfloat16),
       ("qnorm_rope", (256, 128, 512), jnp.bfloat16),
       ("qnorm_rope", (96, 64, 512), jnp.bfloat16),

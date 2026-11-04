@@ -212,8 +212,11 @@ def token_block_spec(shape: tuple[int, ...], block_size: int) -> pl.BlockSpec:
 
 def fold_norm_scale(norm_scale, w_pre, w_post, w_res) -> jax.Array:
   """Folds the RMSNorm channel scale into the three projection matrices."""
-  weights = jnp.concatenate((w_pre, w_post, w_res), axis=-1).astype(jnp.float32)
-  return norm_scale.astype(jnp.float32)[:, None] * weights
+  with jax.named_scope("fold_norm_scale"):
+    weights = jnp.concatenate((w_pre, w_post, w_res), axis=-1).astype(
+        jnp.float32
+    )
+    return norm_scale.astype(jnp.float32)[:, None] * weights
 
 
 def validate_token_block_size(

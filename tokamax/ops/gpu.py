@@ -17,8 +17,8 @@
 # pylint: disable=g-importing-member,useless-import-alias
 from tokamax._src.ops.attention.pallas_mosaic_gpu import Config as PallasMosaicFlashAttentionConfig
 from tokamax._src.ops.attention.pallas_mosaic_gpu import PallasMosaicGpuFlashAttention as PallasMosaicFlashAttention
-from tokamax._src.ops.attention.pallas_triton import Config as PallasTritonFlashAttentionConfig
-from tokamax._src.ops.attention.pallas_triton import PallasTritonFlashAttention as PallasTritonFlashAttention
+from tokamax._src.ops.attention.triton import Config as PallasTritonFlashAttentionConfig
+from tokamax._src.ops.attention.triton import TritonFlashAttention as PallasTritonFlashAttention
 from tokamax._src.ops.gated_linear_unit.pallas_mosaic_gpu import Config as PallasMosaicGatedLinearUnitConfig
 from tokamax._src.ops.gated_linear_unit.pallas_mosaic_gpu import PallasMosaicGpuGatedLinearUnit as PallasMosaicGatedLinearUnit
 from tokamax._src.ops.gated_linear_unit.triton import Config as PallasTritonGatedLinearUnitConfig

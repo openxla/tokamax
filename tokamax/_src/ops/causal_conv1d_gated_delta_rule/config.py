@@ -84,6 +84,25 @@ class GDNConfig:
   # shapes and loops can be sized off it unconditionally and the extra axis
   # / iterations fold away in the non-speculative paths.
   window_size: int = 1
+  # Indicate the use of unified pool.
+  is_shared: bool = False
+
+  @property
+  def conv_hbm_offset(self) -> int:
+    if self.is_shared:
+      # In Unified pool. Conv state is stored after recurrent state.
+      # Offset is calculated via recurrent state size.
+      lane_bytes = pltpu.get_tpu_info().num_lanes * 4
+      lane_elements = (
+          lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+      )
+      num_elements = self.v_dim_size * self.kq_head_dim
+      return num_elements // lane_elements
+    return 0
+
+  @property
+  def recurrent_hbm_offset(self) -> int:
+    return 0
 
   @property
   def chunk_size(self) -> int:

@@ -21,6 +21,10 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
+# Query rows attended per step of `mla_attention`'s per-sequence loop. Bounds
+# the logits to `heads x _Q_CHUNK_ROWS x max_kv_len` per step.
+_Q_CHUNK_ROWS = 256
+
 
 def align_to(a, b):
   return ((a + b - 1) // b) * b
@@ -43,6 +47,7 @@ def update_kv_cache(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     batch_size: int,
+    distribution: jax.Array | None = None,
 ) -> jax.Array:
   """Updates the paged KV cache with new key and value per batch.
 
@@ -64,6 +69,8 @@ def update_kv_cache(
     cu_q_lens: Cumulative lengths of queries, used to slice `new_kv_c` and
       `new_k_pe`.
     batch_size: The total batch size.
+    distribution: Optional `(i, j, k)` sequence distribution; only the first `k`
+      sequence slots are written. If None, all `batch_size` slots are.
 
   Returns:
     The updated KV cache.
@@ -109,7 +116,11 @@ def update_kv_cache(
 
     return lax.fori_loop(0, q_len, per_token_loop, cache_kv)
 
-  return lax.fori_loop(0, batch_size, per_batch_loop, cache_kv)
+  if distribution is None:
+    num_seqs = batch_size
+  else:
+    num_seqs = jnp.clip(distribution[2], 0, batch_size)
+  return lax.fori_loop(0, num_seqs, per_batch_loop, cache_kv)
 
 
 @functools.partial(
@@ -156,7 +167,9 @@ def mla_attention(
     kv_lens: The current length of each sequence in the cache.
     page_indices: The page indices mapping sequence tokens to cache pages.
     cu_q_lens: Cumulative lengths of queries for each sequence in the batch.
-    distribution: Distribution array, likely related to batching.
+    distribution: `(i, j, k)`: sequences [0, i) are decode-only, [i, j) are
+      chunked-prefill-only and [j, k) are mixed; `k` is the number of valid
+      sequences. Slots at or past `k` are skipped and their rows are zero.
     sm_scale: Scaling factor for logits before softmax.
     sliding_window: Optional sliding window size for attention.
     soft_cap: Optional soft capping value for logits.
@@ -183,6 +196,7 @@ def mla_attention(
       page_indices,
       cu_q_lens,
       batch_size,
+      distribution,
   )
   actual_lkv_dim = ql_nope.shape[-1]
   lkv_dim = align_to(actual_lkv_dim, 128)
@@ -216,48 +230,53 @@ def mla_attention(
       total_num_pages, page_size, r_dim
   )
 
-  def _run_per_batch(start, end):
-    per_batch_outputs = []
-    for i in range(start, end):
-      q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
-      q_len = q_end - q_start
-      kv_len = kv_lens[i]
-      # q_i = q[q_start:q_end]
-      static_q_len = q.shape[0] // batch_size
-      q_i = jax.lax.dynamic_slice(
-          q, (q_start, 0, 0), (static_q_len, q.shape[1], q.shape[2])
-      )
+  # Queries are ragged: sequence i owns rows [cu_q_lens[i], cu_q_lens[i + 1]).
+  # Each sequence is processed in fixed-size chunks of rows up to its own
+  # `q_len`. `q` and the output are padded by one chunk so every chunk's
+  # `dynamic_slice` stays in bounds; an out-of-bounds start would be clamped,
+  # silently shifting the window onto the wrong rows.
+  num_tokens, num_heads, _ = q.shape
+  chunk = max(1, min(_Q_CHUNK_ROWS, num_tokens))
+  q = jnp.pad(q, ((0, chunk), (0, 0), (0, 0)))
+  # Rows of padding tokens (past `cu_q_lens[-1]`) stay zero.
+  outputs = jnp.zeros((num_tokens + chunk, num_heads, lkv_dim), q_kv_dtype)
 
-      indices_start = i * pages_per_seq
-      # jax.jit requires static shapes, so we use dynamic slice instead of
-      # slicing with static values.
-      indices = jax.lax.dynamic_slice(
-          page_indices, (indices_start,), (pages_per_seq,)
-      )
+  # Only the first `distribution[2]` sequence slots are valid; the remaining
+  # slots up to `batch_size` are padding and are skipped entirely (no page
+  # gather, no attention).
+  num_seqs = jnp.clip(distribution[2], 0, batch_size)
 
-      gathered_kv_c = kv_c_cache[indices]
-      gathered_k_pe = k_pe_cache[indices]
+  def seq_body(i, outputs):
+    q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
+    q_len = q_end - q_start
+    kv_len = kv_lens[i]
 
-      flat_kv_c = gathered_kv_c.reshape(-1, lkv_dim)
-      flat_k_pe = gathered_k_pe.reshape(-1, r_dim)
+    indices_start = i * pages_per_seq
+    # jax.jit requires static shapes, so we use dynamic slice instead of
+    # slicing with static values.
+    indices = jax.lax.dynamic_slice(
+        page_indices, (indices_start,), (pages_per_seq,)
+    )
+    k_c = kv_c_cache[indices].reshape(-1, lkv_dim)
+    k_pe = k_pe_cache[indices].reshape(-1, r_dim)
+    k_i = jnp.concatenate([k_c, k_pe], axis=-1)
+    v_i = k_c
+    k_indices = jnp.arange(k_c.shape[0])
 
-      k_c = jax.lax.dynamic_slice(
-          flat_kv_c, (0, 0), (flat_kv_c.shape[0], lkv_dim)
+    def chunk_body(c, outputs):
+      row0 = c * chunk
+      q_c = jax.lax.dynamic_slice(
+          q, (q_start + row0, 0, 0), (chunk, num_heads, q.shape[2])
       )
-      k_pe = jax.lax.dynamic_slice(
-          flat_k_pe, (0, 0), (flat_k_pe.shape[0], r_dim)
-      )
-      k_i = jnp.concatenate([k_c, k_pe], axis=-1)
-      v_i = k_c
 
       # MQA attention:
-      # q:[q_len, actual_num_q_heads, lkv_dim+r_dim]
+      # q:[chunk, actual_num_q_heads, lkv_dim+r_dim]
       # k:[kv_len, lkv_dim+r_dim]
       # v:[kv_len, lkv_dim]
-      # attn: [q_len, actual_num_q_heads, kv_len]
+      # attn: [actual_num_q_heads, chunk, kv_len]
       logits = jnp.einsum(
           "qnh,kh->nqk",
-          q_i.astype(q_kv_dtype),
+          q_c.astype(q_kv_dtype),
           k_i.astype(q_kv_dtype),
           preferred_element_type=jnp.float32,
       )
@@ -267,8 +286,8 @@ def mla_attention(
       if q_scale is not None:
         logits *= q_scale
 
-      q_indices = jnp.arange(static_q_len) + (kv_len - q_len)
-      k_indices = jnp.arange(flat_kv_c.shape[0])
+      rows = jnp.arange(chunk) + row0
+      q_indices = rows + (kv_len - q_len)
       mask = jnp.logical_or(k_indices > q_indices[:, None], k_indices >= kv_len)
       if sliding_window is not None:
         mask = jnp.logical_or(
@@ -281,21 +300,31 @@ def mla_attention(
       logits = logits.astype(s_dtype)
       probs = jax.nn.softmax(logits, axis=-1).astype(v_i.dtype)
 
-      # out_i: [total_q_len, actual_num_q_heads, lkv_dim]
-      out_i = jnp.einsum(
+      # out_c: [chunk, actual_num_q_heads, lkv_dim]
+      out_c = jnp.einsum(
           "nqk,kl->qnl",
           probs,
           v_i.astype(cache_kv.dtype),
           preferred_element_type=jnp.float32,
       )
       if v_scale is not None:
-        out_i *= v_scale
-      per_batch_outputs.append(out_i.astype(q_kv_dtype))
-    return per_batch_outputs
+        out_c *= v_scale
 
-  outputs = _run_per_batch(0, batch_size)
+      # Only this sequence's rows; the rest of the chunk belongs to the next.
+      prev = jax.lax.dynamic_slice(
+          outputs, (q_start + row0, 0, 0), (chunk, num_heads, lkv_dim)
+      )
+      out_c = jnp.where(
+          (rows < q_len)[:, None, None], out_c.astype(q_kv_dtype), prev
+      )
+      return jax.lax.dynamic_update_slice(
+          outputs, out_c, (q_start + row0, 0, 0)
+      )
 
-  return (
-      jnp.concatenate(outputs, axis=0),
-      updated_cache_kv,
-  )
+    return jax.lax.fori_loop(
+        0, (q_len + chunk - 1) // chunk, chunk_body, outputs
+    )
+
+  outputs = jax.lax.fori_loop(0, num_seqs, seq_body, outputs)
+
+  return outputs[:num_tokens], updated_cache_kv

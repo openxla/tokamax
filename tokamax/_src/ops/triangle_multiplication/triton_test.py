@@ -27,8 +27,10 @@ from tokamax._src.ops.triangle_multiplication import base
 
 try:
   from tokamax._src.ops.triangle_multiplication import triton as triton_tri_mul  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.triangle_multiplication import triton_vjp as triton_tri_mul_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
   triton_tri_mul = None
+  triton_tri_mul_vjp = None
 
 
 def _get_params(n: int, c: int, h: int, d: int, dtype: jax.typing.DTypeLike):
@@ -145,7 +147,7 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
     )
 
   def test_autotuning_configs(self):
-    assert triton_tri_mul is not None
+    assert triton_tri_mul is not None and triton_tri_mul_vjp is not None
     n, c, h, d = 128, 64, 64, 64
     dtype = jnp.bfloat16
     params = _get_params(n=n, c=c, h=h, d=d, dtype=dtype)
@@ -161,6 +163,12 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
           params
       )
       chex.assert_trees_all_close(out, expected, atol=0.15, rtol=0.05)
+
+    vjp_op = triton_tri_mul_vjp.TritonTriangleMultiplicationVjp()
+    vjp_ba = vjp_op.bind(**ba.vjp_arg_spec)
+    vjp_configs = vjp_op._get_autotuning_configs(vjp_ba)
+    self.assertNotEmpty(vjp_configs)
+    self.assertIn(vjp_op._get_heuristics_config(vjp_ba), vjp_configs)
 
   @parameterized.product(
       prologue_persistent=[True, False],
@@ -240,9 +248,77 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
     out = jax.jit(lambda p: self._op(**p, triangle_type=triangle_type))(params)
     self._assert_matches_reference(out, params, triangle_type)
 
+  @parameterized.parameters(jnp.nan, jnp.inf, -jnp.inf)
+  def test_nan_in_masked_tokens_does_not_propagate(self, bad_val):
+    n = 64
+    valid = jnp.arange(n) < 48
+    mask = valid[:, None] & valid[None, :]
+    params = _get_params(n=n, c=64, h=64, d=64, dtype=jnp.bfloat16)
+    params.pop("mask")
+    params_nan = dict(params)
+    params_nan["x"] = jnp.where(mask[:, :, None], params["x"], bad_val)
+
+    out_clean = jax.jit(
+        lambda p: self._op(**p, mask=mask, triangle_type="outgoing")
+    )(params)
+    out_nan = jax.jit(
+        lambda p: self._op(**p, mask=mask, triangle_type="outgoing")
+    )(params_nan)
+    chex.assert_trees_all_close(out_nan[:48, :48], out_clean[:48, :48])
+
+    dout = jnp.where(
+        mask[:, :, None],
+        jax.random.normal(jax.random.key(3), (n, n, 64), dtype=jnp.bfloat16),
+        0.0,
+    )
+    _, vjp_clean = jax.jit(
+        lambda p: jax.vjp(
+            lambda q: self._op(**q, mask=mask, triangle_type="outgoing"), p
+        )
+    )(params)
+    _, vjp_nan = jax.jit(
+        lambda p: jax.vjp(
+            lambda q: self._op(**q, mask=mask, triangle_type="outgoing"), p
+        )
+    )(params_nan)
+    (grads_clean,) = jax.jit(vjp_clean)(dout)
+    (grads_nan,) = jax.jit(vjp_nan)(dout)
+    for k in grads_nan:
+      with self.subTest(k):
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grads_nan[k]))))
+        chex.assert_trees_all_close(grads_nan[k], grads_clean[k])
+
+  def test_zero_epsilon_padded_rows_no_nan(self):
+    n = 20
+    params = _get_params(n=n, c=64, h=64, d=64, dtype=jnp.bfloat16)
+    mask = params.pop("mask")
+    dout = jax.random.normal(jax.random.key(0), (n, n, 64), dtype=jnp.bfloat16)
+    out, vjp_fn = jax.jit(
+        lambda p: jax.vjp(
+            lambda q: self._op(
+                **q, mask=mask, triangle_type="outgoing", epsilon=0.0
+            ),
+            p,
+        )
+    )(params)
+    (grads,) = jax.jit(vjp_fn)(dout)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
+    for g in jax.tree.leaves(grads):
+      self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
+
   def test_config_validation(self):
-    assert triton_tri_mul is not None
-    triton_tri_mul.Config(block_m=256, epilogue_block_m=32, num_warps=16)
+    assert triton_tri_mul is not None and triton_tri_mul_vjp is not None
+    triton_tri_mul.Config(
+        block_m=256,
+        epilogue_block_m=32,
+        num_warps=16,
+    )
+    triton_tri_mul_vjp.Config(
+        block_m=64,
+        epilogue_block_m=32,
+        num_warps=8,
+        epilogue_num_warps=4,
+    )
     for kwargs in (
         dict(block_m=96),  # Not a power of two.
         dict(block_m=16),  # Too small.
@@ -253,17 +329,20 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
     ):
       with self.subTest(str(kwargs)), self.assertRaises(ValueError):
         triton_tri_mul.Config(**kwargs)
+      with self.subTest(f"vjp_{kwargs}"), self.assertRaises(ValueError):
+        triton_tri_mul_vjp.Config(**kwargs)
 
   @parameterized.product(
       triangle_type=["incoming", "outgoing"],
       use_api=[False, True],
+      n=[64, 100],
+      dtype=[jnp.bfloat16, jnp.float16],
   )
-  def test_gradients(self, triangle_type, use_api):
-    params = _get_params(n=64, c=64, h=64, d=64, dtype=jnp.bfloat16)
+  def test_gradients(self, triangle_type, use_api, n, dtype):
+    assert triton_tri_mul is not None and triton_tri_mul_vjp is not None
+    params = _get_params(n=n, c=64, h=64, d=64, dtype=dtype)
     mask = params.pop("mask")
-    dout = jax.random.normal(
-        jax.random.key(0), (64, 64, 64), dtype=jnp.bfloat16
-    )
+    dout = jax.random.normal(jax.random.key(0), (n, n, 64), dtype=dtype)
 
     if use_api:
       # The default implementation tries Triton first.
@@ -273,14 +352,63 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
 
     def loss(p, fn, **kwargs):
       out = fn(**p, mask=mask, triangle_type=triangle_type, **kwargs)
-      return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32))
+      return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32)) / n
 
-    grads = jax.jit(jax.grad(lambda p: loss(p, fn)))(params)
+    grad_fn = jax.jit(jax.grad(lambda p: loss(p, fn)))
+    grads = grad_fn(params)
     expected = jax.jit(
         jax.grad(lambda p: loss(p, self._ref_op, implementation="xla"))
     )(params)
 
+    bound_args = hlo_utils.get_bound_args(grad_fn.lower(params))
+    abstract_params, abstract_mask = jax.eval_shape(
+        lambda p, m: (p, m), params, mask
+    )
+    expected_fwd_ba = self._op.bind(
+        **abstract_params,
+        mask=abstract_mask,
+        triangle_type=triangle_type,
+        return_residuals=True,
+    )
+    expected_vjp_ba = self._op.vjp.bind(**expected_fwd_ba.vjp_arg_spec)  # pyrefly: ignore[missing-attribute]
+    self.assertCountEqual(bound_args, (expected_fwd_ba, expected_vjp_ba))
+
     self.assertEqual(jax.tree.structure(grads), jax.tree.structure(expected))
+    for k in params:
+      with self.subTest(k):
+        chex.assert_trees_all_close(
+            grads[k].astype(jnp.float32),
+            expected[k].astype(jnp.float32),
+            atol=0.5 if dtype == jnp.bfloat16 else 0.1,
+            rtol=0.05,
+        )
+
+  @parameterized.product(
+      triangle_type=["incoming", "outgoing"],
+      dims=[
+          dict(n=64, c=16, h=32, d=64),
+          dict(n=64, c=64, h=64, d=64),
+          dict(n=64, c=128, h=128, d=128),
+      ],
+  )
+  def test_gradients_channel_dims_and_sparse_mask(self, triangle_type, dims):
+    assert triton_tri_mul is not None
+    n, c, h, d = dims["n"], dims["c"], dims["h"], dims["d"]
+    params = _get_params(n=n, c=c, h=h, d=d, dtype=jnp.bfloat16)
+    mask = jax.random.uniform(jax.random.key(1), (n, n)) < 0.25
+    mask = mask.at[: n // 4].set(False)
+    params.pop("mask")
+    dout = jax.random.normal(jax.random.key(0), (n, n, d), dtype=jnp.bfloat16)
+
+    def loss(p, fn, **kwargs):
+      out = fn(**p, mask=mask, triangle_type=triangle_type, **kwargs)
+      return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32)) / n
+
+    grads = jax.jit(jax.grad(lambda p: loss(p, self._op)))(params)
+    expected = jax.jit(
+        jax.grad(lambda p: loss(p, self._ref_op, implementation="xla"))
+    )(params)
+
     for k in params:
       with self.subTest(k):
         chex.assert_trees_all_close(
@@ -290,15 +418,74 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
             rtol=0.05,
         )
 
+  @parameterized.product(
+      bwd_persistent=[True, False],
+      triangle_type=["incoming", "outgoing"],
+  )
+  def test_gradients_bwd_config_overrides(self, bwd_persistent, triangle_type):
+    assert triton_tri_mul is not None and triton_tri_mul_vjp is not None
+    n = 64
+    params = _get_params(n=n, c=64, h=64, d=64, dtype=jnp.bfloat16)
+    dout = jax.random.normal(jax.random.key(0), (n, n, 64), dtype=jnp.bfloat16)
+    config = triton_tri_mul.Config(block_m=64)
+    vjp_config = triton_tri_mul_vjp.Config(
+        block_m=64,
+        num_warps=8,
+        num_stages=2,
+        epilogue_block_m=32,
+        epilogue_num_warps=4,
+        epilogue_num_stages=3,
+        prologue_persistent=bwd_persistent,
+        epilogue_persistent=bwd_persistent,
+    )
+    vjp_op = triton_tri_mul_vjp.TritonTriangleMultiplicationVjp(
+        config=vjp_config
+    )
+    op_cfg = triton_tri_mul.TritonTriangleMultiplication(
+        config=config, vjp=vjp_op
+    )
+
+    def f_triton(p):
+      return op_cfg(**p, triangle_type=triangle_type)
+
+    def f_ref(p):
+      return self._ref_op(
+          **p, triangle_type=triangle_type, implementation="xla"
+      )
+
+    out, vjp_fn = jax.jit(lambda p: jax.vjp(f_triton, p))(params)
+    (grads,) = jax.jit(vjp_fn)(dout)
+    out_ref, vjp_ref = jax.jit(lambda p: jax.vjp(f_ref, p))(params)
+    (expected,) = jax.jit(vjp_ref)(dout)
+
+    chex.assert_trees_all_close(out, out_ref, atol=0.15, rtol=0.05)
+    for k in params:
+      if k == "mask":
+        continue
+      with self.subTest(k):
+        chex.assert_trees_all_close(
+            grads[k].astype(jnp.float32),
+            expected[k].astype(jnp.float32),
+            atol=0.5 * n,
+            rtol=0.05,
+        )
+
   def test_return_residuals(self):
     params = _get_params(n=64, c=64, h=64, d=64, dtype=jnp.bfloat16)
     out, residuals = jax.jit(
         lambda p: self._op(**p, triangle_type="outgoing", return_residuals=True)
     )(params)
-    self.assertIsNone(residuals)
+    self.assertIsInstance(residuals, tuple)
+    self.assertLen(residuals, 3)
+    for res in residuals:
+      self.assertEqual(res.shape, (64, 64, 64))
+      self.assertEqual(res.dtype, jnp.bfloat16)
     self.assertEqual(out.shape, (64, 64, 64))
 
   def test_int32_offset_overflow_raises(self):
+    assert triton_tri_mul_vjp is not None
+    vjp_op = triton_tri_mul_vjp.TritonTriangleMultiplicationVjp()
+
     def get_shapes(n, c):
       # Use abstract shapes, so that no memory is allocated.
       dtype = jnp.bfloat16
@@ -322,33 +509,112 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
     with self.assertRaisesRegex(NotImplementedError, "int32"):
       jax.eval_shape(f, get_shapes(n=4097, c=128))
 
+    def f_vjp(p, res):
+      return vjp_op(
+          res,
+          p["x"],
+          p["x"],
+          **p,
+          triangle_type="outgoing",
+          precision=(jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
+          epsilon=1e-6,
+      )
+
+    res_4097 = (jax.ShapeDtypeStruct((128, 4097, 4097), jnp.bfloat16),) * 3
+    with self.assertRaisesRegex(NotImplementedError, "int32"):
+      jax.eval_shape(f_vjp, get_shapes(n=4097, c=128), res_4097)
+
   def test_unsupported_raises_not_implemented(self):
+    assert triton_tri_mul_vjp is not None
+    vjp_op = triton_tri_mul_vjp.TritonTriangleMultiplicationVjp()
+    default_prec = (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT)
+
     with self.subTest("unsupported_dtype"):
       params = _get_params(n=128, c=64, h=64, d=64, dtype=jnp.float32)
+      res = (jnp.zeros((64, 128, 128), dtype=jnp.float32),) * 3
       with self.assertRaises(NotImplementedError):
         self._op(**params, triangle_type="outgoing")
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            params["x"],
+            params["x"],
+            **params,
+            triangle_type="outgoing",
+            precision=default_prec,
+            epsilon=1e-6,
+        )
 
     with self.subTest("unsupported_channel_dims"):
       params = _get_params(n=128, c=48, h=48, d=64, dtype=jnp.bfloat16)
+      res = (jnp.zeros((48, 128, 128), dtype=jnp.bfloat16),) * 3
       with self.assertRaises(NotImplementedError):
         self._op(**params, triangle_type="outgoing")
+      out = jnp.zeros((128, 128, 64), dtype=jnp.bfloat16)
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            out,
+            out,
+            **params,
+            triangle_type="outgoing",
+            precision=default_prec,
+            epsilon=1e-6,
+        )
 
     with self.subTest("unsupported_precision"):
       params = _get_params(n=128, c=64, h=64, d=64, dtype=jnp.bfloat16)
+      res = (jnp.zeros((64, 128, 128), dtype=jnp.bfloat16),) * 3
       with self.assertRaises(NotImplementedError):
         self._op(
             **params,
             triangle_type="outgoing",
             precision=jax.lax.DotAlgorithmPreset.F32_F32_F32,
         )
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            params["x"],
+            params["x"],
+            **params,
+            triangle_type="outgoing",
+            precision=jax.lax.DotAlgorithmPreset.F32_F32_F32,
+            epsilon=1e-6,
+        )
 
     with self.subTest("mismatched_weight_dtype"):
       params = _get_params(n=128, c=64, h=64, d=64, dtype=jnp.bfloat16)
+      res = (jnp.zeros((64, 128, 128), dtype=jnp.bfloat16),) * 3
       params["projection_in_weights"] = params["projection_in_weights"].astype(
           jnp.float16
       )
       with self.assertRaises(NotImplementedError):
         self._op(**params, triangle_type="outgoing")
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            params["x"],
+            params["x"],
+            **params,
+            triangle_type="outgoing",
+            precision=default_prec,
+            epsilon=1e-6,
+        )
+
+    with self.subTest("vjp_return_residuals"):
+      params = _get_params(n=64, c=64, h=64, d=64, dtype=jnp.bfloat16)
+      res = (jnp.zeros((64, 64, 64), dtype=jnp.bfloat16),) * 3
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            params["x"],
+            params["x"],
+            **params,
+            triangle_type="outgoing",
+            precision=default_prec,
+            epsilon=1e-6,
+            return_residuals=True,
+        )
 
 
 if __name__ == "__main__":

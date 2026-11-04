@@ -22,7 +22,7 @@ module, directly or transitively -- so this builds the import graph of the
 What the graph cannot see is handled by triggering a full run.
 
 Usage:
-  python3 .github/ci/deps.py tokamax/_src/pallas/block.py  # explain a change
+  python3 .github/ci/deps.py tokamax/_src/triton_utils.py  # explain a change
   python3 .github/ci/deps.py --graph                       # fan-in summary
 """
 
@@ -50,16 +50,24 @@ PACKAGE_ROOT: Final[str] = 'tokamax'
 #   data           any non-Python file in the package, read at runtime by
 #                  path, so a behavioural input with no import edge at all.
 #                  The autotuning tables are the exception; see below.
-#   __init__.py    executed by every import that passes through the package,
-#                  but never named by one. `from a.b import c` records edges to
-#                  `a.b` and `a.b.c`, so the package being imported *from* is
-#                  covered -- but `a`, and every package above it, is not, even
-#                  though python runs all of their `__init__.py` files first.
-#                  The missing edges are always ancestors, and an ancestor is
-#                  always a package, so the gap is exactly this file name.
 #
-# All three are named by the rules in `full_run_reason` rather than listed
-# here; this comment is what they are.
+# Both are named by the rules in `full_run_reason` rather than listed here;
+# this comment is what they are.
+#
+# A package `__init__.py` is the other file the import graph cannot see by
+# name. Python runs it for every import that passes through the package, but
+# no statement names it: `from a.b import c` records edges to `a.b` and
+# `a.b.c`, so the package being imported *from* is covered, but `a`, and every
+# package above it, is not, even though python runs all of their `__init__.py`
+# files first. pytest likewise runs the `__init__.py` files between a test file
+# and the nearest directory above it that has none, since it imports the test
+# by its dotted name from there. The missing edges are always to enclosing
+# packages, so they can be read off the tree instead: `execution_edges` adds
+# an edge from every file to every enclosing `__init__.py` -- for pytest, more
+# than it runs when a directory on the way has no `__init__.py`, which can
+# only widen a selection -- and a changed `__init__.py` selects every test whose
+# closure over that graph runs it. Only a *deleted* `__init__.py` still selects
+# every shard; see `full_run_reason`.
 
 # `all_test_files` in shards.py matches pytest's `python_files`; the same
 # universe, kept in one place there and mirrored here rather than imported, so
@@ -70,6 +78,14 @@ TEST_FILE_PREFIX: Final[str] = 'test_'
 # Non-Python files that cannot change what a test does, and so do not force a
 # full run.
 INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
+
+# The workflow this module selects shards for. Every other workflow runs on its
+# own trigger (a schedule, `workflow_run`, or by hand), and CI-Build neither
+# calls nor executes it, so running every shard tests nothing about a change to
+# one; `deps_test.py` checks that `ci-build.yml` calls no local workflow or
+# action, which is what would make one matter.
+WORKFLOWS_DIR: Final[str] = '.github/workflows/'
+CI_BUILD_WORKFLOW: Final[str] = f'{WORKFLOWS_DIR}ci-build.yml'
 
 # `_src/autotuning/cache.py` reads `<device_kind>/<op_name>.json` for the op
 # whose snake-cased class name is `<op_name>`. Narrowed by op only, not runner.
@@ -336,6 +352,62 @@ def dependents(
   return index
 
 
+def enclosing_inits(path: str, known: Collection[str]) -> set[str]:
+  """The `__init__.py` files python runs before it can run `path`.
+
+  Importing `a.b.c` runs `a/__init__.py`, then `a/b/__init__.py`, then
+  `a/b/c.py`. An `__init__.py` is its package, so its own enclosing packages
+  are the ones above that.
+
+  Args:
+    path: Repo-relative path to a `.py` file.
+    known: The files that exist. A directory without an `__init__.py` is a
+      namespace package, which runs nothing, so it contributes nothing.
+
+  Returns:
+    Every enclosing package `__init__.py` in `known`, up to the package root.
+  """
+  directory = os.path.dirname(path)
+  if _is_package_init(path):
+    directory = os.path.dirname(directory)
+  inits = set()
+  while directory:
+    if (init := f'{directory}/__init__.py') in known:
+      inits.add(init)
+    directory = os.path.dirname(directory)
+  return inits
+
+
+def execution_edges(
+    edges: ImportEdges, files: Sequence[str] | None = None
+) -> dict[str, set[str]]:
+  """`edges` plus each file's edges to its enclosing `__init__.py` files.
+
+  These are the edges `import_graph` cannot record, because no statement names
+  them; see the comment on `__init__.py` at the top of the module. Over this
+  graph, a test reaches an `__init__.py` whenever importing it can run that
+  `__init__.py` -- directly, or because something it imports, or something an
+  `__init__.py` on the way imports, lives in that package.
+
+  Used only for a changed `__init__.py`. Every test runs `tokamax/__init__.py`
+  and whatever it imports, so selecting ordinary edits over this graph would
+  select nearly every test for any change to those modules.
+
+  Args:
+    edges: Forward import graph, as built by `import_graph`.
+    files: Files to cover. Defaults to every `.py` file in the package.
+
+  Returns:
+    A new forward graph; `edges` is not modified.
+  """
+  files = python_files() if files is None else files
+  known = set(files)
+  return {
+      path: set(edges.get(path, ())) | enclosing_inits(path, known)
+      for path in files
+  }
+
+
 def full_run_reason(
     changed: Collection[str],
     unparsed: Collection[str] = (),
@@ -345,15 +417,16 @@ def full_run_reason(
   """Why `changed` requires every shard, or `None` if it does not.
 
   The exception is `INERT_SUFFIXES`, checked before anything else: those files
-  cannot affect a test wherever they live (think documentation).
+  cannot affect a test wherever they live (think documentation). Nor can a
+  workflow other than `CI_BUILD_WORKFLOW`.
 
   `known` is the file set the graph was built from. Changed paths absent from
   `known` represent deleted files. Most deletions do not force a full run
   because `affected_tests` identifies their surviving referrers.
 
-  Any `__init__.py` forces a full run whether it was edited or deleted, since
-  no import statement names one and the graph therefore under-reports what it
-  reaches. `known` only distinguishes the two in the reason string.
+  A deleted `__init__.py` forces a full run. An edited or added one does not:
+  `affected_tests` selects its dependents over `execution_edges`. Without
+  `known` the two cannot be told apart, so any `__init__.py` forces a full run.
 
   `unparsed` is not checked against `changed`: it is a property of the graph,
   and forces a full run if the collection is non-empty
@@ -362,9 +435,8 @@ def full_run_reason(
     changed: Repo-relative paths of the changed files.
     unparsed: Files `ast` could not read, from `import_graph`. Any at all makes
       the whole graph untrustworthy.
-    known: The file set the graph was built from. `None` reports a changed
-      `__init__.py` as edited rather than deleted, which is only safe when the
-      caller already knows every changed path still exists.
+    known: The file set the graph was built from. `None` makes every changed
+      `__init__.py` force a full run, since it might have been deleted.
     ops: Op name to defining files, from `op_modules`.
 
   Returns:
@@ -386,6 +458,8 @@ def full_run_reason(
   for path in sorted(changed):
     if path.endswith(INERT_SUFFIXES):
       continue
+    if path.startswith(WORKFLOWS_DIR) and path != CI_BUILD_WORKFLOW:
+      continue
     if not path.startswith(f'{PACKAGE_ROOT}/'):
       return f'{path} is outside {PACKAGE_ROOT}/'
     if os.path.basename(path) == 'conftest.py':
@@ -399,20 +473,19 @@ def full_run_reason(
       continue
     if not path.endswith('.py'):
       return f'{path} is package data, which no import edge covers'
-    # An `__init__.py` is depended on by tree position, never by name, so the
-    # graph cannot answer for it: see the comment on the fail-open rules above.
-    # Deletion is called out separately because it is a different failure --
-    # `module_name` collapses an `__init__.py` to the package itself, so
-    # removing it does not retire one module, it changes how every sibling
-    # resolves, and leaves a namespace package behind so the imports that named
-    # it may still work rather than failing loudly.
+    # A deleted `__init__.py` is not one module going away: `module_name`
+    # collapses an `__init__.py` to the package itself, so removing it changes
+    # how every sibling resolves, and leaves a namespace package behind so the
+    # imports that named it may still work rather than failing loudly. An
+    # edited or added one is selected over `execution_edges` instead.
     if _is_package_init(path):
-      if known is not None and path not in known:
+      if known is None:
+        return (
+            f'{path} is a package __init__.py, and without the file list it'
+            ' cannot be told apart from a deleted one'
+        )
+      if path not in known:
         return f'{path} was deleted, which re-resolves the whole package'
-      return (
-          f'{path} is a package __init__.py, which every import through the'
-          ' package executes but none names'
-      )
   return None
 
 
@@ -460,6 +533,12 @@ def affected_tests(
   deleted = [p for p in changed if p not in known and p.endswith('.py')]
   for path in changed:
     tests |= index.get(path, set())
+  # `full_run_reason` has already failed a deleted `__init__.py` open, so
+  # these all exist.
+  if inits := [p for p in changed if _is_package_init(p)]:
+    run_by = dependents(execution_edges(edges, files), files)
+    for path in inits:
+      tests |= run_by.get(path, set())
   for path, name in tables.items():
     op_tests = set().union(*(index.get(m, set()) for m in ops[name]))
     if not op_tests:

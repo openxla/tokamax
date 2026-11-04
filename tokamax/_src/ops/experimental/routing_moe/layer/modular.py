@@ -33,6 +33,43 @@ NamedSharding = sharding.NamedSharding
 Mesh = sharding.Mesh
 
 
+def _prepare_ep_inputs(
+    topk_weights: jax.Array,
+    w2_bias: jax.Array | None,
+    ep_shard_idx: jax.Array | None,
+    *,
+    local_num_experts: int,
+    cfg: config.RoutingMoEConfig,
+) -> tuple[int, jax.Array, jax.Array | None, jax.Array]:
+  """Derives global expert count, shard group offset, and EP-local inputs."""
+  if cfg.ep_axis is None:
+    return (
+        local_num_experts,
+        jnp.array([0], dtype=jnp.int32),
+        w2_bias,
+        topk_weights,
+    )
+
+  num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
+  global_num_experts = local_num_experts * num_ep_shards
+  if ep_shard_idx is None:
+    ep_shard_idx = jax.lax.axis_index(cfg.ep_axis)
+  elif not jnp.isscalar(ep_shard_idx):
+    ep_shard_idx = ep_shard_idx[0]
+  group_offset = jnp.array([ep_shard_idx * local_num_experts], dtype=jnp.int32)
+  if w2_bias is not None:
+    w2_bias = jnp.where(ep_shard_idx == 0, w2_bias, 0)
+  if cfg.plan.remote_scatter and not cfg.use_sp:
+    num_local_tokens = topk_weights.shape[0] // num_ep_shards
+    topk_weights = jax.lax.dynamic_slice_in_dim(
+        topk_weights,
+        ep_shard_idx * num_local_tokens,
+        num_local_tokens,
+        axis=0,
+    )
+  return global_num_experts, group_offset, w2_bias, topk_weights
+
+
 def _routing_moe_local(
     x: jax.Array,
     topk_weights: jax.Array,
@@ -43,7 +80,7 @@ def _routing_moe_local(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    shard_idx: jax.Array | None,
+    ep_shard_idx: jax.Array | None,
     *,
     cfg: config.RoutingMoEConfig,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
@@ -54,24 +91,13 @@ def _routing_moe_local(
   topk = topk_indices.shape[-1]
 
   # Step 1: Book keep sharding related logictics.
-  if cfg.tp_axis is not None:
-    global_num_experts = local_num_experts
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    num_ep_shards = jax.lax.axis_size(cfg.ep_axis)
-    global_num_experts = local_num_experts * num_ep_shards
-    if shard_idx is None:
-      shard_idx = jax.lax.axis_index(cfg.ep_axis)
-    elif not jnp.isscalar(shard_idx):
-      shard_idx = shard_idx[0]
-    group_offset = jnp.array([shard_idx * local_num_experts], dtype=jnp.int32)
-    if w2_bias is not None:
-      w2_bias = jnp.where(shard_idx == 0, w2_bias, 0)
-    if cfg.plan.remote_scatter and not cfg.use_sp:
-      num_local_tokens = topk_weights.shape[0] // num_ep_shards
-      topk_weights = jax.lax.dynamic_slice_in_dim(
-          topk_weights, shard_idx * num_local_tokens, num_local_tokens, axis=0
-      )
+  global_num_experts, group_offset, w2_bias, topk_weights = _prepare_ep_inputs(
+      topk_weights,
+      w2_bias,
+      ep_shard_idx,
+      local_num_experts=local_num_experts,
+      cfg=cfg,
+  )
 
   if cfg.use_sp:
     # Step 2: If input is not replicated (SP), perform all-gather.
@@ -89,7 +115,7 @@ def _routing_moe_local(
   # repacking triggers both input and output relayout. Thus, we need to perform
   # repacking after all-gather.
   # TODO: Support all-gather with compact layout.
-  x_compact = input_pack.input_pack(x)
+  x_compact = input_pack.input_pack(x, cfg.gmm_in_format)
 
   # Step 4: Sort indices and compute expert group sizes.
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
@@ -109,17 +135,18 @@ def _routing_moe_local(
   # Step 5: Invoke GMM Gate and Up.
   gmm_res = gmm.routing_gmm(
       x=x_compact,
-      w=(
-          arg.make_weight_wrapper(w1, w1_scale, w1_bias, fused_gate_up=True),
-          arg.make_weight_wrapper(w2, w2_scale, w2_bias),
+      w=arg.SingleWeightWrapper.create(
+          w1, w1_scale, w1_bias, fused_gate_up=True
       ),
+      w2=arg.SingleWeightWrapper.create(w2, w2_scale, w2_bias),
       group_sizes=group_sizes,
-      gather=arg.make_routing_wrapper(topk_argsort_indices // topk),
-      scatter=arg.make_routing_wrapper(
+      gather=arg.RoutingWrapper.create(topk_argsort_indices // topk),
+      scatter=arg.RoutingWrapper.create(
           topk_argsort_indices,
-          remote_axis=cfg.reduction_axis if cfg.plan.remote_scatter else None,
+          remote_axis=cfg.ep_axis if cfg.plan.remote_scatter else None,
       ),
       fuse_act=cfg.activation,
+      out_format=cfg.gmm_out_format,
       group_offset=group_offset,
       row_group=row_group,
       custom_plan=gmm_plan,
@@ -184,7 +211,7 @@ def routing_moe(
     reduce_output: bool = True,
     moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
     gmm_plan: gmm_plan_lib.RoutingGmmPlan | None = None,
-    shard_idx: jax.Array | None = None,
+    ep_shard_idx: jax.Array | None = None,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
@@ -206,16 +233,18 @@ def routing_moe(
     reduce_output: reduce output across devices.
     moe_plan: optional MoE layer execution plan.
     gmm_plan: optional GMM kernel execution plan.
-    shard_idx: optional int32 [num_shards] that holds each shard's index.
+    ep_shard_idx: optional int32 [num_shards] that holds each ep_shard's index.
 
   Returns:
     Output of moe operation. [num_tokens, hidden_size] if reduce_output=True,
-      else [num_shards * num_tokens, hidden_size].
+    else [num_shards * num_tokens, hidden_size].
   """
   if w1_bias is not None or w2_bias is not None:
     raise NotImplementedError("Bias is currently not supported.")
 
-  resolved_plan = moe_plan_lib.ResolvedMoEPlan.create(moe_plan)
+  resolved_plan = moe_plan_lib.ResolvedMoEPlan.create(
+      moe_plan, x_dtype=hidden_states.dtype
+  )
   cfg = config.RoutingMoEConfig.create(
       tp_axis=tp_axis,
       ep_axis=ep_axis,
@@ -223,15 +252,19 @@ def routing_moe(
       reduce_output=reduce_output,
       activation=activation,
       plan=resolved_plan,
+      mesh=mesh,
   )
 
   w1_spec = P(ep_axis, None, tp_axis)
   w2_spec = P(ep_axis, tp_axis, None)
   w1_scale_spec = None if w1_scale is None else P(ep_axis, None, None, tp_axis)
-  w2_scale_spec = None if w2_scale is None else P(ep_axis, None, None, None)
+  w2_scale_spec = None
+  if w2_scale is not None:
+    block_axis = None if w2_scale.shape[1] == 1 else tp_axis
+    w2_scale_spec = P(ep_axis, block_axis, None, None)
   w1_bias_spec = None if w1_bias is None else P(ep_axis, None, tp_axis)
   w2_bias_spec = None if w2_bias is None else P(ep_axis, None, None)
-  shard_idx_spec = None if shard_idx is None else P(cfg.reduction_axis)
+  ep_shard_idx_spec = None if ep_shard_idx is None else P(ep_axis)
 
   return jax.shard_map(
       functools.partial(
@@ -241,18 +274,18 @@ def routing_moe(
       ),
       mesh=mesh,
       in_specs=(
-          cfg.act_spec,
-          cfg.act_spec,
-          cfg.act_spec,
+          cfg.act_pspec,
+          cfg.act_pspec,
+          cfg.act_pspec,
           w1_spec,
           w2_spec,
           w1_scale_spec,
           w2_scale_spec,
           w1_bias_spec,
           w2_bias_spec,
-          shard_idx_spec,
+          ep_shard_idx_spec,
       ),
-      out_specs=(cfg.out_spec),
+      out_specs=(cfg.out_pspec),
       check_vma=False,
   )(
       hidden_states,
@@ -264,5 +297,5 @@ def routing_moe(
       w2_scale,
       w1_bias,
       w2_bias,
-      shard_idx,
+      ep_shard_idx,
   )

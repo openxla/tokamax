@@ -17,10 +17,14 @@
 
 import dataclasses
 import enum
+from typing import Self
 
 from jax import sharding
+from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
 
+Mesh = sharding.Mesh
 P = sharding.PartitionSpec
 
 
@@ -33,18 +37,10 @@ class OutputCollective(enum.StrEnum):
   ALL_REDUCE = enum.auto()
 
 
+@dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
 class RoutingMoEConfig:
-  """Compile-time static configuration of the routing MoE layer.
-
-  Attributes:
-    tp_axis: Tensor parallelism mesh axis name, or `None` if disabled.
-    ep_axis: Expert parallelism mesh axis name, or `None` if disabled.
-    use_sp: Whether inputs are sequence-parallel along the reduction axis.
-    reduce_output: Whether to reduce the output across devices.
-    activation: Activation function applied to the gate/up projection.
-    plan: Resolved execution plan for the MoE layer.
-  """
+  """Compile-time static configuration of the routing MoE layer."""
 
   tp_axis: str | None
   ep_axis: str | None
@@ -63,16 +59,41 @@ class RoutingMoEConfig:
       reduce_output: bool,
       activation: str,
       plan: plan_lib.ResolvedMoEPlan,
-  ):
+      mesh: Mesh,
+  ) -> Self:
     """Assembles the config and validates the plan against layer parameters."""
-    if tp_axis is not None and ep_axis is not None:
-      raise NotImplementedError("Hybrid parallelism is not yet supported.")
-    if plan.remote_scatter and ep_axis is None:
-      raise ValueError("remote_scatter requires ep_axis.")
-    if plan.remote_scatter and not reduce_output:
+
+    if tp_axis is not None and tp_axis not in mesh.shape:
       raise ValueError(
-          "remote_scatter cannot be True when reduce_output is False."
+          f"{tp_axis=} is provided but it is not present at {mesh.shape=}"
       )
+    if ep_axis is not None and ep_axis not in mesh.shape:
+      raise ValueError(
+          f"{ep_axis=} is provided but it is not present at {mesh.shape=}"
+      )
+    if plan.remote_scatter:
+      if ep_axis is None:
+        raise ValueError("remote_scatter requires ep_axis.")
+      if tp_axis is not None:
+        raise NotImplementedError(
+            "remote_scatter with hybrid parallelism is not yet supported."
+        )
+      if not reduce_output:
+        raise ValueError(
+            "remote_scatter cannot be True when reduce_output is False."
+        )
+
+    if ep_axis is not None and tp_axis is not None:
+      # Supporting (TP, EP) is possible but number of potential use cases is too
+      # small to justify complexities on supporting both (EP, TP) and (TP, EP).
+      ep_axis_idx = mesh.axis_names.index(ep_axis)
+      tp_axis_idx = mesh.axis_names.index(tp_axis)
+
+      if ep_axis_idx > tp_axis_idx:
+        raise NotImplementedError(
+            "Only supports hybrid parallelism where ep_axis comes before"
+            f" tp_axis. Currently {ep_axis_idx=} and {tp_axis_idx=}"
+        )
 
     return cls(
         tp_axis=tp_axis,
@@ -84,22 +105,31 @@ class RoutingMoEConfig:
     )
 
   @property
-  def reduction_axis(self) -> str | None:
-    """The mesh axis name over which partial MoE outputs are combined."""
-    if self.tp_axis is not None:
-      return self.tp_axis
-    return self.ep_axis
+  def reduction_axis(self) -> tuple[str, ...]:
+    """The mesh axes over which partial MoE outputs are combined."""
+    return tuple(ax for ax in (self.ep_axis, self.tp_axis) if ax is not None)
 
   @property
-  def act_spec(self) -> P:
+  def act_pspec(self) -> P:
     """The PartitionSpec of the input activations and top-k routing tensors."""
     return P(self.reduction_axis) if self.use_sp else P(None)
 
   @property
-  def out_spec(self) -> P:
+  def gmm_in_format(self) -> out_format.ResolvedActivationFormat:
+    """The ResolvedActivationFormat produced by input_pack for routing_gmm."""
+    # TODO: Add support for gather quantization.
+    return self.plan.gather_format
+
+  @property
+  def gmm_out_format(self) -> out_format.ResolvedActivationFormat:
+    """The ResolvedActivationFormat produced by routing_gmm."""
+    return self.plan.scatter_format
+
+  @property
+  def out_pspec(self) -> P:
     """The PartitionSpec of the layer output."""
     if self.reduce_output:
-      return self.act_spec
+      return self.act_pspec
     # Ideally, we want to use P(unreduced={axis}) but that is only supported in
     # explicit mesh mode. Instead, we create an axis where output is unreduced.
     # TODO: Make gmm work in explicit mesh mode.
@@ -108,15 +138,16 @@ class RoutingMoEConfig:
   @property
   def output_collective(self) -> OutputCollective:
     """The cross-device collective applied to unpacked MoE outputs."""
+    unreduced = set(self.reduction_axis)
     if self.plan.remote_scatter:
       output_spec = P(self.reduction_axis)
     else:
-      output_spec = P(None, unreduced={self.reduction_axis})
+      output_spec = P(None, unreduced=unreduced)
 
     if self.reduce_output:
-      expected_out_spec = self.act_spec
+      expected_out_spec = self.act_pspec
     else:
-      expected_out_spec = P(None, unreduced={self.reduction_axis})
+      expected_out_spec = P(None, unreduced=unreduced)
 
     if output_spec == expected_out_spec:
       return OutputCollective.NONE

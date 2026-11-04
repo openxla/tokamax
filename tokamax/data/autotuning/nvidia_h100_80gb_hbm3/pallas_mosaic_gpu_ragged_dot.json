@@ -1521,5 +1521,35 @@
   "{\"lhs\":{\"value\":\"bf16[8192,7168]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,7168,1024]\",\"scale\":\"bf16[64,28,1024]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
   "{\"lhs\":{\"value\":\"bf16[8192,7168]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,7168,1024]\",\"scale\":\"bf16[64,28,1024]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":{\"num_groups\":64,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":true,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
   "{\"lhs\":{\"value\":\"bf16[81920,4096]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,4096,2048]\",\"scale\":\"bf16[64,1,2048]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":\"silu\"}": {},
-  "{\"lhs\":{\"value\":\"bf16[81920,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,1024,4096]\",\"scale\":\"bf16[64,1,4096]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {}
+  "{\"lhs\":{\"value\":\"bf16[81920,1024]\",\"qtype\":\"jax.numpy.float8_e4m3fn\",\"channelwise_axes\":[],\"tiled_axes\":null,\"calibration_method\":\"absmax\"},\"rhs\":{\"qvalue\":\"f8_e4m3fn[64,1024,4096]\",\"scale\":\"bf16[64,1,4096]\",\"zero_point\":null,\"qtype\":\"float8_e4m3fn\"},\"group_sizes\":[1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280,1280],\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[1]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {},
+  "{\"lhs\":\"bf16[8192,14336]\",\"rhs\":\"bf16[8,4096,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[1],[2]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[0]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"block_m\":128,\"block_n\":64,\"block_k\":128,\"num_stages\":4,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"post_scale\":false,\"collective\":false,\"grid_minor_dim\":1,\"grid_tile_width\":4,\"epilogue_quant_qtype\":null,\"epilogue_quant_subchannel_size\":null}": {
+      "compile_time_ms": 497.6921650000179,
+      "lower_time_ms": 1514.6697669999867,
+      "evaluation_times_ms": [
+        2.6793099999999996,
+        2.670798,
+        2.699822,
+        2.757678,
+        2.735183
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2181.039248
+    }
+  },
+  "{\"lhs\":\"bf16[8192,4096]\",\"rhs\":\"bf16[8192,14336]\",\"group_sizes\":{\"num_groups\":8,\"total_size\":8192},\"ragged_dot_dimension_numbers\":{\"dot_dimension_numbers\":[[[0],[0]],[[],[]]],\"lhs_ragged_dimensions\":[0],\"rhs_group_dimensions\":[]},\"precision\":[\"DEFAULT\",\"DEFAULT\"],\"preferred_element_type\":\"bfloat16\",\"return_residuals\":false,\"activation\":null,\"manual_axis_type\":null,\"group_offset\":null,\"zero_initialize\":false,\"fuse_gateup_activation\":null}": {
+    "{\"block_m\":128,\"block_n\":64,\"block_k\":128,\"num_stages\":4,\"split_k\":1,\"split_m\":1,\"persistent\":true,\"post_scale\":false,\"collective\":false,\"grid_minor_dim\":1,\"grid_tile_width\":2,\"epilogue_quant_qtype\":null,\"epilogue_quant_subchannel_size\":null}": {
+      "compile_time_ms": 2886.8783318903297,
+      "lower_time_ms": 6438.108988804743,
+      "evaluation_times_ms": [
+        3.638896,
+        3.6324,
+        3.634768,
+        3.643824,
+        3.64248
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1308.622912
+    }
+  }
 }

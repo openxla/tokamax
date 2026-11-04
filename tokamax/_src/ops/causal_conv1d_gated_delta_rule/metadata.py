@@ -28,14 +28,16 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
   """Metadata for computing multiple sequences per tile.
 
   A sequence contributes exactly one tile holding all of its query tokens:
   a single decoded token, or a speculative verify window of up to
   `cfg.window_size` of them. The initial state is read from
-  `read_indices[s] + read_offsets[s]` and one state checkpoint per window
-  position is written back to `state_indices[s] + t`.
+  `read_indices[s] + read_offsets[s]` (or `ckpt_indices[s, read_offsets[s]]`)
+  and one state checkpoint per window position is written back to
+  `state_indices[s] + t` (or `ckpt_indices[s, t]`).
   """
 
   max_seqs = seq_lens.size
@@ -61,6 +63,7 @@ def compute_batched_seq_metadata(
       s_idx_to_state_indices=state_indices,
       s_idx_to_read_offset=read_offsets,
       s_idx_to_read_indices=read_indices,
+      s_idx_to_ckpt_indices=ckpt_indices,
   )
 
 
@@ -73,6 +76,7 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    ckpt_indices: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
   """Metadata for computing single sequence per tile."""
   # `read_offsets` selects the checkpoint a resuming sequence's initial state
@@ -95,6 +99,8 @@ def compute_per_seq_metadata(
   state_indices = jnp.roll(state_indices, shift=-start_seq)
   read_indices = jnp.roll(read_indices, shift=-start_seq)
   read_offsets = jnp.roll(read_offsets, shift=-start_seq)
+  if ckpt_indices is not None:
+    ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
 
   query_lens = query_start_loc[1:] - query_start_loc[:-1]
   # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -161,4 +167,5 @@ def compute_per_seq_metadata(
       s_idx_to_state_indices=state_indices,
       s_idx_to_read_offset=read_offsets,
       s_idx_to_read_indices=read_indices,
+      s_idx_to_ckpt_indices=ckpt_indices,
   )

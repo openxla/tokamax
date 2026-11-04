@@ -159,6 +159,18 @@ class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
     )
 
 
+class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
+  """An abstract float array initialized uniformly in `[minval, maxval)`."""
+
+  def __init__(self, shape, dtype, minval: float, maxval: float):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+    self.minval = minval
+    self.maxval = maxval
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    return rng.uniform(self.minval, self.maxval, self.shape).astype(self.dtype)
+
+
 # Threshold (in number of elements) above which arrays are initialized directly
 # on device via `jax.jit` + `jax.random` instead of on the host with NumPy.
 # Small arrays stay on the host path to avoid per-shape XLA compile overhead
@@ -281,7 +293,13 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
   rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
 
-  with futures.ThreadPoolExecutor() as executor:
-    arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
+  if jax.process_count() > 1:
+    # Initializing arrays sharded across processes launches a program on every
+    # process. These must be launched in the same order on all processes, so we
+    # can't initialize concurrently.
+    arrays = list(map(init_with_layout, rngs, abstract_arrays))
+  else:
+    with futures.ThreadPoolExecutor() as executor:
+      arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
 
   return tree.unflatten(merge(arrays, other))

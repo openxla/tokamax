@@ -28,6 +28,11 @@ def align_to(a: Any, b: int) -> Any:
   return pl.cdiv(a, b) * b
 
 
+def get_tpu_num_lanes() -> int:
+  """Returns the number of physical lanes on the current TPU (typically 128)."""
+  return pltpu.get_tpu_info().num_lanes
+
+
 def align_span(start: Any, size: Any, align: int) -> tuple[Any, Any, Any]:
   """Returns (aligned_start, lead, aligned_size) for [start, start + size).
 

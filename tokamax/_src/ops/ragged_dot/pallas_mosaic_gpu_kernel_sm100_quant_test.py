@@ -27,7 +27,7 @@ from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
 from tokamax._src.ops.ragged_dot import (
-    pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant,
+    pallas_mosaic_gpu_kernel_sm100_quant_x8 as sm100_quant_x8,
 )
 from tokamax._src.ops.ragged_dot import test_base
 
@@ -274,7 +274,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=jnp.float8_e4m3fn,
         epilogue_quant_subchannel_size=sub,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
     )
     self.assertIsInstance(out, qwix.QArray)
@@ -285,7 +285,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     chex.assert_trees_all_close(
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
-    out2 = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out2 = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
     )
     self.assertIsInstance(out2, qwix.QArray)
@@ -310,7 +310,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     config = dataclasses.replace(
         _CONFIG, block_m=16, block_n=128, block_k=block_k
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
     )
     expected = test_base.ref(a, b, group_sizes, activation)
@@ -357,7 +357,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     config = dataclasses.replace(
         _CONFIG, block_m=32 if collective else 16, collective=collective
     )
-    kernel = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+    kernel = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
     expected = kernel(a, b, group_sizes, jnp.bfloat16, config, activation)
     actual = kernel(
         a,
@@ -432,7 +432,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=jnp.float8_e4m3fn,
         epilogue_quant_subchannel_size=sub,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, activation
     )
     self.assertIsInstance(out, qwix.QArray)
@@ -469,7 +469,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=jnp.float8_e4m3fn,
         epilogue_quant_subchannel_size=sub,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, None
     )
     self.assertIsInstance(out, qwix.QArray)
@@ -506,7 +506,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=jnp.float8_e4m3fn,
         epilogue_quant_subchannel_size=128,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, activation
     )
     self.assertIsInstance(out, qwix.QArray)
@@ -543,7 +543,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=jnp.float8_e4m3fn,
         epilogue_quant_subchannel_size=128,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, group_sizes, jnp.bfloat16, config, activation
     )
     self.assertIsInstance(out, qwix.QArray)
@@ -595,7 +595,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     cfg_plain = dataclasses.replace(
         _CONFIG, block_m=16, block_n=128, block_k=128
     )
-    kernel = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+    kernel = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel
 
     h_fused = kernel(a, w1, gs, jnp.bfloat16, cfg_fused, activation)
     self.assertIsInstance(h_fused, qwix.QArray)
@@ -722,7 +722,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=None,
         epilogue_quant_subchannel_size=None,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, None
     )
     self.assertNotIsInstance(out, qwix.QArray)
@@ -771,7 +771,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
         epilogue_quant_qtype=None,
         epilogue_quant_subchannel_size=None,
     )
-    out = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel(
+    out = sm100_quant_x8.ragged_dot_gpu_quant_x8_blackwell_kernel(
         a_fused, b, jnp.asarray(group_sizes), jnp.bfloat16, config, None
     )
     self.assertNotIsInstance(out, qwix.QArray)
