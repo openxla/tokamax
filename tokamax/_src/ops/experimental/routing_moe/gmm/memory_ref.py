@@ -19,7 +19,7 @@ import abc
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, ClassVar, Self, override
+from typing import Any, Self, override
 
 import jax
 from jax import lax
@@ -30,10 +30,8 @@ import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
-from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
-
 
 GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
@@ -127,31 +125,50 @@ class _BypassBufferedRef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingBufferedRef(_BypassBufferedRef):
-  """Shared common interface for both all routed BufferedRef instances."""
+  """Shared interface for routed activation BufferedRef instances.
+
+  Attributes:
+    metadata_ref: SMEM metadata reference for routing and tile scheduling.
+    idx_ref: SMEM row-index reference, or None when unindexed.
+    cfg: Static configuration for the routing GMM kernel.
+    act_cfg: Resolved spec and routing mode for this activation.
+  """
 
   metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
-  # SMEM ref used for indexing src or dst ref.
   idx_ref: Any = dataclasses.field(default=None, metadata=dict(static=True))
-
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
+  act_cfg: config.ActivationConfig = dataclasses.field(
+      metadata=dict(static=True)
+  )
 
   def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
     return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
 
   @classmethod
+  @override
   def create(
       cls,
+      spec: pl.BlockSpec,
+      dtype_or_type: Any,
+      buffer_type: pltpu.BufferType,
+      buffer_count: int,
+      grid_rank: int | None = None,
       *args: Any,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
+      act_cfg: config.ActivationConfig,
       **kwargs: Any,
   ) -> Self:
-    standard_ref = _BypassBufferedRef.create(*args, **kwargs)
+    standard_ref = _BypassBufferedRef.create(
+        spec, dtype_or_type, buffer_type, buffer_count, grid_rank, *args
+    )
     return cls(
         metadata_ref=metadata_ref,
         cfg=cfg,
+        act_cfg=act_cfg,
+        **kwargs,
         **{
             f.name: getattr(standard_ref, f.name)
             for f in dataclasses.fields(pltpu.BufferedRef)
@@ -173,6 +190,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
       The loaded activation tile in `[rows, tile_k]` large layout.
     """
     del grid_indices
+    assert self.is_input
     return layout_util.load_compact_to_large(vmem_ref, self.cfg.plan.tile_k)
 
   def write_vmem(
@@ -191,6 +209,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
       grid_indices: Grid coordinates `(n_id, gm_id, k_id)` of the tile.
     """
     del grid_indices
+    assert self.is_output
     layout_util.store_large_to_compact(vmem_ref, value.astype(vmem_ref.dtype))
 
   @abc.abstractmethod
@@ -228,6 +247,14 @@ class RoutingBufferedRef(_BypassBufferedRef):
 @dataclasses.dataclass(frozen=True)
 class BranchedBufferedRef(RoutingBufferedRef):
   """BufferedRef managed by emit_pipeline. Not overlaped with compute."""
+
+  @classmethod
+  @override
+  def output(
+      cls, *args: Any, act_cfg: config.ActivationConfig, **kwargs: Any
+  ) -> Self:
+    assert act_cfg.spec.quant is None
+    return super().output(*args, act_cfg=act_cfg, **kwargs)
 
   def _no_op(self, ref, grid_indices) -> None:
     del ref, grid_indices
@@ -424,8 +451,154 @@ class IndexBufferedRef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class QuantStash:
+  """VMEM staging buffers that quantize output tiles before copy-out DMA.
+
+  `store` computes quantization scales as the result leaves the MXU and
+  stashes the result (in `plan.stash_dtype`) and scales in VMEM. At the next
+  step, `load_and_quantize_rows` loads and quantizes `num_sublanes` rows at a
+  time into VREGs for the caller to pack into the output slot before DMA.
+
+  Each output chunk is stashed as its own compact `plan.stash_dtype` tile, so
+  loading `num_sublanes` rows of it and casting them packs them directly into
+  `num_sublanes` compact output rows.
+
+  Attributes:
+    stash: VMEM buffer `[num_stash_buffers, num_chunks, tile_m, ratio,
+      stash_packing, lanes]` of stashed results, one compact tile per chunk.
+    scale: VMEM buffer `f32[num_stash_buffers, tile_m, lanes]` of per-lane
+      quantization scales.
+    inv_scale: VMEM buffer `u32[num_stash_buffers, ratio * tile_m, lanes]` of
+      packed reciprocal scales.
+    act_cfg: Resolved spec and routing mode for the quantized output.
+    ratio: Number of u32 words of `stash_dtype` per u32 word of output dtype.
+  """
+
+  stash: hijax.TransformedRef
+  scale: hijax.TransformedRef
+  inv_scale: hijax.TransformedRef
+  act_cfg: config.ActivationConfig = dataclasses.field(
+      metadata=dict(static=True)
+  )
+  ratio: int = dataclasses.field(metadata=dict(static=True))
+
+  @classmethod
+  def create(
+      cls, cfg: config.RoutingGmmConfig, act_cfg: config.ActivationConfig
+  ) -> Self:
+    """Allocates VMEM staging buffers for quantized output tiles."""
+    assert isinstance(act_cfg.spec.quant, spec_lib.LaneStridedQuantSpec)
+    count = cfg.plan.num_stash_buffers
+    stash_dtype = cfg.plan.stash_dtype
+    assert count is not None and stash_dtype is not None
+    lanes, tile_m = cfg.tpu_info.num_lanes, cfg.plan.tile_m
+    out_packing = layout_util.get_packing(act_cfg.spec.dtype)
+    ratio = out_packing // layout_util.get_packing(stash_dtype)
+    chunk_shape = layout_util.to_compact_shape(
+        (tile_m, out_packing * lanes), stash_dtype, lanes=lanes
+    )
+    num_chunks = act_cfg.spec.num_logical_chunks // cfg.num_n
+    return cls(
+        stash=pltpu.VMEM((count, num_chunks, *chunk_shape), stash_dtype),
+        scale=pltpu.VMEM((count, tile_m, lanes), jnp.float32),
+        inv_scale=pltpu.VMEM((count, ratio * tile_m, lanes), jnp.uint32),
+        act_cfg=act_cfg,
+        ratio=ratio,
+    )
+
+  def _stash_slot(self, gm_id: jax.Array | int) -> jax.Array:
+    count = self.stash.shape[0]
+    # Tiles cycle through the stash slots, and adding count keeps the dividend
+    # non-negative when gm_id is -1.
+    return lax.rem(gm_id + count, count)
+
+  def store(self, value: jax.Array, gm_id: jax.Array | int) -> None:
+    """Computes quantization scales and stashes `value` and scales in VMEM."""
+    quant = self.act_cfg.spec.quant
+    assert isinstance(quant, spec_lib.LaneStridedQuantSpec)
+    value = value.astype(jnp.float32)
+    scale, inv_scale = quant_util.compute_scale(
+        value, self.act_cfg.spec.dtype, quant
+    )
+    slot = self._stash_slot(gm_id)
+    rows = value.shape[0]
+    stash_dtype = self.stash.dtype
+    chunks = jnp.split(value.astype(stash_dtype), self.stash.shape[1], axis=-1)
+    for chunk, chunk_value in enumerate(chunks):
+      layout_util.store_large_to_compact(
+          self.stash.at[slot, chunk, :rows], chunk_value
+      )
+    self.scale[slot, :rows] = scale
+    packed_inv = pltpu.pack_elementwise(
+        [inv_scale, inv_scale], packed_dtype=stash_dtype
+    )
+    for word in range(self.ratio):
+      self.inv_scale[slot, pl.ds(word, rows, stride=self.ratio)] = packed_inv
+
+  def load_and_quantize_rows(
+      self, gm_id: jax.Array | int, first_row: int, num_rows: int
+  ) -> tuple[list[jax.Array], jax.Array]:
+    """Loads and quantizes `num_rows` stashed rows starting at `first_row`."""
+    slot = self._stash_slot(gm_id)
+    lanes = self.scale.shape[-1]
+    stash_dtype = self.stash.dtype
+    stash_rows = pl.ds(self.ratio * first_row, self.ratio * num_rows)
+
+    inv_scale = pltpu.bitcast(self.inv_scale[slot, stash_rows], stash_dtype)
+    q_chunks = []
+    for chunk in range(self.stash.shape[1]):
+      words = self.stash.at[slot, chunk].bitcast(jnp.uint32).reshape(-1, lanes)
+      stashed = pltpu.bitcast(words[stash_rows], stash_dtype)
+      q_chunks.append(
+          quant_util.quantize(stashed, inv_scale, self.act_cfg.spec.dtype)
+      )
+
+    return q_chunks, self.scale[slot, pl.ds(first_row, num_rows)]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class BranchlessBufferedRef(RoutingBufferedRef):
-  """BufferedRef that performs branchless DMAs to allow matmul overlap."""
+  """BufferedRef that performs branchless DMAs to allow matmul overlap.
+
+  Attributes:
+    quant_stash: VMEM stash that quantizes output tiles before copy-out DMAs, or
+      None when unquantized or for inputs.
+  """
+
+  quant_stash: QuantStash | None
+
+  @classmethod
+  @override
+  def input(
+      cls,
+      *args: Any,
+      cfg: config.RoutingGmmConfig,
+      act_cfg: config.ActivationConfig,
+      **kwargs: Any,
+  ) -> Self:
+    assert act_cfg.spec.quant is None
+    return super().input(
+        *args, cfg=cfg, act_cfg=act_cfg, quant_stash=None, **kwargs
+    )
+
+  @classmethod
+  @override
+  def output(
+      cls,
+      *args: Any,
+      cfg: config.RoutingGmmConfig,
+      act_cfg: config.ActivationConfig,
+      **kwargs: Any,
+  ) -> Self:
+    quant_stash = (
+        QuantStash.create(cfg, act_cfg)
+        if act_cfg.spec.quant is not None
+        else None
+    )
+    return super().output(
+        *args, cfg=cfg, act_cfg=act_cfg, quant_stash=quant_stash, **kwargs
+    )
 
   def _idx_offset(
       self, grid_indices: GridIndices, rows_ds: pl.Slice
@@ -440,6 +613,19 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
     rows_ds_start = jnp.uint32(rows_ds.start)
     return n_offset + lax.rem(rows_ds_start, ring_size)
+
+  @override
+  def write_vmem(
+      self,
+      vmem_ref: hijax.TransformedRef,
+      value: jax.Array,
+      grid_indices: GridIndices,
+  ) -> None:
+    """Stashes `value` when `quant_stash` is set, or writes `vmem_ref`."""
+    if self.quant_stash is None:
+      super().write_vmem(vmem_ref, value, grid_indices)
+    else:
+      self.quant_stash.store(value, grid_indices[1])
 
   @override
   def branchless_copy_in(
@@ -463,19 +649,6 @@ class BranchlessBufferedRef(RoutingBufferedRef):
           sem=sem,
       ).start()
 
-  def _copy_out_slot_ref(self, slot: jax.Array | int) -> hijax.TransformedRef:
-    """Returns the VMEM slot reference read by `branchless_copy_out`."""
-    return pltpu.annotate(self._window_ref_at(slot), no_hazard_no_deps=True)
-
-  def _prepare_copy_out_row(
-      self,
-      vmem_src: hijax.TransformedRef,
-      grid_indices: GridIndices,
-      row: int,
-  ) -> None:
-    """Runs immediately before row `row`'s output DMA is issued."""
-    del vmem_src, grid_indices, row
-
   @override
   def branchless_copy_out(
       self, dst_ref: hijax.TransformedRef, grid_indices: GridIndices
@@ -486,11 +659,29 @@ class BranchlessBufferedRef(RoutingBufferedRef):
     slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
     rows_ds, cols_ds, *_ = self.compute_index(*grid_indices)
     sem = self.sem_sends.at[slot]
-    vmem_src = self._copy_out_slot_ref(slot)
     offset = self._idx_offset(grid_indices, rows_ds)
 
+    vmem_src = self._window_ref_at(slot)
+    if self.quant_stash is None:
+      # Unquantized outputs were written in the previous step, whereas
+      # quant_stash writes vmem_src right before the row DMAs below.
+      vmem_src = pltpu.annotate(vmem_src, no_hazard_no_deps=True)
+
+    sublanes = self.cfg.tpu_info.num_sublanes
     for r in range(self.cfg.plan.tile_m):
-      self._prepare_copy_out_row(vmem_src, grid_indices, r)
+      if self.quant_stash is not None and r % sublanes == 0:
+        # Quantizing sublanes rows at a time bounds the VREG live range and
+        # lets row DMAs start before the full tile is quantized.
+        q_chunks, scale = self.quant_stash.load_and_quantize_rows(
+            grid_indices[1], r, sublanes
+        )
+        layout_util.store_compact_chunk(
+            vmem_src, r, len(q_chunks), pltpu.bitcast(scale, jnp.uint32)
+        )
+        for chunk, q_chunk in enumerate(q_chunks):
+          layout_util.store_compact_chunk(
+              vmem_src, r, chunk, pltpu.bitcast(q_chunk, jnp.uint32)
+          )
       live = r < rows_ds.size
       size = jnp.where(live, 1, 0)
       src = vmem_src.at[pl.ds(r, size), pl.ds(0, cols_ds.size)]
@@ -550,7 +741,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
   """Output ref that DMAs each row to the device that owns it.
 
@@ -559,7 +750,17 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
       devices.
   """
 
-  recv_sem: hijax.TransformedRef | None = None
+  recv_sem: hijax.TransformedRef
+
+  @classmethod
+  @override
+  def input(cls, *args: Any, **kwargs: Any) -> Self:
+    raise NotImplementedError("Remote gather is not supported.")
+
+  @classmethod
+  @override
+  def output(cls, *args: Any, **kwargs: Any) -> Self:
+    return super().output(*args, recv_sem=pltpu.SemaphoreType.DMA(()), **kwargs)
 
   @override
   def _copy_out_row(
@@ -575,9 +776,8 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
     assert self.cfg.spec.scatter is not None
     axis = self.cfg.spec.scatter.remote_axis
     assert axis is not None
-    assert self.recv_sem is not None
     # Unsigned lax div/rem skip the sign fixups of int32 jnp.divmod.
-    rows_per_dev = jnp.uint32(self.cfg.out.spec.row_size)
+    rows_per_dev = jnp.uint32(self.act_cfg.spec.row_size)
     uidx = idx.astype(jnp.uint32)
     dev = lax.div(uidx, rows_per_dev).astype(jnp.int32)
     row = lax.rem(uidx, rows_per_dev).astype(jnp.int32)
@@ -609,193 +809,21 @@ class RemoteBranchlessBufferedRef(BranchlessBufferedRef):
   @override
   def epilogue(self, dst_ref: hijax.TransformedRef) -> None:
     # Wait for every row owned here before the output is read.
-    recv = dst_ref.at[pl.ds(0, self.cfg.out.spec.row_size)]
+    recv = dst_ref.at[pl.ds(0, self.act_cfg.spec.row_size)]
     pltpu.make_async_copy(recv, recv, self.recv_sem).wait()
 
 
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class QuantizedBufferedRef(BranchlessBufferedRef):
-  """BufferedRef that quantizes output tiles right before copying them out.
-
-  `write_vmem` computes per-lane scales as the result leaves the MXU and
-  stashes the result (in `stash_dtype`) and scales in VMEM. At the next step,
-  `branchless_copy_out` quantizes the stashed tile into the output slot
-  `num_sublanes` rows at a time, immediately before issuing those rows' DMAs.
-
-  Each output chunk is stashed as its own compact `stash_dtype` tile, so
-  loading `num_sublanes` rows of it and casting them packs them into
-  `num_sublanes` compact output rows.
-
-  Attributes:
-    stash_count: Number of tiles stashed at once. A tile is quantized one step
-      after it is computed, so tiles alternate between two stash slots.
-    stash_dtype: Dtype in which results wait to be quantized.
-    acc: VMEM buffer `[stash_count, num_logical_chunks, tile_m, ratio, packing,
-      lanes]` of `stash_dtype` results, one compact tile per output chunk.
-    scale: VMEM buffer `f32[stash_count, tile_m, lanes]` of per-lane scales.
-    inv_scale: VMEM buffer `u32[stash_count, ratio * tile_m, lanes]` of
-      `ratio` packed `stash_dtype` copies of `1 / scale` per row.
-  """
-
-  stash_count: ClassVar[int] = 2
-  stash_dtype: ClassVar[jnp.dtype] = jnp.dtype(jnp.bfloat16)
-
-  acc: hijax.TransformedRef | None = None
-  scale: hijax.TransformedRef | None = None
-  inv_scale: hijax.TransformedRef | None = None
-
-  @classmethod
-  @override
-  def create(
-      cls,
-      *args: Any,
-      metadata_ref: metadata.AbstractMetadataRef,
-      cfg: config.RoutingGmmConfig,
-      **kwargs: Any,
-  ) -> Self:
-    """Creates a `QuantizedBufferedRef` and allocates VMEM for outputs."""
-    bref = super().create(*args, metadata_ref=metadata_ref, cfg=cfg, **kwargs)
-    if not bref.is_output:
-      return bref
-    lanes, tile_m = cfg.tpu_info.num_lanes, cfg.plan.tile_m
-    ratio = bref._stash_ratio
-    chunk_shape = layout_util.to_compact_shape(
-        (tile_m, layout_util.get_packing(cfg.out.spec.dtype) * lanes),
-        cls.stash_dtype,
-    )
-    count, num_chunks = cls.stash_count, cfg.out.spec.num_logical_chunks
-    return dataclasses.replace(
-        bref,
-        acc=pltpu.VMEM((count, num_chunks, *chunk_shape), cls.stash_dtype),
-        scale=pltpu.VMEM((count, tile_m, lanes), jnp.float32),
-        inv_scale=pltpu.VMEM((count, ratio * tile_m, lanes), jnp.uint32),
-    )
-
-  @override
-  def branchless_copy_in(
-      self, src_ref: hijax.TransformedRef, grid_indices: GridIndices
-  ) -> None:
-    del src_ref, grid_indices
-    # TODO: Support pre-quantized inputs.
-    raise AssertionError(
-        "QuantizedBufferedRef does not support branchless_copy_in yet."
-    )
-
-  @override
-  def read_vmem(
-      self, vmem_ref: hijax.TransformedRef, grid_indices: GridIndices
-  ) -> jax.Array:
-    del vmem_ref, grid_indices
-    # TODO: Support pre-quantized inputs.
-    raise AssertionError("QuantizedBufferedRef does not support read_vmem yet.")
-
-  @override
-  def write_vmem(
-      self,
-      vmem_ref: hijax.TransformedRef,
-      value: jax.Array,
-      grid_indices: GridIndices,
-  ) -> None:
-    del vmem_ref
-    assert (
-        self.acc is not None
-        and self.scale is not None
-        and self.inv_scale is not None
-        and self.cfg.out.spec.quant is not None
-    )
-    # Compute per-lane scales immediately as the result leaves the MXU.
-    value = value.astype(jnp.float32)
-    scale, inv_scale = quant_util.compute_scale(
-        value, self.cfg.out.spec.dtype, self.cfg.out.spec.quant
-    )
-    slot = self._stash_slot(grid_indices[1])
-    rows = value.shape[0]
-    stash = value.astype(self.stash_dtype)
-    for chunk, chunk_value in enumerate(
-        jnp.split(stash, self.cfg.out.spec.num_logical_chunks, axis=-1)
-    ):
-      layout_util.store_large_to_compact(
-          self.acc.at[slot, chunk, :rows], chunk_value
-      )
-    self.scale[slot, :rows] = scale
-    packed_inv = pltpu.pack_elementwise(
-        [inv_scale, inv_scale], packed_dtype=self.stash_dtype
-    )
-    ratio = self._stash_ratio
-    for word in range(ratio):
-      self.inv_scale[slot, pl.ds(word, rows, stride=ratio)] = packed_inv
-
-  @override
-  def _copy_out_slot_ref(self, slot: jax.Array | int) -> hijax.TransformedRef:
-    # Row DMAs read the rows quantized just before them, so preserve store
-    # ordering instead of annotating no_hazard_no_deps.
-    return self._window_ref_at(slot)
-
-  @override
-  def _prepare_copy_out_row(
-      self,
-      vmem_src: hijax.TransformedRef,
-      grid_indices: GridIndices,
-      row: int,
-  ) -> None:
-    if row % self.cfg.tpu_info.num_sublanes != 0:
-      return
-    gm_id = grid_indices[1]
-    inv_scale, scale = self._load_scales(gm_id, row)
-    compute.quantize_rows(
-        vmem_src,
-        row,
-        scale,
-        inv_scale,
-        functools.partial(self._load_chunk, gm_id, row),
-        self.cfg.out,
-    )
-
-  @property
-  def _stash_ratio(self) -> int:
-    """Returns u32 words of `stash_dtype` per u32 word of the output dtype."""
-    packing = layout_util.get_packing(self.cfg.out.spec.dtype)
-    return packing // layout_util.get_packing(self.stash_dtype)
-
-  def _stash_slot(self, gm_id: jax.Array | int) -> jax.Array:
-    # Tiles cycle through the stash slots; adding stash_count keeps gm_id
-    # non-negative.
-    return lax.rem(gm_id + self.stash_count, self.stash_count)
-
-  def _load_scales(
-      self, gm_id: jax.Array | int, first_row: int
-  ) -> tuple[jax.Array, jax.Array]:
-    """Loads `num_sublanes` rows of `1 / scale` and f32 `scale`."""
-    assert self.scale is not None and self.inv_scale is not None
-    slot = self._stash_slot(gm_id)
-    ratio, sublanes = self._stash_ratio, self.cfg.tpu_info.num_sublanes
-    inv_scale = pltpu.bitcast(
-        self.inv_scale[slot, pl.ds(ratio * first_row, ratio * sublanes)],
-        self.stash_dtype,
-    )
-    return inv_scale, self.scale[slot, pl.ds(first_row, sublanes)]
-
-  def _load_chunk(
-      self, gm_id: jax.Array | int, first_row: int, chunk: int
-  ) -> jax.Array:
-    """Loads `num_sublanes` rows of stashed values for `chunk`."""
-    assert self.acc is not None
-    slot = self._stash_slot(gm_id)
-    ratio, sublanes = self._stash_ratio, self.cfg.tpu_info.num_sublanes
-    words = self.acc.at[slot, chunk].bitcast(jnp.uint32)
-    words = words.reshape(-1, self.cfg.tpu_info.num_lanes)
-    return pltpu.bitcast(
-        words[pl.ds(ratio * first_row, ratio * sublanes)], self.stash_dtype
-    )
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class RemoteQuantizedBufferedRef(
-    QuantizedBufferedRef, RemoteBranchlessBufferedRef
-):
-  """Quantized output ref that DMAs each row to the device that owns it."""
+def _get_buffered_ref(mode: config.RoutingMode) -> type[RoutingBufferedRef]:
+  """Returns the RoutingBufferedRef subclass for `mode`."""
+  match mode:
+    case config.RoutingMode.LOCAL:
+      return BranchlessBufferedRef
+    case config.RoutingMode.REMOTE:
+      return RemoteBranchlessBufferedRef
+    case config.RoutingMode.DIRECT:
+      return BranchedBufferedRef
+    case _:
+      raise NotImplementedError(f"Unsupported routing mode: {mode}.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -880,11 +908,12 @@ class PipelineBlockSpecs:
 
   def _act_spec(
       self,
-      hbm_shape: tuple[int, ...],
+      act_cfg: config.ActivationConfig,
       num_tiles: int,
       index_map: Callable[..., tuple[pl.Slice, pl.Slice, int, int]],
   ) -> pl.BlockSpec:
     """Builds the VMEM BlockSpec for a compact activation tensor."""
+    hbm_shape = act_cfg.spec.physical_compact_shape
     tile_chunks = hbm_shape[1] // num_tiles
     num_tile_chunks = layout_util.to_bank_conflict_aware_stride(tile_chunks)
     block_shape = (
@@ -905,7 +934,7 @@ class PipelineBlockSpecs:
   def get_x_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the input activation tensor."""
     return self._act_spec(
-        self.cfg.x.spec.physical_compact_shape,
+        self.cfg.x,
         self.cfg.num_k,
         self.index_map_provider.x_index,
     )
@@ -913,7 +942,7 @@ class PipelineBlockSpecs:
   def get_out_spec(self) -> pl.BlockSpec:
     """Returns the BlockSpec for the output activation tensor."""
     return self._act_spec(
-        self.cfg.out.spec.physical_compact_shape,
+        self.cfg.out,
         self.cfg.num_n,
         self.index_map_provider.out_index,
     )
@@ -1023,24 +1052,12 @@ class PipelineAllocs:
   def create(
       cls,
       in_hbm_ref: PipelineInputs[hijax.TransformedRef],
-      out_hbm_ref: hijax.TransformedRef,
       metadata_ref: metadata.AbstractMetadataRef,
       cfg: config.RoutingGmmConfig,
   ) -> Self:
-    """Creates BufferedRef allocations for all pipeline inputs and outputs.
-
-    Args:
-      in_hbm_ref: HBM references for the pipelined kernel inputs.
-      out_hbm_ref: HBM reference for the kernel output.
-      metadata_ref: SMEM metadata reference for routing and tile scheduling.
-      cfg: Static configuration for the routing GMM kernel.
-
-    Returns:
-      A PipelineAllocs instance containing input and output BufferedRefs.
-    """
+    """Creates BufferedRef allocations for all pipeline inputs and outputs."""
     pipeline_index_maps = PipelineIndexMaps(metadata_ref, cfg)
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
-    x_hbm_ref = in_hbm_ref.x
 
     def _make_weight_bref(
         w_hbm_ref: AbstractWeightRef,
@@ -1091,47 +1108,24 @@ class PipelineAllocs:
           cfg.plan.tile_n,
       )
 
-    def _get_buffered_ref(
-        mode: config.RoutingMode, *, quantized: bool = False
-    ) -> type[RoutingBufferedRef]:
-      match mode, quantized:
-        case config.RoutingMode.LOCAL, False:
-          return BranchlessBufferedRef
-        case config.RoutingMode.LOCAL, True:
-          return QuantizedBufferedRef
-        case config.RoutingMode.REMOTE, False:
-          return RemoteBranchlessBufferedRef
-        case config.RoutingMode.REMOTE, True:
-          return RemoteQuantizedBufferedRef
-        case config.RoutingMode.DIRECT, False:
-          return BranchedBufferedRef
-        case _:
-          raise NotImplementedError(
-              f"Unsupported routing mode: {mode} ({quantized=})."
-          )
-
     x_bref = _get_buffered_ref(cfg.x.mode).input(
         spec=pipeline_block_specs.get_x_spec(),
-        dtype_or_type=x_hbm_ref.dtype,
+        dtype_or_type=cfg.x.spec.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
         grid_rank=3,
         cfg=cfg,
+        act_cfg=cfg.x,
         metadata_ref=metadata_ref,
     )
-    out_bref = _get_buffered_ref(
-        cfg.out.mode, quantized=cfg.out.spec.quant is not None
-    ).output(
+    out_bref = _get_buffered_ref(cfg.out.mode).output(
         spec=pipeline_block_specs.get_out_spec(),
-        dtype_or_type=out_hbm_ref.dtype,
+        dtype_or_type=cfg.out.spec.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
         grid_rank=3,
         cfg=cfg,
+        act_cfg=cfg.out,
         metadata_ref=metadata_ref,
     )
-    if cfg.out.mode == config.RoutingMode.REMOTE:
-      out_bref = dataclasses.replace(
-          out_bref, recv_sem=pltpu.SemaphoreType.DMA(())
-      )
 
     # TODO: Support use case when indices are not stream from HBM and
     # instead entirely stored in SMEM.

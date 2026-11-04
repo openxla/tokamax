@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 
 
 def topk_reduce(
@@ -163,13 +163,13 @@ def unfused_gmm_scatter(
 
 
 def compute_topk(
-    moe: test_inputs.MoEInputs,
-    shape: test_shapes.MoEShape,
+    moe: helper_inputs.MoEInputs,
+    shape: helper_shapes.MoEShape,
     *,
     fold_shared_expert: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
   """Computes top-k weights and indices, appending a shared expert if folded."""
-  weights, indices = test_inputs.top_k(
+  weights, indices = helper_inputs.top_k(
       moe.gating_output, shape.top_k, renormalize=shape.renormalize
   )
   if not fold_shared_expert:
@@ -220,8 +220,8 @@ def shared_expert(
 
 @jax.jit(static_argnames=("shape", "fold_shared_expert"))
 def reference_moe(
-    moe: test_inputs.MoEInputs,
-    shape: test_shapes.MoEShape,
+    moe: helper_inputs.MoEInputs,
+    shape: helper_shapes.MoEShape,
     *,
     fold_shared_expert: bool = False,
 ) -> jax.Array:

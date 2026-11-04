@@ -140,20 +140,7 @@ THEMES = (
 )
 
 # Test files intentionally run by no shard.
-#
-# The routing MoE `test/common/` modules are shared helpers -- cases, inputs,
-# reference implementations, shapes and timing utilities -- that the real test
-# files import. They declare no tests, but their `test_*.py` names match
-# pytest's `python_files`, so without this they land in the catch-all, where
-# pytest collects nothing from them, and every change that reaches them selects
-# the catch-all.
-EXCLUDED_TESTS = (
-    'tokamax/_src/ops/experimental/routing_moe/test/common/test_cases.py',
-    'tokamax/_src/ops/experimental/routing_moe/test/common/test_inputs.py',
-    'tokamax/_src/ops/experimental/routing_moe/test/common/test_reference.py',
-    'tokamax/_src/ops/experimental/routing_moe/test/common/test_shapes.py',
-    'tokamax/_src/ops/experimental/routing_moe/test/common/test_util.py',
-)
+EXCLUDED_TESTS = ()
 
 # The JAX versions CI tests. `latest_jax()` is what every ordinary shard job
 # installs; every version in `older_jaxs()` gets a compat rerun
@@ -671,11 +658,15 @@ SHARDS: ShardMap = {
     # Re-measure them from the first green runs.
     'experimental-routing-moe-gmm-unit': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/common/dataclass_util_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/common/out_format_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
-            'tokamax/_src/ops/experimental/routing_moe/test/common/test_inputs_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/config_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/metadata_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/plan_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/spec_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/helper/helper_inputs_unit_test.py',
         ),
         minutes=12,
     ),
@@ -699,6 +690,7 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-layer-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_plan_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',
         ),
         minutes=9,

@@ -19,9 +19,9 @@ from absl.testing import parameterized
 import jax
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 jax.config.parse_flags_with_absl()
 
@@ -29,7 +29,7 @@ jax.config.parse_flags_with_absl()
 class MetadataUnitTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
   @parameterized.product(
@@ -41,18 +41,18 @@ class MetadataUnitTest(parameterized.TestCase):
       plan: gmm_plan.RoutingGmmPlan,
   ):
     case = routing_case.case
-    test_util.check_gmm_supported(
+    helper_util.check_gmm_supported(
         case, live_group_walk=bool(plan.live_group_walk)
     )
     shape = case.shape
-    gating_output = test_inputs.random_gating(
+    gating_output = helper_inputs.random_gating(
         jax.random.key(0),
         case.num_tokens,
         shape.num_experts,
         num_skipped=routing_case.num_skipped,
     )
-    _, topk_indices = test_inputs.top_k(gating_output, shape.top_k)
-    routing = test_inputs.Routing.make_routing(
+    _, topk_indices = helper_inputs.top_k(gating_output, shape.top_k)
+    routing = helper_inputs.Routing.make_routing(
         topk_indices,
         shape.num_experts,
         group_offset=routing_case.group_offset,

@@ -28,8 +28,8 @@ from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
 
 # Columns of a tile table: local group, first sorted row, and rows in the tile.
 _TILE_COLUMNS = ("group_id", "m_offset", "num_rows")
@@ -45,7 +45,7 @@ class RoutingCase:
     num_skipped: Trailing experts that receive no routed rows.
   """
 
-  case: test_cases.Case
+  case: helper_cases.Case
   group_offset: int = 0
   num_skipped: int = 0
 
@@ -53,11 +53,11 @@ class RoutingCase:
 # Every shared unit case, plus shards in the middle of the experts, a single
 # token, groups spanning several tiles, and a shard that no token routes to.
 ROUTINGS = (
-    *(RoutingCase(c) for c in test_cases.UNIT_CASES),
-    RoutingCase(test_cases.DECODE_64_EP8, group_offset=128),
-    RoutingCase(test_cases.DECODE_1_EP8, group_offset=128),
-    RoutingCase(test_cases.PREFILL_16E),
-    RoutingCase(test_cases.DECODE_64_EP8, group_offset=448, num_skipped=64),
+    *(RoutingCase(c) for c in helper_cases.UNIT_CASES),
+    RoutingCase(helper_cases.DECODE_64_EP8, group_offset=128),
+    RoutingCase(helper_cases.DECODE_1_EP8, group_offset=128),
+    RoutingCase(helper_cases.PREFILL_16E),
+    RoutingCase(helper_cases.DECODE_64_EP8, group_offset=448, num_skipped=64),
 )
 
 PLANS = (
@@ -141,7 +141,7 @@ def _fill_kernel(
 
 
 def fill_metadata(
-    routing: test_inputs.Routing, cfg: config.RoutingGmmConfig
+    routing: helper_inputs.Routing, cfg: config.RoutingGmmConfig
 ) -> np.ndarray:
   """Runs the metadata walk of `cfg` on TPU and returns `[num_gm, 3]` tiles."""
   group_cum_sum = jnp.cumulative_sum(routing.group_sizes, include_initial=True)
@@ -173,7 +173,9 @@ def fill_metadata(
   return tiles[: int(num_gm[0])]
 
 
-def expected_metadata(routing: test_inputs.Routing, tile_m: int) -> np.ndarray:
+def expected_metadata(
+    routing: helper_inputs.Routing, tile_m: int
+) -> np.ndarray:
   """Computes expected `[num_gm, 3]` tiles of `routing` with `tile_m` rows."""
   group_cum_sum = np.concatenate([[0], np.cumsum(routing.group_sizes)])
   tiles = []

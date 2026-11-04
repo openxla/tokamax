@@ -49,6 +49,7 @@ class RoutingGmmPlan:
   bucket_base: int | None = None
   num_xo_buffers: int | None = None
   num_w_buffers: int | None = None
+  num_stash_buffers: int | None = None
   # Accumulator dtype across quantization blocks and K tiles.
   acc_dtype: jax.typing.DTypeLike | None = None
   # Dtype in which inputs are fed to the MXU. Performs dynamic quantization if
@@ -56,6 +57,8 @@ class RoutingGmmPlan:
   matmul_dtype: jax.typing.DTypeLike | None = None
   # Block size if dynamic quantization is performed.
   x_quant_block_size: int | None = None
+  # VMEM staging dtype for output tiles before output quantization.
+  stash_dtype: jax.typing.DTypeLike | None = None
   # Whether gate/up and down projections run in one fused kernel when w2 is set.
   fuse_up_and_down: bool | None = None
   vmem_limit_bytes: int | None = None
@@ -88,10 +91,14 @@ class ResolvedGmmPlan:
   bucket_base: int
   num_xo_buffers: int
   num_w_buffers: int
+  # It is None unless the output is quantized.
+  num_stash_buffers: int | None
   acc_dtype: jnp.dtype
   matmul_dtype: jnp.dtype
   # It is None unless x is dynamically quantized.
   x_quant_block_size: int | None
+  # It is None unless the output is quantized.
+  stash_dtype: jnp.dtype | None
   fuse_up_and_down: bool
   vmem_limit_bytes: int
   live_group_walk: bool
@@ -142,6 +149,9 @@ class ResolvedGmmPlan:
     matmul_dtype, acc_dtype, x_quant_block_size = _resolve_dtypes(
         plan, x=spec.x, w=spec.w, tpu_info=tpu_info
     )
+    num_stash_buffers, stash_dtype = _resolve_stash(
+        plan, out_quant=out_format.quant
+    )
 
     live_group_walk = plan.live_group_walk
     if live_group_walk is None:
@@ -170,6 +180,8 @@ class ResolvedGmmPlan:
         acc_dtype=acc_dtype,
         out_dtype=out_format.dtype,
         out_quant=out_format.quant,
+        num_stash_buffers=num_stash_buffers,
+        stash_dtype=stash_dtype,
         vmem_limit_bytes=capped_vmem_limit_bytes,
         tpu_info=tpu_info,
     )
@@ -182,6 +194,8 @@ class ResolvedGmmPlan:
           acc_dtype=acc_dtype,
           out_dtype=out_format.dtype,
           out_quant=out_format.quant,
+          num_stash_buffers=num_stash_buffers,
+          stash_dtype=stash_dtype,
           vmem_limit_bytes=capped_vmem_limit_bytes,
           tpu_info=tpu_info,
       )
@@ -208,9 +222,11 @@ class ResolvedGmmPlan:
         bucket_base=bucket_base,
         num_xo_buffers=num_xo_buffers,
         num_w_buffers=num_w_buffers,
+        num_stash_buffers=num_stash_buffers,
         acc_dtype=acc_dtype,
         matmul_dtype=matmul_dtype,
         x_quant_block_size=x_quant_block_size,
+        stash_dtype=stash_dtype,
         fuse_up_and_down=fuse_up_and_down,
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
@@ -275,6 +291,24 @@ def _resolve_dtypes(
   else:
     acc_dtype = jnp.dtype(plan.acc_dtype)
   return matmul_dtype, acc_dtype, x_quant_block_size
+
+
+def _resolve_stash(
+    plan: RoutingGmmPlan,
+    *,
+    out_quant: out_format_lib.ResolvedQuantFormat | None,
+) -> tuple[int | None, jnp.dtype | None]:
+  """Resolves VMEM stash parameters for quantized output."""
+  num_stash_buffers = plan.num_stash_buffers
+  stash_dtype = (
+      None if plan.stash_dtype is None else jnp.dtype(plan.stash_dtype)
+  )
+  if out_quant is not None:
+    if num_stash_buffers is None:
+      num_stash_buffers = 2
+    if stash_dtype is None:
+      stash_dtype = jnp.bfloat16.dtype
+  return num_stash_buffers, stash_dtype
 
 
 def _choose_tiling_and_fusion(
@@ -343,6 +377,8 @@ def _vmem_estimate(
     tile_n: int,
     num_xo_buffers: int,
     num_w_buffers: int,
+    num_stash_buffers: int | None = None,
+    stash_dtype: jnp.dtype | None = None,
     tpu_info: pltpu.TpuInfo,
 ) -> int:
   """Estimates VMEM usage in bytes for routing GMM."""
@@ -361,9 +397,12 @@ def _vmem_estimate(
   x_vmem = num_xo_buffers * tile_m * x_chunks * chunk_bytes
   out_vmem = num_xo_buffers * tile_m * out_chunks * chunk_bytes
   if out_quant is not None:
-    stash_ratio = max(layout_util.get_packing(out_dtype) // 2, 1)
-    out_vmem += 2 * tile_m * tile_n * 2
-    out_vmem += 2 * (1 + stash_ratio) * tile_m * tpu_info.num_lanes * 4
+    assert num_stash_buffers is not None and stash_dtype is not None
+    out_bits = jax.dtypes.itemsize_bits(out_dtype)
+    stash_bits = jax.dtypes.itemsize_bits(stash_dtype)
+    stash_ratio = max(stash_bits // out_bits, 1)
+    out_vmem += num_stash_buffers * tile_m * tile_n * stash_bits // 8
+    out_vmem += num_stash_buffers * (1 + stash_ratio) * tile_m * chunk_bytes
 
   def _matmul_vmem(
       weight: tensor_spec.WeightSpec, k_tile: int, n_tile: int, num_w_refs: int
@@ -503,6 +542,8 @@ def calculate_tiling(
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype | None = None,
     out_quant: out_format_lib.ResolvedQuantFormat | None = None,
+    num_stash_buffers: int | None = None,
+    stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
     allow_vmem_growth: bool = True,
@@ -516,6 +557,8 @@ def calculate_tiling(
     acc_dtype: Accumulator dtype.
     out_dtype: Output dtype of the kernel, or None to default to `spec.x.dtype`.
     out_quant: Optional output quantization format.
+    num_stash_buffers: Stash buffer count when `out_quant` is set, else None.
+    stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
     allow_vmem_growth: Whether heuristics may pick settings that use more VMEM
@@ -550,11 +593,13 @@ def calculate_tiling(
     w_plan_tile_n = plan.tile_n
     w_out_dtype = x.dtype if out_dtype is None else out_dtype
     w_out_quant = out_quant
+    w_num_stash_buffers, w_stash_dtype = num_stash_buffers, stash_dtype
   else:
     w_out_n = spec.size_k2
     w_plan_tile_n = plan.tile_k2
     w_out_dtype = x.dtype
     w_out_quant = None
+    w_num_stash_buffers, w_stash_dtype = None, None
 
   out_chunk_cols = layout_util.get_packing(w_out_dtype) * tpu_info.num_lanes
 
@@ -571,6 +616,8 @@ def calculate_tiling(
       tile_k=tile_k,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
+      num_stash_buffers=w_num_stash_buffers,
+      stash_dtype=w_stash_dtype,
       tpu_info=tpu_info,
   )
 
@@ -644,6 +691,8 @@ def can_fuse_up_and_down(
     tile_n: int,
     num_xo_buffers: int,
     num_w_buffers: int,
+    num_stash_buffers: int | None = None,
+    stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
 ) -> bool:
@@ -670,6 +719,8 @@ def can_fuse_up_and_down(
       tile_n=tile_n,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
+      num_stash_buffers=num_stash_buffers,
+      stash_dtype=stash_dtype,
       tpu_info=tpu_info,
   )
   return estimate <= vmem_limit_bytes

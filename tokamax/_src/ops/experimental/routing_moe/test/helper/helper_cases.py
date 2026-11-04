@@ -19,7 +19,7 @@ import itertools
 import math
 from typing import NamedTuple
 
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 
 DP_AXIS = "data"
 EP_AXIS = "ep"
@@ -69,7 +69,7 @@ class Case:
   """
 
   name: str
-  shape: test_shapes.MoEShape
+  shape: helper_shapes.MoEShape
   num_tokens: int
   sharding: MoESharding = MoESharding()
   max_to_mean_load: float = 1.0
@@ -93,7 +93,7 @@ class Case:
 
 
 def _prod_sweep(
-    shape: test_shapes.MoEShape,
+    shape: helper_shapes.MoEShape,
     token_counts: tuple[int, ...],
     shardings: tuple[MoESharding, ...],
     *,
@@ -119,26 +119,26 @@ def _prod_sweep(
   )
 
 
-BASIC_256 = Case("basic_256", test_shapes.BASIC, 256)
+BASIC_256 = Case("basic_256", helper_shapes.BASIC, 256)
 PREFILL_64K = Case(
-    "prefill_64k", test_shapes.GMM_PREFILL, 65536, MoESharding(ep=8)
+    "prefill_64k", helper_shapes.GMM_PREFILL, 65536, MoESharding(ep=8)
 )
 PREFILL_8K = Case(
-    "prefill_8k", test_shapes.GMM_PREFILL, 8192, MoESharding(ep=8)
+    "prefill_8k", helper_shapes.GMM_PREFILL, 8192, MoESharding(ep=8)
 )
-PREFILL_16E = Case("prefill_16e", test_shapes.GMM_FEW_EXPERTS, 4096)
-TOP1_200 = Case("top1_200", test_shapes.GMM_TOP1, 200)
-DECODE_1 = Case("decode_1", test_shapes.GMM_DECODE, 1)
-DECODE_16 = Case("decode_16", test_shapes.GMM_DECODE, 16)
+PREFILL_16E = Case("prefill_16e", helper_shapes.GMM_FEW_EXPERTS, 4096)
+TOP1_200 = Case("top1_200", helper_shapes.GMM_TOP1, 200)
+DECODE_1 = Case("decode_1", helper_shapes.GMM_DECODE, 1)
+DECODE_16 = Case("decode_16", helper_shapes.GMM_DECODE, 16)
 DECODE_1_EP8 = Case(
-    "decode_1_ep8", test_shapes.GMM_DECODE, 1, MoESharding(ep=8)
+    "decode_1_ep8", helper_shapes.GMM_DECODE, 1, MoESharding(ep=8)
 )
 DECODE_64_EP8 = Case(
-    "decode_64_ep8", test_shapes.GMM_DECODE, 64, MoESharding(ep=8)
+    "decode_64_ep8", helper_shapes.GMM_DECODE, 64, MoESharding(ep=8)
 )
 QWEN_38_FLASH_NEXT_8 = Case(
     "qwen_38_flash_next_8_ep4",
-    test_shapes.QWEN_38_FLASH_NEXT,
+    helper_shapes.QWEN_38_FLASH_NEXT,
     8,
     MoESharding(ep=4),
 )
@@ -149,29 +149,29 @@ UNIT_CASES = (BASIC_256, *PREFILL_CASES, *DECODE_CASES)
 
 PROD_CASES = (
     *_prod_sweep(
-        test_shapes.QWEN_235,
+        helper_shapes.QWEN_235,
         (512,),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
     ),
     *_prod_sweep(
-        test_shapes.QWEN_30B_A3B,
+        helper_shapes.QWEN_30B_A3B,
         (512,),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
     ),
     *_prod_sweep(
-        test_shapes.QWEN_CODER_480B,
+        helper_shapes.QWEN_CODER_480B,
         (64, 8192),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
         max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
-        test_shapes.MISTRAL_3_LARGE,
+        helper_shapes.MISTRAL_3_LARGE,
         (2048, 4096, 32768),
         shardings=(MoESharding(ep=8), MoESharding(tp=8)),
         max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
-        test_shapes.QWEN_35_397B,
+        helper_shapes.QWEN_35_397B,
         (8, 32, 256, 8192),
         shardings=(
             MoESharding(ep=8),
@@ -180,7 +180,7 @@ PROD_CASES = (
         ),
     ),
     *_prod_sweep(
-        test_shapes.GPT_OSS_120,
+        helper_shapes.GPT_OSS_120,
         (64,),
         shardings=(MoESharding(ep=2), MoESharding(tp=2)),
     ),
@@ -188,19 +188,19 @@ PROD_CASES = (
     # Attention is TP over the host, so the MoE input is replicated and the MoE
     # runs EP.
     *_prod_sweep(
-        test_shapes.QWEN_38_FLASH_NEXT,
+        helper_shapes.QWEN_38_FLASH_NEXT,
         (4, 8, 12),
         shardings=(MoESharding(ep=4),),
     ),
     # Prefill with moderately and heavily skewed expert loads.
     *_prod_sweep(
-        test_shapes.QWEN_38_FLASH_NEXT,
+        helper_shapes.QWEN_38_FLASH_NEXT,
         (16384,),
         shardings=(MoESharding(ep=4),),
         max_to_mean_loads=(2.0, 4.0),
     ),
     *_prod_sweep(
-        test_shapes.QWEN_38_FLASH_NEXT,
+        helper_shapes.QWEN_38_FLASH_NEXT,
         (4, 8, 12, 16384),
         shardings=(MoESharding(tp=4),),
     ),
