@@ -24,6 +24,7 @@ carrying `None` unions past planning.
 from collections.abc import Callable
 import dataclasses
 import functools
+import math
 from typing import Any, Self
 
 import jax
@@ -73,11 +74,33 @@ class RoutingGmmPlan:
   # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
   # Revisit it based on per-group DMA vs. compute time.
   max_num_w_buffers: int | None = None
+  # Multiplier on the mean rows per expert group when bounding tile_m, so
+  # moderately skewed groups still fit in one tile.
+  # TODO: The default of 1.5 was chosen empirically from TPUv7x routing
+  # skew sweeps and is not derived. Revisit it based on measured routing skew.
+  skew_headroom: float | None = None
+  # tile_m is kept at or above i_local // dma_floor_divisor, where i_local is
+  # the per-shard intermediate width, so per-tile row gather/scatter stays
+  # small next to the group's weight DMA.
+  # TODO: The default of 16 was chosen empirically from TPUv7x sweeps
+  # and is not derived. Revisit it on other chips and weight dtypes.
+  dma_floor_divisor: int | None = None
+
+  def __post_init__(self) -> None:
+    for name in ("skew_headroom", "dma_floor_divisor"):
+      value = getattr(self, name)
+      if value is not None and value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}.")
 
 
 @dataclass_util.resolves_from(
     RoutingGmmPlan,
-    dropped=("vmem_usage_fraction", "max_num_w_buffers"),
+    dropped=(
+        "vmem_usage_fraction",
+        "max_num_w_buffers",
+        "skew_headroom",
+        "dma_floor_divisor",
+    ),
 )
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedGmmPlan:
@@ -657,6 +680,36 @@ def _grow_num_w_buffers(
   return num_w_buffers
 
 
+def _max_group_rows(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    min_tile_m: int,
+) -> int:
+  """Bounds `tile_m` by expected rows per group and input token count."""
+  # With gather, a group gets at most one row per input token; without gather,
+  # x holds all routed rows so a group gets at most x.row_size.
+  token_cap = max(
+      min_tile_m, min_tile_m * pl.cdiv(spec.x.row_size, min_tile_m)
+  )
+  if spec.size_out_m <= 0 or spec.num_global_groups <= 0:
+    return token_cap
+  if spec.size_k2 is not None:
+    i_local = spec.size_k2
+  elif spec.w.fused_gate_up:
+    i_local = spec.w.out_size // 2
+  elif spec.gather is None and spec.scatter is not None:
+    i_local = spec.size_k
+  else:
+    i_local = min(spec.size_k, spec.w.out_size)
+  dma_floor = max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
+  expected_rows = spec.size_out_m / spec.num_global_groups
+  skew_headroom = plan.skew_headroom or 1.5
+  skew_rows = pl.next_power_of_2(math.ceil(skew_headroom * expected_rows))
+  target_rows = min_tile_m * pl.cdiv(max(dma_floor, skew_rows), min_tile_m)
+  return min(target_rows, token_cap)
+
+
 def calculate_tiling(
     plan: RoutingGmmPlan,
     *,
@@ -696,8 +749,10 @@ def calculate_tiling(
   # A group gets at most one row per input token, so a tile never needs more
   # rows than there are tokens (e.g. decode). Compact VMEM loads and stores
   # operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
+  # Group rows are bounded by expected load and input token count to avoid
+  # over-padding sparse expert groups.
   min_tile_m = tpu_info.num_sublanes
-  max_group_rows = min_tile_m * pl.cdiv(x.row_size, min_tile_m)
+  max_group_rows = _max_group_rows(plan, spec=spec, min_tile_m=min_tile_m)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
