@@ -32,6 +32,7 @@ except ImportError:
   _TestTritonRaggedDot: Any = object
 else:
   from tokamax._src.ops.ragged_dot import triton
+  # pyrefly: ignore[unsupported-operation]
   _JAX_TRITON_AVAILABLE = jt.__version_info__ >= (0, 4, 1)
   del jt
 
