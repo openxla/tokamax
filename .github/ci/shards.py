@@ -380,6 +380,18 @@ SHARDS: ShardMap = {
         ),
         minutes=12,
     ),
+    'experimental-batched-rpa-correctness': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_test.py',),
+        minutes=12,
+        compat_minutes=4,
+    ),
+    'experimental-batched-rpa-quant': Spec(
+        paths=(
+            'tokamax/_src/ops/batched_rpa/correctness_per_token_quantization_test.py',
+        ),
+        minutes=12,
+        compat_minutes=4,
+    ),
     'experimental-masked-dense-mla': Spec(
         paths=(
             'tokamax/_src/ops/masked_dense_mla/api_test.py',
@@ -418,15 +430,23 @@ SHARDS: ShardMap = {
         compat_minutes=3,
     ),
     'experimental-batched-rpa': Spec(
-        paths=(
-            'tokamax/_src/ops/batched_rpa/base_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/configs_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/seq_along_lane_parity_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/speculative_decode_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
-            'tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=6,
+        paths=('tokamax/_src/ops/batched_rpa/base_test.py',),
+        minutes=3,
+        compat_minutes=1,
+    ),
+    'experimental-batched-rpa-cp': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_cp_test.py',),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    'experimental-batched-rpa-mtp': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_mtp_test.py',),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    'experimental-batched-rpa-pallas': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',),
+        minutes=5,
         compat_minutes=2,
     ),
     'experimental-mla-v2': Spec(
