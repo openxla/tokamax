@@ -86,7 +86,7 @@ def chunked_kda_per_seq(
   # transition blocks (L) against every column block, then immediately use
   # L[row_block, :row_block] to forward-substitute that row strip of T_inv.
   #
-  # Off-diagonal (col_block < row_block), g_ref separates the rows from the columns:
+  # Off-diagonal (col_block < row_block), g_ref separates rows from columns:
   # g_cumsum[t] >= g_ref for every column and g_r <= g_ref for every row, so
   # both exponents are provably <= 0, neither can overflow, and underflow to
   # 0 is a fully decayed contribution.
@@ -97,6 +97,10 @@ def chunked_kda_per_seq(
   # blocks take exact pairwise differences g_r - g_t, which stay <= 0 for
   # causal pairs because g_cumsum is monotonically decreasing.
   block_size = min(cfg.triangular_block_size, cfg.chunk_size)
+  assert cfg.chunk_size % block_size == 0, (
+      f"chunk_size ({cfg.chunk_size}) must be divisible by block_size"
+      f" ({block_size})"
+  )
   num_blocks = cfg.chunk_size // block_size
 
   identity_chunk = jnp.eye(cfg.chunk_size, dtype=jnp.float32)
@@ -132,7 +136,8 @@ def chunked_kda_per_seq(
         k_col_scaled = k_col * jnp.exp(g_ref - g_col)
 
         # [H, 2*BC, K] @ [H, BC, K]^T -> [H, 2*BC, BC], giving
-        # both Aqk[row_block, col_block] and L[row_block, col_block] in one contraction.
+        # both Aqk[row_block, col_block] and L[row_block, col_block] in one
+        # contraction.
         qk_scaled_merged = jnp.concat([q_scaled, k_beta_scaled], axis=1)
         gemm_out = jax.lax.dot(
             qk_scaled_merged,
@@ -168,7 +173,9 @@ def chunked_kda_per_seq(
     # Solve T_inv for the Current Row Sub-Block row_block
     # target to invert: (I + StrictTril(L)) @ T_inv = I
     # for row block row_block:
-    #   T_inv[row_block, :] = (I[row_block, :] - L[row_block, :row_block] @ T_inv[:row_block, :])
+    #   T_inv[row_block, :] = (
+    #       I[row_block, :] - L[row_block, :row_block] @ T_inv[:row_block, :]
+    #   )
     target_rhs = jnp.broadcast_to(
         identity_chunk[None, r_start:r_end, :],
         (cfg.num_v_heads, block_size, cfg.chunk_size),

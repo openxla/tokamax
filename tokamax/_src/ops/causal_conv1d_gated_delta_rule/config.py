@@ -182,7 +182,10 @@ class GDNConfig:
           return b
       return 2
     # GDN
-    return max(2, min(16, 16 // head_groups))
+    for b in (16, 8, 4):
+      if head_groups * b <= 16:
+        return b
+    return 2
 
   def get_kernel_name(self) -> str:
     # Windows of different sizes compile to different kernels; keep them
@@ -223,14 +226,20 @@ class GDNConfig:
   MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
   @classmethod
-  def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+  def get_vmem_limit_bytes(
+      cls,
+      window_size: int = 1,
+      vmem_capacity_bytes: int | None = None,
+  ) -> int:
     """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+    if vmem_capacity_bytes is None:
+      vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     fraction = (
         cls.WINDOWED_VMEM_FRACTION
         if window_size > 1
         else cls.DEFAULT_VMEM_FRACTION
     )
-    return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
+    return int(fraction * vmem_capacity_bytes)
 
   def get_scratch_shape_dict(self) -> dict[str, Any]:
     conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

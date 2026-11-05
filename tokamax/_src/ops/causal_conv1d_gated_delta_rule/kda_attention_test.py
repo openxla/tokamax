@@ -31,13 +31,16 @@ weights, so each needs its own oracle.
 """
 
 from typing import Any
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
+
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import wrapper
@@ -374,15 +377,14 @@ _SHAPES = (
     ),
     # Kimi-Linear-48B's head count. `triangular_block_size` is a step
     # function of `num_v_heads`, so this covers a different sub-block
-    # size (8) than the cases above (16). Sized to chunk_size=64 to fit the
-    # 4096-channel gate (n_v * d_k) within the 51.20 MiB scoped VMEM limit.
+    # size (8) than the cases above (16). Sized automatically by VMEM
+    # heuristic (chunk_size=64 on 64 MiB TPUs, chunk_size=128 on 128 MiB TPUs).
     dict(
         name="kimi_linear_heads",
         max_reqs=2,
         q_loc=[0, 192, 256],
         distribution=[0, 2, 2],
         n_v=32,
-        mixed_tile_size=64,
     ),
 )
 
@@ -401,7 +403,7 @@ def _cases():
 
 
 def _unified_pool_cases():
-  """Every shape and gate form under both float32 and bfloat16 recurrent state."""
+  """Every shape and gate form under float32 and bfloat16 recurrent state."""
   for case in _cases():
     for rec_name, rec_dtype in (
         ("f32_rec", jnp.float32),
@@ -428,7 +430,18 @@ class KdaAttentionTest(parameterized.TestCase):
       distribution,
       gate_lower_bound,
       n_v=4,
-      mixed_tile_size=None,
+  ):
+    self._run_kda_matches_the_recurrence(
+        max_reqs, q_loc, distribution, gate_lower_bound, n_v=n_v
+    )
+
+  def _run_kda_matches_the_recurrence(
+      self,
+      max_reqs,
+      q_loc,
+      distribution,
+      gate_lower_bound,
+      n_v=4,
   ):
     n_kq = n_v
     d_k = d_v = 128
@@ -492,7 +505,6 @@ class KdaAttentionTest(parameterized.TestCase):
     (_, out_state), out = wrapper.fused_conv1d_gdn(
         states=(conv_state, recurrent_state),
         **common_kwargs,
-        mixed_tile_size=mixed_tile_size,
     )
 
     np.testing.assert_allclose(
@@ -504,6 +516,20 @@ class KdaAttentionTest(parameterized.TestCase):
         rtol=2e-2,
         atol=1e-2,
     )
+
+  @parameterized.parameters(*test_base.SERVED_KDA_HEADS)
+  def test_every_reachable_tile_matches_recurrence(self, n_kq, n_v):
+    for batch in test_base.reachable_tile_batches(
+        n_kq, n_v, jnp.float32, 1, config.AttentionMode.KDA
+    ):
+      with self.subTest(max_reqs=batch["max_reqs"], tokens=batch["q_loc"][-1]):
+        self._run_kda_matches_the_recurrence(
+            batch["max_reqs"],
+            batch["q_loc"],
+            batch["distribution"],
+            gate_lower_bound=None,
+            n_v=n_v,
+        )
 
   @parameterized.named_parameters(
       dict(
@@ -699,6 +725,7 @@ class KdaAttentionTest(parameterized.TestCase):
         decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(window),
         mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
         window_size=window,
+        attention_mode=config.AttentionMode.KDA,
     )
     self.assertGreaterEqual(decode_tile, 2)
     self.assertGreaterEqual((num_seqs + decode_tile - 1) // decode_tile, 3)
@@ -796,7 +823,6 @@ class KdaAttentionTest(parameterized.TestCase):
       gate_lower_bound,
       recurrent_dtype,
       n_v=4,
-      mixed_tile_size=None,
   ):
     """KDA unified granule pool (`is_shared=True`) matches the oracle."""
     n_kq = n_v
@@ -889,7 +915,6 @@ class KdaAttentionTest(parameterized.TestCase):
         kernel_size=kernel_size,
         attention_mode=config.AttentionMode.KDA,
         gate_lower_bound=gate_lower_bound,
-        mixed_tile_size=mixed_tile_size,
         conv_dtype=jnp.float32,
         recurrent_dtype=recurrent_dtype,
     )
@@ -916,6 +941,180 @@ class KdaAttentionTest(parameterized.TestCase):
         rtol=3e-2,
         atol=3e-2,
     )
+
+  def test_kda_vmem_and_tile_sizes_across_parallelism(self):
+    """KDA VMEM accounting and tile picks across TP/DP/DCP/PCP/MTP regimes."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    d_k = d_v = 128
+    kernel_size = 4
+    vmem_64m = 64 * 1024 * 1024
+    limit_w1 = config.GDNConfig.get_vmem_limit_bytes(
+        1, vmem_capacity_bytes=vmem_64m
+    )
+    limit_w4 = config.GDNConfig.get_vmem_limit_bytes(
+        4, vmem_capacity_bytes=vmem_64m
+    )
+
+    dim_32 = 2 * 32 * d_k + 32 * d_v
+    est_kda_c128 = tiling.get_vmem_estimate_bytes(
+        tile_b=1,
+        chunk_sz=128,
+        n_kq=32,
+        n_v=32,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        act_out_bytes=2,
+        rec_state_bytes=4,
+        num_lanes=num_lanes,
+        conv_state_dim_size=dim_32,
+        is_decode=False,
+        window_size=1,
+        attention_mode=config.AttentionMode.KDA,
+    )
+    self.assertEqual(est_kda_c128, 59_884_032)
+    self.assertGreater(est_kda_c128, limit_w1)
+
+    dp8_dec, dp8_mix = tiling.get_tile_sizes(
+        batch_size=128,
+        num_seqs=64,
+        padded_batch_size=128,
+        n_kq=32,
+        n_v=32,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim_32,
+        act_out_dtype=jnp.dtype(jnp.bfloat16),
+        recurrent_state_dtype=jnp.dtype(jnp.float32),
+        num_lanes=num_lanes,
+        decode_vmem_limit_bytes=limit_w1,
+        mixed_vmem_limit_bytes=limit_w1,
+        window_size=1,
+        attention_mode=config.AttentionMode.KDA,
+    )
+    self.assertEqual((dp8_dec, dp8_mix), (4, 64))
+
+    for n_kq, n_v, w_sz, expected in (
+        (3, 3, 1, (16, 128)),
+        (3, 3, 4, (16, 128)),
+        (12, 12, 1, (8, 128)),
+        (12, 12, 4, (4, 128)),
+        (4, 4, 1, (16, 128)),
+        (4, 4, 4, (16, 128)),
+        (32, 32, 1, (4, 64)),
+        (32, 32, 4, (2, 64)),
+    ):
+      dim = 2 * n_kq * d_k + n_v * d_v
+      got = tiling.get_tile_sizes(
+          batch_size=512,
+          num_seqs=64,
+          padded_batch_size=512,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          conv_state_dim_size=dim,
+          act_out_dtype=jnp.dtype(jnp.bfloat16),
+          recurrent_state_dtype=jnp.dtype(jnp.float32),
+          num_lanes=num_lanes,
+          decode_vmem_limit_bytes=limit_w4 if w_sz > 1 else limit_w1,
+          mixed_vmem_limit_bytes=limit_w1,
+          window_size=w_sz,
+          attention_mode=config.AttentionMode.KDA,
+      )
+      self.assertEqual(got, expected)
+
+    dummy_arr_dt: Any = jnp.dtype(jnp.float32)
+    dummy_out_dt: Any = jnp.dtype(jnp.bfloat16)
+    for n_kq, n_v, tile_sz, is_decode, w_sz in (
+        (3, 3, 16, True, 4),
+        (12, 12, 4, True, 4),
+        (4, 4, 16, True, 4),
+        (32, 32, 2, True, 4),
+        (32, 32, 64, False, 1),
+    ):
+      dim = 2 * n_kq * d_k + n_v * d_v
+      aligned_dim = tiling.align_to(dim, num_lanes)
+      cfg = config.GDNConfig(
+          mode=config.GDNMode.BATCHED if is_decode else config.GDNMode.PER_SEQ,
+          dtypes=config.Dtypes(
+              act_in=jnp.dtype(jnp.float32),
+              act_out=jnp.dtype(jnp.bfloat16),
+              compute=jnp.dtype(jnp.float32),
+              recurrent_state=jnp.dtype(jnp.float32),
+              conv_state=jnp.dtype(jnp.float32),
+          ),
+          batch_size=tile_sz,
+          dim_size=aligned_dim,
+          kernel_size=kernel_size,
+          tile_size=tile_sz,
+          num_kq_heads=n_kq,
+          num_v_heads=n_v,
+          kq_head_dim=d_k,
+          v_head_dim=d_v,
+          num_buffers=2,
+          window_size=w_sz,
+          attention_mode=config.AttentionMode.KDA,
+      )
+      dummy_meta = memory_ref.MetadataRef(
+          num_tiles=None,
+          records=None,
+          s_idx_has_initial_state=None,
+          s_idx_to_state_indices=None,
+          s_idx_to_read_offset=None,
+          s_idx_to_read_indices=None,
+          s_idx_to_ckpt_indices=None,
+          shape=(1, cfg.seq_tile_size),
+      )
+      allocs = memory_ref.create_allocs(
+          metadata_ref=dummy_meta,
+          qkv_ref=dummy_arr_dt,
+          b_ref=dummy_arr_dt,
+          a_ref=dummy_arr_dt,
+          out_ref=dummy_out_dt,
+          cfg=cfg,
+      )
+      declared_allocs_bytes = sum(
+          int(np.prod(a.window_ref.shape))
+          * jnp.dtype(a.window_ref.dtype).itemsize
+          for a in allocs
+          if a.window_ref is not None
+      )
+      scratch_shapes = cfg.get_scratch_shape_dict()
+      declared_scratch_bytes = sum(
+          int(np.prod(s.shape)) * 4
+          for s in scratch_shapes.values()
+          if s is not None
+      )
+      weights_bytes = (kernel_size + 1) * aligned_dim * 4 + (
+          tiling.align_to(n_v, num_lanes)
+          + tiling.align_to(n_v * d_k, num_lanes)
+      ) * 4
+      total_declared = (
+          declared_allocs_bytes + declared_scratch_bytes + weights_bytes
+      )
+
+      tile_b = cfg.seq_tile_size
+      chunk_sz = cfg.chunk_size
+      vmem_declared = tiling.get_vmem_declared_bytes(
+          tile_b=tile_b,
+          chunk_sz=chunk_sz,
+          n_kq=n_kq,
+          n_v=n_v,
+          d_k=d_k,
+          d_v=d_v,
+          kernel_size=kernel_size,
+          act_out_bytes=2,
+          rec_state_bytes=4,
+          num_lanes=num_lanes,
+          conv_state_dim_size=aligned_dim,
+          is_decode=is_decode,
+          window_size=w_sz,
+          attention_mode=config.AttentionMode.KDA,
+      )
+      self.assertEqual(vmem_declared, total_declared)
 
 
 if __name__ == "__main__":
