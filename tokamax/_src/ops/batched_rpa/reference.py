@@ -117,13 +117,24 @@ def batched_ragged_paged_attention_reference(
     sm_scale: Softmax scaling factor (typically 1 / sqrt(head_dim)).
     sliding_window: Optional local attention window size.
     soft_cap: Optional tanh logit soft-capping factor.
+    mask_value: Optional attention mask value.
     out_dtype: Desired output data type.
     q_scale: Optional query quantization scale.
     k_scale: Optional key quantization scale.
+    v_scale: Optional value quantization scale.
+    decode_query_size: Query token block size for decode.
+    skip_kv_update: Whether to skip writing back KV cache.
+    kv_layout: Memory layout for KV cache.
+    cp_group_size: Size of CP group.
+    cp_rank: Device rank within CP group.
+    attention_scope: Scope of attention (FULL, CACHE_ONLY, NEW_TOKENS_ONLY).
+    return_lse: Whether to return logsumexp.
+    **unused_kwargs: Additional unused arguments.
 
   Returns:
     outputs: [total_q_tokens, num_q_heads, head_dim] attention outputs.
     updated_kv_cache: Updated KV cache buffer.
+    lse (optional): [total_q_tokens, num_q_heads] logsumexp values.
   """
   if out_dtype is None:
     out_dtype = queries.dtype
@@ -196,11 +207,22 @@ def batched_ragged_paged_attention_reference(
   all_k = jnp.repeat(all_k, actual_num_q_heads_per_kv_head, axis=2)
   all_v = jnp.repeat(all_v, actual_num_q_heads_per_kv_head, axis=2)
 
-  scaled_queries = queries / q_scale if q_scale is not None else queries
-  if k_scale is not None:
-    all_k = all_k / k_scale
-  if v_scale is not None:
-    all_v = all_v / v_scale
+  if q_scale is not None:
+    scaled_queries = queries / q_scale
+    if jnp.issubdtype(keys.dtype, jnp.floating):
+      dtype_info = jnp.finfo(keys.dtype)
+      minval = float(dtype_info.min)
+      maxval = float(dtype_info.max)
+      scaled_queries = jnp.clip(scaled_queries, min=minval, max=maxval)
+    scaled_queries = scaled_queries.astype(keys.dtype)
+  else:
+    scaled_queries = queries
+
+  effective_mask_value = (
+      float(jnp.finfo(jnp.dtype(out_dtype)).min)
+      if mask_value is None
+      else mask_value
+  )
 
   # Step 3: Compute attention per query token.
   def compute_single_token(t: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -209,9 +231,14 @@ def batched_ragged_paged_attention_reference(
     k_s = all_k[s]
     v_s = all_v[s]
 
-    scores = jnp.einsum(
-        "hd,khd->hk", q_t, k_s, preferred_element_type=jnp.float32
-    ) * sm_scale
+    scores = (
+        jnp.einsum("hd,khd->hk", q_t, k_s, preferred_element_type=jnp.float32)
+        * sm_scale
+    )
+    if k_scale is not None:
+      scores = scores * k_scale
+    if q_scale is not None:
+      scores = scores * q_scale
 
     if soft_cap is not None:
       scores = soft_cap * jnp.tanh(scores / soft_cap)
@@ -223,13 +250,16 @@ def batched_ragged_paged_attention_reference(
     if sliding_window is not None:
       mask = mask & (k_positions > token_kv_pos[t] - sliding_window)
 
-    scores = jnp.where(mask[None, :], scores, -1e30)
-    lse = jax.nn.logsumexp(scores, axis=-1).astype(jnp.float32)
+    scores = jnp.where(mask[None, :], scores, effective_mask_value)
+    lse = jax.nn.logsumexp(scores, axis=-1).astype(out_dtype)
     weights = jax.nn.softmax(scores, axis=-1).astype(out_dtype)
 
     token_out = jnp.einsum(
         "hk,khd->hd", weights, v_s, preferred_element_type=jnp.float32
-    ).astype(out_dtype)
+    )
+    if v_scale is not None:
+      token_out = token_out * v_scale
+    token_out = token_out.astype(out_dtype)
     return token_out, lse
 
   token_outputs, token_lses = jax.vmap(compute_single_token)(token_indices)

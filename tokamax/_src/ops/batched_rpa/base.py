@@ -71,7 +71,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       out_dtype: Any = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
-      kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: KVLayout | str | None = None,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
@@ -150,7 +150,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       out_dtype: Any = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
-      kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: KVLayout | str | None = None,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
@@ -186,7 +186,9 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
         debug_mode=debug_mode,
         decode_query_size=decode_query_size,
         skip_kv_update=skip_kv_update,
-        kv_layout=kv_layout,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE
+        if kv_layout is None
+        else kv_layout,
         cp_group_size=cp_group_size,
         cp_rank=cp_rank,
         attention_scope=attention_scope,
