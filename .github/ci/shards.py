@@ -363,6 +363,7 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-gmm-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/common/dataclass_util_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/common/module_scope_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/out_format_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/config_unit_test.py',

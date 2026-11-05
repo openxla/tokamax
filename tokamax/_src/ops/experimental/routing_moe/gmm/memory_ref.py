@@ -33,7 +33,7 @@ from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 
-GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
+type GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
 
 
 def map_memory_constraint[T](obj: T, memory_space: pltpu.MemorySpace) -> T:

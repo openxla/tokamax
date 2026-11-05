@@ -28,10 +28,6 @@ from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce
 from tokamax._src.ops.experimental.routing_moe.layer import config
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 
-P = sharding.PartitionSpec
-NamedSharding = sharding.NamedSharding
-Mesh = sharding.Mesh
-
 
 def _prepare_ep_inputs(
     topk_weights: jax.Array,
@@ -203,7 +199,7 @@ def routing_moe(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
-    mesh: Mesh,
+    mesh: sharding.Mesh,
     activation: str,
     tp_axis: str | None,
     ep_axis: str | None,
@@ -255,16 +251,18 @@ def routing_moe(
       mesh=mesh,
   )
 
-  w1_spec = P(ep_axis, None, tp_axis)
-  w2_spec = P(ep_axis, tp_axis, None)
-  w1_scale_spec = None if w1_scale is None else P(ep_axis, None, None, tp_axis)
-  w2_scale_spec = None
-  if w2_scale is not None:
-    block_axis = None if w2_scale.shape[1] == 1 else tp_axis
-    w2_scale_spec = P(ep_axis, block_axis, None, None)
-  w1_bias_spec = None if w1_bias is None else P(ep_axis, None, tp_axis)
-  w2_bias_spec = None if w2_bias is None else P(ep_axis, None, None)
-  ep_shard_idx_spec = None if ep_shard_idx is None else P(ep_axis)
+  w2_block_axis = None
+  if w2_scale is not None and w2_scale.shape[1] > 1:
+    w2_block_axis = tp_axis
+
+  # PartitionSpec leaves match None inputs because None has no PyTree leaves.
+  w1_spec = sharding.PartitionSpec(ep_axis, None, tp_axis)
+  w2_spec = sharding.PartitionSpec(ep_axis, tp_axis, None)
+  w1_scale_spec = sharding.PartitionSpec(ep_axis, None, None, tp_axis)
+  w2_scale_spec = sharding.PartitionSpec(ep_axis, w2_block_axis, None, None)
+  w1_bias_spec = sharding.PartitionSpec(ep_axis, None, tp_axis)
+  w2_bias_spec = sharding.PartitionSpec(ep_axis, None, None)
+  ep_shard_idx_spec = sharding.PartitionSpec(ep_axis)
 
   return jax.shard_map(
       functools.partial(
@@ -285,7 +283,7 @@ def routing_moe(
           w2_bias_spec,
           ep_shard_idx_spec,
       ),
-      out_specs=(cfg.out_pspec),
+      out_specs=cfg.out_pspec,
       check_vma=False,
   )(
       hidden_states,
