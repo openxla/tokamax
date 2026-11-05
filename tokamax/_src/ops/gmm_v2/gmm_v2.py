@@ -346,9 +346,23 @@ class GmmConfigs:
       return self.dims.size_n // 2
 
 
-TileFn = Callable[
-    [Dimensions, InputConfigs, InputConfigs, int, str | None, bool], TileSizes
-]
+@dataclasses.dataclass(frozen=True)
+class TilingRequest:
+  """Inputs passed to a GMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: Dimensions
+  lhs_cfgs: InputConfigs
+  rhs_cfgs: InputConfigs
+  vmem_limit_bytes: int
+  fuse_act: str | None = None
+  has_partial_sum: bool = False
+
+
+TileFn = Callable[[TilingRequest], TileSizes]
 
 
 class IndexMaps:
@@ -1155,6 +1169,18 @@ def kernel_main(
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
 
 
+def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
+  """Default `TileFn` for `gmm_v2`: calls `calculate_tiling` with `req`."""
+  return calculate_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.fuse_act,
+      req.has_partial_sum,
+  )
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1614,12 +1640,15 @@ def make_gmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        vmem_limit_bytes,  # pyrefly: ignore[bad-argument-type]
-        fuse_act,
-        partial_sum is not None,
+        TilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            fuse_act=fuse_act,
+            has_partial_sum=partial_sum is not None,
+        )
     )
 
   return GmmConfigs(
@@ -1672,7 +1701,7 @@ def gmm_v2(
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
     partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
-    tile_info: TileSizes | TileFn = calculate_tiling,
+    tile_info: TileSizes | TileFn = calculate_tiling_from_request,
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -1711,7 +1740,8 @@ def gmm_v2(
       Not supported together with fuse_act.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
-    tile_info: The tile sizes or tile function to use.
+    tile_info: The tile sizes, or a function that takes a `TilingRequest` and
+      returns them.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.

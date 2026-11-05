@@ -331,7 +331,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else gmm_backend.calculate_tiling,
+          else gmm_backend.calculate_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type,
@@ -373,7 +373,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else gmm_backend.calculate_tiling,
+          else gmm_backend.calculate_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type
@@ -420,7 +420,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           group_offset=group_offset,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else tgmm_backend.calculate_tgmm_tiling,
+          else tgmm_backend.calculate_tgmm_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type

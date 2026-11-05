@@ -42,19 +42,25 @@ class OperandRef:
   scale: Any | None = None
 
 
-TileTgmmFn = Callable[
-    [
-        gmm_v2.Dimensions,
-        gmm_v2.InputConfigs,
-        gmm_v2.InputConfigs,
-        int,
-        jnp.dtype,
-        jnp.dtype,
-        int,
-        bool,
-    ],
-    gmm_v2.TileSizes,
-]
+@dataclasses.dataclass(frozen=True)
+class TgmmTilingRequest:
+  """Inputs passed to a TGMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: gmm_v2.Dimensions
+  lhs_cfgs: gmm_v2.InputConfigs
+  rhs_cfgs: gmm_v2.InputConfigs
+  vmem_limit_bytes: int
+  out_dtype: jnp.dtype
+  acc_dtype: jnp.dtype
+  target_zero_ref_bytes: int
+  has_partial_sum: bool = False
+
+
+TileTgmmFn = Callable[[TgmmTilingRequest], gmm_v2.TileSizes]
 
 
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
@@ -78,6 +84,22 @@ def get_cost_estimate(cfgs: gmm_v2.GmmConfigs) -> pl.CostEstimate:
       flops=flops,
       bytes_accessed=lhs_bytes + rhs_bytes + out_bytes,
       transcendentals=0,
+  )
+
+
+def calculate_tgmm_tiling_from_request(
+    req: TgmmTilingRequest,
+) -> gmm_v2.TileSizes:
+  """Default `TileTgmmFn` for `tgmm_v2`: calls `calculate_tgmm_tiling`."""
+  return calculate_tgmm_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.out_dtype,
+      req.acc_dtype,
+      req.target_zero_ref_bytes,
+      req.has_partial_sum,
   )
 
 
@@ -285,15 +307,17 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        # pyrefly: ignore[bad-argument-type]
-        vmem_limit_bytes,
-        out_dtype,
-        acc_dtype,
-        target_zero_ref_bytes,
-        partial_sum is not None,
+        TgmmTilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            out_dtype=out_dtype,
+            acc_dtype=acc_dtype,
+            target_zero_ref_bytes=target_zero_ref_bytes,
+            has_partial_sum=partial_sum is not None,
+        )
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
       f"tile_m ({tiles.tile_m}) must be divisible by bucket_base"
@@ -750,7 +774,9 @@ def tgmm_v2(
     group_offset: jax.Array | None = None,
     partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
-    tile_info: gmm_v2.TileSizes | TileTgmmFn = calculate_tgmm_tiling,
+    tile_info: gmm_v2.TileSizes | TileTgmmFn = (
+        calculate_tgmm_tiling_from_request
+    ),
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -776,7 +802,7 @@ def tgmm_v2(
       Must have the output dtype; the output is written in place over this
       buffer.
     tile_info: Specifies the tiling strategy. Can be a `TileSizes` object or a
-      function to calculate it.
+      function that takes a `TgmmTilingRequest` and returns one.
     vmem_limit_bytes: The VMEM limit in bytes for the kernel.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
