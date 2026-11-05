@@ -1772,9 +1772,10 @@ def gmm_v2(
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    if jnp.isscalar(group_offset):
-      group_offset = group_offset[None]
+  elif jnp.isscalar(group_offset):
+    # Also accept a Python int or 0-d array (e.g. under `jax.disable_jit()`,
+    # where it is not traced).
+    group_offset = jnp.asarray(group_offset, dtype=jnp.int32).reshape((1,))
 
   if vmem_limit_bytes is None:
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
