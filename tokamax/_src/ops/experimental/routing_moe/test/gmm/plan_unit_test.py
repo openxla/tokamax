@@ -125,30 +125,22 @@ def _resolve(
   )
 
 
-def _sublane_tiling(quantized: bool) -> int:
-  matmul_dtype = jnp.dtype(jnp.float8_e4m3fn if quantized else jnp.bfloat16)
-  return max(
-      _tpu_info().get_sublane_tiling(jnp.dtype(jnp.bfloat16)),
-      _tpu_info().get_sublane_tiling(matmul_dtype),
-  )
-
-
 class TileMTest(parameterized.TestCase):
   """Checks the tile_m the planner picks."""
 
-  @parameterized.product(num_tokens=[1, 4, 8, 12], quantized=[True, False])
+  @parameterized.product(num_tokens=[1, 4, 8], quantized=[True, False])
   def test_decode_tile_is_one_sublane_tile(
       self, num_tokens: int, quantized: bool
   ):
     # An expert gets at most one row per token, so one sublane tile suffices.
     resolved = _resolve(num_tokens, quantized=quantized)
-    min_tile_m = _sublane_tiling(quantized)
+    min_tile_m = _tpu_info().num_sublanes
     self.assertEqual(resolved.tile_m, min_tile_m)
     self.assertEqual(resolved.bucket_rows, [min_tile_m])
 
-  @parameterized.parameters(64, 200)
+  @parameterized.parameters(12, 64, 200)
   def test_tile_is_capped_at_tokens(self, num_tokens: int):
-    min_tile_m = _sublane_tiling(quantized=True)
+    min_tile_m = _tpu_info().num_sublanes
     self.assertEqual(
         _resolve(num_tokens).tile_m,
         min_tile_m * math.ceil(num_tokens / min_tile_m),
@@ -277,16 +269,16 @@ class QuantStashPlanTest(parameterized.TestCase):
     self.assertEqual(larger_stash_single.tile_m, 128)
 
     # 13.55 MB fits fused up/down with 2 bf16 stash buffers (13,459,456 bytes),
-    # but unfuses with 3 buffers or f32 stash dtype.
+    # but unfuses with 3 buffers or f32 stash dtype. 32 tokens give tile_m=32.
     fused_budget = dict(vmem_limit_bytes=13_550_000, vmem_usage_fraction=1.0)
     default_two_stage = _resolve(
-        8,
+        32,
         gmm_plan.RoutingGmmPlan(**fused_budget),
         with_down=True,
         out_format=fmt,
     )
     larger_stash_two_stage = _resolve(
-        8,
+        32,
         dataclasses.replace(extra_plan, **fused_budget),
         with_down=True,
         out_format=fmt,

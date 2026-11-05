@@ -162,6 +162,24 @@ def unfused_gmm_scatter(
   return jnp.zeros_like(out).at[sorted_to_flat].set(out)
 
 
+@jax.jit
+def unfused_gather_gmm_gmm_scatter(
+    x: jax.Array,
+    w: arg.SingleWeightWrapper[jax.Array],
+    w2: arg.SingleWeightWrapper[jax.Array],
+    group_sizes: jax.Array,
+    gather_indices: jax.Array,
+    sorted_to_flat: jax.Array,
+) -> jax.Array:
+  """Gathers, runs gate/up and down GMMs, and scatters as an XLA baseline."""
+  out = reference_gmm(
+      x[gather_indices], w, group_sizes, w2=w2, fuse_act="silu"
+  )
+  mask = jnp.arange(out.shape[0]) < group_sizes.sum()
+  out = jnp.where(mask[:, None], out, 0)
+  return jnp.zeros_like(out).at[sorted_to_flat].set(out)
+
+
 def compute_topk(
     moe: helper_inputs.MoEInputs,
     shape: helper_shapes.MoEShape,

@@ -463,6 +463,72 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=1e-1,
     )
 
+  @parameterized.product(
+      case_spec=(
+          helper_cases.DECODE_1,
+          helper_cases.DECODE_16,
+          helper_cases.QWEN_38_FLASH_NEXT_8,
+      ),
+      out_dtype=[None, FP8],
+  )
+  def test_decode_gather_gmm_gmm_scatter(
+      self,
+      case_spec: helper_cases.Case,
+      out_dtype: jax.typing.DTypeLike | None,
+  ):
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, quant_w1=True, quant_w2=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        out_format=None if out_dtype is None else _FP8_OUT_FORMAT,
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    rows = np.asarray(routing.scattered_rows)
+    if out_dtype is None:
+      np.testing.assert_allclose(
+          gmm_test_lib.to_large_layout(actual)[rows],
+          expected,
+          rtol=6e-2,
+          atol=6e-2,
+      )
+    else:
+      deq = np.asarray(gmm_test_lib.dequantize_rows(actual.data))[rows]
+      self.assertLessEqual(
+          _rel_diff(deq, np.asarray(expected, np.float32)), 2**-3
+      )
+
+  @parameterized.parameters(
+      gmm_plan.RoutingGmmPlan(tile_m=4),
+      gmm_plan.RoutingGmmPlan(tile_m=16, bucket_base=4),
+  )
+  def test_misaligned_tile_m_or_bucket_base_raises(
+      self, custom_plan: gmm_plan.RoutingGmmPlan
+  ):
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.DECODE_16)
+    with self.assertRaisesRegex(ValueError, "must be multiples of"):
+      kernel.routing_gmm(
+          case.x_compact,
+          case.w1,
+          gather=case.routing.gather,
+          fuse_act="silu",
+          custom_plan=custom_plan,
+          **case.routing.kernel_kwargs,
+      )
+
   def test_fuse_up_and_down_without_w2_raises(self):
     case = gmm_test_lib.GmmCase.make_case(helper_cases.DECODE_16)
     with self.assertRaisesRegex(ValueError, "fuse_up_and_down"):

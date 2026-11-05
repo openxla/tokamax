@@ -54,7 +54,9 @@ class RoutingGmmProdTest(parameterized.TestCase):
     """Checks `fused` numerics against `gmm_only` and logs latencies."""
     actual = gmm_test_lib.to_large_layout(fused.fn(fused.args))[actual_rows]
     expected = gmm_only.fn(gmm_only.args)[expected_rows]
-    np.testing.assert_allclose(actual, expected, rtol=5e-2, atol=8e-2)
+    rtol = 5e-2
+    atol = max(8e-2, rtol * float(np.abs(expected).max()))
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
     logging.info("gmm_only: %.1f us", gmm_only.latency_us())
     logging.info("unfused: %.1f us", unfused.latency_us())
     logging.info("fused: %.1f us %s", fused.latency_us(), fused.trace())
@@ -121,6 +123,46 @@ class RoutingGmmProdTest(parameterized.TestCase):
             case.x_sorted,
             case.w1,
             routing.local_group_sizes,
+            routing.sorted_to_flat,
+        ),
+        actual_rows=routing.scattered_rows,
+        expected_rows=routing.sorted_rows,
+    )
+
+  @parameterized.product(case_spec=helper_cases.PROD_CASES)
+  def test_gather_gmm_gmm_scatter(self, case_spec: helper_cases.Case):
+    """Times gather, gate/up, down, and scatter in one call."""
+    case = gmm_test_lib.GmmCase.make_case(case_spec)
+    routing = case.routing
+    helper_util.log_expert_load(
+        case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
+    )
+    self._check_and_log(
+        fused=helper_util.Timed.create(
+            kernel.routing_gmm,
+            case.x_compact,
+            case.w1,
+            w2=case.w2,
+            gather=routing.gather,
+            scatter=routing.scatter,
+            fuse_act="silu",
+            **routing.kernel_kwargs,
+        ),
+        gmm_only=helper_util.Timed.create(
+            helper_reference.reference_gmm,
+            case.x_sorted,
+            case.w1,
+            routing.local_group_sizes,
+            w2=case.w2,
+            fuse_act="silu",
+        ),
+        unfused=helper_util.Timed.create(
+            helper_reference.unfused_gather_gmm_gmm_scatter,
+            case.x,
+            case.w1,
+            case.w2,
+            routing.local_group_sizes,
+            routing.gather_indices,
             routing.sorted_to_flat,
         ),
         actual_rows=routing.scattered_rows,

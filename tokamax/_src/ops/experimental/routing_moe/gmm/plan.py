@@ -571,12 +571,9 @@ def calculate_tiling(
   x, w = spec.x, spec.w
   # Step 1: Set default values.
   # A group gets at most one row per input token, so a tile never needs more
-  # rows than there are tokens (e.g. decode). Tiles stay a whole number of
-  # sublane tiles of x and, with dynamic quantization, of x in matmul_dtype.
-  min_tile_m = max(
-      tpu_info.get_sublane_tiling(x.dtype),
-      tpu_info.get_sublane_tiling(matmul_dtype),
-  )
+  # rows than there are tokens (e.g. decode). Compact VMEM loads and stores
+  # operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
+  min_tile_m = tpu_info.num_sublanes
   max_group_rows = min_tile_m * pl.cdiv(x.row_size, min_tile_m)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
