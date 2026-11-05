@@ -122,16 +122,6 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
         self.skipTest("No contracting dim kernel for A100 (drhs gradient).")
     super().setUp()
 
-  @parameterized.parameters(
-      ((256, 256, 256, 256),),
-      ((100, 156, 200, 56, 312, 72, 64, 64),),
-  )
-  def test_vjp_multi_block_groups(self, group_sizes):
-    # In `test_vjp` every group has 16 or 128 rows; these groups span more than
-    # one 128-row block of the contracting dimension of the `drhs` ragged dot.
-    num_groups, m, k, n = len(group_sizes), sum(group_sizes), 128, 256
-    self._test_vjp(num_groups, m, k, n, group_sizes=group_sizes)
-
   def test_get_autotuning_configs(self):
     op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot()
     lhs = jax.ShapeDtypeStruct((128, 512), dtype=jnp.bfloat16)
@@ -142,6 +132,16 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     configs = op._get_autotuning_configs(ba)
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
+
+  @parameterized.parameters(
+      ((256, 256, 256, 256),),
+      ((100, 156, 200, 56, 312, 72, 64, 64),),
+  )
+  def test_vjp_multi_block_groups(self, group_sizes):
+    # In `test_vjp` every group has 16 or 128 rows; these groups span more than
+    # one 128-row block of the contracting dimension of the `drhs` ragged dot.
+    num_groups, m, k, n = len(group_sizes), sum(group_sizes), 128, 256
+    self._test_vjp(num_groups, m, k, n, group_sizes=group_sizes)
 
 
 if __name__ == "__main__":
