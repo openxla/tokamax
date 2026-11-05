@@ -172,7 +172,17 @@ class SegmentBlockOverlapTest(parameterized.TestCase):
 class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
   """Schedule tests for `_refine_mask_info_with_segments` (fwd and dkv)."""
 
-  def _refine(self, mask_info, segment_ids, *, seq_len, bq, bkv, is_dkv=False):
+  def _refine(
+      self,
+      mask_info,
+      segment_ids,
+      *,
+      seq_len,
+      bq,
+      bkv,
+      is_dkv=False,
+      skip_uniform_segment_mask=False,
+  ):
     return splash._refine_mask_info_with_segments(  # pylint: disable=protected-access
         mask_info,
         segment_ids,
@@ -181,6 +191,7 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
         bq=bq,
         bkv=bkv,
         is_dkv=is_dkv,
+        skip_uniform_segment_mask=skip_uniform_segment_mask,
     )
 
   @parameterized.named_parameters(
@@ -322,11 +333,15 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
     self.assertTrue(all(m == 0 for m in tiles.values()))
 
   @parameterized.named_parameters(
-      ("fwd_dense", False, False),
-      ("fwd_compacted", True, False),
-      ("dkv_compacted", True, True),
+      ("fwd_dense", False, False, False),
+      ("fwd_compacted", True, False, False),
+      ("dkv_compacted", True, True, False),
+      ("fwd_compacted_skip_uniform", True, False, True),
+      ("dkv_compacted_skip_uniform", True, True, True),
   )
-  def test_lowers_without_gather(self, dynamic, is_dkv):
+  def test_lowers_without_gather(
+      self, dynamic, is_dkv, skip_uniform_segment_mask
+  ):
     # TPU7x offloads large gathers to SparseCore, which fails to lower them for
     # schedule-sized index arrays (T >= 16K), so refine must avoid gathers.
     bq = bkv = 128
@@ -338,13 +353,189 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
     hlo = (
         jax.jit(
             lambda s: self._refine(
-                mask_info, s, seq_len=seq_len, bq=bq, bkv=bkv, is_dkv=is_dkv
+                mask_info,
+                s,
+                seq_len=seq_len,
+                bq=bq,
+                bkv=bkv,
+                is_dkv=is_dkv,
+                skip_uniform_segment_mask=skip_uniform_segment_mask,
             )
         )
         .lower(_segment_ids(lengths))
         .as_text()
     )
     self.assertNotIn("gather", hlo)
+
+  @parameterized.named_parameters(
+      ("fwd", False),
+      ("dkv", True),
+  )
+  def test_skip_uniform_segment_mask_promotes_only_uniform_full_blocks(
+      self, is_dkv
+  ):
+    bq = bkv = 128
+    # Segment 0 spans [0, 320) -> blocks 0, 1 are uniform (0..256), block 2
+    # [256, 384) straddles segment 0 and segment 1 [320, 512).
+    lengths = (320, 192)
+    seq_len = sum(lengths)
+    ids = _ids_from_lengths(lengths)
+    mask_info = _causal_mask_info(
+        seq_len, seq_len, bq, bkv, is_dkv=is_dkv, dynamic=True
+    )
+    refined, _, _ = self._refine(
+        mask_info,
+        _segment_ids(lengths),
+        seq_len=seq_len,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=is_dkv,
+        skip_uniform_segment_mask=True,
+    )
+    tiles = _scheduled_tiles(refined)
+    for (r, c), m in tiles.items():
+      if m == 3:
+        qi, kj = (c, r) if is_dkv else (r, c)
+        qs = ids[qi * bq : (qi + 1) * bq]
+        kvs = ids[kj * bkv : (kj + 1) * bkv]
+        self.assertTrue(
+            bool((qs[:, None] == kvs[None, :]).all()),
+            f"Tile {(r, c)} promoted to block_mask=3 despite mixed segments",
+        )
+    # Off-diagonal causal interior tile (q=1, kv=0) lies strictly inside seg 0
+    # and is promoted 2 -> 3, whereas (q=2, kv=0) straddles seg 0/1 in q and
+    # remains block_mask == 2 (never downgraded to causal-diagonal 1).
+    interior_coord = (0, 1) if is_dkv else (1, 0)
+    boundary_coord = (0, 2) if is_dkv else (2, 0)
+    self.assertEqual(tiles[(0, 0)], 1)
+    self.assertEqual(tiles[interior_coord], 3)
+    self.assertEqual(tiles[boundary_coord], 2)
+
+
+class SplashAttentionSegmentsInterpretTest(parameterized.TestCase):
+  """CPU `interpret=True` tests for segment skipping and FP8 `ds` casts."""
+
+  def setUp(self):
+    super().setUp()
+    if jax.default_backend() != "cpu":
+      self.skipTest("Interpret mode only supported on CPU.")
+
+  @parameterized.named_parameters(
+      ("default", False),
+      ("qk_diag_skip", True),
+  )
+  def test_skip_uniform_segment_mask_is_bit_exact(self, qk_diag_skip):
+    lengths = (300, 212, 390, 122)
+    seq_len, head_dim, bq, bkv = sum(lengths), 128, 128, 128
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(11), 4)
+    scale = jnp.bfloat16(0.25)
+    q = jax.random.normal(k1, (4, seq_len, head_dim), jnp.bfloat16) * scale
+    k = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    do = jax.random.normal(k4, (4, seq_len, head_dim), jnp.bfloat16) * scale
+    segment_ids = _segment_ids(lengths)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def _run(skip_uniform: bool):
+      cfg = splash.SplashConfig(
+          block_q=bq,
+          block_kv=bkv,
+          block_kv_compute=bkv,
+          block_q_dkv=bq,
+          block_kv_dkv=bkv,
+          block_kv_dkv_compute=bkv,
+          dq_reduction_steps=3,
+          qk_diag_skip=qk_diag_skip,
+          skip_uniform_segment_mask=skip_uniform,
+          interpret=True,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=cfg)
+      o, vjp_fn = jax.vjp(attn, q, k, v, segment_ids)
+      dq, dk, dv, _ = vjp_fn(do)
+      return o, dq, dk, dv
+
+    o_ref, dq_ref, dk_ref, dv_ref = _run(False)
+    o_opt, dq_opt, dk_opt, dv_opt = _run(True)
+    np.testing.assert_array_equal(o_opt, o_ref)
+    np.testing.assert_array_equal(dq_opt, dq_ref)
+    np.testing.assert_array_equal(dk_opt, dk_ref)
+    np.testing.assert_array_equal(dv_opt, dv_ref)
+
+  def test_fp8_qk_cast_s_to_v_and_bf16_dq_lhs_match_reference(self):
+    lengths = (300, 212, 512)
+    seq_len, head_dim, bq, bkv = sum(lengths), 128, 128, 256
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(19), 4)
+    q_bf16 = jax.random.normal(
+        k1, (4, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.25)
+    half = jnp.bfloat16(0.5)
+    k_bf16 = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16) * half
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16) * half
+    do = jax.random.normal(k4, (4, seq_len, head_dim), jnp.bfloat16) * half
+    segment_ids = _segment_ids(lengths)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    cfg = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=128,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=128,
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+        skip_uniform_segment_mask=True,
+        cast_s_to_v_dtype=True,
+        dq_reduction_steps=3,
+        interpret=True,
+    )
+    attn = splash.make_splash_mha_single_device(mask, config=cfg)
+
+    def _loss(q_in, k_in, v_in):
+      q_fp8 = (q_in * jnp.bfloat16(splash.LOG2E)).astype(jnp.float8_e4m3fn)
+      k_fp8 = k_in.astype(jnp.float8_e4m3fn)
+      o = attn(q_fp8, k_fp8, v_in, segment_ids)
+      return jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32)), o
+
+    (_, o), (dq, dk, dv) = jax.value_and_grad(
+        _loss, argnums=(0, 1, 2), has_aux=True
+    )(q_bf16, k_bf16, v)
+
+    dense_mask = jnp.asarray(mask[:, :])
+    q_qref = (
+        (q_bf16 * jnp.bfloat16(splash.LOG2E))
+        .astype(jnp.float8_e4m3fn)
+        .astype(jnp.float32)
+        / splash.LOG2E
+    )
+    k_qref = k_bf16.astype(jnp.float8_e4m3fn).astype(jnp.float32)
+    v32, do32 = v.astype(jnp.float32), do.astype(jnp.float32)
+    o_ref, stats_ref = base.attention_reference(
+        q_qref,
+        k_qref,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        is_mqa=False,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+        do32,
+        q_qref,
+        k_qref,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        o_ref,
+        stats_ref["logsumexp"],
+        is_mqa=False,
+    )
+    np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(dq, dq_ref, atol=3e-2, rtol=3e-2)
+    np.testing.assert_allclose(dk, dk_ref, atol=3e-2, rtol=3e-2)
+    np.testing.assert_allclose(dv, dv_ref, atol=3e-2, rtol=3e-2)
 
 
 class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
@@ -440,6 +631,123 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
     np.testing.assert_allclose(dq, dq_ref, atol=5e-2, rtol=5e-2)
     np.testing.assert_allclose(dk, dk_ref, atol=5e-2, rtol=5e-2)
     np.testing.assert_allclose(dv, dv_ref, atol=5e-2, rtol=5e-2)
+
+  @parameterized.named_parameters(
+      ("default", False),
+      ("qk_diag_skip", True),
+  )
+  def test_skip_uniform_segment_mask_real_kernel_is_bit_exact(
+      self, qk_diag_skip
+  ):
+    lengths = (300, 212, 390, 122)
+    seq_len, head_dim, bq, bkv = sum(lengths), 128, 128, 128
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(11), 4)
+    scale = jnp.bfloat16(0.25)
+    q = jax.random.normal(k1, (4, seq_len, head_dim), jnp.bfloat16) * scale
+    k = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    do = jax.random.normal(k4, (4, seq_len, head_dim), jnp.bfloat16) * scale
+    segment_ids = _segment_ids(lengths)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def _run(skip_uniform: bool):
+      cfg = splash.SplashConfig(
+          block_q=bq,
+          block_kv=bkv,
+          block_kv_compute=bkv,
+          block_q_dkv=bq,
+          block_kv_dkv=bkv,
+          block_kv_dkv_compute=bkv,
+          dq_reduction_steps=3,
+          qk_diag_skip=qk_diag_skip,
+          skip_uniform_segment_mask=skip_uniform,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=cfg)
+      o, vjp_fn = jax.vjp(attn, q, k, v, segment_ids)
+      dq, dk, dv, _ = vjp_fn(do)
+      return o, dq, dk, dv
+
+    o_ref, dq_ref, dk_ref, dv_ref = _run(False)
+    o_opt, dq_opt, dk_opt, dv_opt = _run(True)
+    np.testing.assert_array_equal(o_opt, o_ref)
+    np.testing.assert_array_equal(dq_opt, dq_ref)
+    np.testing.assert_array_equal(dk_opt, dk_ref)
+    np.testing.assert_array_equal(dv_opt, dv_ref)
+
+  def test_fp8_qk_cast_s_to_v_and_bf16_dq_lhs_match_reference(self):
+    lengths = (300, 212, 512)
+    seq_len, head_dim, bq, bkv = sum(lengths), 128, 128, 256
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(19), 4)
+    q_bf16 = jax.random.normal(
+        k1, (4, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.25)
+    half = jnp.bfloat16(0.5)
+    k_bf16 = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16) * half
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16) * half
+    do = jax.random.normal(k4, (4, seq_len, head_dim), jnp.bfloat16) * half
+    segment_ids = _segment_ids(lengths)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    cfg = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=128,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=128,
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+        skip_uniform_segment_mask=True,
+        cast_s_to_v_dtype=True,
+        dq_reduction_steps=3,
+    )
+    attn = splash.make_splash_mha_single_device(mask, config=cfg)
+
+    def _loss(q_in, k_in, v_in):
+      q_fp8 = (q_in * jnp.bfloat16(splash.LOG2E)).astype(jnp.float8_e4m3fn)
+      k_fp8 = k_in.astype(jnp.float8_e4m3fn)
+      o = attn(q_fp8, k_fp8, v_in, segment_ids)
+      return jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32)), o
+
+    (_, o), (dq, dk, dv) = jax.value_and_grad(
+        _loss, argnums=(0, 1, 2), has_aux=True
+    )(q_bf16, k_bf16, v)
+
+    dense_mask = jnp.asarray(mask[:, :])
+    q_qref = (
+        (q_bf16 * jnp.bfloat16(splash.LOG2E))
+        .astype(jnp.float8_e4m3fn)
+        .astype(jnp.float32)
+        / splash.LOG2E
+    )
+    k_qref = k_bf16.astype(jnp.float8_e4m3fn).astype(jnp.float32)
+    v32, do32 = v.astype(jnp.float32), do.astype(jnp.float32)
+    o_ref, stats_ref = base.attention_reference(
+        q_qref,
+        k_qref,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        is_mqa=False,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+        do32,
+        q_qref,
+        k_qref,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        o_ref,
+        stats_ref["logsumexp"],
+        is_mqa=False,
+    )
+    np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(dq, dq_ref, atol=3e-2, rtol=3e-2)
+    np.testing.assert_allclose(dk, dk_ref, atol=3e-2, rtol=3e-2)
+    np.testing.assert_allclose(dv, dv_ref, atol=3e-2, rtol=3e-2)
 
   def test_orphan_segment_empty_rows_write_zero_without_nan(self):
     # First half [0:256] has segment id 0 in both q and kv.
