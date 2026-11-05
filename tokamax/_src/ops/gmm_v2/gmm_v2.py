@@ -1325,7 +1325,7 @@ def calculate_tiling(
 
   # TODO: max number of bucket was choosen empiirically.
   # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 4
+  max_num_buckets = 8 if tpu_generation >= 8 else 4
   bucket_base = tile_m
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
@@ -1335,12 +1335,18 @@ def calculate_tiling(
       break
     tile_m = new_tile_m
 
-  lhs_buffer_count = (
-      3
-      if _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=3)
-      <= vmem_limit_bytes
-      else 2
-  )
+  # Up to this point, we have found tile_m, tile_n, tile_k for
+  # lhs_buffer_count == 2. So it's guaranteed the for loop below can find an
+  # available lhs_buffer_count.
+  max_lhs_buffers = 4 if tpu_generation >= 8 else 3
+  lhs_buffer_count = 2
+  for count in range(max_lhs_buffers, 2, -1):
+    if (
+        _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=count)
+        <= vmem_limit_bytes
+    ):
+      lhs_buffer_count = count
+      break
 
   return TileSizes(
       tile_m=tile_m,

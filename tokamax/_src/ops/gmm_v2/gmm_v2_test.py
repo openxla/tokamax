@@ -2508,6 +2508,81 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
     self.assertEqual(tiles_tight.tile_n, tiles_large.tile_n)
     self.assertEqual(tiles_tight.tile_k, tiles_large.tile_k)
 
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_calculate_tiling_tpu_gen8(self, mock_get_tpu_info):
+    mock_tpu_info = mock.create_autospec(
+        gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
+    )
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock_tpu_info.generation = 8
+    mock.seal(mock_tpu_info)
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    # 1. qwen_3_5_prefill_down: 81920 tokens, 64 groups of 1280
+    dims_down = gmm_v2.Dimensions(
+        size_m=81920,
+        size_k=1024,
+        size_n=4096,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs_down = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=1024,
+        is_transposed=False,
+    )
+    vmem_limit_bytes = int(192 * 1024 * 1024 * 0.9)
+    tiles_down = gmm_v2.calculate_tiling(
+        dims=dims_down,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_down,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # tile_m scales up to 2048 with max_num_buckets=8
+    self.assertGreaterEqual(tiles_down.tile_m, 1024)
+    self.assertEqual(tiles_down.bucket_base, 256)
+
+    # 2. qwen_3_5_prefill_conc8_gate_up: 163840 tokens, 64 groups of 2560
+    dims_conc8 = gmm_v2.Dimensions(
+        size_m=163840,
+        size_k=4096,
+        size_n=2048,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    rhs_cfgs_gateup = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=4096,
+        is_transposed=False,
+    )
+    tiles_conc8 = gmm_v2.calculate_tiling(
+        dims=dims_conc8,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_gateup,
+        vmem_limit_bytes=vmem_limit_bytes,
+        fuse_act="silu",
+    )
+    # tile_m scales beyond 4 buckets (1024) to 2048 with max_num_buckets=8
+    self.assertGreaterEqual(tiles_conc8.tile_m, 2048)
+    self.assertEqual(tiles_conc8.bucket_base, 256)
+    self.assertGreaterEqual(tiles_conc8.lhs_buffer_count, 3)
+
 
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.
