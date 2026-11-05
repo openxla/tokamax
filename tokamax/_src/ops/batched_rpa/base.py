@@ -47,9 +47,15 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      queries: Float[Array | AbstractArray, "total_q_tokens num_q_heads head_dim"],
-      keys: Float[Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"],
-      values: Float[Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"],
+      queries: Float[
+          Array | AbstractArray, "total_q_tokens num_q_heads head_dim"
+      ],
+      keys: Float[
+          Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"
+      ],
+      values: Float[
+          Array | AbstractArray, "total_q_tokens num_kv_heads head_dim"
+      ],
       kv_cache: Shaped[Array | AbstractArray, "..."],
       kv_lens: Int[Array | AbstractArray, "max_num_seqs"],
       page_indices: Int[Array | AbstractArray, "total_page_indices"],
@@ -71,7 +77,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       out_dtype: Any = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
-      kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: KVLayout | str | None = None,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
@@ -82,12 +88,19 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
     """Validates structural dimensions and binds input arguments."""
     total_q_tokens, num_q_heads, head_dim = queries.shape
     _, num_kv_heads, kv_head_dim = keys.shape
-    assert head_dim == kv_head_dim, f"Head dim mismatch: {head_dim} vs {kv_head_dim}"
+    assert (
+        head_dim == kv_head_dim
+    ), f"Head dim mismatch: {head_dim} vs {kv_head_dim}"
     assert num_q_heads % num_kv_heads == 0, (
-        f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads"
+        f" ({num_kv_heads})"
     )
-    assert keys.shape == values.shape, f"Keys {keys.shape} != Values {values.shape}"
-    assert cu_q_lens.shape[0] == kv_lens.shape[0] + 1, "cu_q_lens must have len(kv_lens) + 1"
+    assert (
+        keys.shape == values.shape
+    ), f"Keys {keys.shape} != Values {values.shape}"
+    assert (
+        cu_q_lens.shape[0] == kv_lens.shape[0] + 1
+    ), "cu_q_lens must have len(kv_lens) + 1"
 
     return super().bind(
         queries=queries,
@@ -150,7 +163,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       out_dtype: Any = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
-      kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: KVLayout | str | None = None,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
@@ -158,7 +171,9 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       return_lse: bool = False,
       return_residuals: bool = False,
       config: _Config | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
+  ) -> tuple[
+      tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None
+  ]:
     """Invokes standard reference implementation."""
     del config, return_residuals
     ref_res = reference.batched_ragged_paged_attention_reference(
@@ -186,7 +201,9 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
         debug_mode=debug_mode,
         decode_query_size=decode_query_size,
         skip_kv_update=skip_kv_update,
-        kv_layout=kv_layout,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE
+        if kv_layout is None
+        else kv_layout,
         cp_group_size=cp_group_size,
         cp_rank=cp_rank,
         attention_scope=attention_scope,

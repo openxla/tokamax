@@ -108,7 +108,8 @@ def batched_ragged_paged_attention_reference(
     queries: [total_q_tokens, num_q_heads, head_dim]
     keys: [total_q_tokens, num_kv_heads, head_dim]
     values: [total_q_tokens, num_kv_heads, head_dim]
-    kv_cache: [total_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim_aligned]
+    kv_cache: [total_pages, page_size, num_kv_heads_x2 // kv_packing,
+      kv_packing, head_dim_aligned]
     kv_lens: [max_num_seqs] sequence lengths for each request.
     page_indices: [max_num_seqs * pages_per_seq] page allocation mapping.
     cu_q_lens: [max_num_seqs + 1] cumulative query tokens per request.
@@ -117,13 +118,24 @@ def batched_ragged_paged_attention_reference(
     sm_scale: Softmax scaling factor (typically 1 / sqrt(head_dim)).
     sliding_window: Optional local attention window size.
     soft_cap: Optional tanh logit soft-capping factor.
+    mask_value: Optional attention mask value.
     out_dtype: Desired output data type.
     q_scale: Optional query quantization scale.
     k_scale: Optional key quantization scale.
+    v_scale: Optional value quantization scale.
+    decode_query_size: Query token block size for decode.
+    skip_kv_update: Whether to skip writing back KV cache.
+    kv_layout: Memory layout for KV cache.
+    cp_group_size: Size of CP group.
+    cp_rank: Device rank within CP group.
+    attention_scope: Scope of attention (FULL, CACHE_ONLY, NEW_TOKENS_ONLY).
+    return_lse: Whether to return logsumexp.
+    **unused_kwargs: Additional unused arguments.
 
   Returns:
     outputs: [total_q_tokens, num_q_heads, head_dim] attention outputs.
     updated_kv_cache: Updated KV cache buffer.
+    lse (optional): [total_q_tokens, num_q_heads] logsumexp values.
   """
   if out_dtype is None:
     out_dtype = queries.dtype
@@ -135,10 +147,17 @@ def batched_ragged_paged_attention_reference(
 
   if kv_cache.ndim != 5:
     raise ValueError(
-        f"kv_cache must be 5D, matching get_kv_cache_shape. Got {kv_cache.ndim}D with shape {kv_cache.shape}"
+        "kv_cache must be 5D, matching get_kv_cache_shape. Got"
+        f" {kv_cache.ndim}D with shape {kv_cache.shape}"
     )
 
-  total_pages, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned = kv_cache.shape
+  (
+      total_pages,
+      page_size,
+      num_kv_heads_x2_per_kv_packing,
+      kv_packing,
+      head_dim_aligned,
+  ) = kv_cache.shape
   num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
   merged_kv = _merge_kv(keys, values, kv_packing=kv_packing)
   max_num_seqs = kv_lens.shape[0]
@@ -167,18 +186,29 @@ def batched_ragged_paged_attention_reference(
 
   # Mask out invalid / padding tokens beyond active sequence count.
   active_count = distribution[-1]
-  valid_token = (token_indices < cu_q_lens[active_count]) & (seq_idx < active_count)
+  valid_token = (token_indices < cu_q_lens[active_count]) & (
+      seq_idx < active_count
+  )
 
   if not skip_kv_update:
     # Append a dummy page to absorb invalid token writes safely.
     dummy_page = jnp.zeros(
-        (1, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned), dtype=kv_cache.dtype
+        (
+            1,
+            page_size,
+            num_kv_heads_x2_per_kv_packing,
+            kv_packing,
+            head_dim_aligned,
+        ),
+        dtype=kv_cache.dtype,
     )
     padded_cache = jnp.concatenate([kv_cache, dummy_page], axis=0)
 
     safe_page_idx = jnp.where(valid_token, page_idx, total_pages)
     safe_page_offset = jnp.where(valid_token, page_offset, 0)
-    padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(merged_kv)
+    padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(
+        merged_kv
+    )
     updated_kv_cache = padded_cache[:total_pages]
   else:
     updated_kv_cache = kv_cache
@@ -188,7 +218,9 @@ def batched_ragged_paged_attention_reference(
   seq_kv_pages = updated_kv_cache[page_table]
   flat_kv = seq_kv_pages.reshape(
       max_num_seqs, max_kv_len, num_kv_heads_x2, head_dim_aligned
-  )[:, :, : actual_num_kv_heads * 2]  # Drop the kv_packing padding heads.
+  )[
+      :, :, : actual_num_kv_heads * 2
+  ]  # Drop the kv_packing padding heads.
 
   all_k = flat_kv[:, :, 0::2, :actual_head_dim]
   all_v = flat_kv[:, :, 1::2, :actual_head_dim]
@@ -196,11 +228,25 @@ def batched_ragged_paged_attention_reference(
   all_k = jnp.repeat(all_k, actual_num_q_heads_per_kv_head, axis=2)
   all_v = jnp.repeat(all_v, actual_num_q_heads_per_kv_head, axis=2)
 
-  scaled_queries = queries / q_scale if q_scale is not None else queries
-  if k_scale is not None:
-    all_k = all_k / k_scale
-  if v_scale is not None:
-    all_v = all_v / v_scale
+  if q_scale is not None:
+    scaled_queries = queries / q_scale
+    if (
+        jnp.issubdtype(keys.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(keys.dtype) == 8
+    ):
+      scaled_queries = jnp.clip(
+          scaled_queries,
+          float(jnp.finfo(keys.dtype).min),
+          float(jnp.finfo(keys.dtype).max),
+      ).astype(keys.dtype)
+  else:
+    scaled_queries = queries
+
+  effective_mask_value = (
+      float(jnp.finfo(jnp.dtype(out_dtype)).min)
+      if mask_value is None
+      else mask_value
+  )
 
   # Step 3: Compute attention per query token.
   def compute_single_token(t: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -209,9 +255,14 @@ def batched_ragged_paged_attention_reference(
     k_s = all_k[s]
     v_s = all_v[s]
 
-    scores = jnp.einsum(
-        "hd,khd->hk", q_t, k_s, preferred_element_type=jnp.float32
-    ) * sm_scale
+    scores = (
+        jnp.einsum("hd,khd->hk", q_t, k_s, preferred_element_type=jnp.float32)
+        * sm_scale
+    )
+    if k_scale is not None:
+      scores = scores * k_scale
+    if q_scale is not None:
+      scores = scores * q_scale
 
     if soft_cap is not None:
       scores = soft_cap * jnp.tanh(scores / soft_cap)
@@ -223,20 +274,27 @@ def batched_ragged_paged_attention_reference(
     if sliding_window is not None:
       mask = mask & (k_positions > token_kv_pos[t] - sliding_window)
 
-    scores = jnp.where(mask[None, :], scores, -1e30)
-    lse = jax.nn.logsumexp(scores, axis=-1).astype(jnp.float32)
+    scores = jnp.where(mask[None, :], scores, effective_mask_value)
+    lse = jax.nn.logsumexp(scores, axis=-1).astype(out_dtype)
     weights = jax.nn.softmax(scores, axis=-1).astype(out_dtype)
 
     token_out = jnp.einsum(
         "hk,khd->hd", weights, v_s, preferred_element_type=jnp.float32
-    ).astype(out_dtype)
+    )
+    if v_scale is not None:
+      token_out = token_out * v_scale
+    token_out = token_out.astype(out_dtype)
     return token_out, lse
 
   token_outputs, token_lses = jax.vmap(compute_single_token)(token_indices)
-  outputs = jnp.where(valid_token[:, None, None], token_outputs, jnp.zeros_like(token_outputs))
+  outputs = jnp.where(
+      valid_token[:, None, None], token_outputs, jnp.zeros_like(token_outputs)
+  )
 
   if return_lse:
-    lse = jnp.where(valid_token[:, None], token_lses, jnp.full_like(token_lses, -jnp.inf))
+    lse = jnp.where(
+        valid_token[:, None], token_lses, jnp.full_like(token_lses, -jnp.inf)
+    )
     return outputs, updated_kv_cache, lse
 
   return outputs, updated_kv_cache
