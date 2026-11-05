@@ -545,14 +545,16 @@ def _store_via_swizzled_smem(
       (rows, epi_cols), out_dtype, swizzle=epi_swizzle
   )
   for c0 in range(0, cols, epi_cols):
-    plgpu.store(
+    mgpu_lib.store(
         epi_smem,
         val[:, c0 : c0 + epi_cols].astype(out_dtype),
         optimized=False,
     )
     mgpu_lib.warpgroup_barrier()
     staged = plgpu.load(epi_smem, layout=copy_layout, optimized=False)
-    plgpu.store(gmem_ref.at[:, pl.ds(c0, epi_cols)], staged, optimized=False)
+    mgpu_lib.store(
+        gmem_ref.at[:, pl.ds(c0, epi_cols)], staged, optimized=False
+    )
     if c0 + epi_cols < cols:
       mgpu_lib.warpgroup_barrier()
 
@@ -988,8 +990,8 @@ def flash_attention_kernel(
           l_empty = plgpu.layout_cast(
               jnp.zeros((wg_q,), jnp.float32), mma_row
           )
-          plgpu.store(m_gmem.at[hi, qs], m_empty, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_empty, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_empty, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_empty, optimized=False)
 
       @pl.when(cta_active)
       def _active_q_parallel():
@@ -1352,8 +1354,8 @@ def flash_attention_kernel(
               finfo_min,
               m_final * (1.0 / math.log2(math.e)),
           )
-          plgpu.store(m_gmem.at[hi, qs], m_out, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_final, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_out, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_final, optimized=False)
 
         _write_output_epilogue(
             out_gtile,
@@ -1419,8 +1421,8 @@ def flash_attention_kernel(
           l_empty = plgpu.layout_cast(
               jnp.zeros((block_q,), jnp.float32), mma_row
           )
-          plgpu.store(m_gmem.at[hi, qs], m_empty, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_empty, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_empty, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_empty, optimized=False)
 
       @pl.when(wg == 1)
       def _z1():
@@ -1558,8 +1560,8 @@ def flash_attention_kernel(
               finfo_min,
               m_final * (1.0 / math.log2(math.e)),
           )
-          plgpu.store(m_gmem.at[hi, qs], m_out, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_final, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_out, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_final, optimized=False)
         _cta_barrier()
         _write_output_epilogue(
             out_gtile.at[:, pl.ds(0, v_split0)],

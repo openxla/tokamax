@@ -383,14 +383,16 @@ def _store_swizzled(
       (rows, buf_cols), out_dtype, swizzle=swizzle
   )
   for c0 in range(0, cols, buf_cols):
-    plgpu.store(
+    mgpu_lib.store(
         smem_buf,
         val[:, c0 : c0 + buf_cols].astype(out_dtype),
         optimized=False,
     )
     mgpu_lib.warpgroup_barrier()
     staged = plgpu.load(smem_buf, layout=copy_layout, optimized=False)
-    plgpu.store(gmem_ref.at[:, pl.ds(c0, buf_cols)], staged, optimized=False)
+    mgpu_lib.store(
+        gmem_ref.at[:, pl.ds(c0, buf_cols)], staged, optimized=False
+    )
     if c0 + buf_cols < cols:
       mgpu_lib.warpgroup_barrier()
 
@@ -747,7 +749,7 @@ def flash_attention_vjp_kernel(
       z_ds = plgpu.layout_cast(
           jnp.zeros((block_q_dq, block_kv_dq), jnp.float32), mma_acc
       )
-      plgpu.store(ds_smems.at[wg], z_ds.astype(ds_dtype), optimized=False)
+      mgpu_lib.store(ds_smems.at[wg], z_ds.astype(ds_dtype), optimized=False)
       mgpu_lib.warpgroup_barrier()
       copy_layout = plgpu.Layout.SMEM_GMEM_COPY(
           (block_q_dq, block_kv_dq), ds_dtype, swizzle=ds_swizzle
@@ -758,7 +760,7 @@ def flash_attention_vjp_kernel(
 
       def _z_body(ki, _):
         ks = pl.ds(ki * block_kv_dq, block_kv_dq)
-        plgpu.store(ds_gmem.at[hi, qs, ks], staged_zero, optimized=False)
+        mgpu_lib.store(ds_gmem.at[hi, qs, ks], staged_zero, optimized=False)
         return None
 
       lax.fori_loop(lo_ki, hi_ki, _z_body, None)
@@ -1644,7 +1646,7 @@ def flash_attention_vjp_kernel(
                   mask_smem,
                   apply_idx=apply_idx,
               )
-              plgpu.store(pt_smem, p_t.astype(dtype), optimized=False)
+              mgpu_lib.store(pt_smem, p_t.astype(dtype), optimized=False)
               _cta_barrier()
 
               dp_t = plgpu.load(dpt_smem, layout=mma_acc, optimized=False)
@@ -1708,7 +1710,7 @@ def flash_attention_vjp_kernel(
                 mma_lhs,
                 mma_rhs,
             )
-            plgpu.store(dpt_smem, dp_t, optimized=False)
+            mgpu_lib.store(dpt_smem, dp_t, optimized=False)
             _cta_barrier()
 
             pt_lhs = plgpu.load(pt_smem, layout=mma_lhs)

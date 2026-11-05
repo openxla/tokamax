@@ -731,6 +731,10 @@ class PallasMosaicGpuTriangleMultiplicationTest(parameterized.TestCase):
         )
 
   @parameterized.parameters(64, 128)
+  @absltest.skip(
+      "The Mosaic GPU interpreter in released JAX does not support wgmma with"
+      " A in registers."
+  )
   def test_mosaic_gpu_race_detection(self, c):
     params = _get_params(n=16, c=c, h=64, d=64, dtype=jnp.bfloat16)
     interpret_params = plgpu.InterpretGPUParams(detect_races=True)
