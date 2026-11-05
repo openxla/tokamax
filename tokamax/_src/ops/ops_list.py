@@ -691,9 +691,14 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/gated_linear_unit/base.py",
             ),
             Impl(
-                name="mosaic",
+                name="mosaic_gpu",
                 backend=MOSAIC_GPU,
                 module="_src/ops/gated_linear_unit/pallas_mosaic_gpu.py",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/gated_linear_unit/pallas_mosaic_tpu.py",
             ),
             Impl(
                 name="triton",
