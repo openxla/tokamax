@@ -600,6 +600,20 @@ SHARDS: ShardMap = {
         ),
         minutes=1,
     ),
+    'experimental-ragged-causal-conv1d': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/ragged_causal_conv1d/causal_conv1d_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
+    'experimental-ssd-scan': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/ssd_scan/ssd_scan_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
     # Separated from experimental-topk-kernel to isolate TPU-only tests.
     'experimental-topk': Spec(
         paths=(
