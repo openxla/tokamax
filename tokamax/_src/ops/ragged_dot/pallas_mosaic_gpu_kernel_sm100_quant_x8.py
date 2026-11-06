@@ -928,10 +928,6 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
     )
   else:
     out_type = jax.ShapeDtypeStruct((m, n), jnp.bfloat16)
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   if epilogue_quant_enabled:
     kernel_name = "ragged_dot_fp8_quant_fused_output_sm100"
@@ -957,7 +953,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
           unsafe_no_auto_barriers=True,
           profile_space=250 if profile else 0,
           profile_dir="sponge" if profile else "",
-          lowering_semantics=lowering_semantics,
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
       ),
   )
   out = f(

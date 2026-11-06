@@ -738,6 +738,11 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/triangle_multiplication/pallas_mosaic_gpu.py",
             ),
             Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/triangle_multiplication/pallas_mosaic_tpu.py",
+            ),
+            Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/triangle_multiplication/triton.py",

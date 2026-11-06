@@ -49,8 +49,7 @@ def strided_load_bkv(
     # kv_ref must be annotated with no_hazard_no_deps so XLA knows not to add a
     # dependency between the HBM->VMEM DMA copy-in from stage n - 1 and the vld
     # instructions for matmuls at stage n.
-    if jax.__version_info__ >= (0, 11, 2):
-        kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
+    kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
 
     if cfgs.serve.packing_kv == 1:
         k = utils.strided_load(
@@ -441,8 +440,7 @@ def rpa_body(
     del slot
 
     # pyrefly: ignore[bad-assignment]
-    if jax.__version_info__ >= (0, 11, 2):
-        kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+    kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
 
     # Step 1: Fetch the metadata the stitch needs. Everything the mask needs is
     # deferred until after the fence below, so it does not gate the writeback.
