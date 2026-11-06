@@ -15,12 +15,16 @@
 """Benchmark and autotuning argument specifications for Batched RPA."""
 
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.autotuning import arg_spec
+
+# sm_scale bound in every arg spec. BatchedRpa uses it in its autotuning cache
+# key, since sm_scale does not change which config is fastest.
+SM_SCALE: Final[float] = 1.0
 
 
 class HashableNPArray(np.ndarray):
@@ -161,6 +165,7 @@ def _make_rpa_spec(
           page_indices=page_indices,
           cu_q_lens=cu_q_lens,
           distribution=distribution,
+          sm_scale=SM_SCALE,
       ),
       project=project,
       name=name,
