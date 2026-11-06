@@ -49,8 +49,9 @@ all-zero weights, per-shard sums). This file checks the same things here:
 Modes (hw_util): by default the kernels run on CPU devices in Pallas TPU
 interpret mode at small shapes (16 devices as two boards of 8 or four boards
 of 4, D = F = 256, E = 64, K = 4); on TPU v8i they run on the host's devices
-at large shapes (D = 8192, F = 2048, K = 10, 32 experts per device) and the
-full t_local sweep, with De-Dup only where the host holds two boards.
+at large shapes (D = 8192, F = 2048, K = 10, 32 experts per device; on TPU v7x
+D = 4096, F = 1024, which fits its VMEM) and the full t_local sweep, with
+De-Dup only where the host holds two boards.
 """
 
 import itertools
@@ -108,6 +109,9 @@ MONO_T = 16
 COMBINE_HIDDEN = 256
 # CPU: two 512-column chunks of the intermediate.
 FFN_HIDDEN, FFN_INTER = 512, 1024
+# The hardware expert shape on TPU v7x, whose VMEM cannot hold one 8192x2048
+# bf16 expert (setUpModule).
+V7X_HIDDEN, V7X_INTER = 4096, 1024
 # The monolithic option matrix: one board on CPU.
 MONO_EP_CPU = 8
 FMTS = ("fp8", "bf16")
@@ -131,6 +135,10 @@ def setUpModule():
   ON_HW = hw_util.on_hardware()
   if ON_HW:
     HIDDEN, INTER, TOPK = 8192, 2048, 10
+    if not hw_util.on_v8i():
+      # One bf16 expert of 8192x2048 weights alone (96MiB) exceeds TPU v7x's
+      # VMEM; keep the large-shape cases at an expert size that fits.
+      HIDDEN, INTER = V7X_HIDDEN, V7X_INTER
     G_LOCAL = 32
     CAPACITY = 128
     EDGE_T = 128
@@ -223,7 +231,7 @@ class LayerCorrectnessTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
 
   def _setup(self, layout):
@@ -411,7 +419,7 @@ class MonolithicOptionsTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
     self.ep = _hw_layout()[0] if ON_HW else MONO_EP_CPU
     self.mesh = hw_util.make_mesh(self.ep, self)
@@ -632,7 +640,7 @@ class CombineTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
 
   @parameterized.named_parameters(*_combine_cases())
@@ -774,7 +782,7 @@ class ExpertFfnTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   @parameterized.named_parameters(*_ffn_cases())
   def test_expert_ffn_matches_reference(self, fmt, act_fn, bias, m):

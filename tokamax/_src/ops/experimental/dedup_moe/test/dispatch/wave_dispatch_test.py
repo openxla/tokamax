@@ -139,7 +139,7 @@ class WaveDispatchPlanTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   def test_experts_are_visited_fewest_rows_first_and_empties_last(self):
     hist = np.array([[5, 0, 2, 2], [0, 0, 0, 0], [1, 9, 3, 0]])
@@ -368,7 +368,7 @@ class WaveDispatchLayerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     if "mesh" not in self._cache:
       mesh = hw_util.make_mesh(_shapes().ep, self)
       self._cache["mesh"] = mesh
@@ -449,7 +449,7 @@ class WaveDispatchRejectionTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   def _args(self, ep):
     mesh = Mesh(np.asarray(interpret_util.cpu_devices(ep)), axis_names=(AXIS,))

@@ -134,7 +134,7 @@ class WavePlanTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   @parameterized.named_parameters(*_plan_cases())
   def test_waves_match_the_model_and_the_kernel_reads_them_back(
@@ -219,7 +219,7 @@ class WaveExchangeTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   @parameterized.named_parameters(*_exchange_cases())
   def test_every_needed_row_lands_once_in_its_first_wave(
@@ -348,7 +348,7 @@ class WaveOrderLayerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     if "mesh" not in self._cache:
       mesh = hw_util.make_mesh(_shapes().ep, self)
       self._cache["mesh"] = mesh
