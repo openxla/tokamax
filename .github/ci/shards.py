@@ -646,6 +646,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/mosaic_gpu_test.py',
             'tokamax/_src/numerics_test.py',
             'tokamax/_src/ops/op_test.py',
+            'tokamax/_src/ops/ops_list_test.py',
             'tokamax/_src/precision_test.py',
             'tokamax/_src/pydantic_test.py',
             'tokamax/_src/shape_test.py',
