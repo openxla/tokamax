@@ -458,7 +458,7 @@ def flash_attention_kernel(
       ub = kv_seq_len // block_kv
 
       if is_causal:
-        ub = lax.min(ub, pl.cdiv(q_base_cluster + block_q, block_kv))
+        ub = lax.min(ub, mgpu_lib.ucdiv(q_base_cluster + block_q, block_kv))
 
       def load_k_bound(k_range_ref):
         idx = (
@@ -471,13 +471,13 @@ def flash_attention_kernel(
         k_start_max = None
       else:
         k_start_min, k_start_max = map(load_k_bound, k_start_minmax_gmems)
-        lb = lax.max(lb, lax.div(k_start_min, block_kv))
+        lb = lax.max(lb, mgpu_lib.udiv(lax.max(k_start_min, 0), block_kv))
 
       if k_end_minmax_gmems is None:
         k_end_min = None
       else:
         k_end_min, k_end_max = map(load_k_bound, k_end_minmax_gmems)
-        ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
+        ub = lax.min(ub, mgpu_lib.ucdiv(lax.max(k_end_max, 0), block_kv))
 
       @pl.when(wg == _MMA_TMA_WG)
       def mma_tma_wg():
@@ -489,7 +489,7 @@ def flash_attention_kernel(
         )
 
         def tma_load_kv_warp(gmem, smem, produced, consumed, partition_axis):
-          kv_head = lax.div(hi, q_heads_per_kv_head)
+          kv_head = mgpu_lib.udiv(hi, q_heads_per_kv_head)
           block_d = gmem.shape[-1] // num_tma_splits
           if collective:
             leader_tracked = plgpu.CopyPartition.PARTITIONED(partition_axis)
@@ -504,7 +504,7 @@ def flash_attention_kernel(
 
           @pl.loop(lb, ub)
           def kv_loop(ki):
-            si = lax.rem(prev_iters + ki - lb, num_stages)
+            si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
             ks = pl.ds(ki * block_kv, block_kv)
 
             for i in range(num_tma_splits):
@@ -520,7 +520,7 @@ def flash_attention_kernel(
 
         def qk_mma(ki):
           block_d = head_dim // num_tma_splits
-          si = lax.rem(prev_iters + ki - lb, num_stages)
+          si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
 
           with jax.named_scope("wait_k"):
             plgpu.barrier_wait(s_consumed)
@@ -543,8 +543,8 @@ def flash_attention_kernel(
 
         def pv_mma(ki):
           block_d = head_dim_out // num_tma_splits
-          v_si = lax.rem(prev_iters + ki - lb, num_stages)
-          p_si = lax.rem(prev_iters + ki - lb, 2)
+          v_si = mgpu_lib.urem(prev_iters + ki - lb, num_stages)
+          p_si = mgpu_lib.urem(prev_iters + ki - lb, 2)
 
           with jax.named_scope("wait_v"):
             plgpu.barrier_wait(v_produced.at[v_si])
@@ -732,7 +732,7 @@ def flash_attention_kernel(
 
           def kv_loop(ki, carry, *, do_causal=False):
             m_scale, m_i, l_i = carry
-            si = lax.rem(prev_iters + ki - lb, 2)
+            si = mgpu_lib.urem(prev_iters + ki - lb, 2)
             with jax.named_scope("Q@K"):
               plgpu.barrier_wait(s_produced)
             with jax.named_scope("load_qk"):
@@ -868,7 +868,7 @@ def flash_attention_kernel(
 
         @pl.loop(lb + 1, ub)
         def kv_loop(ki):
-          si = lax.rem(prev_iters + ki - lb, alpha_smem.shape[0])
+          si = mgpu_lib.urem(prev_iters + ki - lb, alpha_smem.shape[0])
           plgpu.barrier_wait(pv_mma_produced)
           tile_d = 32
 
@@ -951,7 +951,7 @@ def flash_attention_kernel(
 
             def load_acc_tiles():
               for di in range(num_d_tiles):
-                si = lax.rem(epi_slot_offset + di, num_epi_slots)
+                si = mgpu_lib.urem(epi_slot_offset + di, num_epi_slots)
                 ds = slice(di * epi_tile_d, (di + 1) * epi_tile_d)
                 acc = plgpu.async_load_tmem(acc_tmem.at[:, ds], layout=_TCGEN05)
                 yield ds, si, acc
@@ -969,7 +969,7 @@ def flash_attention_kernel(
               m_gmem[hi, qs] = jnp.full_like(m_gmem.at[hi, qs], -jnp.inf)
               l_gmem[hi, qs] = jnp.zeros_like(l_gmem.at[hi, qs])
 
-            si = lax.rem(epi_slot_offset, num_epi_slots)
+            si = mgpu_lib.urem(epi_slot_offset, num_epi_slots)
             plgpu.wait_smem_to_gmem(num_epi_slots - 1, wait_read_only=True)
             o_smem[si] = jnp.zeros_like(o_smem.at[si])
             plgpu.commit_smem()

@@ -115,7 +115,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
             def tma_loop(ki):
               ks = pl.ds(ki * block_k, block_k)
               step = carry * k_iters + ki
-              si = lax.rem(step, num_stages)
+              si = mgpu_lib.urem(step, num_stages)
 
               @pl.when(step >= num_stages)
               def _():
@@ -142,7 +142,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
           @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0))
           def mma_warp():
-            si_acc = lax.rem(carry, jnp.int32(2))
+            si_acc = mgpu_lib.urem(carry, jnp.int32(2))
             ms_acc = pl.ds(si_acc * cluster_block_m, cluster_block_m)
 
             @pl.when(carry > 1)
@@ -152,7 +152,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
             @pl.loop(0, k_iters)
             def mma_loop_body(ki):
-              si_tma = lax.rem(carry * k_iters + ki, num_stages)
+              si_tma = mgpu_lib.urem(carry * k_iters + ki, num_stages)
               with jax.named_scope("wait for xw"):
                 plgpu.barrier_wait(xw_barrier.at[si_tma])
               with jax.named_scope("issuing mma"):
@@ -171,7 +171,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
         @pl.when(wg == _EPILOGUE_WG)
         def epilogue_wg():
-          si = lax.rem(carry, jnp.int32(2))
+          si = mgpu_lib.urem(carry, jnp.int32(2))
           plgpu.barrier_wait(acc_barrier.at[si])
           with jax.named_scope("tmem -> smem"):
             ms_acc = pl.ds(si * cluster_block_m, cluster_block_m)
