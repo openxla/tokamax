@@ -276,6 +276,42 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         expect_supported=self._supports_bias and self._supports_mask,
     )
 
+  @parameterized.product(
+      head_dim=(8, 16, 24, 32, 48, 72),
+      dtype_and_precision=(
+          (jnp.bfloat16, None),
+          (jnp.float16, None),
+          (jnp.float32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+      ),
+  )
+  def test_head_dim_not_a_multiple_of_64_vjp(
+      self, head_dim, dtype_and_precision
+  ):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    dtype, precision = dtype_and_precision
+    impl_kwargs = {} if precision is None else {"precision": precision}
+    self._run_test(
+        q_shape=(2, 128, 4, head_dim),
+        dtype=dtype,
+        impl_kwargs=impl_kwargs,
+        atol=0.02,
+        atol_grads=0.04,
+    )
+
+  def test_head_dim_not_a_multiple_of_64_bias_and_mask_vjp(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    self._run_test(
+        q_shape=(2, 128, 4, 32),
+        bias_shape=(1, 4, 128, 128),
+        mask_shape=(2, 1, 1, 128),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+        atol_grads=0.04,
+        expect_supported=self._supports_bias,
+    )
+
   def test_unaligned_seq_q_vjp(self):
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
