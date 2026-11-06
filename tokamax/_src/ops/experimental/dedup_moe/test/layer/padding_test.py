@@ -134,7 +134,7 @@ class PaddingTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
     self.mesh = hw_util.make_mesh(self.ep, self)
 
@@ -314,7 +314,7 @@ class RowquantBarrierTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
 
   @parameterized.parameters(("fp8", True), ("bf16", False))
   def test_quantized_rows_pass_an_optimization_barrier(self, fmt, want):
