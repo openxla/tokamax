@@ -47,6 +47,10 @@ TEST_FILE_PREFIX: Final[str] = 'test_'
 # Non-Python files that do not affect test execution.
 INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
 
+# Files under these directories never affect a test, whatever their type.
+# `docs/` is the documentation site, which nothing in the package reads.
+INERT_DIRS: Final[tuple[str, ...]] = ('docs/',)
+
 # Workflows other than ci-build.yml are inert: CI-Build never calls them, and
 # `deps_test.py` checks that it calls no local workflow or action.
 WORKFLOWS_DIR: Final[str] = '.github/workflows/'
@@ -348,8 +352,8 @@ def full_run_reason(
 ) -> str | None:
   """Returns why `changed` requires running every shard, or None.
 
-  Files with an `INERT_SUFFIXES` suffix and workflows other than
-  `CI_BUILD_WORKFLOW` never force a full run. Any unparsed file does, whether
+  Files with an `INERT_SUFFIXES` suffix or under `INERT_DIRS`, and workflows
+  other than `CI_BUILD_WORKFLOW`, never force a full run. Any unparsed file does, whether
   or not it changed. Of the deleted `.py` files (changed paths missing from
   `known`), only an `__init__.py` forces one. With `known=None`, every changed
   `__init__.py` forces one, since a deletion cannot be ruled out.
@@ -375,7 +379,7 @@ def full_run_reason(
     )
 
   for path in sorted(changed):
-    if path.endswith(INERT_SUFFIXES):
+    if path.endswith(INERT_SUFFIXES) or path.startswith(INERT_DIRS):
       continue
     if path.startswith(WORKFLOWS_DIR) and path != CI_BUILD_WORKFLOW:
       continue
