@@ -99,7 +99,11 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
     self._assert_one_call_per_kernel(g_remat_lowered)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+    # `g_ref` runs eagerly and `g_remat` under jit, so the final sum can
+    # reduce in a different order.
+    chex.assert_trees_all_close(
+        g_out, g_ref(x, scale, offset), rtol=1e-6, atol=1e-6
+    )
 
   def test_remat_with_vmap(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
@@ -121,7 +125,11 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
     self._assert_one_call_per_kernel(g_remat_lowered)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+    # `g_ref` runs eagerly and `g_remat` under jit, so the final sum can
+    # reduce in a different order.
+    chex.assert_trees_all_close(
+        g_out, g_ref(x, scale, offset), rtol=1e-6, atol=1e-6
+    )
 
   def test_vmap_large_batch(self):
     # More blocks than CUDA allows along grid axes 1 and 2.
