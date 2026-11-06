@@ -50,11 +50,10 @@ def find_bounds(
 def dkv_q_blocks_are_contiguous(
     mask_info: 'MaskInfo', q_blocks_per_shard: int
 ) -> bool:
-  """Returns whether VMEM dq reduction (`dq_reduction_steps=1`) is safe.
+  """Returns whether the dkv grid visits each q block in one contiguous run.
 
-  It keeps a q block's dq in VMEM across consecutive dkv grid steps and writes
-  it once, so in every shard each q block must appear in exactly one run of
-  consecutive steps. Trivially true without a dynamic grid, where it is unused.
+  In every shard each q block must appear in a single run of consecutive steps.
+  Trivially true without a dynamic grid.
 
   Args:
     mask_info: dKV `MaskInfo` with concrete (non-traced) arrays.
