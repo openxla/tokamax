@@ -197,6 +197,13 @@ def _module_op_dir(module: str) -> str | None:
   return None
 
 
+def _top_level_class_names(file_path: pathlib.Path) -> set[str]:
+  tree = _parse_source_file(file_path)
+  return {
+      node.name for node in tree.body if isinstance(node, ast.ClassDef)
+  }
+
+
 class OpsListTest(absltest.TestCase):
   """Tests verifying ops_list manifest integrity and consistency."""
 
@@ -518,6 +525,56 @@ class OpsListTest(absltest.TestCase):
             f"Impl {impl.module} resolves to {impl_op_dir}, expected"
             f" {op.op_dir}",
         )
+
+  def test_impl_cls_defined_in_module(self):
+    google_dir_exists = (_TOKAMAX_ROOT / "google").is_dir()
+    for op_entry in ops_list.OPS:
+      base_path = _TOKAMAX_ROOT / f"_src/ops/{op_entry.op_dir}/base.py"
+      has_base = base_path.is_file()
+      for impl in op_entry.impls:
+        if has_base:
+          self.assertIsNotNone(
+              impl.cls,
+              f"Op '{op_entry.name}' has base.py so impl '{impl.name}' must set"
+              " cls",
+          )
+        if impl.cls is None:
+          continue
+        if impl.module.startswith("google/") and not google_dir_exists:
+          continue
+        class_names = _top_level_class_names(_TOKAMAX_ROOT / impl.module)
+        self.assertIn(
+            impl.cls,
+            class_names,
+            f"Class '{impl.cls}' for op '{op_entry.name}' impl '{impl.name}'"
+            f" not found in '{impl.module}'",
+        )
+
+  def test_impl_cls_validation(self):
+    impl = ops_list.Impl(
+        name="xla",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttention",
+    )
+    self.assertEqual(impl.cls, "DotProductAttention")
+
+    no_cls_impl = ops_list.Impl(
+        name="raw",
+        backend=ops_list.XLA,
+        module="_src/ops/gmm_v2/gmm_v2.py",
+    )
+    self.assertIsNone(no_cls_impl.cls)
+
+    for bad_cls in ("", "not an identifier", "123invalid", cast(Any, 123)):
+      with self.subTest(bad_cls=bad_cls):
+        with self.assertRaises(ValueError):
+          ops_list.Impl(
+              name="xla",
+              backend=ops_list.XLA,
+              module="_src/ops/attention/base.py",
+              cls=bad_cls,
+          )
 
 
 if __name__ == "__main__":
