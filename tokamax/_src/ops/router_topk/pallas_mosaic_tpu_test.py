@@ -166,7 +166,7 @@ class PallasMosaicTpuKernelTest(parameterized.TestCase):
   def test_interpret_matches_compiled(self, rows):
     """Upstream gates the kernel in interpret mode; check it agrees."""
     scores = jnp.asarray(test_base.make_scores(rows))
-    iw, ii = pallas_mosaic_tpu_kernel.select(scores, 10, interpret=True)
+    iw, ii = pallas_mosaic_tpu_kernel.select(scores, 10, interpret=pltpu.InterpretParams())
     kw, ki = pallas_mosaic_tpu_kernel.select(scores, 10)
     rw, ri = test_base.reference_topk(scores)
     np.testing.assert_array_equal(iw, rw)
