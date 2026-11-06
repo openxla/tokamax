@@ -197,6 +197,55 @@ def _module_op_dir(module: str) -> str | None:
   return None
 
 
+def _top_level_class_names(file_path: pathlib.Path) -> set[str]:
+  tree = _parse_source_file(file_path)
+  return {
+      node.name for node in tree.body if isinstance(node, ast.ClassDef)
+  }
+
+
+def _called_vjp_class(call: ast.Call) -> str | None:
+  if isinstance(call.func, ast.Name) and call.func.id.endswith("Vjp"):
+    return call.func.id
+  if isinstance(call.func, ast.Attribute) and call.func.attr.endswith("Vjp"):
+    return call.func.attr
+  return None
+
+
+def _default_vjp_classes_in_method(method: ast.FunctionDef) -> set[str]:
+  vjp_classes: set[str] = set()
+  for node in ast.walk(method):
+    if isinstance(node, ast.Call):
+      vjp_cls = _called_vjp_class(node)
+      if vjp_cls is not None:
+        vjp_classes.add(vjp_cls)
+  return vjp_classes
+
+
+def _default_vjp_classes(file_path: pathlib.Path, cls_name: str) -> set[str]:
+  tree = _parse_source_file(file_path)
+  for node in tree.body:
+    if not isinstance(node, ast.ClassDef) or node.name != cls_name:
+      continue
+    for item in node.body:
+      if isinstance(item, ast.FunctionDef) and item.name == "__post_init__":
+        return _default_vjp_classes_in_method(item)
+  return set()
+
+
+def _forward_impls_with_source(
+    op_entry: ops_list.Op, google_dir_exists: bool
+) -> list[ops_list.Impl]:
+  result: list[ops_list.Impl] = []
+  for impl in op_entry.impls:
+    if impl.vjp or impl.cls is None:
+      continue
+    if impl.module.startswith("google/") and not google_dir_exists:
+      continue
+    result.append(impl)
+  return result
+
+
 class OpsListTest(absltest.TestCase):
   """Tests verifying ops_list manifest integrity and consistency."""
 
@@ -366,10 +415,11 @@ class OpsListTest(absltest.TestCase):
       if not api_full_path.is_file():
         continue
 
-      all_names = frozenset(impl.name for impl in op_entry.impls)
+      forward_impls = [impl for impl in op_entry.impls if not impl.vjp]
+      all_names = frozenset(impl.name for impl in forward_impls)
       oss_names = frozenset(
           impl.name
-          for impl in op_entry.impls
+          for impl in forward_impls
           if not impl.module.startswith("google/")
       )
       api_tree = _parse_source_file(api_full_path)
@@ -499,11 +549,12 @@ class OpsListTest(absltest.TestCase):
       self.assertNotEmpty(
           op.impls, f"Op '{op.name}' must have at least one implementation"
       )
-      modules = [impl.module for impl in op.impls]
+      module_cls_pairs = [(impl.module, impl.cls) for impl in op.impls]
       self.assertCountEqual(
-          modules,
-          set(modules),
-          f"Implementation modules must be unique within op '{op.name}'",
+          module_cls_pairs,
+          set(module_cls_pairs),
+          f"Implementation (module, cls) pairs must be unique within op"
+          f" '{op.name}'",
       )
       for impl in op.impls:
         impl_op_dir = _module_op_dir(impl.module)
@@ -518,6 +569,133 @@ class OpsListTest(absltest.TestCase):
             f"Impl {impl.module} resolves to {impl_op_dir}, expected"
             f" {op.op_dir}",
         )
+
+  def test_impl_cls_defined_in_module(self):
+    google_dir_exists = (_TOKAMAX_ROOT / "google").is_dir()
+    for op_entry in ops_list.OPS:
+      base_path = _TOKAMAX_ROOT / f"_src/ops/{op_entry.op_dir}/base.py"
+      has_base = base_path.is_file()
+      for impl in op_entry.impls:
+        if has_base:
+          self.assertIsNotNone(
+              impl.cls,
+              f"Op '{op_entry.name}' has base.py so impl '{impl.name}' must set"
+              " cls",
+          )
+        if impl.cls is None:
+          continue
+        if impl.module.startswith("google/") and not google_dir_exists:
+          continue
+        class_names = _top_level_class_names(_TOKAMAX_ROOT / impl.module)
+        self.assertIn(
+            impl.cls,
+            class_names,
+            f"Class '{impl.cls}' for op '{op_entry.name}' impl '{impl.name}'"
+            f" not found in '{impl.module}'",
+        )
+
+  def test_impl_cls_validation(self):
+    impl = ops_list.Impl(
+        name="xla",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttention",
+    )
+    self.assertEqual(impl.cls, "DotProductAttention")
+
+    no_cls_impl = ops_list.Impl(
+        name="raw",
+        backend=ops_list.XLA,
+        module="_src/ops/gmm_v2/gmm_v2.py",
+    )
+    self.assertIsNone(no_cls_impl.cls)
+
+    for bad_cls in ("", "not an identifier", "123invalid", cast(Any, 123)):
+      with self.subTest(bad_cls=bad_cls):
+        with self.assertRaises(ValueError):
+          ops_list.Impl(
+              name="xla",
+              backend=ops_list.XLA,
+              module="_src/ops/attention/base.py",
+              cls=bad_cls,
+          )
+
+  def test_vjp_validation(self):
+    with self.assertRaises(ValueError):
+      ops_list.Impl(
+          name="empty_target",
+          backend=ops_list.XLA,
+          module="_src/ops/attention/base.py",
+          vjp=("",),
+      )
+
+    fwd = ops_list.Impl(
+        name="xla",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttention",
+    )
+    with self.assertRaises(ValueError):
+      ops_list.Op(name="dup", apis=(), impls=(fwd, fwd))
+
+    bad_ref = ops_list.Impl(
+        name="xla_vjp",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttentionVjp",
+        vjp=("unknown",),
+    )
+    with self.assertRaises(ValueError):
+      ops_list.Op(name="unknown_ref", apis=(), impls=(fwd, bad_ref))
+
+    self_ref = ops_list.Impl(
+        name="self_vjp",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        vjp=("self_vjp",),
+    )
+    with self.assertRaises(ValueError):
+      ops_list.Op(name="self_cycle", apis=(), impls=(self_ref,))
+
+    vjp_impl = ops_list.Impl(
+        name="xla_vjp",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttentionVjp",
+        vjp=("xla",),
+    )
+    vjp_of_vjp = ops_list.Impl(
+        name="vjp2",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        vjp=("xla_vjp",),
+    )
+    with self.assertRaises(ValueError):
+      ops_list.Op(
+          name="non_fwd_target",
+          apis=(),
+          impls=(fwd, vjp_impl, vjp_of_vjp),
+      )
+
+  def test_forward_default_vjp_registered(self):
+    google_dir_exists = (_TOKAMAX_ROOT / "google").is_dir()
+    for op_entry in ops_list.OPS:
+      for impl in _forward_impls_with_source(op_entry, google_dir_exists):
+        vjp_classes = _default_vjp_classes(
+            _TOKAMAX_ROOT / impl.module, cast(str, impl.cls)
+        )
+        for vjp_cls in vjp_classes:
+          matching = [
+              candidate
+              for candidate in op_entry.impls
+              if candidate.cls == vjp_cls and impl.name in candidate.vjp
+          ]
+          self.assertNotEmpty(
+              matching,
+              f"Op '{op_entry.name}' forward impl '{impl.name}' constructs"
+              f" default VJP '{vjp_cls}' in __post_init__, but no VJP impl"
+              f" with cls='{vjp_cls}' lists '{impl.name}' in vjp",
+          )
 
 
 if __name__ == "__main__":
