@@ -970,7 +970,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
       group_info.start_within_block,
       group_info.actual_size,
       group_info.block_start,
-      (group_info.actual_size > 0).sum().astype(jnp.int32),
+      group_info.num_non_empty_blocks,
   )
   if epilogue_quant_dtype is not None:
     qvalue, scales = out

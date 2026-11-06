@@ -17,7 +17,7 @@
 
 import dataclasses
 import enum
-from typing import Annotated, Any
+from typing import Annotated, Any, TYPE_CHECKING
 
 import jax
 from jax import lax
@@ -76,7 +76,7 @@ class Config:
     return None if v is None else jnp.dtype(v).name
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class GroupInfo:
   """Information regarding the group being processed in a block."""
 
@@ -86,6 +86,30 @@ class GroupInfo:
   actual_end: jax.Array
   start_within_block: jax.Array
   actual_size: jax.Array
+  precomputed_num_non_empty_blocks: dataclasses.InitVar[jax.Array | None] = None
+  if TYPE_CHECKING:
+    _precomputed_num_non_empty_blocks: jax.Array | None = dataclasses.field(
+        init=False, repr=False, compare=False
+    )
+
+  def __post_init__(
+      self, precomputed_num_non_empty_blocks: jax.Array | None
+  ) -> None:
+    object.__setattr__(
+        self,
+        "_precomputed_num_non_empty_blocks",
+        precomputed_num_non_empty_blocks,
+    )
+
+  @property
+  def cached_num_non_empty_blocks(self) -> jax.Array | None:
+    return self._precomputed_num_non_empty_blocks
+
+  @property
+  def num_non_empty_blocks(self) -> jax.Array:
+    if self._precomputed_num_non_empty_blocks is not None:
+      return self._precomputed_num_non_empty_blocks.reshape(())
+    return (self.actual_size > 0).sum().astype(jnp.int32)
 
   @classmethod
   def create_aligned(
