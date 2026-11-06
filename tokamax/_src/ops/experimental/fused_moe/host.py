@@ -1003,45 +1003,95 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
-    """The token number each of shard `me`'s slab rows computes, [stride].
+def shard_slab_tables(routing, me, *, shard_stride, rows=None, scale_bits=None):
+    """Build shard `me`'s token-gather and activation row-scale slab tables.
 
-    `rows` is the destination slab row of each routed pair, which is derived
-    here when the caller does not hold it already; passing it in keeps both
-    slab scatters on one index.
+    Every on-shard pair (`0 <= row < shard_stride`) owns a distinct slab row.
+    Off-shard pairs (`row >= shard_stride`) receive distinct out-of-range
+    indices `total + arange(n_pairs)` so every scatter index is unique and XLA
+    lowers the write with `unique_indices=True` without serializing collisions
+    or accumulating off-shard pairs onto a trailing padding row.
 
-    The scatter runs against this shard's slab alone rather than against the
-    replicated ep-wide slab followed by a slice, which built seven eighths
-    of its result to discard it. What the kernel receives is unchanged.
+    When `scale_bits` is supplied, token indices and repeated scale bits are
+    stacked into `[n_pairs, 2]` and written in a single scatter rather than two
+    separate scatters over all `T * K` routed pairs. The scale slab is built
+    flat and handed over in the dense `[act_scale_slab_rows(stride),
+    HIDDEN_LANE_BLOCK]` lane-block view without a padded `[rows, 1]` copy; the
+    kernel rebuilds the column a tile at a time.
 
-    The kernel fetches an input row by this table value with bounds checks
-    off, so the one index that reaches memory is clamped here rather than
-    trusted. An expert id outside [0, e_total) would land two pairs on one
-    row and sum their token numbers; the acceptance check refuses a gating
-    width that could produce one, and this is the backstop for it. Clipped
-    on BOTH sides, to the bounds gather_clamp_bounds names -- see there for
-    why the upper one is floored at zero. build_routing_tables refuses T = 0
-    before any of this; the clip is written so that it would hold on its own.
+    `token_gather` is clipped on both sides to `gather_clamp_bounds(T)` because
+    the kernel fetches input rows with bounds checks off.
+
+    Args:
+        routing: Replicated or sharded routing plan (`RoutingTables` or
+            `ShardRoutingTables`).
+        me: Scalar int32 EP shard index.
+        shard_stride: Per-shard slab row allocation.
+        rows: Optional `[T * K]` rebased slab row indices (`local_slab_rows`).
+        scale_bits: Optional `[T]` int32 bitcast of per-token f32 row scales.
+
+    Returns:
+        `(token_gather, scale_slab)`, where `token_gather` is `int32
+        [shard_stride]` and `scale_slab` is `float32
+        [act_scale_slab_rows(shard_stride), HIDDEN_LANE_BLOCK]` or `None`.
     """
-    T, K = routing.pair_grid
+    n_tokens, topk = routing.pair_grid
+    n_pairs = n_tokens * topk
     # The token number of each routed pair is a counted repeat, not a
     # division: pair i belongs to token i // K, which is the token index
     # broadcast K times. K is the selection width and need not be a power
     # of two, so this is the spelling that removes the division rather
     # than the one that shifts it.
     token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+        jnp.arange(n_tokens, dtype=jnp.int32)[:, None], (n_tokens, topk)
     ).reshape(-1)
     row = (
         local_slab_rows(routing, me, shard_stride=shard_stride)
         if rows is None
         else rows
     )
-    gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
+    on_shard = row < shard_stride
+    gather_lo, gather_hi = gather_clamp_bounds(n_tokens)
+    pair_iota = jnp.arange(n_pairs, dtype=jnp.int32)
+    if scale_bits is None:
+        uidx = jnp.where(on_shard, row, shard_stride + pair_iota)
+        scattered = (
+            jnp.zeros((shard_stride,), jnp.int32)
+            .at[uidx]
+            .set(token_of_pair, mode="drop", unique_indices=True)
+        )
+        clipped = jnp.clip(
+            scattered, jnp.int32(gather_lo), jnp.int32(gather_hi)
+        )
+        return clipped, None
+
+    scale_rows = act_scale_slab_rows(shard_stride)
+    scale_len = scale_rows * HIDDEN_LANE_BLOCK
+    total = max(shard_stride, scale_len)
+    uidx = jnp.where(on_shard, row, total + pair_iota)
+    vals = jnp.stack([token_of_pair, jnp.repeat(scale_bits, topk)], axis=1)
+    both = (
+        jnp.zeros((total, 2), jnp.int32)
+        .at[uidx]
+        .set(vals, mode="drop", unique_indices=True)
     )
-    return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
+    token_gather = jnp.clip(
+        both[:shard_stride, 0], jnp.int32(gather_lo), jnp.int32(gather_hi)
+    )
+    scale_f32 = lax.bitcast_convert_type(both[:scale_len, 1], jnp.float32)
+    scale_slab = scale_f32.reshape(scale_rows, HIDDEN_LANE_BLOCK)
+    return token_gather, scale_slab
+
+
+def shard_token_gather(routing, me, *, shard_stride, rows=None):
+    """Return the token number each of shard `me`'s slab rows computes."""
+    # The scatter runs against this shard's slab alone rather than against the
+    # replicated ep-wide slab followed by a slice, which built seven eighths
+    # of its result to discard it. What the kernel receives is unchanged.
+    token_gather, _ = shard_slab_tables(
+        routing, me, shard_stride=shard_stride, rows=rows
+    )
+    return token_gather
 
 
 def expert_visit_list(rows, g_local):

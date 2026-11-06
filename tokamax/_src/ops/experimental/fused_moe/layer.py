@@ -32,7 +32,6 @@ from .host import (
     U32_SUBLANE_TILE,
     GatheredPairs,
     WeightFormat,
-    act_scale_slab_rows,
     align_up,
     build_routing_tables,
     build_routing_tables_sharded,
@@ -45,7 +44,7 @@ from .host import (
     shard_count_vector,
     shard_expert_slabs,
     shard_push_tables_in_rows,
-    shard_token_gather,
+    shard_slab_tables,
     shard_transport_tables_in_blocks,
     token_gather_window_rows,
     weight_form,
@@ -569,40 +568,18 @@ def fused_ep_moe_v2(
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
+        token_gather, scale_slab = shard_slab_tables(
+            routing,
+            me,
+            shard_stride=ragged_stride,
+            rows=slab_row,
+            scale_bits=scale_bits_g if form.quantized_activations else None,
         )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
         # sentinel remains out of range and cannot write a live padding row.
         token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
-        # The activation row scale, scattered onto the slab row each routed
-        # pair computes on. It exists only where the rows were quantized.
-        #
-        # The slab is built flat and handed over in the dense lane-block
-        # view, which is the same bytes in the same order and so costs
-        # nothing. A column would cost a copy of the whole slab: [rows, 1]
-        # is padded out to a full lane block on the way to the kernel, and
-        # that copy is the largest single piece of glue above a thousand
-        # rows. The kernel rebuilds the column a tile at a time instead.
-        #
-        # The scatter runs the length of the view rather than of the slab.
-        # Those extra elements are past the slab's last row, so a pair the
-        # rebase sent past the end lands on one of them instead of being
-        # dropped; nothing reads them, and the slab's own rows are the same
-        # either way.
-        if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
-            scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
-        else:
-            scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
