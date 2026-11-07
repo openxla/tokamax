@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -98,6 +99,38 @@ class PrecisionTest(parameterized.TestCase):
       precision.to_dot_algorithm_preset(
           jnp.float32, jnp.float32, 'invalid_precision'
       )
+
+  @parameterized.parameters(
+      ('NVIDIA Corporation', '7.5', jax.lax.DotAlgorithmPreset.F32_F32_F32),
+      ('NVIDIA Corporation', '9.0', jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+      # On ROCm, `compute_capability` is the architecture name, not a number.
+      (
+          'Advanced Micro Devices, Inc',
+          'gfx942',
+          jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+      ),
+      (
+          'Advanced Micro Devices, Inc',
+          'gfx1151',
+          jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+      ),
+  )
+  def test_to_dot_algorithm_preset_gpu_bf16(
+      self, device_vendor, compute_capability, expected
+  ):
+    device = mock.Mock(
+        platform='gpu',
+        device_vendor=device_vendor,
+        compute_capability=compute_capability,
+    )
+    with (
+        mock.patch.object(jax, 'default_backend', return_value='gpu'),
+        mock.patch.object(jax, 'devices', return_value=[device]),
+    ):
+      preset = precision.to_dot_algorithm_preset(
+          jnp.bfloat16, jnp.bfloat16, jax.lax.Precision.DEFAULT
+      )
+    self.assertEqual(preset, expected)
 
 
 if __name__ == '__main__':
