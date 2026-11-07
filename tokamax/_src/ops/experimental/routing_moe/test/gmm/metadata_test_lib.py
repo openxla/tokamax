@@ -101,6 +101,7 @@ def make_gmm_config(
       num_global_groups=num_global_groups,
       fuse_act=None,
       size_ep=1,
+      size_row_group=num_rows,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat(
       dtype=x.dtype, quant=None
@@ -138,6 +139,14 @@ def _fill_kernel(
     return carry
 
   jax.lax.fori_loop(0, metadata_ref.cfg.max_num_gm, copy, None)
+
+
+def smem_bytes(
+    routing: helper_inputs.Routing, cfg: config.RoutingGmmConfig
+) -> int:
+  """Computes total SMEM bytes allocated by the metadata walk of `cfg`."""
+  del routing
+  return sum(gmm_plan.smem_estimate(cfg.spec, cfg.plan).values())
 
 
 def fill_metadata(

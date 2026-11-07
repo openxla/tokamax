@@ -287,21 +287,13 @@ class RoutingGmmConfig:
       )
 
   def _validate_buffers(self) -> None:
-    """Validates pipeline buffer counts and SMEM footprint."""
+    """Validates pipeline buffer counts."""
     if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
       )
     if self.plan.num_w_buffers < 2:
       raise ValueError("Buffer counts must be at least 2.")
-    smem_threshold = int(0.45 * self.tpu_info.smem_capacity_bytes)
-    # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
-    smem_allocation = (self.max_num_gm * 3) * 4
-    if smem_allocation >= smem_threshold:
-      raise ValueError(
-          f"Total number of SMEM allocation must be less than {smem_threshold}"
-          f" to avoid OOM. Got {smem_allocation}"
-      )
 
   @property
   def max_num_gm(self) -> int:
