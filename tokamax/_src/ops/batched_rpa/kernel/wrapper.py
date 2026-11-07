@@ -212,11 +212,7 @@ def get_kv_cache_shape(
 
 
 def _is_sfs(tpu_info) -> bool:
-    """Returns True on TPU v8i.
-
-    Accepts an enum or a string, since the unit tests mock chip_version with a
-    plain string and a strict `==` against the enum would never match.
-    """
+    """Returns True on TPU v8i; accepts enum or string mocks."""
     return tpu_info.generation == 8 and tpu_info.chip_version in (
         pltpu.ChipVersion.TPU_8I,
         "v8i",
@@ -405,9 +401,7 @@ def calculate_block_sizes(
         ):
             batch_size -= 1
 
-        # Indicates OOM was triggered even when batch_size=1.
-        # NOTE: If the function does not exit at this point even when the value is
-        # zero, it will trigger infinite loop at the next while loop.
+        # The loop above stops at 1, so this only catches max_batch_size == 0.
         if batch_size == 0:
             raise ValueError("Cannot find batch size that fits within VMEM limit.")
 
@@ -632,8 +626,6 @@ def ragged_paged_attention(
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
 
-    # update_kv_cache (as passed by tpu-inference) overrides skip_kv_update when
-    # set; update_kv_cache=False (KV-share) is the same as skip_kv_update=True.
     if update_kv_cache is not None:
         skip_kv_update = not update_kv_cache
 
@@ -851,8 +843,7 @@ def ragged_paged_attention(
     if not return_lse:
         return o_hbm, kv_cache
 
-    # Reshape LSE from [num_kv_heads, max_tokens, q_per_kv // q_packing, q_packing
-    # , num_lanes] to [max_tokens, num_q_heads].
+    # Reshape LSE to [max_tokens, num_q_heads].
     max_tokens = queries.shape[0]
     # Extract first lane (scalar LSE value per token-head pair).
     lse = cast(jax.Array, lse_hbm).reshape(
