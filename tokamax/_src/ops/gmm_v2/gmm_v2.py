@@ -346,9 +346,23 @@ class GmmConfigs:
       return self.dims.size_n // 2
 
 
-TileFn = Callable[
-    [Dimensions, InputConfigs, InputConfigs, int, str | None, bool], TileSizes
-]
+@dataclasses.dataclass(frozen=True)
+class TilingRequest:
+  """Inputs passed to a GMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: Dimensions
+  lhs_cfgs: InputConfigs
+  rhs_cfgs: InputConfigs
+  vmem_limit_bytes: int
+  fuse_act: str | None = None
+  has_partial_sum: bool = False
+
+
+TileFn = Callable[[TilingRequest], TileSizes]
 
 
 class IndexMaps:
@@ -1155,6 +1169,18 @@ def kernel_main(
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
 
 
+def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
+  """Default `TileFn` for `gmm_v2`: calls `calculate_tiling` with `req`."""
+  return calculate_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.fuse_act,
+      req.has_partial_sum,
+  )
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1171,11 +1197,17 @@ def calculate_tiling(
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
+  tpu_info = pltpu.get_tpu_info()
+
   # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
-  # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
+  gen = getattr(tpu_info, "generation", None)
+  tpu_generation = gen if type(gen) is int else 0
+  if tpu_generation >= 8:
+    bf16_bf16_tile_m = 256
+  else:
+    bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1184,7 +1216,7 @@ def calculate_tiling(
 
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_limit = tpu_info.mxu_column_size * 2
   tile_n_limit = min(tile_n_limit, dims.size_n)
 
   size_n_per_rhs = dims.size_n
@@ -1293,7 +1325,7 @@ def calculate_tiling(
 
   # TODO: max number of bucket was choosen empiirically.
   # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 4
+  max_num_buckets = 8 if tpu_generation >= 8 else 4
   bucket_base = tile_m
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
@@ -1303,12 +1335,18 @@ def calculate_tiling(
       break
     tile_m = new_tile_m
 
-  lhs_buffer_count = (
-      3
-      if _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=3)
-      <= vmem_limit_bytes
-      else 2
-  )
+  # Up to this point, we have found tile_m, tile_n, tile_k for
+  # lhs_buffer_count == 2. So it's guaranteed the for loop below can find an
+  # available lhs_buffer_count.
+  max_lhs_buffers = 4 if tpu_generation >= 8 else 3
+  lhs_buffer_count = 2
+  for count in range(max_lhs_buffers, 2, -1):
+    if (
+        _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=count)
+        <= vmem_limit_bytes
+    ):
+      lhs_buffer_count = count
+      break
 
   return TileSizes(
       tile_m=tile_m,
@@ -1608,12 +1646,15 @@ def make_gmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        vmem_limit_bytes,  # pyrefly: ignore[bad-argument-type]
-        fuse_act,
-        partial_sum is not None,
+        TilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            fuse_act=fuse_act,
+            has_partial_sum=partial_sum is not None,
+        )
     )
 
   return GmmConfigs(
@@ -1666,7 +1707,7 @@ def gmm_v2(
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
     partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
-    tile_info: TileSizes | TileFn = calculate_tiling,
+    tile_info: TileSizes | TileFn = calculate_tiling_from_request,
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -1705,7 +1746,8 @@ def gmm_v2(
       Not supported together with fuse_act.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
-    tile_info: The tile sizes or tile function to use.
+    tile_info: The tile sizes, or a function that takes a `TilingRequest` and
+      returns them.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.

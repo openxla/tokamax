@@ -290,8 +290,8 @@ def get_autotuning_configs(ba: op.BoundArguments) -> set[Config]:
   return configs
 
 
-def _async_copy(src, dst):
-  common.cp_async_gmem_to_smem(src, dst)
+def _async_copy(src, dst, swizzle: int | None = None):
+  common.cp_async_gmem_to_smem(src, dst, swizzle)
 
 
 def _cta_barrier():
@@ -383,14 +383,16 @@ def _store_swizzled(
       (rows, buf_cols), out_dtype, swizzle=swizzle
   )
   for c0 in range(0, cols, buf_cols):
-    plgpu.store(
+    mgpu_lib.store(
         smem_buf,
         val[:, c0 : c0 + buf_cols].astype(out_dtype),
         optimized=False,
     )
     mgpu_lib.warpgroup_barrier()
     staged = plgpu.load(smem_buf, layout=copy_layout, optimized=False)
-    plgpu.store(gmem_ref.at[:, pl.ds(c0, buf_cols)], staged, optimized=False)
+    mgpu_lib.store(
+        gmem_ref.at[:, pl.ds(c0, buf_cols)], staged, optimized=False
+    )
     if c0 + buf_cols < cols:
       mgpu_lib.warpgroup_barrier()
 
@@ -747,7 +749,7 @@ def flash_attention_vjp_kernel(
       z_ds = plgpu.layout_cast(
           jnp.zeros((block_q_dq, block_kv_dq), jnp.float32), mma_acc
       )
-      plgpu.store(ds_smems.at[wg], z_ds.astype(ds_dtype), optimized=False)
+      mgpu_lib.store(ds_smems.at[wg], z_ds.astype(ds_dtype), optimized=False)
       mgpu_lib.warpgroup_barrier()
       copy_layout = plgpu.Layout.SMEM_GMEM_COPY(
           (block_q_dq, block_kv_dq), ds_dtype, swizzle=ds_swizzle
@@ -758,7 +760,7 @@ def flash_attention_vjp_kernel(
 
       def _z_body(ki, _):
         ks = pl.ds(ki * block_kv_dq, block_kv_dq)
-        plgpu.store(ds_gmem.at[hi, qs, ks], staged_zero, optimized=False)
+        mgpu_lib.store(ds_gmem.at[hi, qs, ks], staged_zero, optimized=False)
         return None
 
       lax.fori_loop(lo_ki, hi_ki, _z_body, None)
@@ -800,8 +802,8 @@ def flash_attention_vjp_kernel(
       k_start_bound = _load_k_bound(k_start_gmem)
       k_end_bound = _load_k_bound(k_end_gmem)
 
-      _async_copy(q_gmem.at[qs, hi], q_smem.at[wg])
-      _async_copy(dout_gmem.at[qs, hi], dout_smem.at[wg])
+      _async_copy(q_gmem.at[qs, hi], q_smem.at[wg], k_dq_swizzle)
+      _async_copy(dout_gmem.at[qs, hi], dout_smem.at[wg], v_dq_swizzle)
       plgpu.wait_gmem_to_smem(0)
       if q_in_regs_dq:
         q_reg = plgpu.load(q_smem.at[wg], layout=mma_lhs)
@@ -820,16 +822,16 @@ def flash_attention_vjp_kernel(
 
         def _do_cp():
           if dq_wgs == 1:
-            _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[slot])
-            _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[slot])
+            _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[slot], k_dq_swizzle)
+            _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[slot], v_dq_swizzle)
           else:
             @pl.when(wg == 0)
             def _cp_k():
-              _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[slot])
+              _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[slot], k_dq_swizzle)
 
             @pl.when(wg == 1)
             def _cp_v():
-              _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[slot])
+              _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[slot], v_dq_swizzle)
 
           if bias_smem is not None:
             b_hi = 0 if bias_gmem.shape[0] == 1 else hi
@@ -1576,7 +1578,9 @@ def flash_attention_vjp_kernel(
           f_qs = pl.ds(fetch_qi * block_q_dkv, block_q_dkv)
 
           def _do():
-            _async_copy(q_gmem.at[f_qs, fetch_hi], q_smem.at[slot])
+            _async_copy(
+                q_gmem.at[f_qs, fetch_hi], q_smem.at[slot], q_dkv_swizzle
+            )
             if bias_smem is not None:
               b_hi = 0 if bias_t_gmem.shape[0] == 1 else fetch_hi
               _async_copy(
@@ -1600,14 +1604,16 @@ def flash_attention_vjp_kernel(
           lax.cond(
               step_idx < total_steps,
               lambda: _async_copy(
-                  dout_gmem.at[f_qs, fetch_hi], dout_smem.at[slot]
+                  dout_gmem.at[f_qs, fetch_hi],
+                  dout_smem.at[slot],
+                  do_dkv_swizzle,
               ),
               common.commit_cp_async_group,
           )
 
         @pl.when(wg == 0)
         def _run_dk_wg():
-          _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[0])
+          _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[0], q_dkv_swizzle)
           plgpu.wait_gmem_to_smem(0)
           k_reg = plgpu.load(k_smem.at[0], layout=mma_lhs)
           _cta_barrier()
@@ -1644,7 +1650,7 @@ def flash_attention_vjp_kernel(
                   mask_smem,
                   apply_idx=apply_idx,
               )
-              plgpu.store(pt_smem, p_t.astype(dtype), optimized=False)
+              mgpu_lib.store(pt_smem, p_t.astype(dtype), optimized=False)
               _cta_barrier()
 
               dp_t = plgpu.load(dpt_smem, layout=mma_acc, optimized=False)
@@ -1683,7 +1689,7 @@ def flash_attention_vjp_kernel(
 
         @pl.when(wg == 1)
         def _run_dv_wg():
-          _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[0])
+          _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[0], do_dkv_swizzle)
           plgpu.wait_gmem_to_smem(0)
           v_reg = plgpu.load(v_smem.at[0], layout=mma_lhs)
           _cta_barrier()
@@ -1708,7 +1714,7 @@ def flash_attention_vjp_kernel(
                 mma_lhs,
                 mma_rhs,
             )
-            plgpu.store(dpt_smem, dp_t, optimized=False)
+            mgpu_lib.store(dpt_smem, dp_t, optimized=False)
             _cta_barrier()
 
             pt_lhs = plgpu.load(pt_smem, layout=mma_lhs)
@@ -1740,8 +1746,8 @@ def flash_attention_vjp_kernel(
       bias_smem = extras.get("bias_smem")
       mask_smem = extras.get("mask_smem")
 
-      _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[wg])
-      _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[wg])
+      _async_copy(k_gmem.at[ks, hi_kv], k_smem.at[wg], q_dkv_swizzle)
+      _async_copy(v_gmem.at[ks, hi_kv], v_smem.at[wg], do_dkv_swizzle)
       plgpu.wait_gmem_to_smem(0)
       if kv_in_regs_dkv:
         k_reg = plgpu.load(k_smem.at[wg], layout=mma_lhs)
@@ -1761,16 +1767,28 @@ def flash_attention_vjp_kernel(
 
         def _do_cp():
           if dkv_wgs == 1:
-            _async_copy(q_gmem.at[f_qs, fetch_hi], q_smem.at[slot])
-            _async_copy(dout_gmem.at[f_qs, fetch_hi], dout_smem.at[slot])
+            _async_copy(
+                q_gmem.at[f_qs, fetch_hi], q_smem.at[slot], q_dkv_swizzle
+            )
+            _async_copy(
+                dout_gmem.at[f_qs, fetch_hi],
+                dout_smem.at[slot],
+                do_dkv_swizzle,
+            )
           else:
             @pl.when(wg == 0)
             def _cp_q():
-              _async_copy(q_gmem.at[f_qs, fetch_hi], q_smem.at[slot])
+              _async_copy(
+                  q_gmem.at[f_qs, fetch_hi], q_smem.at[slot], q_dkv_swizzle
+              )
 
             @pl.when(wg == 1)
             def _cp_do():
-              _async_copy(dout_gmem.at[f_qs, fetch_hi], dout_smem.at[slot])
+              _async_copy(
+                  dout_gmem.at[f_qs, fetch_hi],
+                  dout_smem.at[slot],
+                  do_dkv_swizzle,
+              )
 
           if bias_smem is not None:
             b_hi = 0 if bias_t_gmem.shape[0] == 1 else fetch_hi

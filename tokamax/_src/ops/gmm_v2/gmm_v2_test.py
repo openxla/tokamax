@@ -336,6 +336,50 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(fused, unfused)
 
+  @parameterized.parameters(False, True)
+  def test_gmm_tile_fn_receives_tiling_request(self, use_partial_sum):
+    """A custom `tile_info` callback is called with a `TilingRequest`."""
+    batch_size, in_size, out_size, num_groups = 128, 512, 512, 16
+    key = jax.random.key(0)
+    k0, k1, k2 = jax.random.split(key, 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    partial_sum = None
+    if use_partial_sum:
+      partial_sum = jax.random.normal(
+          k2, (batch_size, out_size), dtype=jnp.bfloat16
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    vmem_limit_bytes = 32 * 1024 * 1024
+
+    requests = []
+
+    def tile_fn(req):
+      requests.append(req)
+      return gmm_v2.calculate_tiling_from_request(req)
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        partial_sum=partial_sum,
+        tile_info=tile_fn,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    self.assertNotEmpty(requests)
+    req = requests[0]
+    self.assertIsInstance(req, gmm_v2.TilingRequest)
+    self.assertEqual(req.dims.size_k, in_size)
+    self.assertEqual(req.dims.size_n, out_size)
+    self.assertEqual(req.vmem_limit_bytes, vmem_limit_bytes)
+    self.assertIsNone(req.fuse_act)
+    self.assertEqual(req.has_partial_sum, use_partial_sum)
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[73, 117],
       out_size=[255, 512],
@@ -609,6 +653,55 @@ class GmmTest(parameterized.TestCase):
             int(gmm_v2.select_bucket_idx(jnp.int32(rows), bucket_base)),
             expected,
         )
+
+  @parameterized.parameters(False, True)
+  def test_tgmm_tile_fn_receives_tiling_request(self, use_partial_sum):
+    """A custom `tile_info` callback is called with a `TgmmTilingRequest`."""
+    batch_size, in_size, out_size, num_groups = 256, 1024, 1024, 16
+    key = jax.random.key(0)
+    key1, key2, key3 = jax.random.split(key, 3)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = None
+    if use_partial_sum:
+      partial_sum = jax.random.normal(
+          key3, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    vmem_limit_bytes = 32 * 1024 * 1024
+
+    requests = []
+
+    def tile_fn(req):
+      requests.append(req)
+      return tgmm_v2.calculate_tgmm_tiling_from_request(req)
+
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=tile_fn,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    self.assertNotEmpty(requests)
+    req = requests[0]
+    self.assertIsInstance(req, tgmm_v2.TgmmTilingRequest)
+    self.assertEqual(req.dims.size_k, in_size)
+    self.assertEqual(req.dims.size_n, out_size)
+    self.assertEqual(req.vmem_limit_bytes, vmem_limit_bytes)
+    self.assertEqual(req.out_dtype, jnp.bfloat16)
+    self.assertEqual(req.acc_dtype, jnp.float32)
+    self.assertEqual(req.has_partial_sum, use_partial_sum)
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1), grad, group_sizes, num_groups
+    )
+    if use_partial_sum:
+      expected = expected + partial_sum
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       rows_per_group=[64, 128, 192, 256],
@@ -2415,6 +2508,81 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
     self.assertEqual(tiles_tight.tile_n, tiles_large.tile_n)
     self.assertEqual(tiles_tight.tile_k, tiles_large.tile_k)
 
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_calculate_tiling_tpu_gen8(self, mock_get_tpu_info):
+    mock_tpu_info = mock.create_autospec(
+        gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
+    )
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock_tpu_info.generation = 8
+    mock.seal(mock_tpu_info)
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    # 1. qwen_3_5_prefill_down: 81920 tokens, 64 groups of 1280
+    dims_down = gmm_v2.Dimensions(
+        size_m=81920,
+        size_k=1024,
+        size_n=4096,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs_down = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=1024,
+        is_transposed=False,
+    )
+    vmem_limit_bytes = int(192 * 1024 * 1024 * 0.9)
+    tiles_down = gmm_v2.calculate_tiling(
+        dims=dims_down,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_down,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # tile_m scales up to 2048 with max_num_buckets=8
+    self.assertGreaterEqual(tiles_down.tile_m, 1024)
+    self.assertEqual(tiles_down.bucket_base, 256)
+
+    # 2. qwen_3_5_prefill_conc8_gate_up: 163840 tokens, 64 groups of 2560
+    dims_conc8 = gmm_v2.Dimensions(
+        size_m=163840,
+        size_k=4096,
+        size_n=2048,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    rhs_cfgs_gateup = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=4096,
+        is_transposed=False,
+    )
+    tiles_conc8 = gmm_v2.calculate_tiling(
+        dims=dims_conc8,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_gateup,
+        vmem_limit_bytes=vmem_limit_bytes,
+        fuse_act="silu",
+    )
+    # tile_m scales beyond 4 buckets (1024) to 2048 with max_num_buckets=8
+    self.assertGreaterEqual(tiles_conc8.tile_m, 2048)
+    self.assertEqual(tiles_conc8.bucket_base, 256)
+    self.assertGreaterEqual(tiles_conc8.lhs_buffer_count, 3)
+
 
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.
@@ -2467,7 +2635,7 @@ class GmmV2VmemStressTest(parameterized.TestCase):
       in_size,
       out_size,
       transpose_rhs,
-      tile_info=gmm_v2.calculate_tiling,
+      tile_info=gmm_v2.calculate_tiling_from_request,
   ):
     group_sizes = get_group_sizes(batch_size, num_groups)
     lhs_spec = jax.ShapeDtypeStruct((batch_size, in_size), jnp.bfloat16)

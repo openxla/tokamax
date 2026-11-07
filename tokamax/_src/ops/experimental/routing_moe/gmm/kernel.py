@@ -172,6 +172,10 @@ def routing_gmm(
       tpu_info=tpu_info,
   )
   if w2 is not None and not resolved_plan.fuse_up_and_down:
+    # Even though plan has resolved to disable up and down fusion, we do not
+    # override custom plan as we need to respect user's custom plan.
+    # TODO: Figure out a better way to handle this. Maybe simply
+    # raise error if up down fusion is not possible.
     gmm1_res = routing_gmm(
         x=x,
         w=w,

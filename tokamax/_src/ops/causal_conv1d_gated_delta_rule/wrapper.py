@@ -329,6 +329,7 @@ def outer_kernel(
         "num_spec_tokens",
         "decode_tile_size",
         "mixed_tile_size",
+        "max_mixed_tile_size",
         "zero_initialize_out",
         "compute_precision",
         "recurrent_dtype",
@@ -375,6 +376,7 @@ def fused_conv1d_gdn(
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    max_mixed_tile_size: int | None = None,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
   """Perform conv1d and gdn in a single fused kernel.
 
@@ -547,6 +549,8 @@ def fused_conv1d_gdn(
       window_size=window_size,
       decode_tile_size=decode_tile_size,
       mixed_tile_size=mixed_tile_size,
+      attention_mode=attention_mode,
+      max_mixed_tile_size=max_mixed_tile_size,
   )
 
   aligned_num_v_heads = tiling.align_to(n_v, num_lanes)

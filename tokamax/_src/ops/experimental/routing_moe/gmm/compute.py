@@ -15,11 +15,7 @@
 
 """Functions required to perform matrix multiplication."""
 
-from collections.abc import Callable
-
 import jax
-from jax.experimental import hijax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
@@ -215,34 +211,3 @@ def matmul(
     acc += w_bias
 
   return acc
-
-
-def quantize_rows(
-    dst: hijax.TransformedRef,
-    first_row: int,
-    scale: jax.Array,
-    inv_scale: jax.Array,
-    load_chunk: Callable[[int], jax.Array],
-    out: config.ActivationConfig,
-) -> None:
-  """Quantizes `scale.shape[0]` rows and writes logical and scale chunks.
-
-  Args:
-    dst: Destination compact output VMEM slot.
-    first_row: Starting row index in `dst` for this `scale.shape[0]`-row slice.
-    scale: Per-lane scales of shape `f32[rows, lanes]`.
-    inv_scale: Broadcastable reciprocal scales matching `load_chunk` outputs.
-    load_chunk: Callable returning the unquantized values for logical chunk `c`.
-    out: Output configuration describing logical chunks and quantization dtype.
-  """
-  assert out.spec.quant is not None
-  num_chunks = out.spec.num_logical_chunks
-  layout_util.store_compact_chunk(
-      dst, first_row, num_chunks, pltpu.bitcast(scale, jnp.uint32)
-  )
-  for chunk in range(num_chunks):
-    q_chunk = quant_util.quantize(
-        load_chunk(chunk), inv_scale, out.spec.dtype
-    )
-    words = pltpu.bitcast(q_chunk, jnp.uint32)
-    layout_util.store_compact_chunk(dst, first_row, chunk, words)

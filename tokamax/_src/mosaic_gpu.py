@@ -495,3 +495,16 @@ def not_persistent_grid_loop_kernel(
     return body(grid_loop, **kwargs)
 
   return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)
+
+
+def store(ref, value, *, optimized: bool = True) -> None:
+  """Stores `value` to `ref`, like `plgpu.store`.
+
+  Only the OSS export calls this; internal code calls `plgpu.store` directly.
+  JAX 0.11.2 has no `plgpu.store`, and there assigning through the ref already
+  does an unoptimized store.
+  """
+  if jax.__version_info__ >= (0, 12, 0):
+    plgpu.store(ref, value, optimized=optimized)
+  else:
+    ref[...] = value

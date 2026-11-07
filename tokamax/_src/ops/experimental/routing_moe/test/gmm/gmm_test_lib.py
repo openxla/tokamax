@@ -25,9 +25,9 @@ from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 P = sharding.PartitionSpec
 FP8 = jnp.float8_e4m3fn
@@ -47,7 +47,7 @@ def _local_weight(
   w = w[group_offset : group_offset + num_local_experts]
   scale = None
   if quantize:
-    w, scale = test_inputs.sub_channel_quantize(
+    w, scale = helper_inputs.sub_channel_quantize(
         w, quant_dtype or jnp.float8_e4m3fn, quant_block_size
     )
   return arg.SingleWeightWrapper.create(w, scale, fused_gate_up=fused_gate_up)
@@ -67,7 +67,7 @@ class GmmCase:
   x: jax.Array
   w1: arg.SingleWeightWrapper[jax.Array]
   w2: arg.SingleWeightWrapper[jax.Array]
-  routing: test_inputs.Routing
+  routing: helper_inputs.Routing
 
   @property
   def x_sorted(self) -> jax.Array:
@@ -87,7 +87,7 @@ class GmmCase:
   @classmethod
   def make_case(
       cls,
-      case: test_cases.Case,
+      case: helper_cases.Case,
       *,
       quant_w1: bool = False,
       quant_w2: bool = False,
@@ -96,12 +96,12 @@ class GmmCase:
       balanced_ep: int | None = None,
   ) -> Self:
     """Builds the layer inputs of `case` for the shard at `group_offset`."""
-    test_util.check_gmm_supported(case)
+    helper_util.check_gmm_supported(case)
     shape = dataclasses.replace(
         case.shape, intermediate_size=case.local_intermediate_size
     )
     quant_shape = shape.w_dtype is not None
-    layer_inputs = test_inputs.MoEInputs.generate(
+    layer_inputs = helper_inputs.MoEInputs.generate(
         shape,
         case.num_tokens,
         max_to_mean_load=case.max_to_mean_load,
@@ -109,7 +109,7 @@ class GmmCase:
         force_expert=None if num_skipped or balanced_ep else group_offset,
     )
     if balanced_ep is not None:
-      topk_indices = test_inputs.balanced_topk_indices(
+      topk_indices = helper_inputs.balanced_topk_indices(
           jax.random.key(1),
           case.num_tokens,
           shape.top_k,
@@ -117,7 +117,7 @@ class GmmCase:
           balanced_ep,
       )
     else:
-      _, topk_indices = test_inputs.top_k(
+      _, topk_indices = helper_inputs.top_k(
           layer_inputs.gating_output, shape.top_k
       )
     local = dict(
@@ -141,7 +141,7 @@ class GmmCase:
             quant_block_size=shape.w_quant_block_size,
             quant_dtype=shape.w_dtype,
         ),
-        routing=test_inputs.Routing.make_routing(
+        routing=helper_inputs.Routing.make_routing(
             topk_indices, shape.num_experts, **local
         ),
     )
@@ -212,7 +212,7 @@ def sharded_gmm_unpermute(
     out_dtype: jax.typing.DTypeLike | None = None,
 ) -> jax.Array:
   """Runs EP-sharded `routing_gmm` scatter, with fused or unfused all-to-all."""
-  axis = test_cases.EP_AXIS
+  axis = helper_cases.EP_AXIS
   ep_size = mesh.shape[axis]
   num_experts = w.shape[0]
   group_offset = jnp.arange(0, num_experts, num_experts // ep_size)

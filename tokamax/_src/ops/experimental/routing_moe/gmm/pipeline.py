@@ -191,9 +191,7 @@ def outer_pipeline(
 
   num_gm = metadata_ref.fill_metadata_and_return_num_gm(metadata_in_ref)
 
-  allocs = memory_ref.PipelineAllocs.create(
-      in_hbm_ref, out_hbm_ref, metadata_ref, cfg
-  )
+  allocs = memory_ref.PipelineAllocs.create(in_hbm_ref, metadata_ref, cfg)
   in_hbm_ref = in_hbm_ref.transform_for_pipeline(cfg)
 
   @functools.partial(pl.run_scoped, final_allocs=allocs)

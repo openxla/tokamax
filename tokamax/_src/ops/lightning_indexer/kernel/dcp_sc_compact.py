@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
+from tokamax._src.ops.lightning_indexer.kernel import tc_topk as tc_topk_lib
 
 SCAN_UNROLL = 8
 
@@ -93,18 +94,33 @@ def _pack_body(
   )(vals_hbm, out_hbm)
 
 
-def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
+def pack_nonnegative(
+    vals: jax.Array,  # i32[num_rows, width]
+    *,
+    tc_topk: bool = False,
+) -> jax.Array:
   """Left-packs each row's non-negative entries into a `-1` padded prefix.
 
   Relative order is preserved, and a row of all non-negatives fills exactly
   `width`, so this never truncates.
+
+  Args:
+    vals: `int32[num_rows, width]` array of indices where negative values are
+      dropped and non-negative values are packed to the left.
+    tc_topk: If True, runs the TensorCore pack implementation instead of the
+      SparseCore kernel.
+
+  Returns:
+    `int32[num_rows, width]` array with each row's non-negative entries packed
+    at the front and `-1` padding in the tail.
   """
   b, width = vals.shape
   if vals.dtype != jnp.int32:
     raise ValueError(f"vals must be int32, got {vals.dtype}")
+  if tc_topk:
+    return tc_topk_lib.pack_nonnegative_tc(vals)
   sc = pltpu.get_tpu_info().sparse_core
-  if sc is None:
-    raise NotImplementedError("SparseCore is not available")
+  assert sc is not None
 
   # Geometry off the chip: a row per subcore, a chunk per lane.
   lanes = sc.num_lanes
@@ -150,6 +166,8 @@ def resolve_owned_winners(
     slots: jax.Array,  # i32[num_rows, k], flat columns of the merged score list
     k: int,
     dcp_rank: jax.Array | int,
+    *,
+    tc_topk: bool = False,
 ) -> jax.Array:
   """Picks the merged winners this rank produced out of its own list, packed.
 
@@ -162,4 +180,4 @@ def resolve_owned_winners(
   safe = jnp.maximum(slots, 0)
   ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
   mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
-  return pack_nonnegative(jnp.where(ours, mine, -1))
+  return pack_nonnegative(jnp.where(ours, mine, -1), tc_topk=tc_topk)

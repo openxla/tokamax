@@ -162,7 +162,8 @@ class RoutingGmmConfig:
     )
     cfg._validate_dtypes()
     cfg._validate_out()
-    cfg._validate_tiling_and_buffers()
+    cfg._validate_tiling()
+    cfg._validate_buffers()
     return cfg
 
   def _validate_dtypes(self) -> None:
@@ -200,6 +201,14 @@ class RoutingGmmConfig:
         raise NotImplementedError(
             "Unquantized output dtype conversion is not supported yet."
         )
+      if self.plan.num_stash_buffers is not None:
+        raise ValueError(
+            "plan.num_stash_buffers has no effect when output is not quantized."
+        )
+      if self.plan.stash_dtype is not None:
+        raise ValueError(
+            "plan.stash_dtype has no effect when output is not quantized."
+        )
       return
 
     if self.spec.scatter is None:
@@ -211,6 +220,16 @@ class RoutingGmmConfig:
     if out_spec.dtype.itemsize != 1:
       raise ValueError(
           f"Quantized output requires a 1-byte dtype. Got {out_spec.dtype}."
+      )
+    if self.plan.num_stash_buffers != 2:
+      raise NotImplementedError(
+          "num_stash_buffers other than 2 is not supported yet. Got"
+          f" {self.plan.num_stash_buffers}."
+      )
+    if self.plan.stash_dtype != jnp.bfloat16.dtype:
+      raise NotImplementedError(
+          "stash_dtype other than bfloat16 is not supported yet. Got"
+          f" {self.plan.stash_dtype}."
       )
     chunk_cols = (
         layout_util.get_packing(out_spec.dtype) * self.tpu_info.num_lanes
@@ -232,8 +251,8 @@ class RoutingGmmConfig:
           f" ({self.plan.tile_n})."
       )
 
-  def _validate_tiling_and_buffers(self) -> None:
-    """Validates tile sizes, buffer counts, and SMEM footprint."""
+  def _validate_tiling(self) -> None:
+    """Validates tile sizes and sublane alignment."""
     if self.plan.tile_k != self.spec.size_k:
       raise NotImplementedError("K dim tiling is not supported yet.")
     if self.spec.w2 is not None and self.plan.tile_k2 != self.spec.size_k2:
@@ -257,6 +276,18 @@ class RoutingGmmConfig:
           f"bucket_base ({self.plan.bucket_base}) must be in (0, tile_m="
           f"{self.plan.tile_m}]."
       )
+    sublanes = self.tpu_info.num_sublanes
+    if (
+        self.plan.tile_m % sublanes != 0
+        or self.plan.bucket_base % sublanes != 0
+    ):
+      raise ValueError(
+          f"tile_m ({self.plan.tile_m}) and bucket_base"
+          f" ({self.plan.bucket_base}) must be multiples of {sublanes}."
+      )
+
+  def _validate_buffers(self) -> None:
+    """Validates pipeline buffer counts and SMEM footprint."""
     if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
