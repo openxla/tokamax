@@ -76,6 +76,7 @@ def _make_config(
       num_global_groups=num_experts,
       fuse_act=None,
       size_ep=size_ep,
+      size_row_group=routed_rows,
   )
   tpu_info = _tpu_info()
   resolved_plan = gmm_plan.ResolvedGmmPlan.create(

@@ -23,6 +23,18 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 
 
+def _default_tolerances(dtype, precision):
+  dtype = jnp.dtype(dtype)
+  if dtype == jnp.bfloat16:
+    return (0.1, 0.02), (2.0, 0.2)
+  if dtype == jnp.float16:
+    return (2e-2, 5e-3), (0.2, 2e-2)
+  if dtype == jnp.float64 or precision == jax.lax.Precision.HIGHEST:
+    return (1e-4, 1e-4), (5e-4, 5e-4)
+  # Default FP32 on GPU uses TF32 (10-bit mantissa truncation on inputs).
+  return (8e-2, 1e-2), (0.2, 2e-2)
+
+
 # pylint: disable=missing-function-docstring
 class GatedLinearUnitTestBase(parameterized.TestCase):
   """Base class for Gated Linear Unit op tests."""
@@ -30,6 +42,76 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
   def __init__(self, *args, glu_fn):
     super().__init__(*args)
     self._glu_fn = glu_fn
+
+  def _run_test(
+      self,
+      *,
+      batch=(),
+      m,
+      n,
+      k,
+      dtype=jnp.bfloat16,
+      activation=None,
+      precision=None,
+      use_tuple_weights=False,
+      glu_fn=None,
+      atol=None,
+      rtol=None,
+      atol_grads=None,
+      rtol_grads=None,
+  ):
+    if isinstance(activation, str):
+      activation = getattr(jax.nn, activation)
+
+    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
+    x = jax.random.normal(rng0, (*batch, m, k), dtype=dtype)
+    w = jax.random.normal(rng1, (k, 2, n), dtype=dtype)
+    dout = jax.random.normal(rng2, (*batch, m, n), dtype=dtype)
+    ref_dtype = jnp.promote_types(dtype, jnp.float32)
+    x_ref = x.astype(ref_dtype)
+    w_ref = w.astype(ref_dtype)
+    dout_ref = dout.astype(ref_dtype)
+
+    if use_tuple_weights:
+      w = jnp.unstack(w, axis=1)
+      w_ref = jnp.unstack(w_ref, axis=1)
+
+    def f_ref(x, weights):
+      if isinstance(weights, tuple):
+        w_gate, w_proj = weights
+      else:
+        w_gate, w_proj = jnp.unstack(weights, axis=1)
+      gates = jnp.matmul(x, w_gate, precision=jax.lax.Precision.HIGHEST)
+      projection = jnp.matmul(x, w_proj, precision=jax.lax.Precision.HIGHEST)
+      return projection * (gates if activation is None else activation(gates))
+
+    fn = self._glu_fn if glu_fn is None else glu_fn
+    kwargs = {"activation": activation}
+    if precision is not None:
+      kwargs["precision"] = precision
+    f = functools.partial(fn, **kwargs)
+
+    (default_atol, default_rtol), (default_atol_grads, default_rtol_grads) = (
+        _default_tolerances(dtype, precision)
+    )
+    atol = default_atol if atol is None else atol
+    rtol = default_rtol if rtol is None else rtol
+    atol_grads = default_atol_grads if atol_grads is None else atol_grads
+    rtol_grads = default_rtol_grads if rtol_grads is None else rtol_grads
+
+    expected, f_ref_vjp = jax.vjp(f_ref, x_ref, w_ref)
+    out = f(x, w)
+    chex.assert_trees_all_equal_shapes_and_dtypes(out, dout)
+    chex.assert_trees_all_close(out, expected, atol=atol, rtol=rtol)
+
+    actual, f_vjp = jax.vjp(f, x, w)
+    grads = f_vjp(dout)
+    chex.assert_trees_all_equal_shapes_and_dtypes(actual, dout)
+    chex.assert_trees_all_equal_shapes_and_dtypes(grads, (x, w))
+    chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+    chex.assert_trees_all_close(
+        grads, f_ref_vjp(dout_ref), atol=atol_grads, rtol=rtol_grads
+    )
 
   @parameterized.parameters(
       dict(m=256, n=256, k=64, activation="sigmoid"),
@@ -65,44 +147,14 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
       if batch:
         self.skipTest("Batch not supported for MosaicGpuGatedLinearUnit")
 
-    if activation is not None:
-      activation = getattr(jax.nn, activation)
-
-    rng0, rng1, rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
-    x = jax.random.normal(rng0, (*batch, m, k), dtype=jnp.bfloat16)
-    w = jax.random.normal(rng1, (k, 2, n), dtype=jnp.bfloat16)
-    x_ref = x.astype(jnp.float32)
-    w_ref = w.astype(jnp.float32)
-
-    if use_tuple_weights:
-      w = jnp.unstack(w, axis=1)
-      w_ref = jnp.unstack(w_ref, axis=1)
-
-    def f_ref(x, weights):
-      if isinstance(weights, tuple):
-        w, v = weights
-      else:
-        w, v = jnp.unstack(weights, axis=1)
-      gates = jnp.matmul(x, w, precision=jax.lax.Precision.HIGHEST)
-      projection = jnp.matmul(x, v, precision=jax.lax.Precision.HIGHEST)
-      return projection * (gates if activation is None else activation(gates))
-
-    f = functools.partial(
-        self._glu_fn,
+    self._run_test(
+        batch=batch,
+        m=m,
+        n=n,
+        k=k,
         activation=activation,
+        use_tuple_weights=use_tuple_weights,
     )
-
-    assert_all_close = functools.partial(
-        chex.assert_trees_all_close, atol=0.1, rtol=0.02
-    )
-    assert_all_close(f(x, w), f_ref(x_ref, w_ref))
-
-    dout = jax.random.normal(rng2, (*batch, m, n), dtype=jnp.bfloat16)
-    dout_ref = dout.astype(jnp.float32)
-    expected, f_ref_vjp = jax.vjp(f_ref, x_ref, w_ref)
-    actual, f_vjp = jax.vjp(f, x, w)
-    assert_all_close(actual, expected)
-    assert_all_close(f_vjp(dout), f_ref_vjp(dout_ref), atol=2.0, rtol=0.2)
 
 
 # pylint: enable=missing-function-docstring
