@@ -41,14 +41,7 @@ def run_manual_triple_buffer(
 ) -> None:
     """Executes an explicit triple-buffered pipeline over `total_steps`.
 
-    Inputs rotate over `configs.NUM_INPUT_SLOTS` physical slots:
-    - comp_slot = step % NUM_INPUT_SLOTS       (slot being computed on)
-    - comm_slot = (step + 2) % NUM_INPUT_SLOTS (slot fetched two steps ahead)
-
-    Outputs rotate independently over `configs.NUM_OUTPUT_SLOTS` slots:
-    - out_slot = step % NUM_OUTPUT_SLOTS            (slot being written)
-    - wait_out_slot = (step - 2) % NUM_OUTPUT_SLOTS (slot whose writeback is
-    awaited before it is reused)
+    Rotates input slots with 2-step prefetch and output slots with 2-step writeback wait.
 
     Args:
       total_steps: Total number of pipeline steps to execute.

@@ -52,13 +52,11 @@ class DmaNew(ABC):
     data: Any
     pos: Any
 
-    # New-KV fetch. The new tokens are contiguous in HBM and in VMEM, so a
-    # single DMA covers them all: copy_in takes the addresses from entry 0 and
-    # the length from the sum of fetch_val over all entries.
+    # New-KV fetch is coalesced: new tokens are contiguous in HBM and VMEM,
+    # so entry 0 carries the single DMA and remaining entries are zero.
     fetch_hbm = FieldOffset(is_abstract=True)
     fetch_vmem = FieldOffset(is_abstract=True)
-    # Writeback, which stays per-entry because page_indices scatters the
-    # destinations. wb_hbm packs them as (page_idx << page_size_log2) | p_off.
+    # Writeback stays per-entry because page_indices scatters destinations.
     wb_hbm = FieldOffset(is_abstract=True)
     wb_vmem = FieldOffset(is_abstract=True)
     # Fetch/writeback token counts, packed per the subclass's field layout.
@@ -110,8 +108,8 @@ class SeqAlongLaneDmaNew(DmaNew):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class HeadAlongSublaneDmaNew(DmaNew):
-    # Each page writes back exactly the tokens it fetched, from the offset it
-    # fetched them into, so vmem offsets and token counts alias down to 4 slots.
+    # Each page writes back the tokens it fetched at matching offsets, so VMEM
+    # offsets and token counts alias across slots.
     wb_hbm = FieldOffset(0)
     fetch_hbm = FieldOffset(1)
     fetch_vmem = FieldOffset(2)
@@ -606,9 +604,7 @@ class BaseMetadataComputer:
             dma_entry = schedule.dma_kv_new[step, target_lane, i]
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                 align = cfgs.kv_token_align
-                # Fetch: the new tokens are contiguous, so one DMA moves all of them
-                # even though this loop runs once per page. Entry 0 carries that DMA
-                # and the other entries stay zero.
+                # Single coalesced fetch on entry 0 (see DmaNew).
                 if i == 0:
                     src, _, fetch_val = utils.align_span(src_hbm, new_sz, align)
                     dma_entry.fetch_hbm[...] = src
