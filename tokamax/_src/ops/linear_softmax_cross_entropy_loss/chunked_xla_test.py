@@ -66,6 +66,17 @@ def _unaligned_v_dim_test_cases():
     )
 
 
+def _shape_sweep_test_cases():
+  reductions = ("sum", "none")
+  types = (("f32", jnp.float32), ("bf16", jnp.bfloat16))
+  for reduction, (type_name, dtype) in itertools.product(reductions, types):
+    yield dict(
+        testcase_name=f"{reduction}_{type_name}",
+        reduction=reduction,
+        dtype=dtype,
+    )
+
+
 class ChunkedXlaTest(parameterized.TestCase):
 
   @parameterized.named_parameters(*_chunked_xla_test_cases())
@@ -274,6 +285,72 @@ class ChunkedXlaTest(parameterized.TestCase):
 
   def test_aligned_v_dim_matches_reference(self):
     self._run_loss_and_grads_comparison(v_dim=512)
+
+  @parameterized.named_parameters(*_shape_sweep_test_cases())
+  def test_vocab_smaller_than_one_block_matches_reference(
+      self, reduction, dtype
+  ):
+    self._run_loss_and_grads_comparison(
+        v_dim=150,
+        b_dim=128,
+        b_block_size=128,
+        v_block_size=256,
+        reduction=reduction,
+        dtype=dtype,
+    )
+
+  @parameterized.named_parameters(*_shape_sweep_test_cases())
+  def test_vocab_one_block_plus_one_col_matches_reference(
+      self, reduction, dtype
+  ):
+    self._run_loss_and_grads_comparison(
+        v_dim=257,
+        b_dim=128,
+        b_block_size=128,
+        v_block_size=256,
+        reduction=reduction,
+        dtype=dtype,
+    )
+
+  @parameterized.named_parameters(*_shape_sweep_test_cases())
+  def test_aligned_vocab_sweep_matches_reference(self, reduction, dtype):
+    self._run_loss_and_grads_comparison(
+        v_dim=512,
+        b_dim=128,
+        b_block_size=128,
+        v_block_size=256,
+        reduction=reduction,
+        dtype=dtype,
+    )
+
+  @parameterized.named_parameters(
+      ("f32", jnp.float32),
+      ("bf16", jnp.bfloat16),
+  )
+  def test_very_negative_logits_no_nan_grads(self, dtype):
+    b_dim, h_dim, v_dim = 128, 64, 300
+    b_block_size, v_block_size = 128, 256
+    x_input, labels, weights = test_utils.generate_random_data(
+        jax.random.key(123), b_dim, h_dim, v_dim, dtype=dtype
+    )
+    weights = weights - (1000.0 / jnp.sqrt(h_dim)).astype(dtype)
+
+    test_loss_fn = functools.partial(
+        _chunked_xla_loss_with_config,
+        labels=labels,
+        b_block_size=b_block_size,
+        v_block_size=v_block_size,
+        reduction="sum",
+    )
+    chunked_loss, chunked_vjp_fn = jax.vjp(test_loss_fn, x_input, weights)
+    dout = jnp.ones_like(chunked_loss)
+    chunked_dx, chunked_dw = chunked_vjp_fn(dout)
+
+    self.assertFalse(jnp.any(jnp.isnan(chunked_loss)))
+    self.assertFalse(jnp.any(jnp.isnan(chunked_dx)))
+    self.assertFalse(jnp.any(jnp.isnan(chunked_dw)))
+    self.assertFalse(jnp.any(jnp.isinf(chunked_dx)))
+    self.assertFalse(jnp.any(jnp.isinf(chunked_dw)))
 
 
 def _plain_reference_loss(x_input, weights, labels, reduction="sum"):
