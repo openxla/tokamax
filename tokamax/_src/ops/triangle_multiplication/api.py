@@ -50,6 +50,17 @@ try:
 except ImportError:
   pass
 
+try:
+  from tokamax._src.ops.triangle_multiplication import pallas_mosaic_tpu as pl_mtpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_tpu"] = (
+      pl_mtpu.PallasMosaicTpuTriangleMultiplication()
+  )
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(_IMPLEMENTATIONS)
 )
@@ -126,30 +137,11 @@ def triangle_multiplication(
       if impl not in supported_implementations:
         raise NotImplementedError(f"Implementation '{impl}' is not supported.")
       if impl == "mosaic":
-        device = None
-        sharding = getattr(x, "sharding", None)
-        if sharding is not None:
-          device_set = getattr(sharding, "device_set", None)
-          if device_set:
-            device = next(iter(device_set))
-        if device is None and isinstance(x, jax.Array):
-          try:
-            device = next(iter(x.devices()), None)
-          except jax.errors.ConcretizationTypeError:
-            pass
-        if device is None:
-          device = backend.get_default_device()
-        if "NVIDIA" in device.device_kind:
-          impl = "mosaic_gpu"
-        elif device.platform == "tpu":
-          impl = "mosaic_tpu"
-        else:
-          errors.append(
-              NotImplementedError(
-                  f"Mosaic is not supported on {device.platform}."
-              )
-          )
-          continue
+        impl = (
+            "mosaic_gpu"
+            if "NVIDIA" in backend.get_default_device().device_kind
+            else "mosaic_tpu"
+        )
       if impl not in IMPLEMENTATIONS:
         if is_default:
           errors.append(
@@ -181,6 +173,8 @@ def triangle_multiplication(
           implementation=sub_impl,
       )
     except NotImplementedError as e:
+      if len(implementation) == 1:
+        raise
       errors.append(e)
 
   raise ExceptionGroup("all implementations failed", errors)
