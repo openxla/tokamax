@@ -36,6 +36,16 @@ Residuals = base.Residuals
 
 
 @triton.jit
+def _and_masks(a, b):
+  if a is None:
+    return b
+  elif b is None:
+    return a
+  else:
+    return a & b
+
+
+@triton.jit
 def _gated_linear_unit_kernel(
     x_ptr,
     w_ptr,
@@ -64,27 +74,48 @@ def _gated_linear_unit_kernel(
   pid = tl.program_id(axis=0)
   pid_m, pid_n = get_pids_fn(pid, grid_m, grid_n, group_size)
 
-  offs_m = pid_m.to(tl.int64) * block_m + tl.arange(0, block_m)
-  offs_n = pid_n.to(tl.int64) * block_n + tl.arange(0, block_n)
+  offs_m = (
+      pid_m.to(tl.int64) if grid_m * block_m >= 2**31 else pid_m
+  ) * block_m + tl.arange(0, block_m)
+  offs_n = (
+      pid_n.to(tl.int64) if grid_n * block_n >= 2**31 else pid_n
+  ) * block_n + tl.arange(0, block_n)
   offs_k = tl.arange(0, block_k)
 
-  stride_xm, stride_xk = x_strides
-  stride_wk, stride_wg, stride_wn = w_strides
-  stride_om, stride_on = out_strides
+  stride_xm: tl.constexpr = x_strides[0]
+  stride_xk: tl.constexpr = x_strides[1]
+  stride_wk: tl.constexpr = w_strides[0]
+  stride_wg: tl.constexpr = w_strides[1]
+  stride_wn: tl.constexpr = w_strides[2]
+  stride_om: tl.constexpr = out_strides[0]
+  stride_on: tl.constexpr = out_strides[1]
 
-  x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-  w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+  x_ptrs = (
+      x_ptr
+      + triton_utils.row_offset(offs_m, m, stride_xm)
+      + offs_k[None, :] * stride_xk
+  )
+  w_ptrs = (
+      w_ptr
+      + triton_utils.row_offset(offs_k, 0, stride_wk)
+      + offs_n[None, :] * stride_wn
+  )
   v_ptrs = w_ptrs + stride_wg
 
   gates = tl.zeros((block_m, block_n), dtype=tl.float32)
   proj = tl.zeros((block_m, block_n), dtype=tl.float32)
 
+  m_mask = (offs_m[:, None] < m) if m % block_m != 0 else None
+  n_mask = (offs_n[None, :] < n) if n % block_n != 0 else None
+
   for start_k in range(0, k, block_k):
     start_k = tl.multiple_of(start_k, block_k)
-    k_mask = (start_k + offs_k) < k
-    x = tl.load(x_ptrs, mask=k_mask[None, :], other=0.0)
-    w = tl.load(w_ptrs, mask=k_mask[:, None], other=0.0)
-    v = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0)
+    k_mask = ((start_k + offs_k) < k) if k % block_k != 0 else None
+    x_mask = _and_masks(m_mask, None if k_mask is None else k_mask[None, :])
+    w_mask = _and_masks(None if k_mask is None else k_mask[:, None], n_mask)
+    x = tl.load(x_ptrs, mask=x_mask, other=None if x_mask is None else 0.0)
+    w = tl.load(w_ptrs, mask=w_mask, other=None if w_mask is None else 0.0)
+    v = tl.load(v_ptrs, mask=w_mask, other=None if w_mask is None else 0.0)
 
     x = x.to(dot_dtype)
     w = w.to(dot_dtype)
@@ -97,13 +128,15 @@ def _gated_linear_unit_kernel(
     w_ptrs += block_k * stride_wk
     v_ptrs += block_k * stride_wk
 
-  out_mask = (offs_m[:, None] < m) & (offs_n[None, :] < n)
+  out_mask = _and_masks(m_mask, n_mask)
 
   if return_residuals:
-    stride_res_m, stride_res_g, stride_res_n = res_strides
+    stride_res_m: tl.constexpr = res_strides[0]
+    stride_res_g: tl.constexpr = res_strides[1]
+    stride_res_n: tl.constexpr = res_strides[2]
     res_ptrs_0 = (
         res_ptr
-        + offs_m[:, None] * stride_res_m
+        + triton_utils.row_offset(offs_m, m, stride_res_m)
         + offs_n[None, :] * stride_res_n
     )
     res_ptrs_1 = res_ptrs_0 + stride_res_g
@@ -114,7 +147,11 @@ def _gated_linear_unit_kernel(
     gates = activation(gates)
 
   out = proj * gates
-  out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+  out_ptrs = (
+      out_ptr
+      + triton_utils.row_offset(offs_m, m, stride_om)
+      + offs_n[None, :] * stride_on
+  )
   tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 

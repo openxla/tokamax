@@ -31,6 +31,8 @@ from tokamax._src.ops.lightning_indexer.kernel import (
     config,
     dcp_sc_compact,
     metadata,
+    tc_streamindex_topk,
+    tc_topk as tc_topk_lib,
 )
 from tokamax._src.ops.topk import pallas_mosaic_tpu_kernel
 
@@ -974,6 +976,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "tc_topk",
     ),
 )
 def streamindex_topk(
@@ -1003,6 +1006,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    tc_topk: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """StreamIndex Top-K retrieval.
 
@@ -1068,6 +1072,9 @@ def streamindex_topk(
       what makes a cross-rank merge possible. A local top-k over a sharded KV
       axis is not the global top-k, so the merge needs the scores the same way
       the DCP attention kernels need an LSE output.
+    tc_topk: whether to run scoring and top-k on TensorCore
+      (`tc_streamindex_topk`) instead of SparseCore (`sparsecore_topk`).
+      Defaults to False.
 
   Returns:
     Top-K indices in this rank's local compressed space, or
@@ -1076,6 +1083,31 @@ def streamindex_topk(
   """
   # Scale factors for the FP8 index cache format are packed directly inside
   # `cache_kv`, keeping HBM transactions fused.
+  if tc_topk:
+    return tc_streamindex_topk.tc_streamindex_topk(
+        q,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        k=k,
+        compression_ratio=compression_ratio,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        buffer_count=buffer_count,
+        vmem_limit_bytes=vmem_limit_bytes,
+        decode_req_batch_size=decode_req_batch_size,
+        enable_early_exit=enable_early_exit,
+        kv_layout=kv_layout,
+        chunk_tokens=chunk_tokens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        interleave_size=interleave_size,
+        return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
+    )
 
   kv_layout = KVLayout.parse(kv_layout)
 
@@ -1617,6 +1649,7 @@ def streamindex_topk(
         "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "tc_topk",
     ),
 )
 def streamindex_topk_dcp(
@@ -1641,6 +1674,7 @@ def streamindex_topk_dcp(
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    tc_topk: bool = False,
 ) -> jax.Array:
   """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1666,6 +1700,10 @@ def streamindex_topk_dcp(
        crossed the gather -- so no coordinate conversion is needed and
        ownership is decided in exactly one place. The ranks' outputs form an
        exact partition of the global top-k.
+
+  When `tc_topk=True`, steps 1, 3, and 4 run on TensorCore via
+  `tc_streamindex_topk` and `tc_topk.dcp_merge_and_compact_tc`, with the same
+  tie-breaking and output contract.
 
   By gathering candidates along axis 1 upfront rather than partitioning tokens
   over an `all_to_all`, all communication is consolidated into a single upfront
@@ -1699,6 +1737,8 @@ def streamindex_topk_dcp(
       query-token axis, which is orthogonal to the KV axis DCP shards, so the
       two compose.
     dcp_axis_name: name of the DCP mesh axis.
+    tc_topk: whether to run local top-k and the cross-rank merge/compaction on
+      TensorCore instead of SparseCore. Defaults to False.
 
   Returns:
     i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1763,10 +1803,21 @@ def streamindex_topk_dcp(
         cp_rank=dcp_rank,
         interleave_size=interleave_size,
         return_scores=True,
+        tc_topk=tc_topk,
     )
 
     # Stage 1. All-gather the scores; the indices stay home.
     scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
+
+    if tc_topk:
+      return tc_topk_lib.dcp_merge_and_compact_tc(
+          scores,
+          idxs,
+          k=k,
+          dcp_rank=dcp_rank,
+          dcp_size=dcp_size,
+          inputs_sorted=True,
+      )
 
     # Stage 2. Full width as the row length: -inf entries (unfilled local
     # slots, padding tokens) are never selected, so they need no masking.
@@ -1778,7 +1829,9 @@ def streamindex_topk_dcp(
         ),
         write_empty_rows=True,
     )
-    return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
+    return dcp_sc_compact.resolve_owned_winners(
+        idxs, slots, k, dcp_rank, tc_topk=tc_topk
+    )
 
   replicated = P()
   return jax.shard_map(
