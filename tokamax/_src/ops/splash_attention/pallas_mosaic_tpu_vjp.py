@@ -432,8 +432,8 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       can_use_diag_skip_2048 = (
           is_causal and bq == bkv == bkv_c and dropout_rate == 0.0
       )
-      can_use_vmem_dq = can_use_diag_skip_2048 and (
-          q_steps <= 2 or kv_steps == 1
+      try_diag_band_skip = can_use_diag_skip_2048 and (
+          q_steps <= 2 or kv_steps == 1 or bkv_c >= 2048
       )
       # TODO: Make these conditions more configurable
       if bkv_c > 1024 and not can_use_diag_skip_2048:
@@ -476,7 +476,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     qk_diag_grid=qk_grid_size,
                 )
             )
-          if can_use_vmem_dq and (bkv_c // qk_grid_size) % NUM_LANES == 0:
+          if try_diag_band_skip and (bkv_c // qk_grid_size) % NUM_LANES == 0:
             configs.add(
                 Config(
                     block_q_dkv=bq,
