@@ -574,6 +574,53 @@ ARG_SPECS = (
             block_size=1024,
             project='qwen3_5',
         ),
+        # Qwen 3.8 MoE 512 experts EP=32:
+        # Decode (m=1536 tokens across 16 local experts)
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_8_decode_gate_up',
+            num_groups=16,
+            m=1536,
+            k=8192,
+            n=4096,  # N=Ngate+Nup=2048+2048=4096
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=8192,
+            project='qwen3_8',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_8_decode_down',
+            num_groups=16,
+            m=1536,
+            k=2048,
+            n=8192,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=2048,
+            project='qwen3_8',
+        ),
+        # Prefill (m=16384 tokens across 16 local experts)
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_8_prefill_gate_up',
+            num_groups=16,
+            m=16384,
+            k=8192,
+            n=4096,  # N=Ngate+Nup=2048+2048=4096
+            fuse_act='silu',
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=8192,
+            project='qwen3_8',
+        ),
+        _make_ullm_gmm_v2_spec(
+            'qwen_3_8_prefill_down',
+            num_groups=16,
+            m=16384,
+            k=2048,
+            n=8192,
+            fuse_act=None,
+            weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
+            block_size=2048,
+            project='qwen3_8',
+        ),
     )
     # DeepSeek-V3 (256 experts, top-8, 65,536 tokens) with fp8 weights and
     # equal group sizes. Each group's row count is a multiple of the bucket
