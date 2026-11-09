@@ -79,6 +79,34 @@ class Config:
   chunk_tokens: Annotated[int, pydantic.Field(gt=0)] | None = None
 
 
+def _sc_heuristics_config(ba: op.BoundArguments) -> Config:
+  """Choose KV tiles and score windows for SparseCore prefill."""
+  num_tokens, max_num_seqs, pages_per_seq, page_size = _tc_topk_shape_params(ba)
+  _, num_heads, head_dim = ba.arguments["q"].shape
+  if (
+      pltpu.get_tpu_info().generation != 7
+      or max_num_seqs != 1
+      or ba.arguments.get("cp_size", 1) != 1
+      or jax.dtypes.itemsize_bits(ba.arguments["q"].dtype) != 8
+      or num_heads > 64
+      or head_dim != 128
+      or page_size not in (128, 256, 512, 1024)
+      or num_tokens < 512
+      or num_tokens % 256
+      or pages_per_seq * page_size < 8192
+  ):
+    return Config()
+  # Amortize per-step DMA and scoring setup over 2K KV positions. Keep the
+  # query tile fixed: changing it can select a different head-reduction path.
+  kv_pages = min(pages_per_seq, max(1, 2048 // page_size))
+  # Each window is a whole number of the existing 16-query scoring tiles.
+  # This exposes SC(window) / TC(window + 1) overlap without changing the
+  # head-reduction layout or splitting a request-local query tile.
+  return Config(
+      num_kv_pages_per_block=(1, kv_pages, kv_pages), chunk_tokens=256
+  )
+
+
 # TensorCore top-k heuristic. Sizes are in compressed KV positions per sequence.
 #
 # A query block whose whole compressed KV fits in one KV block takes the
@@ -292,15 +320,7 @@ class PallasTpuLightningIndexer(base.LightningIndexer[Config]):
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     if not tc_topk.has_full_sparsecore_topk():
       return _tc_heuristics_config(ba)
-    return Config(
-        num_kv_pages_per_block=(1, 1, 1),
-        num_queries_per_block=(1, 16, 16),
-        buffer_count=kernel_config.DEFAULT_BUFFER_COUNT,
-        vmem_limit_bytes=kernel_lib.DEFAULT_VMEM_LIMIT_BYTES,
-        decode_req_batch_size=4,
-        enable_early_exit=False,
-        chunk_tokens=None,
-    )
+    return _sc_heuristics_config(ba)
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
