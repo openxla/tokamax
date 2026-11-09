@@ -187,6 +187,84 @@ class BaselineMlaTest(parameterized.TestCase):
     np.testing.assert_allclose(out, out_ref, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(updated_kv, kv_ref, rtol=1e-5, atol=1e-5)
 
+  @parameterized.parameters(jnp.bfloat16, jnp.float8_e4m3fn)
+  def test_head_major_layout_matches_token_major(self, dtype):
+    seq_lens_list = [(1, 300), (7, 513), (1, 18)]
+    page_size = 256
+    (
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    ) = utils.generate_mla_inputs(
+        seq_lens_list,
+        128,
+        512,
+        64,
+        page_size,
+        dtype,
+        dtype,
+        16,
+        rng=np.random.default_rng(0),
+    )
+    num_pages, page_size_per_packing, packing, kv_dim = cache_kv.shape
+    lanes_cache_kv = cache_kv.reshape(num_pages, page_size, kv_dim).transpose(
+        0, 2, 1
+    )
+    baseline_op = base.MultiHeadLatentAttention()
+
+    out, updated_kv = baseline_op(
+        jnp.swapaxes(ql_nope, 0, 1),
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        lanes_cache_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        layout=base.MlaLayout.HEAD_MAJOR_SEQ_ALONG_LANE,
+    )
+    expected_out, expected_kv = baseline_op(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+
+    np.testing.assert_array_equal(out, jnp.swapaxes(expected_out, 0, 1))
+    np.testing.assert_array_equal(
+        updated_kv,
+        expected_kv.reshape(
+            num_pages, page_size_per_packing * packing, kv_dim
+        ).transpose(0, 2, 1),
+    )
+
+  def test_layout_rank_validation(self):
+    with self.assertRaisesRegex(ValueError, "rank-3 cache_kv"):
+      base.MultiHeadLatentAttention().bind(
+          ql_nope=jnp.zeros((8, 10, 128)),
+          q_pe=jnp.zeros((10, 8, 64)),
+          new_kv_c=jnp.zeros((10, 128)),
+          new_k_pe=jnp.zeros((10, 64)),
+          cache_kv=jnp.zeros((2, 16, 4, 256)),
+          kv_lens=jnp.zeros((2,), dtype=jnp.int32),
+          page_indices=jnp.zeros((2,), dtype=jnp.int32),
+          cu_q_lens=jnp.zeros((3,), dtype=jnp.int32),
+          distribution=jnp.zeros((3,), dtype=jnp.int32),
+          layout=base.MlaLayout.HEAD_MAJOR_SEQ_ALONG_LANE,
+      )
+
   @parameterized.named_parameters(
       dict(
           testcase_name="mixed",

@@ -396,6 +396,11 @@ OPS: tuple[Op, ...] = (
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla/pallas_mosaic_tpu.py",
             ),
+            Impl(
+                name="mosaic_tpu_v3",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/mla/pallas_mosaic_tpu_v3.py",
+            ),
         ),
     ),
     Op(
