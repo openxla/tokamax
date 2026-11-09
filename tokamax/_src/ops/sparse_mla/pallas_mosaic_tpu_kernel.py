@@ -261,7 +261,7 @@ def _attention_kernel(
     out = (
         lax.div(acc, l_total)
         if q_dtype == jnp.float32
-        else (acc * pl.reciprocal(l_total, approx=True)).astype(q_dtype)
+        else (acc * pltpu.reciprocal(l_total, approx=True)).astype(q_dtype)
     )
     return out
 
