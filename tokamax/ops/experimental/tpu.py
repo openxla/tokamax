@@ -25,6 +25,12 @@ from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu_v3 import Config as Mul
 from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu_v3 import PallasTpuMultiHeadLatentAttentionV3 as MultiHeadLatentAttentionV3
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import Config as MlaSwaConfig
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import PallasTpuMlaSwa as MlaSwa
+from tokamax._src.ops.experimental.routing_moe_op.api import routing_moe as routing_moe
+from tokamax._src.ops.experimental.routing_moe_op.api import routing_moe_from_logits as routing_moe_from_logits
+from tokamax._src.ops.experimental.routing_moe_op.api import routing_topk as routing_topk
+from tokamax._src.ops.experimental.routing_moe_op.api import RoutingMoeFromLogitsWarning as RoutingMoeFromLogitsWarning
+from tokamax._src.ops.experimental.routing_moe_op.pallas_mosaic_tpu import Config as RoutingMoeConfig
+from tokamax._src.ops.experimental.routing_moe_op.pallas_mosaic_tpu import PallasMosaicTpuRoutingMoe as RoutingMoe
 
 # pylint: enable=g-importing-member,useless-import-alias
 
@@ -39,4 +45,10 @@ __all__ = (
     "MultiHeadLatentAttentionConfig",
     "MultiHeadLatentAttentionV3",
     "MultiHeadLatentAttentionV3Config",
+    "RoutingMoe",
+    "RoutingMoeConfig",
+    "RoutingMoeFromLogitsWarning",
+    "routing_moe",
+    "routing_moe_from_logits",
+    "routing_topk",
 )

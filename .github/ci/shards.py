@@ -359,6 +359,9 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/api_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/base_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/pallas_mosaic_tpu_test.py',
         ),
         minutes=15,
         compat_minutes=1,

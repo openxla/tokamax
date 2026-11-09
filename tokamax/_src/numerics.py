@@ -144,6 +144,15 @@ class ArrayInitializer(abc.ABC):
   def dtype(self) -> jnp.dtype:
     ...
 
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> 'ArrayInitializer':
+    """Returns a copy of this initializer with the given sharding."""
+    raise NotImplementedError(
+        f'{type(self).__name__} must implement with_sharding to be used with a'
+        ' sharded abstract mesh.'
+    )
+
 
 class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
   """A abstract array with a known range."""
@@ -234,6 +243,60 @@ def _init_array(
   return jax.device_put(init_host(), out_sharding)
 
 
+def _init_array_initializer(
+    rng: np.random.Generator, x: ArrayInitializer
+) -> jax.Array:
+  """Initializes an `ArrayInitializer`, preserving its declared sharding."""
+  sharding = getattr(x, 'sharding', None)
+  out_sharding = None if sharding is None else getattr(x, 'format', None)
+  return jax.device_put(x(rng), out_sharding)
+
+
+def _init_qarray(rng: np.random.Generator, x: qwix.QArray) -> qwix.QArray:
+  """Initializes an abstract `QArray` or returns a concrete one unchanged."""
+  if x.zero_point is not None:
+    raise NotImplementedError('Zero point not supported.')
+  if x.qvalue.dtype != x.qtype:
+    raise NotImplementedError('`qvalue.dtype` and `qtype` must match.')
+
+  abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
+  abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
+
+  if abstract_qvalue and abstract_scale:
+    x = dataclasses.replace(
+        x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)  # pyrefly: ignore[bad-argument-type]
+    )
+    values = _init_array(rng, jax.ShapeDtypeStruct(x.shape, x.dtype))
+    tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
+    return qwix.quantize(values, x.qtype, tiled_axes=tiled_axes)
+  if not abstract_qvalue and not abstract_scale:
+    return x
+  raise ValueError(
+      '`QArray` values and scales must both be abstract or both concrete.'
+  )
+
+
+def _init_with_layout(rng: np.random.Generator, x: Any) -> Any:
+  """Initializes an abstract array, `ArrayInitializer`, or `QArray`."""
+  if isinstance(x, ArrayInitializer):
+    return _init_array_initializer(rng, x)
+  if isinstance(x, qwix.QArray):
+    return _init_qarray(rng, x)
+  assert isinstance(x, jax.ShapeDtypeStruct)
+  return _init_array(rng, x)
+
+
+def _is_abstract_leaf(x: Any) -> bool:
+  """Returns whether a flattened PyTree leaf requires initialization."""
+  return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
+      isinstance(x, qwix.QArray)
+      and (
+          isinstance(x.qvalue, jax.ShapeDtypeStruct)
+          or isinstance(x.scale, jax.ShapeDtypeStruct)
+      )
+  )
+
+
 def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
   """Randomly initialize all abstract arrays in a PyTree.
 
@@ -249,57 +312,18 @@ def random_initialize(x: PyTree, seed: int = 0) -> PyTree:
     A new PyTree with each abstract array replaced by a randomly initialized
     `jax.Array`.
   """
-
-  def init_with_layout(rng, x):
-    if isinstance(x, ArrayInitializer):
-      return jax.device_put(x(rng))
-    if isinstance(x, qwix.QArray):
-      if x.zero_point is not None:
-        raise NotImplementedError('Zero point not supported.')
-      if x.qvalue.dtype != x.qtype:
-        raise NotImplementedError('`qvalue.dtype` and `qtype` must match.')
-
-      abstract_qvalue = isinstance(x.qvalue, jax.ShapeDtypeStruct)
-      abstract_scale = isinstance(x.scale, jax.ShapeDtypeStruct)
-
-      if abstract_qvalue and abstract_scale:
-        x = dataclasses.replace(
-            x, qvalue=_as_vmap_shape(x.qvalue), scale=_as_vmap_shape(x.scale)  # pyrefly: ignore[bad-argument-type]
-        )
-        values = _init_array(rng, jax.ShapeDtypeStruct(x.shape, x.dtype))
-        tiled_axes = {i: d for i, d in enumerate(x.scale_tile_shape)}
-        return qwix.quantize(values, x.qtype, tiled_axes=tiled_axes)
-      elif not abstract_qvalue and not abstract_scale:
-        return x
-      else:
-        raise ValueError(
-            '`QArray` values and scales must both be abstract or both concrete.'
-        )
-    assert isinstance(x, jax.ShapeDtypeStruct)
-    return _init_array(rng, x)
-
   is_leaf = lambda x: isinstance(x, (ArrayInitializer, qwix.QArray))
   x_flat, tree = jax.tree.flatten(x, is_leaf=is_leaf)
-
-  def is_abstract(x):
-    return isinstance(x, (jax.ShapeDtypeStruct, ArrayInitializer)) or (
-        isinstance(x, qwix.QArray)
-        and (
-            isinstance(x.qvalue, jax.ShapeDtypeStruct)
-            or isinstance(x.scale, jax.ShapeDtypeStruct)
-        )
-    )
-
-  abstract_arrays, other, merge = utils.split_merge(is_abstract, x_flat)
+  abstract_arrays, other, merge = utils.split_merge(_is_abstract_leaf, x_flat)
   rngs = np.random.default_rng(seed).spawn(len(abstract_arrays))
 
   if jax.process_count() > 1:
     # Initializing arrays sharded across processes launches a program on every
     # process. These must be launched in the same order on all processes, so we
     # can't initialize concurrently.
-    arrays = list(map(init_with_layout, rngs, abstract_arrays))
+    arrays = list(map(_init_with_layout, rngs, abstract_arrays))
   else:
     with futures.ThreadPoolExecutor() as executor:
-      arrays = list(executor.map(init_with_layout, rngs, abstract_arrays))
+      arrays = list(executor.map(_init_with_layout, rngs, abstract_arrays))
 
   return tree.unflatten(merge(arrays, other))

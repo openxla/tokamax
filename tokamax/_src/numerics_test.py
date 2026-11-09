@@ -26,6 +26,33 @@ from tokamax._src import batching
 from tokamax._src import numerics
 
 
+class _ShardedCustomArrayInitializer(
+    jax.ShapeDtypeStruct, numerics.ArrayInitializer
+):
+  """Custom array initializer for testing sharded initialization."""
+
+  def __init__(
+      self,
+      shape: tuple[int, ...],
+      dtype: jax.typing.DTypeLike,
+      sharding: jax.sharding.Sharding | None = None,
+      custom_attr: str = 'test_value',
+  ):
+    super().__init__(shape, dtype, sharding=sharding)
+    self.custom_attr = custom_attr
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    del rng
+    return np.ones(self.shape, dtype=self.dtype)
+
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> '_ShardedCustomArrayInitializer':
+    return _ShardedCustomArrayInitializer(
+        self.shape, self.dtype, sharding=sharding, custom_attr=self.custom_attr
+    )
+
+
 class NumericsTest(parameterized.TestCase):
 
   def test_initializer_consistency(self):
@@ -203,6 +230,29 @@ class NumericsTest(parameterized.TestCase):
       actual = numerics.random_initialize(spec, seed=0)
     mock_pool.assert_not_called()
     chex.assert_trees_all_equal(actual, expected)
+
+  def test_random_initialize_sharded_custom_array_initializer(self):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ('x',))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+    sharded_init = _ShardedCustomArrayInitializer(
+        (8, 16), jnp.float32, sharding=sharding, custom_attr='custom_field'
+    )
+    resharded_init = sharded_init.with_sharding(sharding)
+    self.assertEqual(resharded_init.custom_attr, 'custom_field')
+    self.assertEqual(resharded_init.sharding, sharding)
+
+    out_sharded = numerics.random_initialize(sharded_init)
+    self.assertEqual(out_sharded.sharding, sharding)
+    self.assertEqual(out_sharded.shape, (8, 16))
+    self.assertTrue((np.array(out_sharded) == 1.0).all())
+
+    unsharded_init = _ShardedCustomArrayInitializer(
+        (8, 16), jnp.float32, custom_attr='custom_field'
+    )
+    out_unsharded = numerics.random_initialize(unsharded_init)
+    self.assertIsNone(unsharded_init.sharding)
+    self.assertEqual(out_unsharded.shape, (8, 16))
+    self.assertTrue((np.array(out_unsharded) == 1.0).all())
 
 
 if __name__ == '__main__':
