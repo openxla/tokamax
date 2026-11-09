@@ -208,14 +208,10 @@ def _pre_process_pallas(
   K_PADSIZE = int(align_up(K, 128))
   V_ALIGNED = int(align_up(V, 128))
 
-  # ── Auto MB: maximise VMEM utilisation, capped at min(H, 16) ──
+  # ── Auto MB: maximise VMEM utilisation ──
   # scratch per head: h_acc [K, V] + m_acc [K, K], all fp32.
   per_head_scratch = (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE) * 4
-  vmem_budget = 8 * 1024 * 1024
-  MB = max(1, vmem_budget // per_head_scratch)
-  MB = min(MB, H, 16)
-  while H % MB != 0 and MB > 1:
-    MB -= 1
+  MB = estimate_mini_batch(per_head_scratch, H)
 
   # ── Pad K/V then T (reserve trailing BT for safe gather) ──
 
@@ -987,9 +983,7 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
   """
   elem_size = dtype.itemsize if dtype is not None else 4
   per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-  hw = get_tpu_limits()
-  max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
-  return estimate_mini_batch(per_head, H, max_mb=max_mb)
+  return estimate_mini_batch(per_head, H)
 
 
 @functools.partial(
@@ -1648,8 +1642,7 @@ def chunk_kda_fwd_h_o_varlen(
     out_bytes = BT * V_ALIGNED * elem_size
     scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
     per_head = in_bytes + out_bytes + scratch_bytes
-    max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
-    MB = estimate_mini_batch(per_head, H, max_mb=max_mb)  # pylint: disable=invalid-name
+    MB = estimate_mini_batch(per_head, H)  # pylint: disable=invalid-name
   else:
     MB = mini_batch
     assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"

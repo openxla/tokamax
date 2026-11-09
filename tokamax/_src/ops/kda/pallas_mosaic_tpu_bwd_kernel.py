@@ -34,6 +34,7 @@ from tokamax._src.ops.kda.common import (
     chunk_gated_delta_rule_fwd_h,
     estimate_mini_batch,
     get_tpu_limits,
+    get_vmem_limit_bytes,
     kda_gate_chunk_cumsum,
 )
 from tokamax._src.ops.kda.cp_utils import (
@@ -316,19 +317,15 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
   chunk_seg_ids = seg.reshape(NT, BT)[:, 0]
   chunk_active = ((chunk_seg_ids == first_seg_id) & has_real).astype(jnp.int32)
 
-  # ── Auto MB: maximise VMEM utilisation, capped at min(H, 16) ──
+  # ── Auto MB: maximise VMEM utilisation ──
   q_elem = 2 if q.dtype == jnp.bfloat16 else 4
   gk_elem = 2 if gk.dtype == jnp.bfloat16 else 4
   do_elem = 2 if do.dtype == jnp.bfloat16 else 4
   per_head = (
-    2 * BT * (3 * K * q_elem + K * gk_elem + 2 * V * do_elem)
-    + (K * V + K * K) * 4
+      2 * BT * (3 * K * q_elem + K * gk_elem + 2 * V * do_elem)
+      + (K * V + K * K) * 4
   )
-  vmem_budget = 8 * 1024 * 1024
-  MB = max(1, vmem_budget // per_head)
-  MB = min(MB, H, 16)
-  while H % MB != 0 and MB > 1:
-    MB -= 1
+  MB = estimate_mini_batch(per_head, H)
 
   # ── Reshape inputs: [H, 1, T, dim] → [H*NT*BT, dim] (no transpose) ──
   q_r = q.reshape(H * NT * BT, K)
@@ -768,9 +765,9 @@ def fused_recompute_w_u_vnew_from_h_pallas(
     in_bytes = (3 * BT * K + BT * V + BT + BT * BT + K * V) * elem_size  # beta: BT bytes (2D)
     out_bytes = (3 * BT * K + BT * V) * elem_size
     per_chunk = in_bytes + out_bytes
-    vmem_budget = 8 * 1024 * 1024
+    vmem_budget = get_vmem_limit_bytes()
     hw_mb = max(1, vmem_budget // per_chunk)
-    MB = min(hw_mb, total)
+    MB = min(hw_mb, total, 32)
     # align upward to block_align_minor (TPU dim=-2 constraint)
     MB = min(align_up(MB, align_minor), total)
     # try to make total divisible by MB; reduce MB first, pad as fallback
@@ -1746,15 +1743,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         * 4
     )
     per_head = io_per_head + io_per_head * 3 // 2
-    hw = get_tpu_limits()
-    vmem_budget = hw.vmem_limit_bytes
+    vmem_budget = get_vmem_limit_bytes()
     # Scale down VMEM budget for chunk sizes > 64 (override via KDA_BWD_VMEM_FRACTION).
     _frac = float(os.environ.get("KDA_BWD_VMEM_FRACTION", "0") or 0)
     if _frac > 0:
       vmem_budget = int(vmem_budget * _frac)
     elif BT > 64:
       vmem_budget = (vmem_budget * 64) // BT
-    if (
+    is_stateless_bf16_scalar = (
         act_dtype == jnp.bfloat16
         and not per_channel_gate
         and not has_qg_kg_w
@@ -1763,16 +1759,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         and not return_dh0
         and dqkv_out_dtype == jnp.bfloat16
         and BT <= 64
-    ) or (per_channel_gate and hw.vmem_limit_bytes > 64 * 1024 * 1024):
-      max_mb = 32
-    else:
-      max_mb = 16
-    MB = max(1, vmem_budget // per_head)
-    MB = max(gqa_repeats, min(MB, H, max(max_mb, gqa_repeats)))
-    while MB > gqa_repeats:
-      if H % MB == 0 and MB % gqa_repeats == 0:
-        break
-      MB -= 1
+    )
+    MB = estimate_mini_batch(
+        per_head,
+        H,
+        max_mb=32 if is_stateless_bf16_scalar else None,
+        vmem_budget=vmem_budget,
+        multiple_of=gqa_repeats,
+    )  # pylint: disable=invalid-name
   else:
     MB = mini_batch
   if H % MB != 0:
@@ -2250,11 +2244,7 @@ def chunk_kda_bwd_dAv_kernel(
     in_bytes = (2 * BT * V + BT * BT) * elem_size
     out_bytes = (BT * BT * 4 + BT * V * 2)
     per_chunk = in_bytes + out_bytes
-    # Pin MB=1 for BT > 64. `per_chunk` above counts only the pipelined I/O
-    # blocks, not the in-kernel f32 [MB, BT, BT] intermediates (masked A and
-    # the dA accumulator), which grow quadratically with BT.
-    max_mb = 1 if BT > 64 else 32
-    MB = estimate_mini_batch(per_chunk, total, max_mb=max_mb)
+    MB = estimate_mini_batch(per_chunk, total, chunk_size=BT)
   else:
     MB = mini_batch
     assert total % MB == 0, f"total={total} must be divisible by mini_batch={MB}"
