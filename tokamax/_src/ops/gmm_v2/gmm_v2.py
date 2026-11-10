@@ -1381,7 +1381,10 @@ def calculate_tiling(
 
   # TODO: max number of bucket was choosen empiirically.
   # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 8 if tpu_generation >= 8 else 4
+  # Each bucket adds a fully unrolled copy of the matmul body. On TPU8, the
+  # larger VMEM allows tiles big enough that 3+ buckets can exceed instruction
+  # memory, which can make the kernel >2x slower, so use fewer buckets there.
+  max_num_buckets = 2 if tpu_generation >= 8 else 4
   bucket_base = tile_m
   # For transposed RHS (dlhs), cap tile_m at the average group size so tiles do
   # not pad and XLU-transpose rows past typical group boundaries. Keep full

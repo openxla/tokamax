@@ -2587,8 +2587,8 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
         rhs_cfgs=rhs_cfgs_down,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    # tile_m scales up to 2048 with max_num_buckets=8
-    self.assertGreaterEqual(tiles_down.tile_m, 1024)
+    # At most 2 buckets on TPU8, to stay within instruction memory.
+    self.assertEqual(tiles_down.tile_m, 512)
     self.assertEqual(tiles_down.bucket_base, 256)
 
     # 2. qwen_3_5_prefill_conc8_gate_up: 163840 tokens, 64 groups of 2560
@@ -2615,8 +2615,7 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
         vmem_limit_bytes=vmem_limit_bytes,
         fuse_act="silu",
     )
-    # tile_m scales beyond 4 buckets (1024) to 2048 with max_num_buckets=8
-    self.assertGreaterEqual(tiles_conc8.tile_m, 2048)
+    self.assertEqual(tiles_conc8.tile_m, 512)
     self.assertEqual(tiles_conc8.bucket_base, 256)
     self.assertGreaterEqual(tiles_conc8.lhs_buffer_count, 3)
 
@@ -2931,6 +2930,58 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
     tiles = self._calculate_tgmm_tiling(2048, 1280, num_cores=2, size_m=size_m)
     self.assertEqual(tiles.tile_m, want_tile_m)
     self.assertEqual(tiles.bucket_base, 256)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="tpu7", generation=7, expected_num_buckets=4),
+      # TPU8 has enough VMEM for tiles whose unrolled buckets would exceed
+      # instruction memory, so it uses fewer buckets.
+      dict(testcase_name="tpu8", generation=8, expected_num_buckets=2),
+  )
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_calculate_tiling_max_num_buckets(
+      self, mock_get_tpu_info, generation, expected_num_buckets
+  ):
+    mock_tpu_info = mock.MagicMock()
+    mock_tpu_info.generation = generation
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 256
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    # DeepSeek-V3-like FFI: fp8 weights, bf16 activations, fused gate and up.
+    dims = gmm_v2.Dimensions(
+        size_m=8192,
+        size_k=7168,
+        size_n=2048,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=256,
+        is_transposed=False,
+    )
+
+    # VMEM and size_m are large enough that only the bucket cap limits tile_m.
+    tiles = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=1 << 34,
+        fuse_act="silu",
+    )
+
+    self.assertEqual(tiles.tile_m, tiles.bucket_base * expected_num_buckets)
 
 
 class GmmV2VmemStressTest(parameterized.TestCase):

@@ -622,25 +622,77 @@ ARG_SPECS = (
             project='qwen3_8',
         ),
     )
-    # DeepSeek-V3 (256 experts, top-8, 65,536 tokens) with fp8 weights and
-    # equal group sizes. Each group's row count is a multiple of the bucket
-    # size, so these cover bucket selection for full groups.
+    # FP8-weight prefill shapes, with equal and random group sizes. With the
+    # default tiling, these reach 4 buckets on chips with large VMEM, where the
+    # unrolled kernel can exceed instruction memory.
     + tuple(
         _make_fp8_gmm_v2_spec(
-            f'dsv3_{proj}_m524288_{"w8a8" if quantize_lhs else "w8a16"}_equal',
-            num_groups=256,
-            m=524288,
+            f'{model}_{proj}_m{m}_{"w8a8" if quantize_lhs else "w8a16"}'
+            f'_{"equal" if equal_groups else "random"}',
+            num_groups=num_groups,
+            m=m,
             k=k,
             n=n,
             quantize_lhs=quantize_lhs,
-            equal_groups=True,
+            equal_groups=equal_groups,
+            block_size=block_size,
             fuse_act=fuse_act,
-            project='deepseek3',
+            project=project,
         )
-        for proj, k, n, fuse_act in (
-            ('gate_up', 7168, 2 * 2048, 'silu'),
-            ('down', 2048, 7168, None),
+        for model, proj, num_groups, m, k, n, block_size, fuse_act, project in (
+            # DeepSeek-V3: 256 experts, top-8, 65,536 tokens.
+            (
+                'dsv3',
+                'gate_up',
+                256,
+                524288,
+                7168,
+                2 * 2048,
+                256,
+                'silu',
+                'deepseek3',
+            ),
+            ('dsv3', 'down', 256, 524288, 2048, 7168, 256, None, 'deepseek3'),
+            # DeepSeek-V4: 24 local experts (384 / EP=16), top-6, 16,384
+            # tokens per device.
+            (
+                'dsv4',
+                'gate_up',
+                24,
+                98304,
+                7168,
+                2 * 3072,
+                512,
+                'silu',
+                'deepseek4',
+            ),
+            ('dsv4', 'down', 24, 98304, 3072, 7168, 512, None, 'deepseek4'),
+            # Qwen3.8: 16 experts per TensorCore, prefill (16 x 8,192 tokens).
+            (
+                'qwen3_8',
+                'gate_up',
+                16,
+                40960,
+                8192,
+                2 * 2048,
+                256,
+                'silu',
+                'qwen3_8',
+            ),
+            (
+                'qwen3_8',
+                'gate_up',
+                16,
+                131072,
+                8192,
+                2 * 2048,
+                256,
+                'silu',
+                'qwen3_8',
+            ),
+            ('qwen3_8', 'down', 16, 131072, 2048, 8192, 256, None, 'qwen3_8'),
         )
         for quantize_lhs in (False, True)
+        for equal_groups in (True, False)
     )
 )
