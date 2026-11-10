@@ -25,7 +25,9 @@ from jax.extend import backend
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
+from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.experimental.mla import api
+from tokamax._src.ops.experimental.mla import arg_specs
 from tokamax._src.ops.experimental.mla import base
 from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_v3
 from tokamax._src.ops.experimental.mla import test_base
@@ -229,6 +231,98 @@ class PallasTpuMultiHeadLatentAttentionV3Test(parameterized.TestCase):
 
   def test_registered_in_api(self):
     self.assertIsInstance(api.IMPLEMENTATIONS["mosaic_tpu_v3"], MlaV3)
+
+
+def _v3_spec(name: str) -> arg_spec.ArgSpec:
+  (spec,) = (s for s in arg_specs.V3_ARG_SPECS if s.name == name)
+  return spec
+
+
+class AutotuningTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if (
+        backend.get_default_device().platform != "tpu"
+        or pltpu.get_tpu_info().generation < 7
+    ):
+      self.skipTest("Only supported on TPU v7+.")
+    if not bref_override.SUPPORTS_IN_OUT_BUFFER_COUNT:
+      self.skipTest("Requires (in, out) buffer_count support in Pallas.")
+
+  def test_cache_key_ignores_page_count_and_scales(self):
+    args = dict(_v3_spec("mla_v3_decode_rr05_t8").args)
+    key = MlaV3().bind(**args).autotuning_cache_key
+
+    cache_kv = args["cache_kv"]
+    args["cache_kv"] = jax.ShapeDtypeStruct(
+        (12345, *cache_kv.shape[1:]), cache_kv.dtype
+    )
+    args.update(sm_scale=0.1, q_scale=0.5, k_scale=None, v_scale=2.0)
+    self.assertEqual(MlaV3().bind(**args).autotuning_cache_key, key)
+
+    other = MlaV3().bind(**_v3_spec("mla_v3_decode_rr05_t32").args)
+    self.assertNotEqual(other.autotuning_cache_key, key)
+
+  def test_cache_key_ignores_schedules(self):
+    inputs = _inputs(_DECODE_SEQ_LENS, 1024, jnp.bfloat16)
+    op = MlaV3()
+    schedules = op.build_schedules(**inputs)
+    self.assertEqual(
+        op.bind(**inputs, schedules=schedules).autotuning_cache_key,
+        op.bind(**inputs).autotuning_cache_key,
+    )
+
+  @parameterized.parameters("mla_v3_decode_rr05_t8", "mla_v3_mixed_rr05_t1024")
+  def test_autotuning_configs(self, name):
+    ba = MlaV3().bind(**_v3_spec(name).args)
+    heuristic = ba.heuristics_config
+    configs = ba.op._get_autotuning_configs(ba)  # pylint: disable=protected-access
+
+    # Both passes are varied for every shape, whatever the batch's bands.
+    self.assertGreater(len({c.decode_batch_size for c in configs}), 1)
+    self.assertGreater(
+        len({c.prefill_num_queries_per_block for c in configs}), 1
+    )
+    # KV blocks need not divide the sequence length in pages.
+    self.assertIn(3, {c.decode_num_kv_pages_per_block for c in configs})
+    self.assertIn(3, {c.prefill_num_kv_pages_per_block for c in configs})
+    for c in configs:
+      self.assertEqual(c.prefill_num_queries_per_block % c.prefill_q_split, 0)
+      # Each sweep varies one pass and leaves the other at the heuristic.
+      decode_at_heuristic = (
+          c.decode_num_kv_pages_per_block,
+          c.decode_batch_size,
+          c.decode_n_buffer,
+      ) == (
+          heuristic.decode_num_kv_pages_per_block,
+          heuristic.decode_batch_size,
+          heuristic.decode_n_buffer,
+      )
+      prefill_at_heuristic = (
+          c.prefill_num_kv_pages_per_block,
+          c.prefill_num_queries_per_block,
+          c.prefill_q_split,
+      ) == (
+          heuristic.prefill_num_kv_pages_per_block,
+          heuristic.prefill_num_queries_per_block,
+          heuristic.prefill_q_split,
+      )
+      self.assertTrue(decode_at_heuristic or prefill_at_heuristic)
+      # Buffering depth is only swept for the decode pass.
+      self.assertEqual(c.prefill_n_buffer, heuristic.prefill_n_buffer)
+      if prefill_at_heuristic:
+        self.assertIn(c.decode_n_buffer, (2, 3, 4))
+      else:
+        self.assertEqual(c.decode_n_buffer, heuristic.decode_n_buffer)
+
+  def test_production_specs_hit_the_cache(self):
+    device_kind = jax.devices()[0].device_kind.lower().replace(" ", "_")
+    if device_kind != "tpu7x":
+      self.skipTest("The cache is only populated for tpu7x.")
+    for spec in arg_specs.V3_ARG_SPECS:
+      with self.subTest(spec.name):
+        self.assertIsNotNone(MlaV3().bind(**spec.args).cached_autotuning_data)
 
 
 if __name__ == "__main__":
