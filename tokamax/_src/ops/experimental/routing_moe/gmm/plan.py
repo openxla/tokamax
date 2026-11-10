@@ -490,14 +490,20 @@ def _vmem_estimate(
     w_bits = jax.dtypes.itemsize_bits(weight.dtype)
     w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
     scale_vmem = 0
+    bytes_per_fp32 = 4
     if weight.quant is not None:
       num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
-      scale_vmem = num_w_refs * num_w_buffers * num_blocks * n_tile * 4
+      scale_vmem = (
+          num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
+      )
+    bias_vmem = 0
+    if weight.has_bias:
+      bias_vmem = num_w_refs * num_w_buffers * n_tile * bytes_per_fp32
     acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
     # Dynamic quantization materializes a quantized copy of the x tile.
     if is_dynamic_quantized:
       acc_vmem += tile_m * k_tile * matmul_bits // 8
-    return w_vmem + scale_vmem + acc_vmem
+    return w_vmem + scale_vmem + bias_vmem + acc_vmem
 
   num_w1_refs = 2 if is_fused_act else 1
   if w2 is None:

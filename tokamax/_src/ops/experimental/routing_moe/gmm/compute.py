@@ -208,6 +208,6 @@ def matmul(
     acc = _quantized_matmul(cfg, x, w, w_scale)
 
   if w_bias is not None:
-    acc += w_bias
+    acc += w_bias.astype(acc.dtype)
 
   return acc

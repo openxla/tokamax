@@ -107,6 +107,114 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=1e-2,
     )
 
+  @parameterized.named_parameters(
+      ("basic_256", helper_cases.BASIC_256, 0),
+      ("top1_200", helper_cases.TOP1_200, 0),
+      ("decode_16", helper_cases.DECODE_16, 0),
+      ("decode_64_ep8", helper_cases.DECODE_64_EP8, 128),
+  )
+  def test_gmm_scatter_bias(
+      self, case_spec: helper_cases.Case, group_offset: int
+  ):
+    # gmm_scatter has no activation (fuse_act).
+    # We test whether the bias is fetched and added at all.
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, has_bias=True, group_offset=group_offset
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_sorted_compact,
+        case.w1,
+        scatter=routing.scatter,
+        custom_plan=gmm_plan.RoutingGmmPlan(),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+  @parameterized.product(
+      case_spec=[
+          helper_cases.BASIC_256,
+          helper_cases.TOP1_200,
+          helper_cases.DECODE_16,
+      ],
+      tile_n=[None, 512],
+  )
+  def test_gather_gmm_bias(
+      self, case_spec: helper_cases.Case, tile_n: int | None
+  ):
+    # The test ensures the bias must be interleaved like the gate/up weight.
+    case = gmm_test_lib.GmmCase.make_case(case_spec, has_bias=True)
+    # At ×1 the bias is too small to detect a gate/up mix-up error.
+    assert case.w1.bias is not None
+    w1 = arg.SingleWeightWrapper.create(
+        case.w1.weight, case.w1.scale, case.w1.bias * 10, fused_gate_up=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        w1,
+        gather=routing.gather,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        w1,
+        routing.local_group_sizes,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.sorted_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+  @parameterized.product(
+      case_spec=[helper_cases.TOP1_200, helper_cases.DECODE_16],
+      fuse_up_and_down=[None, True, False],
+  )
+  def test_gather_gmm_gmm_scatter_bias(
+      self, case_spec: helper_cases.Case, fuse_up_and_down: bool | None
+  ):
+    # Checks the w2 bias in both the fused kernel and the two-call fallback.
+    case = gmm_test_lib.GmmCase.make_case(case_spec, has_bias=True)
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
   @parameterized.product(case_spec=helper_cases.UNIT_CASES)
   def test_gmm_scatter_fp8(self, case_spec: helper_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)

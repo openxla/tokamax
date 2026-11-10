@@ -29,8 +29,6 @@ def _validate_weights(
   """Validates weight specs and optional gated activation compatibility."""
   if fuse_act is not None and not w.fused_gate_up:
     raise ValueError("fuse_act requires a weight with fused_gate_up=True.")
-  if w.has_bias or (w2 is not None and w2.has_bias):
-    raise NotImplementedError("Bias is not supported yet.")
 
   # The fused activation combines a gate column and an up column into one, so
   # the output halves only when fuse_act is applied. fused_gate_up alone does

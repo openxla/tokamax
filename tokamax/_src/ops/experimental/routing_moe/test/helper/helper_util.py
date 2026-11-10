@@ -41,8 +41,6 @@ def skip_unless_supported(
 
 def check_gmm_supported(case: helper_cases.Case) -> None:
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
-  if case.shape.has_bias:
-    raise absltest.SkipTest("TODO: Support bias in routing_moe.")
   if case.local_intermediate_size % 256 != 0:
     raise absltest.SkipTest(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"
@@ -55,6 +53,8 @@ def check_moe_supported(
 ) -> None:
   """Skips the test if `case` or the mesh layout is unsupported."""
   check_gmm_supported(case)
+  if case.shape.has_bias:
+    raise absltest.SkipTest("TODO: Support bias in routing_moe.")
   if remote_scatter and case.sharding.ep > 1 and case.sharding.tp > 1:
     raise absltest.SkipTest(
         "TODO: Support remote_scatter with hybrid parallelism."

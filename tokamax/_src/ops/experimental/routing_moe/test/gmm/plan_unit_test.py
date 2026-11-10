@@ -50,6 +50,8 @@ def _make_spec(
     w_dtype: jnp.dtype | None = None,
     row_group: bool = True,
     with_scatter: bool = True,
+    has_bias: bool = False,
+    num_w_q_blocks: int = 1,
 ) -> gmm_spec_lib.RoutingGmmSpec:
   """Builds a RoutingGmmSpec for a 512-expert, top-10 MoE layer."""
   num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
@@ -76,10 +78,10 @@ def _make_spec(
         in_size=in_size,
         out_size=out_size,
         dtype=w_dtype,
-        quant=spec.SubchannelQuantSpec(block_size=in_size)
+        quant=spec.SubchannelQuantSpec(block_size=in_size // num_w_q_blocks)
         if quantized
         else None,
-        has_bias=False,
+        has_bias=has_bias,
         fused_gate_up=fused_gate_up,
     )
 
@@ -663,6 +665,85 @@ class SmemEstimateMatchesKernelTest(parameterized.TestCase):
     tile_m_idx = cfg.plan.tile_m_idx
     self.assertEqual(est_smem["gather_idx"], 4 * (num_idx + tile_m_idx))
     self.assertEqual(est_smem["scatter_idx"], 4 * (num_idx + tile_m_idx))
+
+
+class VmemEstimateTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(testcase_name="single", with_down=False),
+      dict(testcase_name="up_down", with_down=True),
+  )
+  def test_vmem_estimate_bias(self, with_down: bool):
+    num_w_buffers = 3
+
+    def estimate(has_bias: bool) -> int:
+      gmm_spec = _make_spec(8, with_down=with_down, has_bias=has_bias)
+      return gmm_plan._vmem_estimate(
+          x=gmm_spec.x,
+          w=gmm_spec.w,
+          w2=gmm_spec.w2,
+          is_fused_act=gmm_spec.is_fused_act,
+          matmul_dtype=jnp.dtype(jnp.float8_e4m3fn),
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=gmm_spec.x.dtype,
+          tile_m=128,
+          tile_k=gmm_spec.size_k,
+          tile_k2=gmm_spec.size_k2,
+          tile_n=gmm_spec.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    bytes_per_f32 = 4
+    gmm_spec = _make_spec(8, with_down=with_down)
+    bias_cols = gmm_spec.w.out_size
+    if gmm_spec.w2 is not None:
+      bias_cols += gmm_spec.w2.out_size
+    self.assertEqual(
+        estimate(True) - estimate(False),
+        num_w_buffers * bias_cols * bytes_per_f32,
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="single", with_down=False),
+      dict(testcase_name="up_down", with_down=True),
+  )
+  def test_vmem_estimate_scale(self, with_down: bool):
+    num_w_buffers = 3
+
+    def estimate(num_w_q_blocks: int) -> int:
+      gmm_spec = _make_spec(
+          8, with_down=with_down, num_w_q_blocks=num_w_q_blocks
+      )
+      return gmm_plan._vmem_estimate(
+          x=gmm_spec.x,
+          w=gmm_spec.w,
+          w2=gmm_spec.w2,
+          is_fused_act=gmm_spec.is_fused_act,
+          matmul_dtype=jnp.dtype(jnp.float8_e4m3fn),
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=gmm_spec.x.dtype,
+          tile_m=128,
+          tile_k=gmm_spec.size_k,
+          tile_k2=gmm_spec.size_k2,
+          tile_n=gmm_spec.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    # Only the scale term depends on the number of weight quant blocks, so one
+    # more block adds one f32 scale row per weight buffer.
+    bytes_per_f32 = 4
+    gmm_spec = _make_spec(8, with_down=with_down)
+    scale_cols = gmm_spec.w.out_size
+    if gmm_spec.w2 is not None:
+      scale_cols += gmm_spec.w2.out_size
+    self.assertEqual(
+        estimate(2) - estimate(1),
+        num_w_buffers * scale_cols * bytes_per_f32,
+    )
 
 
 if __name__ == "__main__":
