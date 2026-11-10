@@ -249,8 +249,11 @@ def calculate_decode_tile_size(
   rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
 
   # Search descending power-of-2 tile candidates (up to 16) bounded by
-  # batch size.
-  decode_candidates = [c for c in tile_sizes if c <= batch_size]
+  # batch size and maximum concurrent heads per recurrent contraction.
+  max_recurrent_batch = max(1, GDNConfig.MAX_BATCHED_RECURRENT_HEADS // n_v)
+  decode_candidates = [
+      c for c in tile_sizes if c <= batch_size and c <= max_recurrent_batch
+  ]
   decode_tile_size = decode_candidates[-1]
 
   for cand in decode_candidates:

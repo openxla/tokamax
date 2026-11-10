@@ -38,7 +38,7 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
-
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_kda
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
@@ -1115,6 +1115,153 @@ class KdaAttentionTest(parameterized.TestCase):
           attention_mode=config.AttentionMode.KDA,
       )
       self.assertEqual(vmem_declared, total_declared)
+
+  def test_recurrent_kda_batched_multi_token_window_with_ragged_masks(self):
+    """Batched recurrent_kda matches explicit per-sequence 2-dot reference across W=1, 4 and ragged real_sizes."""
+    for w_sz in (1, 4):
+      for act_dt in (jnp.float32, jnp.bfloat16):
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(
+                act_in=jnp.dtype(act_dt),
+                act_out=jnp.dtype(act_dt),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            ),
+            batch_size=8 * w_sz,
+            dim_size=2048,
+            kernel_size=4,
+            tile_size=8,
+            num_kq_heads=4,
+            num_v_heads=8,
+            kq_head_dim=128,
+            v_head_dim=128,
+            num_buffers=2,
+            window_size=w_sz,
+            attention_mode=config.AttentionMode.KDA,
+        )
+        real_sizes = jnp.array(
+            [w_sz, max(1, w_sz - 1), w_sz, 1, w_sz, w_sz, 0, w_sz],
+            dtype=jnp.int32,
+        )
+        q_c = jax.random.normal(
+            jax.random.key(42), (8, 4, w_sz, 1, 128), dtype=act_dt
+        )
+        k_c = jax.random.normal(
+            jax.random.key(43), (8, 4, w_sz, 1, 128), dtype=act_dt
+        )
+        v_c = jax.random.normal(
+            jax.random.key(44), (8, 8, w_sz, 1, 128), dtype=act_dt
+        )
+        b_c = jax.random.normal(
+            jax.random.key(45), (8, 1, w_sz, 1, 128), dtype=act_dt
+        )
+        a_c = jax.random.normal(
+            jax.random.key(46), (8, 8, w_sz, 1, 128), dtype=act_dt
+        )
+        s_prev = jax.random.normal(
+            jax.random.key(47), (8, 8, 128, 128), dtype=jnp.float32
+        )
+        a_log = jax.random.normal(jax.random.key(48), (8,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(
+            jax.random.key(49), (8, 128), dtype=jnp.float32
+        )
+
+        with jax.default_matmul_precision("highest"):
+          out, state = compute_kda.recurrent_kda(
+              real_sizes, q_c, k_c, v_c, b_c, a_c, s_prev, a_log, dt_bias, cfg
+          )
+          # Build explicit per-sequence 2-dot reference across all 8 sequence slots.
+          iota = jax.lax.broadcasted_iota(jnp.int32, (8, 1, w_sz, 1, 1), 2)
+          mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1)
+          q_m = compute_kda._l2_norm_f32(
+              jnp.where(mask, q_c.astype(jnp.float32), 0.0)
+          ) * (128**-0.5)
+          k_m = compute_kda._l2_norm_f32(
+              jnp.where(mask, k_c.astype(jnp.float32), 0.0)
+          )
+          v_m = jnp.where(mask, v_c.astype(jnp.float32), 0.0)
+          beta_m = jnp.where(mask, jax.nn.sigmoid(b_c.astype(jnp.float32)), 0.0)
+          if w_sz > 1:
+            beta_m = beta_m.astype(act_dt).astype(jnp.float32)
+          beta_m = jnp.swapaxes(beta_m, 1, 4)[:, :8, :, 0, :]
+          g_log = jnp.where(
+              mask,
+              compute_kda.activate_gate(
+                  a_c,
+                  a_log.reshape(1, 8, 1, 1, 1),
+                  dt_bias.reshape(1, 8, 1, 1, 128),
+                  cfg,
+              ),
+              0.0,
+          )
+          g_dec = jnp.exp(g_log)[:, :, :, 0, :]
+          q_m, k_m, v_m = (
+              q_m[:, :, :, 0, :],
+              k_m[:, :, :, 0, :],
+              v_m[:, :, :, 0, :],
+          )
+          ref_outs, ref_states = [], []
+          for s_i in range(8):
+            st = s_prev[s_i]
+            o_seq, s_seq = [], []
+            for c_i in range(w_sz):
+              qh = jnp.repeat(q_m[s_i, :, c_i], 2, axis=0)[:, None, :]
+              kh = jnp.repeat(k_m[s_i, :, c_i], 2, axis=0)[:, None, :]
+              kht = jnp.swapaxes(kh, 1, 2)
+              st_u = st * g_dec[s_i, :, c_i, :, None]
+              vu = jax.lax.dot(
+                  kh,
+                  st_u,
+                  dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                  preferred_element_type=jnp.float32,
+              )
+              vn = beta_m[s_i, :, c_i : c_i + 1] * (
+                  v_m[s_i, :, c_i : c_i + 1] - vu
+              )
+              st = st_u + kht * vn
+              ot = jax.lax.dot(
+                  qh,
+                  st,
+                  dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                  preferred_element_type=jnp.float32,
+              )
+              o_seq.append(ot[:, 0, :])
+              s_seq.append(st)
+            ref_outs.append(jnp.stack(o_seq, axis=0))
+            ref_states.append(jnp.stack(s_seq, axis=0))
+          ref_out = jnp.stack(ref_outs, axis=0)
+          ref_state = jnp.stack(ref_states, axis=0)
+
+        np.testing.assert_allclose(
+            np.asarray(out, np.float32),
+            np.asarray(ref_out, np.float32),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(state, np.float32),
+            np.asarray(ref_state, np.float32),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out[6], np.float32), 0.0, atol=1e-5
+        )
+        if w_sz == 4:
+          np.testing.assert_allclose(
+              np.asarray(state[1, 3], np.float32),
+              np.asarray(state[1, 2], np.float32),
+              rtol=1e-5,
+              atol=1e-5,
+          )
+          np.testing.assert_allclose(
+              np.asarray(state[3, 3], np.float32),
+              np.asarray(state[3, 0], np.float32),
+              rtol=1e-5,
+              atol=1e-5,
+          )
 
 
 if __name__ == "__main__":
