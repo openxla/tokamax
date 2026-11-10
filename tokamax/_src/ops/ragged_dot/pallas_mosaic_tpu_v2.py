@@ -469,10 +469,15 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     k_ = ((k + 128 - 1) // 128) * 128
     n_ = ((n + 128 - 1) // 128) * 128
 
+    try:
+      tpu_gen = getattr(pltpu.get_tpu_info(), "generation", 0)
+    except ValueError:
+      tpu_gen = 0
+    max_tile_m = 2048 if tpu_gen >= 8 else 1024
     tile_m_range = [
         128 * (2**i)
         for i in range(8)
-        if 128 * (2**i) <= m and 128 * (2**i) <= 1024
+        if 128 * (2**i) <= m and 128 * (2**i) <= max_tile_m
     ]
     tile_k_range = (
         {128 * (2**i) for i in range(8) if 128 * (2**i) <= k_}
@@ -493,8 +498,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         | {n_}
     )
     lhs_buffer_count_range = (
-        [None] if dims == DRHS_RAGGED_DOT_DIM_NUMS else [2, 3]
+        [None]
+        if dims == DRHS_RAGGED_DOT_DIM_NUMS
+        else ([2, 3, 4] if tpu_gen >= 8 else [2, 3])
     )
+    buckets_range = (1, 2, 4, 8) if tpu_gen >= 8 else (1, 2, 4)
     return {
         Config(
             tile_m=tile_m,
@@ -507,7 +515,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             tile_m_range,
             tile_k_range,
             tile_n_range,
-            (1, 2, 4),
+            buckets_range,
             lhs_buffer_count_range,
         )
         if tile_m // num_buckets >= 64
