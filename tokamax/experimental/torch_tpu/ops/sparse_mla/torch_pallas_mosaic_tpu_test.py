@@ -515,8 +515,10 @@ class PallasMosaicTpuSparseMlaTest(parameterized.TestCase):
     self.assertEqual(reconstructed, cfg)
 
     default_cfg = Config()
+    deconstructed_default = op_pallas.deconstruct_config(default_cfg)
+    self.assertEqual(deconstructed_default, (128, 16, -1))
     self.assertEqual(
-        op_pallas.reconstruct_config(op_pallas.deconstruct_config(default_cfg)),
+        op_pallas.reconstruct_config(deconstructed_default),
         default_cfg,
     )
     self.assertIsNone(op_pallas.deconstruct_config(None))
