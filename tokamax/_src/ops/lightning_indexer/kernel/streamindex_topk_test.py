@@ -33,6 +33,7 @@ from tokamax._src.ops.lightning_indexer.kernel.config import KVLayout
 from tokamax._src.ops.lightning_indexer.kernel.streamindex_topk import (
     convert_cache_to_seq_along_lane,
     streamindex_topk,
+    tensorcore_topk_select,
 )
 
 # =====================================================================
@@ -1234,9 +1235,11 @@ class ChunkedStreamIndexTopKTest(parameterized.TestCase):
       return_scores=False,
       *,
       tc_topk=False,
+      require_sparsecore: bool = True,
   ):
     """Call kwargs for one case; unchunked when `chunk_tokens` is None."""
-    self._require_topk_backend(tc_topk)
+    if require_sparsecore:
+      self._require_topk_backend(tc_topk)
     # Leading single-token sequences are decodes, the same rule the numerical
     # test above uses to build its distribution.
     num_decodes = 0
@@ -1854,6 +1857,748 @@ class ChunkedStreamIndexTopKTest(parameterized.TestCase):
           si, mi, err_msg=f"row {row}: positions differ"
       )
       np.testing.assert_array_equal(ss, ms, err_msg=f"row {row}: scores differ")
+
+  def _assert_fused_matches_reference(
+      self, ids_ref, ids_fzd, sc_ref=None, sc_fzd=None
+  ):
+    """Checks ascending-id fused output matches reference ids and scores."""
+    ids_ref_np = np.asarray(ids_ref)
+    ids_fzd_np = np.asarray(ids_fzd)
+    self._verify_padding_at_end(ids_ref_np)
+    self._verify_padding_at_end(ids_fzd_np)
+    sc_ref_np = None if sc_ref is None else np.asarray(sc_ref)
+    sc_fzd_np = None if sc_fzd is None else np.asarray(sc_fzd)
+    for r in range(ids_ref_np.shape[0]):
+      n_v = int(np.sum(ids_ref_np[r] >= 0))
+      self.assertEqual(
+          int(np.sum(ids_fzd_np[r] >= 0)), n_v, msg=f"count, row {r}"
+      )
+      if n_v > 0:
+        order = np.argsort(ids_ref_np[r, :n_v])
+        np.testing.assert_array_equal(
+            ids_fzd_np[r, :n_v],
+            ids_ref_np[r, :n_v][order],
+            err_msg=f"ids, row {r}",
+        )
+        if sc_ref_np is not None and sc_fzd_np is not None:
+          np.testing.assert_array_equal(
+              sc_fzd_np[r, :n_v],
+              sc_ref_np[r, :n_v][order],
+              err_msg=f"scores, row {r}",
+          )
+      np.testing.assert_array_equal(
+          ids_fzd_np[r, n_v:], -1, err_msg=f"padding, row {r}"
+      )
+      if sc_ref_np is not None and sc_fzd_np is not None:
+        np.testing.assert_array_equal(
+            sc_fzd_np[r, n_v:],
+            sc_ref_np[r, n_v:],
+            err_msg=f"pad scores, row {r}",
+        )
+
+  def test_tensorcore_topk_select_prefix_bucketing_and_edge_widths(self):
+    """Verifies tensorcore_topk_select on prefix buckets and edge widths."""
+    rng = np.random.default_rng(77)
+    score_f32 = rng.standard_normal((8, 4096), dtype=np.float32)
+    score_f32[:, 1500:] = 1e30  # Poison beyond row_lengths.
+    score_bits = jax.lax.bitcast_convert_type(jnp.asarray(score_f32), jnp.int32)
+    row_lens = jnp.array(
+        [0, 1, 17, 512, 1024, 1025, 1499, 1500], dtype=jnp.int32
+    )
+    ids_full, scores_full = tensorcore_topk_select(
+        score_bits,
+        512,
+        row_lens,
+        enable_prefix_bucketing=False,
+        return_scores=True,
+    )
+    ids_bkt, scores_bkt = tensorcore_topk_select(
+        score_bits,
+        512,
+        row_lens,
+        enable_prefix_bucketing=True,
+        return_scores=True,
+    )
+    ids_only = tensorcore_topk_select(
+        score_bits,
+        512,
+        row_lens,
+        enable_prefix_bucketing=True,
+        return_scores=False,
+    )
+    np.testing.assert_array_equal(np.asarray(ids_bkt), np.asarray(ids_full))
+    np.testing.assert_array_equal(
+        np.asarray(scores_bkt), np.asarray(scores_full)
+    )
+    np.testing.assert_array_equal(np.asarray(ids_only), np.asarray(ids_full))
+
+    # Single-bucket width (<= 1024), width < k padding, and k > 512 with pad_w.
+    for width, k_val, lens in (
+        (1024, 128, [0, 37, 512, 1024]),
+        (64, 128, [0, 17, 64, 64]),
+        (10240, 640, [0, 500, 4097, 10240]),
+    ):
+      edge_f32 = rng.standard_normal((4, width), dtype=np.float32)
+      edge_bits = jax.lax.bitcast_convert_type(jnp.asarray(edge_f32), jnp.int32)
+      edge_lens = jnp.array(lens, dtype=jnp.int32)
+      e_full, e_sc_full = tensorcore_topk_select(
+          edge_bits,
+          k_val,
+          edge_lens,
+          enable_prefix_bucketing=False,
+          return_scores=True,
+      )
+      e_bkt, e_sc_bkt = tensorcore_topk_select(
+          edge_bits,
+          k_val,
+          edge_lens,
+          enable_prefix_bucketing=True,
+          return_scores=True,
+      )
+      np.testing.assert_array_equal(np.asarray(e_bkt), np.asarray(e_full))
+      np.testing.assert_array_equal(np.asarray(e_sc_bkt), np.asarray(e_sc_full))
+
+  @parameterized.named_parameters(
+      ("continuous_16512", False, 16512),
+      ("continuous_65536", False, 65536),
+      ("ties_16512", True, 16512),
+      ("ties_65536", True, 65536),
+  )
+  def test_tensorcore_topk_select_wide_exactness(
+      self, use_ties: bool, max_row_len: int
+  ):
+    """Verifies 256K-scale tournament exactness on continuous and tied scores."""
+    rng = np.random.default_rng(78)
+    if use_ties:
+      arr = rng.integers(-6, 7, size=(8, 65536)).astype(np.float32)
+      arr[:, ::17] = -np.inf
+    else:
+      arr = rng.standard_normal((8, 65536), dtype=np.float32)
+      arr[:, 1000:1512] += 10.0
+      arr[:, 200] = -0.0
+      arr[:, 205] = +0.0
+    wide_bits = jax.lax.bitcast_convert_type(jnp.asarray(arr), jnp.int32)
+    wide_lens = jnp.array(
+        [
+            0,
+            1,
+            512,
+            4096,
+            4097,
+            16512,
+            min(32769, max_row_len),
+            max_row_len,
+        ],
+        dtype=jnp.int32,
+    )
+    w_ids_full, w_sc_full = tensorcore_topk_select(
+        wide_bits,
+        512,
+        wide_lens,
+        enable_prefix_bucketing=False,
+        return_scores=True,
+    )
+    w_ids_bkt, w_sc_bkt = tensorcore_topk_select(
+        wide_bits,
+        512,
+        wide_lens,
+        enable_prefix_bucketing=True,
+        return_scores=True,
+    )
+    np.testing.assert_array_equal(np.asarray(w_ids_bkt), np.asarray(w_ids_full))
+    np.testing.assert_array_equal(np.asarray(w_sc_bkt), np.asarray(w_sc_full))
+
+  def test_tensorcore_topk_select_relu_zero_ties_and_subbatch_tail(self):
+    """Verifies ReLU-zero ties and VMEM sub-batch scan + tail handling."""
+    rng = np.random.default_rng(79)
+    # 64-row VMEM-tiled scan (with one active and one empty 32-row sub-batch).
+    relu_chunk = np.zeros((64, 32768), dtype=np.float32)
+    for r in range(32):
+      pos_cols = rng.choice(32768, size=120 + r * 5, replace=False)
+      relu_chunk[r, pos_cols] = rng.uniform(
+          0.1, 5.0, size=pos_cols.size
+      ).astype(np.float32)
+      relu_chunk[r, (r * 13) % 512] = -0.0
+    relu_bits = jax.lax.bitcast_convert_type(jnp.asarray(relu_chunk), jnp.int32)
+    relu_lens = jnp.concatenate([
+        jnp.full((32,), 32768, dtype=jnp.int32),
+        jnp.zeros((32,), dtype=jnp.int32),
+    ])
+    r_ids_full, r_sc_full = tensorcore_topk_select(
+        relu_bits,
+        512,
+        relu_lens,
+        enable_prefix_bucketing=False,
+        return_scores=True,
+    )
+    r_ids_bkt, r_sc_bkt = tensorcore_topk_select(
+        relu_bits,
+        512,
+        relu_lens,
+        enable_prefix_bucketing=True,
+        return_scores=True,
+    )
+    r_ids_only = tensorcore_topk_select(
+        relu_bits,
+        512,
+        relu_lens,
+        enable_prefix_bucketing=True,
+        return_scores=False,
+    )
+    np.testing.assert_array_equal(np.asarray(r_ids_bkt), np.asarray(r_ids_full))
+    np.testing.assert_array_equal(np.asarray(r_sc_bkt), np.asarray(r_sc_full))
+    np.testing.assert_array_equal(
+        np.asarray(r_ids_only), np.asarray(r_ids_full)
+    )
+    np.testing.assert_array_equal(np.asarray(r_ids_bkt[32:]), -1)
+
+    # Non-multiple-of-32 batch_rows (45 = 32 scan + 13 tail).
+    r45_ids_bkt, r45_sc_bkt = tensorcore_topk_select(
+        relu_bits[:45],
+        512,
+        relu_lens[:45],
+        enable_prefix_bucketing=True,
+        return_scores=True,
+    )
+    r45_ids_only = tensorcore_topk_select(
+        relu_bits[:45],
+        512,
+        relu_lens[:45],
+        enable_prefix_bucketing=True,
+        return_scores=False,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(r45_ids_bkt), np.asarray(r_ids_full[:45])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(r45_sc_bkt), np.asarray(r_sc_full[:45])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(r45_ids_only), np.asarray(r_ids_full[:45])
+    )
+
+  def test_tensorcore_decode_only_and_max_score_sublanes(self):
+    """Verifies decode_only schedules and max_score_sublanes across TPUs."""
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    b_sz = 8
+    pages_per_seq = 16
+    inputs = _chunk_inputs(
+        (1,) * b_sz,
+        _fragmented_pages(b_sz, pages_per_seq),
+        page_size,
+        h_i,
+        d_dim,
+    )
+    s_list = (1024, 1536, 2048, 1024, 1536, 0, 0, 0)
+    base_kwargs = self._chunk_call_kwargs(
+        inputs,
+        (1, 1, 1, 1, 1, 0, 0, 0),
+        s_list,
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    base_kwargs["q"] = jnp.asarray(inputs.q)
+    base_kwargs["indexer_weights"] = jnp.asarray(inputs.weights)
+    base_kwargs["cu_q_lens"] = jnp.array(
+        [0, 1, 2, 3, 4, 5, 5, 5, 5], dtype=jnp.int32
+    )
+    base_kwargs["distribution"] = jnp.array([5, 5, 5], dtype=jnp.int32)
+
+    out_tc_full = np.asarray(
+        streamindex_topk(**base_kwargs, topk_mode="tensorcore_full")
+    )
+    out_tc_bounded = np.asarray(
+        streamindex_topk(**(
+            base_kwargs
+            | dict(
+                topk_mode="tensorcore_bounded",
+                decode_only=True,
+                max_score_sublanes=8,
+                enable_early_exit=True,
+            )
+        ))
+    )
+    out_tc_fused = np.asarray(
+        streamindex_topk(**(
+            base_kwargs
+            | dict(
+                topk_mode="tensorcore_fused",
+                decode_only=True,
+                max_score_sublanes=8,
+                enable_early_exit=True,
+            )
+        ))
+    )
+    np.testing.assert_array_equal(out_tc_bounded[:5], out_tc_full[:5])
+    self._assert_fused_matches_reference(out_tc_full, out_tc_fused)
+    np.testing.assert_array_equal(out_tc_bounded[5:], -1)
+    if tc_topk.has_full_sparsecore_topk():
+      out_sc = np.asarray(
+          streamindex_topk(**base_kwargs, topk_mode="sparsecore")
+      )
+      for r in range(5):
+        np.testing.assert_array_equal(
+            np.sort(out_tc_bounded[r]), np.sort(out_sc[r])
+        )
+
+    # Remainder decode pass (max_num_seqs=6, decode_req_batch_size=4).
+    rem_t = (1,) * 6
+    rem_s = (1024, 1536, 2048, 800, 1280, 960)
+    rem_inputs = _chunk_inputs(
+        rem_t, _fragmented_pages(6, 16), page_size, h_i, d_dim
+    )
+    rem_kw = self._chunk_call_kwargs(
+        rem_inputs,
+        rem_t,
+        rem_s,
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    rem_ref = streamindex_topk(**rem_kw, topk_mode="tensorcore_full")
+    rem_fzd = streamindex_topk(
+        **(rem_kw | dict(topk_mode="tensorcore_fused", decode_only=True))
+    )
+    self._assert_fused_matches_reference(rem_ref, rem_fzd)
+
+    # Single-sequence batch (max_num_seqs < decode_req_batch_size).
+    one_inputs = _chunk_inputs(
+        (1,), _fragmented_pages(1, 16), page_size, h_i, d_dim
+    )
+    one_kw = self._chunk_call_kwargs(
+        one_inputs,
+        (1,),
+        (1024,),
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    one_ref = streamindex_topk(**one_kw, topk_mode="tensorcore_full")
+    one_fzd = streamindex_topk(
+        **(one_kw | dict(topk_mode="tensorcore_fused", decode_only=True))
+    )
+    self._assert_fused_matches_reference(one_ref, one_fzd)
+
+    # decode_only=True with uniform_q_len (distribution[0] == 0, [1] == [2]).
+    uni_t = (4, 4, 4, 4, 4, 0, 0, 0)
+    uni_inputs = _chunk_inputs(
+        uni_t, _fragmented_pages(b_sz, pages_per_seq), page_size, h_i, d_dim
+    )
+    uni_kw = self._chunk_call_kwargs(
+        uni_inputs,
+        uni_t,
+        s_list,
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    uni_kw["distribution"] = jnp.array([0, 5, 5], dtype=jnp.int32)
+    uni_kw["uniform_q_len"] = 4
+    uni_ref = streamindex_topk(**uni_kw, topk_mode="tensorcore_full")
+    uni_fzd = streamindex_topk(
+        **(uni_kw | dict(topk_mode="tensorcore_fused", decode_only=True))
+    )
+    self._assert_fused_matches_reference(uni_ref, uni_fzd)
+
+  def test_max_score_sublanes_clamps_schedule(self):
+    """Verifies max_score_sublanes clamps runtime seq_lens on cp_size == 1."""
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    pages_per_seq, num_seqs = 8, 2
+    rng = np.random.default_rng(101)
+    block_table = np.asarray(_fragmented_pages(num_seqs, pages_per_seq))
+    num_pages = int(block_table.max()) + 1
+    keys = rng.uniform(0.1, 0.5, (num_pages, page_size, d_dim)).astype(
+        np.float32
+    )
+    # Put dominant keys in seq 0 pages 4..5 (compressed [512, 768), past the
+    # cap) and seq 1 page 2 (compressed [256, 384), below the compressed cap
+    # 512) so missing runtime clamping or missing compression_ratio scaling
+    # diverges from the capped reference.
+    for p in block_table[0, 4:6]:
+      keys[p] = 10.0
+    keys[block_table[1, 2]] = 10.0
+    cache_kv = jnp.asarray(_pack_fp8_cache(keys))
+    q = jnp.ones((num_seqs, h_i, d_dim), dtype=jnp.bfloat16)
+    weights = jnp.ones((num_seqs, h_i), dtype=jnp.float32)
+    cu_q_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32)
+    distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    common_kw = dict(
+        q=q,
+        indexer_weights=weights,
+        cache_kv=cache_kv,
+        page_indices=jnp.asarray(block_table.reshape(-1), dtype=jnp.int32),
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=k,
+        compression_ratio=comp_ratio,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 1, 1),
+        decode_req_batch_size=1,
+        return_scores=True,
+    )
+
+    ref_ids, ref_sc = streamindex_topk(**(
+        common_kw
+        | dict(
+            seq_lens=jnp.array([2048, 1536], dtype=jnp.int32),
+            topk_mode="tensorcore_full",
+        )
+    ))
+    over_cap_seq_lens = jnp.array([3072, 1536], dtype=jnp.int32)
+    bnd_kw = common_kw | dict(
+        seq_lens=over_cap_seq_lens,
+        topk_mode="tensorcore_bounded",
+        decode_only=True,
+        max_score_sublanes=4,
+    )
+    with mock.patch.object(
+        metadata, "compute_metadata", wraps=metadata.compute_metadata
+    ) as mock_meta:
+      streamindex_topk.lower(**bnd_kw)
+    self.assertTrue(mock_meta.called)
+    self.assertIsNot(mock_meta.call_args.kwargs["seq_lens"], over_cap_seq_lens)
+
+    bnd_ids, bnd_sc = streamindex_topk(**bnd_kw)
+    fzd_ids, fzd_sc = streamindex_topk(
+        **(bnd_kw | dict(topk_mode="tensorcore_fused"))
+    )
+    np.testing.assert_array_equal(np.asarray(bnd_ids), np.asarray(ref_ids))
+    np.testing.assert_array_equal(np.asarray(bnd_sc), np.asarray(ref_sc))
+    self._assert_fused_matches_reference(ref_ids, fzd_ids, ref_sc, fzd_sc)
+    bnd_seq1 = np.asarray(bnd_ids[1])
+    self.assertTrue(np.all((bnd_seq1 >= 256) & (bnd_seq1 < 384)))
+
+  @parameterized.named_parameters(
+      ("head_along_sublane", _HAS),
+      ("seq_along_lane", KVLayout.SEQ_ALONG_LANE),
+  )
+  def test_tensorcore_fused_mixed_ragged_short_rows_and_cp(self, layout):
+    """Verifies fused Top-K on mixed ragged batches, short rows, and CP."""
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    mix_b = 4
+    mix_pages_per_seq = 16
+    mix_t_list = (1, 4, 140, 0)
+    mix_s_list = (1024, 1536, 2048, 0)
+    mix_inputs = _chunk_inputs(
+        mix_t_list,
+        _fragmented_pages(mix_b, mix_pages_per_seq),
+        page_size,
+        h_i,
+        d_dim,
+    )
+    mix_kw = self._chunk_call_kwargs(
+        mix_inputs,
+        mix_t_list,
+        mix_s_list,
+        k,
+        comp_ratio,
+        (4, 4, 128),
+        (2, 2, 2),
+        layout,
+        None,
+        require_sparsecore=False,
+    )
+    mix_kw["q"] = jnp.asarray(mix_inputs.q, dtype=jnp.bfloat16)
+    mix_kw["indexer_weights"] = jnp.asarray(mix_inputs.weights)
+    mix_kw["cu_q_lens"] = jnp.array([0, 1, 5, 145, 145], dtype=jnp.int32)
+    mix_kw["distribution"] = jnp.array([1, 2, 3], dtype=jnp.int32)
+    mix_kw["uniform_q_len"] = 4
+
+    ids_full, sc_full = streamindex_topk(
+        **(mix_kw | dict(topk_mode="tensorcore_full", return_scores=True))
+    )
+    ids_bnd, sc_bnd = streamindex_topk(
+        **(mix_kw | dict(topk_mode="tensorcore_bounded", return_scores=True))
+    )
+    ids_fzd, sc_fzd = streamindex_topk(
+        **(mix_kw | dict(topk_mode="tensorcore_fused", return_scores=True))
+    )
+    ids_fzd_only = np.asarray(
+        streamindex_topk(
+            **(mix_kw | dict(topk_mode="tensorcore_fused", return_scores=False))
+        )
+    )
+    np.testing.assert_array_equal(np.asarray(ids_bnd), np.asarray(ids_full))
+    np.testing.assert_array_equal(np.asarray(sc_bnd), np.asarray(sc_full))
+    np.testing.assert_array_equal(ids_fzd_only, np.asarray(ids_fzd))
+    self._assert_fused_matches_reference(ids_full, ids_fzd, sc_full, sc_fzd)
+
+    # Short active rows (0 < eff_row_len < k): seq0=32, seq1=72..75,
+    # seq2=41..180.
+    short_kw = dict(
+        mix_kw,
+        seq_lens=jnp.array([128, 300, 720, 0], dtype=jnp.int32),
+        return_scores=True,
+    )
+    s_full, s_sc_full = streamindex_topk(
+        **short_kw, topk_mode="tensorcore_full"
+    )
+    s_fzd, s_sc_fzd = streamindex_topk(**short_kw, topk_mode="tensorcore_fused")
+    self._assert_fused_matches_reference(s_full, s_fzd, s_sc_full, s_sc_fzd)
+
+    # All-zero tie breaking on short rows (< k) yields [0..n_v-1, -1..].
+    zero_short_kw = dict(
+        short_kw,
+        q=jnp.zeros_like(short_kw["q"]),
+        indexer_weights=jnp.zeros_like(short_kw["indexer_weights"]),
+        return_scores=False,
+    )
+    z_short = np.asarray(
+        streamindex_topk(**zero_short_kw, topk_mode="tensorcore_fused")
+    )
+    expected_row0 = np.concatenate(
+        [np.arange(32, dtype=np.int32), np.full((k - 32,), -1, dtype=np.int32)]
+    )
+    np.testing.assert_array_equal(z_short[0], expected_row0)
+
+    # Context-parallelism (cp_size=2) with non-zero scores across both ranks.
+    for rank in (0, 1):
+      cp_kw = dict(
+          mix_kw,
+          cp_size=2,
+          cp_rank=rank,
+          interleave_size=8,
+      )
+      cp_full, cp_sc_full = streamindex_topk(
+          **(cp_kw | dict(topk_mode="tensorcore_full", return_scores=True))
+      )
+      cp_bnd, cp_sc_bnd = streamindex_topk(
+          **(cp_kw | dict(topk_mode="tensorcore_bounded", return_scores=True))
+      )
+      cp_fzd, cp_sc_fzd = streamindex_topk(
+          **(cp_kw | dict(topk_mode="tensorcore_fused", return_scores=True))
+      )
+      cp_fzd_noscore = np.asarray(
+          streamindex_topk(**(
+              cp_kw | dict(topk_mode="tensorcore_fused", return_scores=False)
+          ))
+      )
+      np.testing.assert_array_equal(np.asarray(cp_bnd), np.asarray(cp_full))
+      np.testing.assert_array_equal(
+          np.asarray(cp_sc_bnd), np.asarray(cp_sc_full)
+      )
+      np.testing.assert_array_equal(cp_fzd_noscore, np.asarray(cp_fzd))
+      self._assert_fused_matches_reference(
+          cp_full, cp_fzd, cp_sc_full, cp_sc_fzd
+      )
+
+  def test_tensorcore_fused_chunked_early_exit_and_vmem_fallback(self):
+    """Verifies chunking, early-exit fast path, bq_sz capping, and fallback."""
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    # 1. Chunked (num_chunks=2) tensorcore_bounded and tensorcore_fused.
+    t_list = (12, 20)
+    s_list = (1024, 1536)
+    inputs = _chunk_inputs(
+        t_list, _fragmented_pages(2, 16), page_size, h_i, d_dim
+    )
+    chunk_kw = self._chunk_call_kwargs(
+        inputs,
+        t_list,
+        s_list,
+        k,
+        comp_ratio,
+        (4, 8, 8),
+        (2, 2, 2),
+        _HAS,
+        16,
+        require_sparsecore=False,
+    )
+    c_full, c_sc_full = streamindex_topk(
+        **(chunk_kw | dict(topk_mode="tensorcore_full", return_scores=True))
+    )
+    c_bnd, c_sc_bnd = streamindex_topk(
+        **(chunk_kw | dict(topk_mode="tensorcore_bounded", return_scores=True))
+    )
+    c_fzd, c_sc_fzd = streamindex_topk(
+        **(chunk_kw | dict(topk_mode="tensorcore_fused", return_scores=True))
+    )
+    c_fzd_only = np.asarray(
+        streamindex_topk(**(
+            chunk_kw | dict(topk_mode="tensorcore_fused", return_scores=False)
+        ))
+    )
+    np.testing.assert_array_equal(np.asarray(c_bnd), np.asarray(c_full))
+    np.testing.assert_array_equal(np.asarray(c_sc_bnd), np.asarray(c_sc_full))
+    np.testing.assert_array_equal(c_fzd_only, np.asarray(c_fzd))
+    self._assert_fused_matches_reference(c_full, c_fzd, c_sc_full, c_sc_fzd)
+
+    # 2. enable_early_exit=True hitting _fast_path (max(eff_row_lengths) <= k).
+    ee_t = (4, 8)
+    ee_s = (160, 480)
+    ee_inputs = _chunk_inputs(
+        ee_t, _fragmented_pages(2, 4), page_size, h_i, d_dim
+    )
+    ee_kw = self._chunk_call_kwargs(
+        ee_inputs,
+        ee_t,
+        ee_s,
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    ee_kw["enable_early_exit"] = True
+    ee_full = np.asarray(streamindex_topk(**ee_kw, topk_mode="tensorcore_full"))
+    ee_bnd = np.asarray(
+        streamindex_topk(**ee_kw, topk_mode="tensorcore_bounded")
+    )
+    ee_fzd = np.asarray(streamindex_topk(**ee_kw, topk_mode="tensorcore_fused"))
+    np.testing.assert_array_equal(ee_bnd, ee_full)
+    np.testing.assert_array_equal(ee_fzd, ee_full)
+
+    # 3. Non-multiple-of-64 uniform_q_len=80 triggers bq_sz=64 cap (128 pages,
+    # stays in tensorcore_fused -> ascending ids) and falls back to
+    # tensorcore_bounded (256 pages, > 0.75 * eff_vmem_limit -> score-sorted
+    # ids) under an 8 MiB VMEM limit.
+    for pps, expect_fused_ascending in ((128, True), (256, False)):
+      pages = (tuple(p % 4 for p in range(pps)),)
+      cap_inputs = _chunk_inputs((80,), pages, page_size, h_i, d_dim)
+      cap_kw = self._chunk_call_kwargs(
+          cap_inputs,
+          (80,),
+          (1024,),
+          k,
+          comp_ratio,
+          (1, 128, 128),
+          (2, 2, 2),
+          _HAS,
+          None,
+          require_sparsecore=False,
+      )
+      cap_kw["distribution"] = jnp.array([0, 1, 1], dtype=jnp.int32)
+      cap_kw["uniform_q_len"] = 80
+      cap_kw["vmem_limit_bytes"] = 8 << 20
+      cap_ref = streamindex_topk(**cap_kw, topk_mode="tensorcore_full")
+      cap_fzd = streamindex_topk(**cap_kw, topk_mode="tensorcore_fused")
+      if expect_fused_ascending:
+        self._assert_fused_matches_reference(cap_ref, cap_fzd)
+      else:
+        np.testing.assert_array_equal(np.asarray(cap_fzd), np.asarray(cap_ref))
+
+  def test_tensorcore_topk_validation_errors(self):
+    """Verifies topk_mode, tc_topk, and max_score_sublanes validation."""
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    inputs = _chunk_inputs(
+        (1, 1), _fragmented_pages(2, 8), page_size, h_i, d_dim
+    )
+    base_kwargs = self._chunk_call_kwargs(
+        inputs,
+        (1, 1),
+        (512, 512),
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (2, 2, 2),
+        _HAS,
+        None,
+        require_sparsecore=False,
+    )
+    with self.assertRaisesRegex(ValueError, "Unsupported topk_mode"):
+      streamindex_topk(**base_kwargs, topk_mode="invalid_mode")
+
+    for bad_mode in (
+        "tensorcore_full",
+        "tensorcore_bounded",
+        "tensorcore_fused",
+    ):
+      with self.assertRaisesRegex(ValueError, "Cannot set both tc_topk=True"):
+        streamindex_topk(
+            **(base_kwargs | dict(tc_topk=True, topk_mode=bad_mode))
+        )
+
+    # A cap that ends inside a 2-page KV block, a non-positive cap, or
+    # combining max_score_sublanes with cp_size > 1.
+    for bad_cap in (3, 0):
+      with self.assertRaisesRegex(ValueError, "max_score_sublanes"):
+        streamindex_topk(**(
+            base_kwargs
+            | dict(
+                topk_mode="tensorcore_fused",
+                num_kv_pages_per_block=(2, 2, 2),
+                max_score_sublanes=bad_cap,
+            )
+        ))
+    with self.assertRaisesRegex(
+        ValueError, "max_score_sublanes is not supported with cp_size > 1"
+    ):
+      streamindex_topk(**(
+          base_kwargs
+          | dict(
+              topk_mode="tensorcore_fused",
+              max_score_sublanes=4,
+              cp_size=2,
+              interleave_size=8,
+          )
+      ))
+
+  @parameterized.named_parameters(
+      # (decode_req_batch_size == num_seqs, return_scores): r_blk and blocks.
+      ("three_row_blocks", 24, False),  # r_blk = 8, 3 row blocks.
+      ("two_row_blocks_with_scores", 32, True),  # r_blk = 16, 2 row blocks.
+      ("one_row_block", 32, False),  # r_blk = 32, 1 row block.
+  )
+  def test_fused_topk_batched_decode_row_blocks(self, num_seqs, return_scores):
+    """Each fused row block of a batched decode pass uses its own row lengths.
+
+    A batched decode pass holds one row per sequence, and the fused epilogue
+    splits its `seq_batch_size` rows into `r_blk`-row blocks. Lengths grow with
+    the sequence index here, so a block that used another block's lengths would
+    select from the wrong prefix and disagree with the reference.
+    """
+    page_size, h_i, d_dim, comp_ratio, k = 128, 4, 128, 4, 128
+    pages_per_seq = 8
+    t_list = (1,) * num_seqs
+    # Row i sees 160 + 24 * i compressed positions: all > k and all distinct.
+    s_list = tuple(640 + 96 * i for i in range(num_seqs))
+    inputs = _chunk_inputs(
+        t_list,
+        _fragmented_pages(num_seqs, pages_per_seq),
+        page_size,
+        h_i,
+        d_dim,
+    )
+    kw = self._chunk_call_kwargs(
+        inputs,
+        t_list,
+        s_list,
+        k,
+        comp_ratio,
+        (4, 4, 4),
+        (1, 1, 1),
+        _HAS,
+        None,
+        return_scores=return_scores,
+        require_sparsecore=False,
+    )
+    kw["decode_req_batch_size"] = num_seqs
+    ref = streamindex_topk(**kw, topk_mode="tensorcore_full")
+    fused = streamindex_topk(**kw, topk_mode="tensorcore_fused")
+    if return_scores:
+      ref_ids, ref_sc = ref
+      fused_ids, fused_sc = fused
+      self._assert_fused_matches_reference(ref_ids, fused_ids, ref_sc, fused_sc)
+    else:
+      self._assert_fused_matches_reference(ref, fused)
 
 
 _SEL_PAGE_SIZE = 128

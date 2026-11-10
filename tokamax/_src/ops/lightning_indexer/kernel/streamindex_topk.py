@@ -215,10 +215,27 @@ def kernel(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    fused_topk_k: int | None = None,
+    fused_return_scores: bool = False,
+    num_sublanes_total: int = 1,
 ):
   """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
-  del compression_ratio, static_q_len, case, cp_size, interleave_c, cp_rank_ref
-  scores_hbm_ref = score_refs[-1]
+  del static_q_len, case
+  fused_topk = fused_topk_k is not None
+  if fused_topk:
+    if fused_return_scores:
+      _, _, topk_ids_out_ref, topk_scores_out_ref = score_refs
+    else:
+      _, topk_ids_out_ref = score_refs
+      topk_scores_out_ref = None
+    scores_hbm_ref = None
+    chunk_tokens = topk_ids_out_ref.shape[0]
+  else:
+    del compression_ratio, cp_size, interleave_c, cp_rank_ref
+    scores_hbm_ref = score_refs[-1]
+    topk_ids_out_ref = None
+    topk_scores_out_ref = None
+    chunk_tokens = scores_hbm_ref.shape[0]
   buffer_cnt = buffer_count
   seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
 
@@ -320,7 +337,7 @@ def kernel(
       use_lookahead=True,
       bq_sz=bq_sz,
       seq_batch_size=seq_batch_size,
-      chunk_tokens=scores_hbm_ref.shape[0],
+      chunk_tokens=chunk_tokens,
       chunk_idx=chunk_idx,
   )
   weights_alloc = bref_override.StreamIndexQBufferedRef.input(
@@ -330,7 +347,7 @@ def kernel(
       use_lookahead=True,
       bq_sz=bq_sz,
       seq_batch_size=seq_batch_size,
-      chunk_tokens=scores_hbm_ref.shape[0],
+      chunk_tokens=chunk_tokens,
       chunk_idx=chunk_idx,
   )
   if seq_along_lane:
@@ -358,16 +375,19 @@ def kernel(
         seq_batch_size=seq_batch_size,
         chunk_idx=chunk_idx,
     )
-  o_alloc = bref_override.StreamIndexOBufferedRef.output(
-      spec=out_spec,
-      dtype_or_type=scores_hbm_ref,
-      buffer_count=2,
-      use_lookahead=False,
-      bq_sz=bq_sz,
-      num_sublanes=num_sublanes_bkv,
-      seq_batch_size=seq_batch_size,
-      chunk_idx=chunk_idx,
-  )
+  if fused_topk:
+    o_alloc = None
+  else:
+    o_alloc = bref_override.StreamIndexOBufferedRef.output(
+        spec=out_spec,
+        dtype_or_type=scores_hbm_ref,
+        buffer_count=2,
+        use_lookahead=False,
+        bq_sz=bq_sz,
+        num_sublanes=num_sublanes_bkv,
+        seq_batch_size=seq_batch_size,
+        chunk_idx=chunk_idx,
+    )
 
   # ------------------------------------------------------------------------
   # SEQ_ALONG_LANE block access.
@@ -496,8 +516,426 @@ def kernel(
       ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
     return jnp.concatenate(ret, axis=0)
 
+  r_raw = seq_batch_size * bq_sz
+  r_pad = align_to(r_raw, 8)
+  if not fused_return_scores and r_pad >= 32 and r_pad % 32 == 0:
+    r_blk = 32
+    grp_tiles = 4
+  else:
+    r_blk = 16 if (r_pad >= 16 and r_pad % 16 == 0) else 8
+    grp_tiles = 8
+  num_s_blks = r_pad // r_blk
+  compact_grp = 4
+  num_m_pad = align_to(num_sublanes_total, grp_tiles)
+  k_aligned = align_to(fused_topk_k, 128) if fused_topk else 128
+  num_k_tiles = k_aligned // 128
+
+  def _monotone_key(bits):
+    sign_mask = lax.shift_right_arithmetic(bits, jnp.int32(31))
+    return lax.bitwise_xor(
+        bits, lax.bitwise_and(sign_mask, jnp.int32(0x7FFFFFFF))
+    )
+
+  def _row_sum_bcast(x_i32):
+    return jnp.broadcast_to(
+        jnp.sum(x_i32.astype(jnp.float32), axis=1, keepdims=True),
+        (r_blk, 128),
+    ).astype(jnp.int32)
+
+  def _fused_epilogue(
+      p_id,
+      bkv_idx,
+      row_scores_vmem,
+      out_ids_vmem,
+      out_scores_vmem,
+      out_sem,
+  ):
+    assert fused_topk_k is not None
+    total_steps = metadata_ref.num_steps[chunk_idx]
+    abs_step = step_offset + p_id
+    next_abs = jnp.minimum(abs_step + 1, metadata_ref.bkv_idx.shape[0] - 1)
+    is_last_bkv = (p_id + 1 >= total_steps) | (
+        metadata_ref.bkv_idx[next_abs] == 0
+    )
+
+    @pl.when(is_last_bkv)
+    def _():
+      active_tiles = jnp.minimum(
+          (bkv_idx + 1) * num_sublanes_bkv, num_sublanes_total
+      )
+      active_groups = (active_tiles + (grp_tiles - 1)) // grp_tiles
+      compact_groups = (active_tiles + (compact_grp - 1)) // compact_grp
+      start_seq = start_end_seq_idx_ref[0]
+      end_seq = start_end_seq_idx_ref[1]
+      chunk_start = start_end_seq_idx_ref[2]
+      seq_idx = seq_tile(p_id)
+      bq_idx = bq_block(p_id)
+      cp_rank_val = cp_rank_ref[0]
+      shift_comp = (compression_ratio - 1).bit_length()
+      num_positions = max(num_sublanes_total * 128, fused_topk_k)
+
+      s_len = jnp.int32(0)
+      q_s = jnp.int32(0)
+      q_l = jnp.int32(0)
+      token_start = jnp.int32(0)
+      if seq_batch_size > 1:
+        lo = jnp.maximum(cu_q_lens_ref[seq_idx], chunk_start)
+        dst_start = lo - chunk_start
+        n_valid_seqs = jnp.maximum(
+            0, jnp.minimum(seq_batch_size, end_seq - seq_idx)
+        )
+        total_sz = jnp.minimum(
+            n_valid_seqs, jnp.maximum(0, chunk_tokens - dst_start)
+        )
+      else:
+        seq_valid = (seq_idx >= start_seq) & (seq_idx < end_seq)
+        seq_safe = jnp.minimum(seq_idx, max_num_seqs - 1)
+        s_len = seq_lens_ref[seq_safe]
+        q_s = cu_q_lens_ref[seq_safe]
+        q_e = cu_q_lens_ref[seq_safe + 1]
+        q_l = q_e - q_s
+        lo = jnp.maximum(q_s, chunk_start)
+        hi = jnp.minimum(q_e, chunk_start + chunk_tokens)
+        token_start = lo + bq_idx * bq_sz
+        dst_start = token_start - chunk_start
+        total_sz = jnp.where(
+            seq_valid,
+            jnp.maximum(0, jnp.minimum(bq_sz, hi - token_start)),
+            0,
+        )
+
+      lanes_2d = lax.broadcasted_iota(jnp.int32, (r_blk, 128), 1)
+      upper_128 = (
+          lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+          <= lax.broadcasted_iota(jnp.int32, (128, 128), 1)
+      ).astype(jnp.bfloat16)
+      key_neg_inf = jnp.int32(BITS_NEG_INF) ^ jnp.int32(0x7FFFFFFF)
+      int32_min = jnp.int32(-0x80000000)
+
+      for s_idx in range(num_s_blks):
+        r0 = s_idx * r_blk
+        if seq_batch_size > 1:
+          # Decode passes hold one row per sequence, so row `r` of block
+          # `s_idx` is sequence `seq_idx + r0 + r`. Blocks past the first exist
+          # once `seq_batch_size > r_blk` (e.g. 24, or 32 with scores).
+          r_iota_8 = r0 + lax.broadcasted_iota(jnp.int32, (r_blk, 128), 0)
+          row_len_vec = jnp.zeros((r_blk, 128), dtype=jnp.int32)
+          for b in range(r0, min(r0 + r_blk, seq_batch_size)):
+            s = seq_idx + b
+            s_in_pass = (s >= start_seq) & (s < end_seq)
+            s_safe = jnp.minimum(s, max_num_seqs - 1)
+            sb_len = seq_lens_ref[s_safe]
+            qb_s = cu_q_lens_ref[s_safe]
+            qb_e = cu_q_lens_ref[s_safe + 1]
+            qb_l = qb_e - qb_s
+            in_chunk = (
+                (qb_s >= chunk_start)
+                & (qb_s < chunk_start + chunk_tokens)
+                & (qb_l > 0)
+            )
+            tok_pos = sb_len - qb_l
+            kv_len = sb_len >> shift_comp
+            vis = jnp.minimum(kv_len, (tok_pos >> shift_comp) + 1)
+            if cp_size > 1:
+              vis = cp_local_length(vis, cp_rank_val, cp_size, interleave_c)
+            rl_b = jnp.where(
+                s_in_pass & in_chunk, jnp.minimum(vis, num_positions), 0
+            )
+            row_len_vec = jnp.where(r_iota_8 == b, rl_b, row_len_vec)
+        else:
+          r_ids_2d = r0 + lax.broadcasted_iota(jnp.int32, (r_blk, 128), 0)
+          tok_id_2d = token_start + r_ids_2d
+          tok_pos_2d = s_len - q_l + (tok_id_2d - q_s)
+          kv_len = s_len >> shift_comp
+          vis_2d = jnp.minimum(kv_len, (tok_pos_2d >> shift_comp) + 1)
+          if cp_size > 1:
+            vis_2d = cp_local_length(vis_2d, cp_rank_val, cp_size, interleave_c)
+          row_len_vec = jnp.where(
+              r_ids_2d < total_sz, jnp.minimum(vis_2d, num_positions), 0
+          )
+
+        # Pass 1: grp_tiles contiguous monotone key conversion + causal/pad mask
+        def _prep_group(g, elig_acc, s_val=s_idx, rl_val=row_len_vec):
+          raw_g = row_scores_vmem[s_val, pl.ds(g * grp_tiles, grp_tiles), :, :]
+          prepped = []
+          for u in range(grp_tiles):
+            m = g * grp_tiles + u
+            cols = m * 128 + lanes_2d
+            skey = _monotone_key(raw_g[u])
+            elig = (m < active_tiles) & (cols < rl_val) & (skey > key_neg_inf)
+            skey_m = jnp.where(elig, skey, int32_min)
+            elig_acc = elig_acc + jnp.where(elig, jnp.int32(1), jnp.int32(0))
+            prepped.append(skey_m)
+          row_scores_vmem[s_val, pl.ds(g * grp_tiles, grp_tiles), :, :] = (
+              jnp.stack(prepped, axis=0)
+          )
+          return elig_acc
+
+        elig_lanes = lax.fori_loop(
+            0,
+            active_groups,
+            _prep_group,
+            jnp.zeros((r_blk, 128), dtype=jnp.int32),
+        )
+        quota_vec = jnp.minimum(
+            _row_sum_bcast(elig_lanes), jnp.int32(fused_topk_k)
+        )
+
+        # Pass 2: 2-bit quaternary signed-int32 bisection (15 coarse + 1 final)
+        def _bisect_quat(p, cur_base, s_val=s_idx, q_val=quota_vec):
+          step_sz = lax.shift_left(jnp.int32(1), jnp.int32(30 - 2 * p))
+          t1 = cur_base + step_sz
+          t2 = t1 + step_sz
+          t3 = t2 + step_sz
+
+          def _cnt_grp(g, accs):
+            a1, a2, a3 = accs
+            sg = row_scores_vmem[s_val, pl.ds(g * grp_tiles, grp_tiles), :, :]
+            for u in range(grp_tiles):
+              sk = sg[u]
+              a1 = a1 + jnp.where(sk >= t1, jnp.int32(1), jnp.int32(0))
+              a2 = a2 + jnp.where(sk >= t2, jnp.int32(1), jnp.int32(0))
+              a3 = a3 + jnp.where(sk >= t3, jnp.int32(1), jnp.int32(0))
+            return (a1, a2, a3)
+
+          z0 = jnp.zeros((r_blk, 128), dtype=jnp.int32)
+          acc1, acc2, acc3 = lax.fori_loop(
+              0, active_groups, _cnt_grp, (z0, z0, z0)
+          )
+          c1 = _row_sum_bcast(acc1)
+          c2 = _row_sum_bcast(acc2)
+          c3 = _row_sum_bcast(acc3)
+          return jnp.where(
+              c3 >= q_val,
+              t3,
+              jnp.where(c2 >= q_val, t2, jnp.where(c1 >= q_val, t1, cur_base)),
+          )
+
+        base_15 = lax.fori_loop(
+            0,
+            15,
+            _bisect_quat,
+            jnp.full((r_blk, 128), int32_min, dtype=jnp.int32),
+        )
+
+        # Final 2-bit step (step_sz = 1) fused with strictly-above count
+        t1_f = base_15 + jnp.int32(1)
+        t2_f = base_15 + jnp.int32(2)
+        t3_f = base_15 + jnp.int32(3)
+
+        def _cnt_final_grp(
+            g,
+            accs,
+            s_val=s_idx,
+            t1_val=t1_f,
+            t2_val=t2_f,
+            t3_val=t3_f,
+        ):
+          a1, a2, a3, agt3 = accs
+          sg = row_scores_vmem[s_val, pl.ds(g * grp_tiles, grp_tiles), :, :]
+          for u in range(grp_tiles):
+            sk = sg[u]
+            a1 = a1 + jnp.where(sk >= t1_val, jnp.int32(1), jnp.int32(0))
+            a2 = a2 + jnp.where(sk >= t2_val, jnp.int32(1), jnp.int32(0))
+            a3 = a3 + jnp.where(sk >= t3_val, jnp.int32(1), jnp.int32(0))
+            agt3 = agt3 + jnp.where(sk > t3_val, jnp.int32(1), jnp.int32(0))
+          return (a1, a2, a3, agt3)
+
+        zf = jnp.zeros((r_blk, 128), dtype=jnp.int32)
+        fa1, fa2, fa3, fagt3 = lax.fori_loop(
+            0, active_groups, _cnt_final_grp, (zf, zf, zf, zf)
+        )
+        fc1 = _row_sum_bcast(fa1)
+        fc2 = _row_sum_bcast(fa2)
+        fc3 = _row_sum_bcast(fa3)
+        fc_gt3 = _row_sum_bcast(fagt3)
+        thresh_vec = jnp.where(
+            fc3 >= quota_vec,
+            t3_f,
+            jnp.where(
+                fc2 >= quota_vec,
+                t2_f,
+                jnp.where(fc1 >= quota_vec, t1_f, base_15),
+            ),
+        )
+        above_cnt = jnp.where(
+            fc3 >= quota_vec,
+            fc_gt3,
+            jnp.where(
+                fc2 >= quota_vec,
+                fc3,
+                jnp.where(fc1 >= quota_vec, fc2, fc1),
+            ),
+        )
+        tie_quota_vec = jnp.where(
+            quota_vec > 0, quota_vec - above_cnt, jnp.int32(0)
+        )
+
+        # Pass 3: 4-tile unrolled lowest-column tie resolution + roll compaction
+        init_ids = tuple(
+            jnp.full((r_blk, 128), jnp.int32(-1), dtype=jnp.int32)
+            for _ in range(num_k_tiles)
+        )
+        if fused_return_scores:
+          init_sc = tuple(
+              jnp.full((r_blk, 128), jnp.int32(BITS_NEG_INF), dtype=jnp.int32)
+              for _ in range(num_k_tiles)
+          )
+        else:
+          init_sc = ()
+
+        def _compact_grp(
+            cg,
+            carry,
+            s_val=s_idx,
+            th_val=thresh_vec,
+            q_val=quota_vec,
+            tq_val=tie_quota_vec,
+        ):
+          written_cnt, ties_used, cur_out_ids, cur_out_sc = carry
+          sg4 = row_scores_vmem[
+              s_val, pl.ds(cg * compact_grp, compact_grp), :, :
+          ]
+          out_ids_list = list(cur_out_ids)
+          out_sc_list = list(cur_out_sc)
+          for u in range(compact_grp):
+            m = cg * compact_grp + u
+            skey = sg4[u]
+            above_m = (q_val > 0) & (skey > th_val)
+            tied_m = (q_val > 0) & (skey == th_val) & (skey > key_neg_inf)
+            tie_rank = lax.dot_general(
+                jnp.where(tied_m, jnp.bfloat16(1.0), jnp.bfloat16(0.0)),
+                upper_128,
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.int32)
+            won_tied = tied_m & (tie_rank <= (tq_val - ties_used))
+            won_m = above_m | won_tied
+
+            n_tied = _row_sum_bcast(
+                jnp.where(won_tied, jnp.int32(1), jnp.int32(0))
+            )
+            win_rank = lax.dot_general(
+                jnp.where(won_m, jnp.bfloat16(1.0), jnp.bfloat16(0.0)),
+                upper_128,
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.int32)
+            n_won = _row_sum_bcast(jnp.where(won_m, jnp.int32(1), jnp.int32(0)))
+
+            rem_delta = jnp.where(
+                won_m, lanes_2d - (win_rank - 1), jnp.int32(0)
+            )
+            cur_col = m * 128 + lanes_2d
+            pkt = jnp.where(
+                won_m,
+                lax.bitwise_or(
+                    jnp.int32(1 << 30),
+                    lax.bitwise_or(
+                        lax.shift_left(rem_delta, jnp.int32(23)), cur_col
+                    ),
+                ),
+                jnp.int32(0),
+            )
+            cur_bits = _monotone_key(skey) if fused_return_scores else None
+            for s in range(7):
+              d = 1 << s
+              move_bit = jnp.int32((1 << 30) | (d << 23))
+              is_move = lax.bitwise_and(pkt, move_bit) == move_bit
+              stay_pkt = jnp.where(is_move, jnp.int32(0), pkt)
+              rolled_pkt = pltpu.roll(
+                  jnp.where(is_move, pkt, jnp.int32(0)), 128 - d, axis=1
+              )
+              arrived = (rolled_pkt != 0) & (lanes_2d < (128 - d))
+              pkt = jnp.where(arrived, rolled_pkt, stay_pkt)
+              if cur_bits is not None:
+                cur_bits = jnp.where(
+                    arrived, pltpu.roll(cur_bits, 128 - d, axis=1), cur_bits
+                )
+
+            cur_col = lax.bitwise_and(pkt, jnp.int32(0x7FFFFF))
+            rot = lax.bitwise_and(written_cnt, jnp.int32(127))
+            for s in range(7):
+              d = 1 << s
+              do_rot = lax.bitwise_and(rot, jnp.int32(d)) != 0
+              cur_col = jnp.where(
+                  do_rot, pltpu.roll(cur_col, d, axis=1), cur_col
+              )
+              if cur_bits is not None:
+                cur_bits = jnp.where(
+                    do_rot, pltpu.roll(cur_bits, d, axis=1), cur_bits
+                )
+
+            offset_s0 = lax.bitwise_and(lanes_2d - rot, jnp.int32(127))
+            valid_rot = offset_s0 < n_won
+            slot_q = lax.shift_right_arithmetic(
+                written_cnt + offset_s0, jnp.int32(7)
+            )
+            for q in range(num_k_tiles):
+              wq = valid_rot & (slot_q == q)
+              out_ids_list[q] = jnp.where(wq, cur_col, out_ids_list[q])
+              if cur_bits is not None:
+                out_sc_list[q] = jnp.where(wq, cur_bits, out_sc_list[q])
+
+            written_cnt = written_cnt + n_won
+            ties_used = ties_used + n_tied
+
+          return (
+              written_cnt,
+              ties_used,
+              tuple(out_ids_list),
+              tuple(out_sc_list),
+          )
+
+        _, _, final_ids, final_sc = lax.fori_loop(
+            0,
+            compact_groups,
+            _compact_grp,
+            (
+                jnp.zeros((r_blk, 128), dtype=jnp.int32),
+                jnp.zeros((r_blk, 128), dtype=jnp.int32),
+                init_ids,
+                init_sc,
+            ),
+        )
+        out_ids_vmem[pl.ds(r0, r_blk)] = jnp.stack(final_ids, axis=1)
+        if fused_return_scores and out_scores_vmem is not None:
+          out_scores_vmem[pl.ds(r0, r_blk)] = jnp.stack(final_sc, axis=1)
+
+      @pl.when(total_sz > 0)
+      def _():
+        assert topk_ids_out_ref is not None
+        id_copy = pltpu.make_async_copy(
+            out_ids_vmem.at[pl.ds(0, total_sz)],
+            topk_ids_out_ref.at[pl.ds(dst_start, total_sz)],
+            out_sem,
+        )
+        id_copy.start()
+        id_copy.wait()
+        if (
+            fused_return_scores
+            and topk_scores_out_ref is not None
+            and out_scores_vmem is not None
+        ):
+          sc_copy = pltpu.make_async_copy(
+              out_scores_vmem.at[pl.ds(0, total_sz)],
+              topk_scores_out_ref.at[pl.ds(dst_start, total_sz)],
+              out_sem,
+          )
+          sc_copy.start()
+          sc_copy.wait()
+
   def step_body(
-      step, q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None
+      step,
+      q_vmem,
+      weights_vmem,
+      bkv_vmem,
+      scores_vmem: Any = None,
+      q_hm_ref: Any = None,
+      row_scores_vmem: Any = None,
+      out_ids_vmem: Any = None,
+      out_scores_vmem: Any = None,
+      out_sem: Any = None,
   ):
     p_id = step.index[0]
     bkv_idx = bkv_block(p_id)
@@ -555,10 +993,45 @@ def kernel(
         bq_weights_vec,
         q_is_head_major=q_hm_ref is not None,
     )
-    scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
+    if fused_topk:
+      for jj in range(num_sublanes_bkv):
+        s_tile = pltpu.bitcast(scores[:, jj, :], jnp.int32)
+        if r_raw < r_pad:
+          s_tile = jnp.pad(
+              s_tile,
+              ((0, r_pad - r_raw), (0, 0)),
+              constant_values=BITS_NEG_INF,
+          )
+        safe_m = jnp.minimum(
+            bkv_idx * num_sublanes_bkv + jj, num_sublanes_total - 1
+        )
+        for s_i in range(num_s_blks):
+          row_scores_vmem[s_i, safe_m, :, :] = s_tile[
+              s_i * r_blk : (s_i + 1) * r_blk
+          ]
+      _fused_epilogue(
+          p_id,
+          bkv_idx,
+          row_scores_vmem,
+          out_ids_vmem,
+          out_scores_vmem,
+          out_sem,
+      )
+    else:
+      scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
 
   def blocked_prefill_step(
-      step, q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
+      step,
+      q_vmem,
+      weights_vmem,
+      bkv_vmem,
+      scores_vmem: Any = None,
+      q_hm_ref: Any = None,
+      wb_ref: Any = None,
+      row_scores_vmem: Any = None,
+      out_ids_vmem: Any = None,
+      out_scores_vmem: Any = None,
+      out_sem: Any = None,
   ):
     """Scores one (q block, kv block) step of the multi-token path.
 
@@ -573,8 +1046,13 @@ def kernel(
         head, token) row order.
       wb_ref: [num_tok_blks, H, tok_blk, 128] cache of the indexer weights,
         broadcast along lanes; bf16 for FP8 queries, f32 otherwise.
+      row_scores_vmem: Optional VMEM scratch holding row scores for fused top-k.
+      out_ids_vmem: Optional VMEM output staging buffer for top-k indices.
+      out_scores_vmem: Optional VMEM output staging buffer for top-k scores.
+      out_sem: Optional DMA semaphore for writing fused top-k outputs to HBM.
     """
-    bkv_idx = bkv_block(step.index[0])
+    p_id = step.index[0]
+    bkv_idx = bkv_block(p_id)
     tok_blk = prefill_cfg.tok_blk
     num_tok_blks = prefill_cfg.num_tok_blks
     num_head_groups = prefill_cfg.num_head_groups
@@ -689,6 +1167,39 @@ def kernel(
           acc = term if acc is None else acc + term
       return acc
 
+    if fused_topk:
+      sub_per_tb = tok_blk // r_blk
+      for c in range(num_lane_chunks):
+        keys, scales = load_chunk(c)
+        sts = [
+            qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
+            for g in range(num_head_groups)
+        ]
+        for tb in range(num_tok_blks):
+          acc = reduce_token_block(sts, tb) * scales
+          for jj in range(tiles_per_chunk):
+            lane_tile = c * tiles_per_chunk + jj
+            safe_m = jnp.minimum(
+                bkv_idx * num_sublanes_bkv + lane_tile,
+                num_sublanes_total - 1,
+            )
+            tile_i32 = pltpu.bitcast(
+                acc[:, jj * 128 : (jj + 1) * 128], jnp.int32
+            )
+            for sub in range(sub_per_tb):
+              row_scores_vmem[tb * sub_per_tb + sub, safe_m, :, :] = tile_i32[
+                  sub * r_blk : (sub + 1) * r_blk
+              ]
+      _fused_epilogue(
+          p_id,
+          bkv_idx,
+          row_scores_vmem,
+          out_ids_vmem,
+          out_scores_vmem,
+          out_sem,
+      )
+      return
+
     # Row `t * score_pitch + j` holds lane tile j of token t.
     scores_rows = (
         scores_vmem.reshape(bq_sz * score_pitch, 128)
@@ -729,7 +1240,62 @@ def kernel(
           s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
       )
 
-  def _run_all(q_hm_ref=None, wb_ref=None):
+  def _run_all(
+      q_hm_ref=None,
+      wb_ref=None,
+      row_scores_vmem=None,
+      out_ids_vmem=None,
+      out_scores_vmem=None,
+      out_sem=None,
+  ):
+    if fused_topk:
+      if prefill_cfg.enabled:
+        body = functools.partial(
+            blocked_prefill_step,
+            scores_vmem=None,
+            q_hm_ref=q_hm_ref,
+            wb_ref=wb_ref,
+            row_scores_vmem=row_scores_vmem,
+            out_ids_vmem=out_ids_vmem,
+            out_scores_vmem=out_scores_vmem,
+            out_sem=out_sem,
+        )
+      else:
+        body = functools.partial(
+            step_body,
+            scores_vmem=None,
+            q_hm_ref=q_hm_ref,
+            row_scores_vmem=row_scores_vmem,
+            out_ids_vmem=out_ids_vmem,
+            out_scores_vmem=out_scores_vmem,
+            out_sem=out_sem,
+        )
+
+      @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc))
+      def _run_fused_pipeline(final_allocs):
+        q_buf, weights_buf, kv_buf = final_allocs
+        pipeline_fn = pltpu.emit_pipeline(
+            body,
+            grid=(metadata_ref.num_steps[chunk_idx],),
+            in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
+            out_specs=(),
+            _explicit_indices=True,
+        )
+
+        window_refs = (cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref)
+
+        @pl.when(metadata_ref.num_steps[chunk_idx] > 0)
+        def _():
+          pipeline_fn(
+              (q_hbm_ref, *window_refs),
+              (indexer_weights_hbm_ref, *window_refs),
+              (cache_kv_hbm_ref, page_indices_ref, metadata_ref),
+              allocations=(q_buf, weights_buf, kv_buf),
+          )
+
+      _run_fused_pipeline()
+      return
+
     if prefill_cfg.enabled:
       body = functools.partial(
           blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
@@ -761,11 +1327,47 @@ def kernel(
 
     _run_pipeline()
 
+  if fused_topk:
+    score_scratch = (
+        (pltpu.VMEM((r_pad, num_k_tiles, 128), jnp.int32),)
+        if fused_return_scores
+        else ()
+    )
+    fused_scratches = (
+        pltpu.VMEM((num_s_blks, num_m_pad, r_blk, 128), jnp.int32),
+        pltpu.VMEM((r_pad, num_k_tiles, 128), jnp.int32),
+        *score_scratch,
+        pltpu.SemaphoreType.DMA,
+    )
+  else:
+    fused_scratches = ()
+
+  def _dispatch_scoped(*scratches):
+    if fused_topk:
+      if fused_return_scores:
+        *q_scratches, rs_vmem, oi_vmem, os_vmem, o_sem = scratches
+      else:
+        *q_scratches, rs_vmem, oi_vmem, o_sem = scratches
+        os_vmem = None
+    else:
+      q_scratches = scratches
+      rs_vmem = oi_vmem = os_vmem = o_sem = None
+    q_hm = q_scratches[0] if len(q_scratches) >= 1 else None
+    wb = q_scratches[1] if len(q_scratches) >= 2 else None
+    _run_all(
+        q_hm_ref=q_hm,
+        wb_ref=wb,
+        row_scores_vmem=rs_vmem,
+        out_ids_vmem=oi_vmem,
+        out_scores_vmem=os_vmem,
+        out_sem=o_sem,
+    )
+
   # Only the multi-token path reorders q, and only a single sequence per tile
   # keeps the cached block unambiguous.
+  q_scratches_spec: tuple[Any, ...] = ()
   if prefill_cfg.enabled:
-    pl.run_scoped(
-        _run_all,
+    q_scratches_spec = (
         pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
         pltpu.VMEM(
             (
@@ -778,10 +1380,13 @@ def kernel(
         ),
     )
   elif seq_batch_size == 1 and bq_sz > 1:
-    pl.run_scoped(
-        _run_all,
+    q_scratches_spec = (
         pltpu.VMEM((num_q_heads * hm_tok, head_dim), q_hbm_ref.dtype),
     )
+
+  all_scratches = (*q_scratches_spec, *fused_scratches)
+  if all_scratches:
+    pl.run_scoped(_dispatch_scoped, *all_scratches)
   else:
     _run_all()
 
@@ -970,6 +1575,309 @@ def _effective_row_lengths(
   return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
+_TC_TOPK_PREFIX_BUCKETS: tuple[int, ...] = (
+    1024,
+    2048,
+    4096,
+    16384,
+    32768,
+    65536,
+)
+_TC_TOPK_TOURNAMENT_LEAF_WIDTH = 4096
+_TC_TOPK_VMEM_SUB_BATCH = 32
+
+
+def _f32_to_desc_key(x: jax.Array) -> jax.Array:
+  """Maps f32 values to int32 keys ordered descending (+0.0 > -0.0)."""
+  bits = jax.lax.bitcast_convert_type(x, jnp.int32)
+  sign_mask = jax.lax.shift_right_arithmetic(bits, jnp.int32(31))
+  return ~((bits & jnp.int32(0x7FFFFFFF)) ^ sign_mask)
+
+
+def _desc_key_to_f32(desc_key: jax.Array) -> jax.Array:
+  """Inverts `_f32_to_desc_key` back to exact IEEE float32 values."""
+  u = ~desc_key
+  sign_mask = jax.lax.shift_right_arithmetic(u, jnp.int32(31))
+  bits = u ^ (sign_mask & jnp.int32(0x7FFFFFFF))
+  return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def _tournament_topk(
+    scores: jax.Array,
+    k: int,
+    leaf_width: int = _TC_TOPK_TOURNAMENT_LEAF_WIDTH,
+) -> tuple[jax.Array, jax.Array]:
+  """Exact tournament top-k via leaf `lax.top_k` and 2-key sort."""
+  batch_rows, width = scores.shape
+  pad_w = (-width) % leaf_width
+  if pad_w > 0:
+    scores = jnp.pad(scores, ((0, 0), (0, pad_w)), constant_values=-jnp.inf)
+  num_blocks = scores.shape[1] // leaf_width
+  leaf_vals, leaf_local = jax.lax.top_k(
+      scores.reshape(batch_rows * num_blocks, leaf_width), k
+  )
+  offsets = (jnp.arange(num_blocks, dtype=jnp.int32) * leaf_width)[
+      None, :, None
+  ]
+  cand_vals = leaf_vals.reshape(batch_rows, num_blocks * k)
+  cand_ids = (
+      leaf_local.reshape(batch_rows, num_blocks, k).astype(jnp.int32) + offsets
+  ).reshape(batch_rows, num_blocks * k)
+
+  cand_desc = _f32_to_desc_key(cand_vals)
+  sorted_desc, sorted_ids = jax.lax.sort(
+      (cand_desc, cand_ids),
+      dimension=1,
+      is_stable=False,
+      num_keys=2,
+  )
+  return _desc_key_to_f32(sorted_desc[:, :k]), sorted_ids[:, :k].astype(
+      jnp.int32
+  )
+
+
+def _exact_tournament_topk(
+    scores: jax.Array,
+    k: int,
+    leaf_width: int = _TC_TOPK_TOURNAMENT_LEAF_WIDTH,
+) -> tuple[jax.Array, jax.Array]:
+  """Exact top-k via strided k=16 VPU filter with certified fallback."""
+  batch_rows, width = scores.shape
+  if k >= leaf_width or width <= leaf_width:
+    vals, ids = jax.lax.top_k(scores, k)
+    return vals, ids.astype(jnp.int32)
+
+  num_lanes = 128
+  k_lane = 16
+  if k <= 512 and width >= 8192 and width % num_lanes == 0:
+    lane_len = width // num_lanes
+    if lane_len >= k_lane:
+      lanes = (
+          scores.reshape(batch_rows, lane_len, num_lanes)
+          .swapaxes(1, 2)
+          .reshape(batch_rows * num_lanes, lane_len)
+      )
+      leaf_vals, leaf_q = jax.lax.top_k(lanes, k_lane)
+      leaf_vals = leaf_vals.reshape(batch_rows, num_lanes, k_lane)
+      lane_ids = jnp.arange(num_lanes, dtype=jnp.int32)[None, :, None]
+      leaf_ids = (
+          leaf_q.reshape(batch_rows, num_lanes, k_lane).astype(jnp.int32)
+          * num_lanes
+          + lane_ids
+      )
+      leaf_desc = _f32_to_desc_key(leaf_vals)
+      drop_desc = leaf_desc[:, :, k_lane - 1]
+      drop_id = leaf_ids[:, :, k_lane - 1]
+      cand_desc = leaf_desc.reshape(batch_rows, num_lanes * k_lane)
+      cand_ids = leaf_ids.reshape(batch_rows, num_lanes * k_lane)
+
+      sorted_desc, sorted_ids = jax.lax.sort(
+          (cand_desc, cand_ids),
+          dimension=1,
+          is_stable=False,
+          num_keys=2,
+      )
+      fast_desc = sorted_desc[:, :k]
+      fast_ids = sorted_ids[:, :k]
+      fast_vals = _desc_key_to_f32(fast_desc)
+      kth_desc = fast_desc[:, k - 1 : k]
+      kth_id = fast_ids[:, k - 1 : k]
+      neg_inf_desc = jnp.int32(0x7F800000)
+      certified = jnp.all(
+          (kth_desc < drop_desc)
+          | ((kth_desc == drop_desc) & (kth_id <= drop_id))
+          | (drop_desc >= neg_inf_desc)
+      )
+      return jax.lax.cond(
+          certified,
+          lambda _: (fast_vals, fast_ids),
+          lambda _: _tournament_topk(scores, k, leaf_width),
+          None,
+      )
+
+  return _tournament_topk(scores, k, leaf_width)
+
+
+def _tensorcore_topk_select_tile(
+    sliced_bits: jax.Array,
+    k: int,
+    row_lengths: jax.Array,
+    *,
+    return_scores: bool,
+    use_tournament: bool = True,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Selects exact top-k columns for one sub-batch tile on TensorCore."""
+  scores = jax.lax.bitcast_convert_type(sliced_bits, jnp.float32)
+  cols = jnp.arange(scores.shape[1], dtype=jnp.int32)[None, :]
+  scores = jnp.where(cols < row_lengths[:, None], scores, -jnp.inf)
+  if scores.shape[1] < k:
+    scores = jnp.pad(
+        scores, ((0, 0), (0, k - scores.shape[1])), constant_values=-jnp.inf
+    )
+  if use_tournament:
+    values, ids = _exact_tournament_topk(scores, k)
+  else:
+    values, ids = jax.lax.top_k(scores, k)
+  valid = values > -jnp.inf
+  ids = jnp.where(valid, ids.astype(jnp.int32), jnp.int32(-1))
+  if not return_scores:
+    return ids
+  values = jnp.where(valid, values, -jnp.inf)
+  return ids, jax.lax.bitcast_convert_type(values, jnp.int32)
+
+
+def _tensorcore_topk_select_width(
+    score_bits: jax.Array,
+    k: int,
+    row_lengths: jax.Array,
+    width: int,
+    *,
+    return_scores: bool,
+    use_tournament: bool = True,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Selects exact top-k over a static prefix width using VMEM sub-batching."""
+  sliced_bits = score_bits[:, :width]
+  batch_rows = sliced_bits.shape[0]
+  sub_batch = _TC_TOPK_VMEM_SUB_BATCH
+  if use_tournament and width >= 8192 and batch_rows > sub_batch:
+    num_sub = batch_rows // sub_batch
+    main_rows = num_sub * sub_batch
+    sub_bits = sliced_bits[:main_rows].reshape(num_sub, sub_batch, width)
+    sub_lens = row_lengths[:main_rows].reshape(num_sub, sub_batch)
+    neg_inf_bits = jax.lax.bitcast_convert_type(
+        jnp.float32(-jnp.inf), jnp.int32
+    )
+
+    def _scan_body(carry, xs):
+      b_bits, b_lens = xs
+
+      def _empty_tile(_):
+        empty_ids = jnp.full((sub_batch, k), jnp.int32(-1), dtype=jnp.int32)
+        if not return_scores:
+          return empty_ids
+        empty_scores = jnp.full((sub_batch, k), neg_inf_bits, dtype=jnp.int32)
+        return empty_ids, empty_scores
+
+      def _active_tile(_):
+        return _tensorcore_topk_select_tile(
+            b_bits,
+            k,
+            b_lens,
+            return_scores=return_scores,
+            use_tournament=True,
+        )
+
+      return carry, jax.lax.cond(
+          jnp.max(b_lens) <= 0, _empty_tile, _active_tile, None
+      )
+
+    _, out = jax.lax.scan(_scan_body, None, (sub_bits, sub_lens))
+    if not return_scores:
+      assert isinstance(out, jax.Array)
+      main_ids = out.reshape(main_rows, k)
+      if main_rows == batch_rows:
+        return main_ids
+      tail_ids = _tensorcore_topk_select_tile(
+          sliced_bits[main_rows:],
+          k,
+          row_lengths[main_rows:],
+          return_scores=False,
+          use_tournament=True,
+      )
+      assert isinstance(tail_ids, jax.Array)
+      return jnp.concatenate([main_ids, tail_ids], axis=0)
+    assert isinstance(out, tuple)
+    out_ids, out_scores = out
+    main_ids = out_ids.reshape(main_rows, k)
+    main_scores = out_scores.reshape(main_rows, k)
+    if main_rows == batch_rows:
+      return main_ids, main_scores
+    tail_out = _tensorcore_topk_select_tile(
+        sliced_bits[main_rows:],
+        k,
+        row_lengths[main_rows:],
+        return_scores=True,
+        use_tournament=True,
+    )
+    assert isinstance(tail_out, tuple)
+    tail_ids, tail_scores = tail_out
+    return (
+        jnp.concatenate([main_ids, tail_ids], axis=0),
+        jnp.concatenate([main_scores, tail_scores], axis=0),
+    )
+
+  return _tensorcore_topk_select_tile(
+      sliced_bits,
+      k,
+      row_lengths,
+      return_scores=return_scores,
+      use_tournament=use_tournament,
+  )
+
+
+def tensorcore_topk_select(
+    score_bits: jax.Array,
+    k: int,
+    row_lengths: jax.Array,
+    *,
+    enable_prefix_bucketing: bool = True,
+    return_scores: bool = True,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Selects top-k indices on TensorCore with optional prefix bucketing.
+
+  Args:
+    score_bits: `int32[batch_rows, width]` raw IEEE float32 score bits.
+    k: Number of top entries to select per row.
+    row_lengths: `int32[batch_rows]` valid prefix length per row.
+    enable_prefix_bucketing: Whether to dispatch to the smallest prefix bucket
+      covering `max(row_lengths)` with tournament selection.
+    return_scores: Whether to also return `int32[batch_rows, k]` bitcast float32
+      scores alongside indices.
+
+  Returns:
+    `indices` (`int32[batch_rows, k]`) or `(indices, score_bits)` if
+    `return_scores` is True. Unfilled entries are `-1` with `-inf` score bits.
+  """
+  full_width = score_bits.shape[1]
+  buckets = tuple(b for b in _TC_TOPK_PREFIX_BUCKETS if k <= b < full_width) + (
+      full_width,
+  )
+  if not enable_prefix_bucketing:
+    return _tensorcore_topk_select_width(
+        score_bits,
+        k,
+        row_lengths,
+        full_width,
+        return_scores=return_scores,
+        use_tournament=False,
+    )
+  if len(buckets) == 1:
+    return _tensorcore_topk_select_width(
+        score_bits,
+        k,
+        row_lengths,
+        full_width,
+        return_scores=return_scores,
+        use_tournament=True,
+    )
+  max_len = jnp.maximum(jnp.max(row_lengths), k)
+  branch_idx = jnp.sum(jnp.asarray(buckets[:-1], dtype=jnp.int32) < max_len)
+  branches = [
+      (
+          lambda w: lambda bits, lens: _tensorcore_topk_select_width(
+              bits,
+              k,
+              lens,
+              w,
+              return_scores=return_scores,
+              use_tournament=True,
+          )
+      )(w)
+      for w in buckets
+  ]
+  return jax.lax.switch(branch_idx, branches, score_bits, row_lengths)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -988,6 +1896,9 @@ def _effective_row_lengths(
         "return_scores",
         "uniform_q_len",
         "tc_topk",
+        "topk_mode",
+        "decode_only",
+        "max_score_sublanes",
     ),
 )
 def streamindex_topk(
@@ -1018,6 +1929,9 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     tc_topk: bool = False,
+    topk_mode: str = "sparsecore",
+    decode_only: bool = False,
+    max_score_sublanes: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """StreamIndex Top-K retrieval.
 
@@ -1086,6 +2000,27 @@ def streamindex_topk(
     tc_topk: whether to run scoring and top-k on TensorCore
       (`tc_streamindex_topk`) instead of SparseCore (`sparsecore_topk`).
       Defaults to False.
+    topk_mode: top-k selector. "sparsecore" (default) runs the SparseCore top-k
+      on the HBM score buffer. "tensorcore_full" runs `lax.top_k` over the full
+      width of the HBM score buffer. "tensorcore_bounded" runs an exact
+      tournament `lax.top_k` over the smallest prefix bucket that covers the
+      longest row. "tensorcore_fused" selects inside the scoring kernel from
+      VMEM-resident score tiles, with no HBM score buffer, and returns each
+      row's ids in ascending column order; when the tiles do not fit in VMEM it
+      runs "tensorcore_bounded" instead.
+    decode_only: whether every sequence is a decode (`distribution[0] ==
+      distribution[2]`, or `distribution[0] == 0` and `distribution[1] ==
+      distribution[2]` when `uniform_q_len` is set), so only the decode passes
+      (or only the `uniform_q_len` pass) run.
+    max_score_sublanes: upper bound, in 128-position tiles, on the compressed
+      positions any row can see. Caps the score buffer (HBM or VMEM) below the
+      `pages_per_seq` extent. Must be a positive multiple of
+      `num_kv_pages_per_block * page_size // 128` for every pass, and raises
+      `ValueError` when `cp_size > 1`. For `cp_size == 1`, runtime metadata
+      scheduling clamps `seq_lens` to `num_sublanes_total * 128` compressed
+      positions (`* compression_ratio` uncompressed tokens), so positions past
+      the cap are not scored. None (default) sizes the buffer from
+      `pages_per_seq`.
 
   Returns:
     Top-K indices in this rank's local compressed space, or
@@ -1095,6 +2030,10 @@ def streamindex_topk(
   # Scale factors for the FP8 index cache format are packed directly inside
   # `cache_kv`, keeping HBM transactions fused.
   if tc_topk:
+    if topk_mode != "sparsecore":
+      raise ValueError(
+          f"Cannot set both tc_topk=True and topk_mode={topk_mode!r}."
+      )
     return tc_streamindex_topk.tc_streamindex_topk(
         q,
         indexer_weights,
@@ -1228,13 +2167,82 @@ def streamindex_topk(
       align_to(pages_per_seq, bkv_p) * page_size // 128
       for bkv_p in num_kv_pages_per_blocks
   )
+  if max_score_sublanes is not None:
+    if cp_size > 1:
+      raise ValueError("max_score_sublanes is not supported with cp_size > 1.")
+    # A KV block writes `bkv_p * page_size // 128` score tiles at once. An
+    # unaligned cap ends the buffer inside a block, so the fused path would
+    # clamp the block's extra tiles onto the last tile and the HBM path would
+    # write past the buffer.
+    for bkv_p in num_kv_pages_per_blocks:
+      sublanes_per_block = bkv_p * page_size // 128
+      if max_score_sublanes <= 0 or max_score_sublanes % sublanes_per_block:
+        raise ValueError(
+            f"max_score_sublanes ({max_score_sublanes}) must be a positive"
+            " multiple of num_kv_pages_per_block * page_size // 128"
+            f" ({bkv_p} * {page_size} // 128 = {sublanes_per_block})."
+        )
+  if max_score_sublanes is not None and max_score_sublanes < num_sublanes_total:
+    num_sublanes_total = max_score_sublanes
 
-  def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
+  if topk_mode not in (
+      "sparsecore",
+      "tensorcore_full",
+      "tensorcore_bounded",
+      "tensorcore_fused",
+  ):
+    raise ValueError(f"Unsupported topk_mode: {topk_mode}")
+
+  try:
+    vmem_cap = pltpu.get_tpu_info().vmem_capacity_bytes
+  except Exception:  # pylint: disable=broad-except
+    vmem_cap = vmem_limit_bytes
+  if vmem_limit_bytes == DEFAULT_VMEM_LIMIT_BYTES:
+    eff_vmem_limit = (
+        min(vmem_cap - (16 << 20), 160 << 20)
+        if vmem_cap >= (128 << 20)
+        else max(48 << 20, vmem_cap - (8 << 20))
+    )
+  else:
+    eff_vmem_limit = min(vmem_limit_bytes, max(48 << 20, vmem_cap - (8 << 20)))
+
+  def _capped_nq(nq: int) -> int:
+    if (
+        topk_mode == "tensorcore_fused"
+        and nq > 64
+        and num_sublanes_total * align_to(nq, 8) * 128 * 4
+        > int(0.45 * eff_vmem_limit)
+    ):
+      return 64
+    return nq
+
+  max_cand_r_pad = max(
+      align_to(decode_req_batch_size, 8),
+      *(align_to(_capped_nq(nq), 8) for nq in num_queries_per_blocks),
+  )
+  use_fused_vmem_topk = (
+      topk_mode == "tensorcore_fused"
+      and num_sublanes_total * max_cand_r_pad * 128 * 4 <= int(
+          0.75 * eff_vmem_limit
+      )
+  )
+
+  def _block_sizes(
+      num_queries_per_block, bkv_p, static_q_len, seq_batch_size=1
+  ):
     """Query and KV block sizes a pass runs with."""
     if static_q_len is not None:
       bq_sz = min(num_queries_per_block, static_q_len)
     else:
       bq_sz = num_queries_per_block
+    if (
+        use_fused_vmem_topk
+        and seq_batch_size == 1
+        and bq_sz > 64
+        and num_sublanes_total * align_to(bq_sz, 8) * 128 * 4
+        > int(0.45 * eff_vmem_limit)
+    ):
+      bq_sz = 64
     bkv_sz = page_size * bkv_p
     return bq_sz, bkv_sz
 
@@ -1273,7 +2281,9 @@ def streamindex_topk(
       chunk_tokens = max_num_tokens
 
     bkv_p = num_kv_pages_per_block
-    bq_sz, _ = _block_sizes(num_queries_per_block, bkv_p, static_q_len)
+    bq_sz, _ = _block_sizes(
+        num_queries_per_block, bkv_p, static_q_len, seq_batch_size
+    )
 
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     # Passes 2 and 3 donate the previous pass's HBM buffer so its rows survive
@@ -1363,6 +2373,131 @@ def streamindex_topk(
       )
     return scores
 
+  def run_fused_topk_kernel(
+      q,
+      prepared_indexer_weights,
+      cache_kv,
+      topk_ids_init,
+      topk_scores_init,
+      seq_lens,
+      page_indices,
+      cu_q_lens,
+      start_seq_idx,
+      end_seq_idx,
+      static_q_len,
+      num_kv_pages_per_block,
+      num_queries_per_block,
+      buffer_count,
+      seq_batch_size,
+      pass_meta,
+      need_scores: bool,
+      case=MlaCase.MIXED,
+      chunk_token_start=None,
+      chunk_tokens=None,
+      chunk_idx=0,
+  ):
+    max_num_tokens = q.shape[0]
+    if seq_batch_size > 1:
+      assert static_q_len == 1
+
+    chunked = chunk_token_start is not None
+    if not chunked:
+      chunk_tokens = max_num_tokens
+
+    bkv_p = num_kv_pages_per_block
+    bq_sz, _ = _block_sizes(
+        num_queries_per_block, bkv_p, static_q_len, seq_batch_size
+    )
+    k_aligned = align_to(k, 128)
+    num_k_tiles = k_aligned // 128
+
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [
+        hbm_spec,  # q
+        hbm_spec,  # prepared_indexer_weights
+        hbm_spec,  # cache_kv
+        hbm_spec,  # topk_ids_init (aliased to output 0)
+    ]
+    if need_scores:
+      in_specs.append(hbm_spec)  # topk_scores_init (aliased to output 1)
+      out_specs = (hbm_spec, hbm_spec)
+      out_shape = (
+          jax.ShapeDtypeStruct((chunk_tokens, num_k_tiles, 128), jnp.int32),
+          jax.ShapeDtypeStruct((chunk_tokens, num_k_tiles, 128), jnp.int32),
+      )
+    else:
+      out_specs = hbm_spec
+      out_shape = jax.ShapeDtypeStruct(
+          (chunk_tokens, num_k_tiles, 128), jnp.int32
+      )
+
+    chunk_start = 0 if chunk_token_start is None else chunk_token_start
+    scalar_prefetches = (
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
+        pass_meta,
+        jnp.asarray([cp_rank], jnp.int32),
+    )
+
+    num_scalar_prefetch = len(scalar_prefetches)
+    num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
+    input_output_aliases = {num_flat_prefetches + 3: 0}
+    if need_scores:
+      input_output_aliases[num_flat_prefetches + 4] = 1
+
+    layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
+    scope_name = (
+        f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}-ftk{k}"
+    )
+    if chunked:
+      scope_name += f"-c{max_num_tokens // chunk_tokens}"
+    pallas_kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                kernel,
+                compression_ratio=compression_ratio,
+                static_q_len=static_q_len,
+                bq_sz=bq_sz,
+                bkv_p=bkv_p,
+                seq_batch_size=seq_batch_size,
+                buffer_count=buffer_count,
+                case=case,
+                kv_layout=kv_layout,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+                chunk_idx=chunk_idx,
+                fused_topk_k=k,
+                fused_return_scores=need_scores,
+                num_sublanes_total=num_sublanes_total,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=num_scalar_prefetch,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=(1,),
+                scratch_shapes=[],
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=eff_vmem_limit,
+                disable_bounds_checks=True,
+            ),
+            out_shape=out_shape,
+            input_output_aliases=input_output_aliases,
+            name=scope_name,
+        )
+    )
+    return pallas_kernel(
+        *scalar_prefetches,
+        q,
+        prepared_indexer_weights,
+        cache_kv,
+        topk_ids_init,
+        *((topk_scores_init,) if need_scores else ()),
+    )
+
   def _pass_specs(decode_batch_end):
     """`run_scores_kernel` kwargs for the passes over the batch."""
     decode_cfg = dict(
@@ -1423,17 +2558,40 @@ def streamindex_topk(
                 case=MlaCase.MIXED,
             ),
         )
+    single_batched_decode = (
+        decode_only
+        and uniform_q_len is None
+        and max_num_seqs >= decode_req_batch_size
+        and max_num_seqs % decode_req_batch_size == 0
+        and q.shape[0] >= max_num_seqs
+    )
     if max_num_seqs < decode_req_batch_size:
       batched_decode = ()
     else:
       batched_decode = (
           dict(
               start_seq_idx=jnp.array(0),
-              end_seq_idx=decode_batch_end,
+              end_seq_idx=(
+                  distribution[0] if single_batched_decode else decode_batch_end
+              ),
               seq_batch_size=decode_req_batch_size,
               **decode_cfg,
           ),
       )
+    if decode_only and uniform_q_len is None:
+      if single_batched_decode:
+        return batched_decode
+      return (
+          *batched_decode,
+          dict(
+              start_seq_idx=decode_batch_end,
+              end_seq_idx=distribution[1],
+              seq_batch_size=1,
+              **decode_cfg,
+          ),
+      )
+    if decode_only and uniform_q_len is not None:
+      return uniform
     return (
         *batched_decode,
         # Handle num_decode_seqs % decode_req_batch_size != 0 case.
@@ -1447,15 +2605,27 @@ def streamindex_topk(
         mixed_spec,
     )
 
+  if max_score_sublanes is not None:
+    meta_seq_lens = jnp.minimum(
+        seq_lens,
+        jnp.asarray(
+            min(num_sublanes_total * 128 * compression_ratio, 0x7FFFFFFF),
+            dtype=seq_lens.dtype,
+        ),
+    )
+  else:
+    meta_seq_lens = seq_lens
+
   def _pass_metadata(spec, chunk_starts, chunk_tokens):
     """One schedule per pass, holding every chunk's steps back to back."""
     bq_sz, bkv_sz = _block_sizes(
         spec["num_queries_per_block"],
         spec["num_kv_pages_per_block"],
         spec["static_q_len"],
+        spec["seq_batch_size"],
     )
     return metadata.compute_metadata(
-        seq_lens=seq_lens,
+        seq_lens=meta_seq_lens,
         cu_q_lens=cu_q_lens,
         start_seq_idx=spec["start_seq_idx"],
         end_seq_idx=spec["end_seq_idx"],
@@ -1506,63 +2676,133 @@ def streamindex_topk(
       )
     return scores
 
-  def _common_path(_):
-    # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
-    # the dtype it wants to read, so nothing has to reformat HBM scores.
-    out_dtype = jnp.int32
-    max_num_tokens = q.shape[0]
-
-    # TODO: we shall sort the sequences by length, so that multiple decode
-    # sequences in one batch have similar lengths to reduce waste of compute.
-    # With the same batch size, the longest sequence will determine number of
-    # blocks to run computation for.
-    decode_batch_end = (
-        jnp.array(0)
-        if max_num_seqs < decode_req_batch_size
-        else distribution[0] // decode_req_batch_size * decode_req_batch_size
+  def _fused_topk_for_chunk(
+      passes,
+      chunk_idx,
+      chunk_token_start,
+      chunk_tokens,
+      need_scores: bool,
+  ):
+    k_aligned = align_to(k, 128)
+    num_k_tiles = k_aligned // 128
+    topk_ids = jnp.full(
+        (chunk_tokens, num_k_tiles, 128), jnp.int32(-1), dtype=jnp.int32
     )
-
-    num_positions = max(num_sublanes_total * 128, k)
-    eff_row_lengths = _effective_row_lengths(
-        seq_lens=seq_lens,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        num_tokens=max_num_tokens,
-        num_positions=num_positions,
-        compression_ratio=compression_ratio,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        interleave_c=interleave_c,
-    )
-
-    if chunk_tokens is None or max_num_tokens % chunk_tokens:
-      num_chunks, chunk_len = 1, max_num_tokens
+    if need_scores:
+      topk_scores = jnp.full(
+          (chunk_tokens, num_k_tiles, 128),
+          jnp.int32(BITS_NEG_INF),
+          dtype=jnp.int32,
+      )
     else:
-      num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+      topk_scores = None
+    for spec, pass_meta in passes:
+      res = run_fused_topk_kernel(
+          q,
+          prepared_indexer_weights,
+          cache_kv,
+          topk_ids,
+          topk_scores,
+          seq_lens,
+          page_indices,
+          cu_q_lens,
+          pass_meta=pass_meta,
+          need_scores=need_scores,
+          chunk_idx=chunk_idx,
+          chunk_token_start=chunk_token_start,
+          chunk_tokens=chunk_tokens,
+          **spec,
+      )
+      if need_scores:
+        topk_ids, topk_scores = res
+      else:
+        topk_ids = res
+    ids_flat = topk_ids.reshape(chunk_tokens, k_aligned)[:, :k]
+    if not need_scores:
+      return ids_flat, None
+    assert topk_scores is not None
+    return ids_flat, topk_scores.reshape(chunk_tokens, k_aligned)[:, :k]
 
-    # Ids count from 1, so the 0 is never a real group: a single chunk has no
-    # pair to annotate and takes the `None` branch below both times.
-    group_base = 0
-    if num_chunks > 1:
-      group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
-
-    chunk_starts = (
-        (None,)
-        if num_chunks == 1
-        else tuple(m * chunk_len for m in range(num_chunks))
-    )
-    passes = tuple(
+  out_dtype = jnp.int32
+  max_num_tokens = q.shape[0]
+  decode_batch_end = (
+      jnp.array(0)
+      if max_num_seqs < decode_req_batch_size
+      else distribution[0] // decode_req_batch_size * decode_req_batch_size
+  )
+  num_positions = max(num_sublanes_total * 128, k)
+  eff_row_lengths = _effective_row_lengths(
+      seq_lens=seq_lens,
+      cu_q_lens=cu_q_lens,
+      distribution=distribution,
+      num_tokens=max_num_tokens,
+      num_positions=num_positions,
+      compression_ratio=compression_ratio,
+      cp_rank=cp_rank,
+      cp_size=cp_size,
+      interleave_c=interleave_c,
+  )
+  if chunk_tokens is None or max_num_tokens % chunk_tokens:
+    num_chunks, chunk_len = 1, max_num_tokens
+  else:
+    num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+  chunk_starts = (
+      (None,)
+      if num_chunks == 1
+      else tuple(m * chunk_len for m in range(num_chunks))
+  )
+  if num_chunks == 1 or topk_mode != "sparsecore":
+    hoisted_passes = tuple(
         (spec, _pass_metadata(spec, chunk_starts, chunk_len))
         for spec in _pass_specs(decode_batch_end)
     )
+  else:
+    hoisted_passes = None
+
+  def _common_path(_):
+    # Ids count from 1, so the 0 is never a real group: a single chunk has no
+    # pair to annotate and takes the `None` branch below both times.
+    group_base = 0
+    if num_chunks > 1 and topk_mode == "sparsecore":
+      group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
+
+    need_scores = return_scores
+
+    if hoisted_passes is not None:
+      passes = hoisted_passes
+    else:
+      passes = tuple(
+          (spec, _pass_metadata(spec, chunk_starts, chunk_len))
+          for spec in _pass_specs(decode_batch_end)
+      )
     topk_idxs = []
     topk_scores_list = []
     for m in range(num_chunks):
+      if use_fused_vmem_topk:
+        chunk_topk_idxs, chunk_topk_scores = _fused_topk_for_chunk(
+            passes,
+            m,
+            chunk_starts[m],
+            chunk_len,
+            need_scores=need_scores,
+        )
+        topk_idxs.append(chunk_topk_idxs)
+        if need_scores:
+          assert chunk_topk_scores is not None
+          topk_scores_list.append(chunk_topk_scores)
+        continue
+
       # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
       # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
       # Chunk 0's scoring and the last top-k have no partner.
-      tc_group = None if m == 0 else group_base + m - 1
-      sc_group = None if m == num_chunks - 1 else group_base + m
+      tc_group = (
+          None if (m == 0 or topk_mode != "sparsecore") else group_base + m - 1
+      )
+      sc_group = (
+          None
+          if (m == num_chunks - 1 or topk_mode != "sparsecore")
+          else group_base + m
+      )
 
       start = m * chunk_len
       scores = _scores_for_chunk(
@@ -1581,32 +2821,53 @@ def streamindex_topk(
             constant_values=BITS_NEG_INF,
         )
 
-      if return_scores:
-        chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+      if topk_mode == "sparsecore":
+        if need_scores:
+          chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+              scores,
+              k,
+              row_lengths=eff_row_lengths[start : start + chunk_len],
+              write_empty_rows=True,
+              scheduling_group_id=sc_group,
+              return_scores=True,
+          )
+        else:
+          chunk_topk_idxs = sparsecore_topk(
+              scores,
+              k,
+              row_lengths=eff_row_lengths[start : start + chunk_len],
+              write_empty_rows=True,
+              scheduling_group_id=sc_group,
+              return_scores=False,
+          )
+          chunk_topk_scores = None
+      elif topk_mode in (
+          "tensorcore_full",
+          "tensorcore_bounded",
+          "tensorcore_fused",
+      ):
+        tc_out = tensorcore_topk_select(
             scores,
             k,
-            row_lengths=eff_row_lengths[start : start + chunk_len],
-            write_empty_rows=True,
-            scheduling_group_id=sc_group,
-            return_scores=True,
+            eff_row_lengths[start : start + chunk_len],
+            enable_prefix_bucketing=topk_mode != "tensorcore_full",
+            return_scores=need_scores,
         )
-        topk_scores_list.append(chunk_topk_scores)
+        if need_scores:
+          assert isinstance(tc_out, tuple)
+          chunk_topk_idxs, chunk_topk_scores = tc_out
+        else:
+          assert isinstance(tc_out, jax.Array)
+          chunk_topk_idxs, chunk_topk_scores = tc_out, None
       else:
-        chunk_topk_idxs = sparsecore_topk(
-            scores,
-            k,
-            row_lengths=eff_row_lengths[start : start + chunk_len],
-            write_empty_rows=True,
-            scheduling_group_id=sc_group,
-            return_scores=False,
-        )
+        raise ValueError(f"Unsupported topk_mode: {topk_mode}")
       topk_idxs.append(chunk_topk_idxs)
+      if need_scores:
+        assert chunk_topk_scores is not None
+        topk_scores_list.append(chunk_topk_scores)
 
     out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
     out = out[:max_num_tokens, :k]
-
-    if cp_size == 1 and not return_scores:
-      return out
 
     if not return_scores:
       return out
@@ -1620,27 +2881,13 @@ def streamindex_topk(
     return out, scores_out
 
   def _fast_path(_):
-    token_idx = jnp.arange(q.shape[0])
-    seq_idx = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
-        seq_lens.shape[0] - 1,
-    )
-    seq_len = seq_lens[seq_idx]
-    q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
-    q_start = cu_q_lens[seq_idx]
-    q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
-    max_valid_idx = jnp.minimum(
-        seq_len // compression_ratio - 1,
-        q_abs_pos // compression_ratio,
-    )
-    max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
     s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
-    return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
+    return jnp.where(s_idx < eff_row_lengths[:, None], s_idx, -1)
 
   if not enable_early_exit:
     return _common_path(None)
   return jax.lax.cond(
-      jnp.max(seq_lens) // compression_ratio <= k,
+      jnp.max(eff_row_lengths) <= k,
       _fast_path,
       _common_path,
       None,
