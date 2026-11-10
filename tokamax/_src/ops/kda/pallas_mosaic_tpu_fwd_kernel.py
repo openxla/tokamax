@@ -49,24 +49,39 @@ from tokamax._src.ops.kda.utils import (
 # The conv weights are left-padded to this many taps, so W <= _CONV_HALO.
 _CONV_HALO = 8
 
+# Dimensions.
+#   B: batch size
+#   H: number of value heads (H_QK for query/key heads when GQA is active)
+#   MB: mini-batch of heads processed per grid point
+#   T: sequence length
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (64 or 128)
+#   BC: sub-chunk block size (16)
+#   K: key/query head dimension
+#   V: value head dimension
+#   GW: gate channel width (1 for scalar gate, K for per-channel gate)
+
 # ─── Context-Parallel Pre-Process ──────────────────────────────────────────
 
 
 def _pre_process_kernel(
-  seqlens_ref,        # scalar prefetch: cu_seqlens [N+1]
-  chunk_to_seq_ref,   # scalar prefetch: chunk -> seq mapping [NT]
-  last_seg_idx_ref,   # scalar prefetch: real last seg idx [1], int32
-  k_ref,    # [MB, 1, BT, K_PADSIZE]
-  w_ref,    # [MB, 1, BT, K_PADSIZE]
-  u_ref,    # [MB, 1, BT, V_ALIGNED]
-  gk_ref,   # [MB, 1, BT, K_PADSIZE]
-  S_ext_ref,  # [MB, 1, K_PADSIZE, V_ALIGNED]
-  M_ref,      # [MB, 1, K_PADSIZE, K_PADSIZE]
-  h_scratch,  # [MB, K_PADSIZE, V_ALIGNED]
-  m_scratch,  # [MB, K_PADSIZE, K_PADSIZE]
-  *,
-  BT,
-  MB,
+    # Inputs.
+    seqlens_ref,  # scalar prefetch: cu_seqlens [N+1]
+    chunk_to_seq_ref,  # scalar prefetch: chunk -> seq mapping [NT]
+    last_seg_idx_ref,  # scalar prefetch: real last seg idx [1], int32
+    k_ref,  # [MB, 1, BT, K_PADSIZE]
+    w_ref,  # [MB, 1, BT, K_PADSIZE]
+    u_ref,  # [MB, 1, BT, V_ALIGNED]
+    gk_ref,  # [MB, 1, BT, K_PADSIZE]
+    # Outputs.
+    S_ext_ref,  # [MB, 1, K_PADSIZE, V_ALIGNED]
+    M_ref,  # [MB, 1, K_PADSIZE, K_PADSIZE]
+    # Scratch.
+    h_scratch,  # [MB, K_PADSIZE, V_ALIGNED]
+    m_scratch,  # [MB, K_PADSIZE, K_PADSIZE]
+    *,
+    BT,
+    MB,
 ):
   """Fused (S_ext, M) pre-process Pallas kernel for KDA CP forward.
 
@@ -1465,8 +1480,8 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   eos = seqlens_ref[i_b, seq_idx + 1]
   t0 = i_c * BT
 
-  K = w_ref.shape[3]
-  V = u_ref.shape[3]
+  K = w_ref.shape[-1]
+  V = u_ref.shape[-1]
 
   # === Init state (first chunk of THIS sequence) — uniform across all MB heads ===
   @pl.when(t0 == bos)

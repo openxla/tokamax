@@ -265,9 +265,8 @@ def _chunk_gated_delta_rule_fwd_varlen_kernel(
   bos = seqlens_ref[i_b, seq_idx]
   eos = seqlens_ref[i_b, seq_idx + 1]
 
-  BT = k_ref.shape[2]
+  _, _, BT, _ = k_ref.shape
   t0 = i_c * BT
-  K, V = k_ref.shape[-1], v_ref.shape[-1]
 
   @pl.when(t0 == bos)
   def _():
@@ -589,8 +588,8 @@ def _chunk_gated_delta_rule_fwd_kernel(
 
   idx_nt = pl.program_id(2)
 
-  BT = k_ref.shape[2]
-  K, V = k_ref.shape[-1], v_ref.shape[-1]
+  _, _, BT, K = k_ref.shape
+  V = v_ref.shape[-1]
   b_k = k_ref[0, 0]
 
   @pl.when(idx_nt == 0)
