@@ -87,6 +87,29 @@ def _make_unvmap_primitive(
 _unvmap_any_p = _make_unvmap_primitive("splash_unvmap_any", jnp.any)
 
 
+@jax.custom_batching.custom_vmap
+def _empty_f32_like(x: jax.Array) -> jax.Array:
+  """`lax.empty(x.shape, f32)` that follows the `vmap` batch dims of `x`.
+
+  An unbatched `lax.empty` feeding an aliased `pallas_call` input is broadcast
+  over the batch (a full fill of the buffer) by the pallas batching rule; this
+  allocates the batched buffer directly. `x` is not read.
+
+  Args:
+    x: The array whose shape, batch dims included, the result takes.
+
+  Returns:
+    An uninitialized float32 array of `x`'s shape.
+  """
+  return lax.empty(x.shape, jnp.float32)
+
+
+@_empty_f32_like.def_vmap
+def _empty_f32_like_vmap(axis_size, in_batched, x):
+  del axis_size  # x already carries the batch dim, at axis 0.
+  return lax.empty(x.shape, jnp.float32), in_batched[0]
+
+
 class SegmentIds(NamedTuple):
   """SegmentIds for Q and KV sequences.
 
@@ -394,6 +417,10 @@ class SplashConfig:
   # The kernel skips its own q scaling and returns dq, dk w.r.t. the
   # pre-scaled input (both divided by LOG2E). Subsumes dkv_reuse_scaled_q.
   q_prescaled_log2e: bool = False
+  # Under `vmap`, allocate the dkv kernel's aliased f32 dk/dv carriers already
+  # batched, instead of letting the pallas batching rule broadcast an unbatched
+  # `lax.empty` into a full fill of the buffer. The values are unchanged.
+  batched_dkv_carriers: bool = False
   # Set by _make_splash_attention when the static dkv schedule visits every q
   # block in a single contiguous run, allowing dq_reduction_steps=1 to write dq
   # directly from VMEM without HBM read-modify-write aliasing.
@@ -2861,8 +2888,13 @@ def _splash_attention_bwd_dkv(
   if alias_dkv:
     # in/out aliasing to accumulate within kv groups.
     in_specs += [dk_spec, dv_spec]
-    dk = lax.empty(k.shape, dtype=jnp.float32)
-    dv = lax.empty(v.shape, dtype=jnp.float32)
+    if config.batched_dkv_carriers:
+      # The carriers are written before they are read (see the kernel).
+      dk = _empty_f32_like(k)
+      dv = _empty_f32_like(v)
+    else:
+      dk = lax.empty(k.shape, dtype=jnp.float32)
+      dv = lax.empty(v.shape, dtype=jnp.float32)
     # Keep gradients in fp32 when accumulating over head groups.
     dk_type = dv_type = jnp.float32
   else:

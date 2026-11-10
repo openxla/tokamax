@@ -17,6 +17,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 import math
+import re
 from typing import Any
 
 from absl.testing import absltest
@@ -1808,6 +1809,58 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
 
     for r, g in zip(grads(False), grads(True)):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
+  def test_batched_dkv_carriers_bit_exact(self):
+    """`batched_dkv_carriers` leaves the vmapped dq, dk and dv bit-identical.
+
+    GQA on the dynamic grid with `dq_reduction_steps=1` and more than 2 kv
+    steps is the case where the dkv kernel aliases the f32 carriers (other
+    `dq_reduction_steps` group the q heads by kv head and do not alias).
+    """
+    batch, seq_len, num_q_heads, num_kv_heads, block = 2, 1024, 4, 2, 256
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = random.normal(k1, (batch, num_q_heads, seq_len, 128), jnp.bfloat16)
+    k = random.normal(k2, (batch, num_kv_heads, seq_len, 128), jnp.bfloat16)
+    v = random.normal(k3, (batch, num_kv_heads, seq_len, 128), jnp.bfloat16)
+    do = random.normal(k4, (batch, num_q_heads, seq_len, 128), jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def make_bwd(batched_dkv_carriers):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          residual_checkpoint_name="context",
+          interpret=self.INTERPRET,
+          dq_reduction_steps=1,
+          batched_dkv_carriers=batched_dkv_carriers,
+      )
+      attn = jax.vmap(splash.make_splash_mha_single_device(mask, config=config))
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(attn, q, k, v)
+        return vjp(do)
+
+      return bwd
+
+    args = (q, k, v, do)
+    # With the flag the carriers are allocated batched; without it they are
+    # allocated per example (and broadcast by the pallas batching rule).
+    batched_empty = re.compile(
+        rf"f32\[{batch},{num_kv_heads},{seq_len},128\] = empty\["
+    )
+    self.assertRegex(str(jax.make_jaxpr(make_bwd(True))(*args)), batched_empty)
+    self.assertNotRegex(
+        str(jax.make_jaxpr(make_bwd(False))(*args)), batched_empty
+    )
+    ref = jax.jit(make_bwd(False))(*args)
+    opt = jax.jit(make_bwd(True))(*args)
+    for r, g in zip(ref, opt):
+      np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
 
   @parameterized.product(
       mask_kind=("causal", "local", "full"),
