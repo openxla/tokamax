@@ -290,7 +290,7 @@ def _tc_gather_attention_kernel(
     l = jnp.tile(l_scratch_ref[slot], (1, head_reps))
     if q_dtype == jnp.float32:
       return lax.div(acc, l)
-    return (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
+    return (acc * pltpu.reciprocal(l, approx=True)).astype(q_dtype)
 
   def _count_tokens(slot, tok_idx, active_tiles):
     _compute_token_counts(
