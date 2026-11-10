@@ -127,6 +127,50 @@ def align_to(x, a):
   return pl.cdiv(x, a) * a
 
 
+def get_num_cores(tpu_info: Any) -> int:
+  """Returns the number of TensorCores that the kernel grid is split across.
+
+  In MegaCore mode (e.g. TPU v4 and v5p), the parallel grid dimensions are
+  partitioned across `tpu_info.num_cores` TensorCores. When multi-core mode is
+  disabled, the whole grid runs on a single core.
+
+  Args:
+    tpu_info: The `pltpu.TpuInfo` of the current device.
+  """
+  if config.disable_multi_core_mode.value:
+    return 1
+  num_cores = getattr(tpu_info, "num_cores", 1)
+  return num_cores if type(num_cores) is int and num_cores > 1 else 1
+
+
+def split_for_cores(
+    size: int, num_tiles: int, num_cores: int, num_lanes: int, min_tile: int
+) -> tuple[int, int] | None:
+  """Splits `size` into a multiple of `num_cores` equal, lane-aligned tiles.
+
+  Args:
+    size: The size of the dimension to split.
+    num_tiles: The current number of tiles. The result has at least as many.
+    num_cores: The number of TensorCores the tiles are partitioned across.
+    num_lanes: The number of lanes that each tile must be aligned to.
+    min_tile: The smallest allowed tile size.
+
+  Returns:
+    `(num_tiles, tile)` for the fewest tiles that are a multiple of `num_cores`,
+    are at least `min_tile` and exactly cover `size` (rounded up to
+    `num_lanes`), or `None` if no such split exists.
+  """
+  aligned_size = align_to(size, num_lanes)
+  start = align_to(max(num_tiles, 1), num_cores)
+  for cand in range(start, aligned_size // num_lanes + 1, num_cores):
+    tile = align_to(size, cand * num_lanes) // cand
+    if tile < min_tile:
+      break
+    if tile * cand == aligned_size:
+      return cand, tile
+  return None
+
+
 def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
   """Sublane block size the kernel processes lhs rows in."""
   size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
@@ -1298,6 +1342,18 @@ def calculate_tiling(
     num_n_tiles -= 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
+  # In MegaCore mode only the n grid dimension is split across TensorCores (see
+  # `kernel_main`), so use a multiple of `num_cores` n tiles to keep every core
+  # busy. Keep the current tiling if `size_n_per_rhs` cannot be split evenly
+  # into tiles of at least `tile_n_limit`.
+  num_cores = get_num_cores(tpu_info)
+  if num_cores > 1 and num_n_tiles % num_cores:
+    split = split_for_cores(
+        size_n_per_rhs, num_n_tiles, num_cores, num_lanes, tile_n_limit
+    )
+    if split is not None:
+      num_n_tiles, tile_n = split
+
   # If memory is STILL exceeded after tile_n adjustment, we must decrease
   # tile_k.
   if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
@@ -1327,9 +1383,19 @@ def calculate_tiling(
   # Revisit the value to be based on number of instruction memory size.
   max_num_buckets = 8 if tpu_generation >= 8 else 4
   bucket_base = tile_m
+  # For transposed RHS (dlhs), cap tile_m at the average group size so tiles do
+  # not pad and XLU-transpose rows past typical group boundaries. Keep full
+  # bucket growth for non-transposed forward calls, where larger tile_m avoids
+  # re-streaming hot expert weights under skewed routing.
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = (
+      min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
+      if rhs_cfgs.is_transposed
+      else dims.size_m
+  )
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
       break

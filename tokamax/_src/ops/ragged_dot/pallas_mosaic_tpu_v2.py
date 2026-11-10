@@ -112,18 +112,13 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             config=config,
         )(*args, **kw)
 
-      if self.dlhs_config is not None:
-        dlhs_config = self.dlhs_config
-      elif self.config is not None:
-        dlhs_config = Config(
-            tile_m=self.config.tile_m,
-            tile_k=self.config.tile_n,
-            tile_n=self.config.tile_k,
-            bucket_base=self.config.bucket_base,
-            lhs_buffer_count=self.config.lhs_buffer_count,
-        )
-      else:
-        dlhs_config = None
+      # The dlhs pass is a transposed-rhs gmm whose output dimension is the
+      # forward `k`, so the forward tiling does not carry over to it. For
+      # example, swapping a forward `tile_n` that splits `n` across MegaCore
+      # TensorCores into the dlhs `tile_k` leaves a single dlhs output tile
+      # that runs on one core. Without an explicit `dlhs_config`, the dlhs
+      # sub-op picks its own tiling (autotuning cache or heuristic).
+      dlhs_config = self.dlhs_config
 
       if self.drhs_config is not None:
         drhs_config = self.drhs_config
