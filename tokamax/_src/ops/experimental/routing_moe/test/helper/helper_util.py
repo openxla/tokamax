@@ -35,8 +35,6 @@ def skip_unless_supported(
     test_case.skipTest("Only supported on TPUs.")
   if pltpu.get_tpu_info().generation < 7:
     test_case.skipTest("Only tested on TPUv7x for now.")
-  if jax.__version_info__ < (0, 11, 2):
-    test_case.skipTest("routing_moe requires JAX >= 0.11.2.")
   if jax.device_count() < min_devices:
     test_case.skipTest(f"Requires at least {min_devices} devices.")
 

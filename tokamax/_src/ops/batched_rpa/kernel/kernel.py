@@ -48,8 +48,7 @@ def strided_load_bkv(
 
     # Avoids false dependency between prior stage DMA copy-in and current
     # stage matmul loads.
-    if jax.__version_info__ >= (0, 11, 2):
-        kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
+    kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
 
     if cfgs.serve.packing_kv == 1:
         k = utils.strided_load(
@@ -437,8 +436,7 @@ def rpa_body(
     del slot
 
     # pyrefly: ignore[bad-assignment]
-    if jax.__version_info__ >= (0, 11, 2):
-        kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+    kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
 
     # Fetch stitch metadata before the fence so it does not gate writeback.
     stitch_meta = fetch_stitch_metadata(

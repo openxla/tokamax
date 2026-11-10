@@ -1568,11 +1568,6 @@ class GDNAttentionTest(parameterized.TestCase):
 
   def test_state_pipeline_has_no_dma_race(self):
     """Pallas interpret-mode vector-clock detector finds zero DMA races."""
-    if jax.__version_info__ < (0, 11, 2):
-      self.skipTest(
-          "Pallas TPU interpret mode requires jax >= 0.11.2 to unwrap"
-          " TransformedRef views."
-      )
     n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
     dim = 2 * n_kq * d_k + n_v * d_v
     # 6 decode sequences, then 3 one-token prefill sequences (one PER_SEQ tile
