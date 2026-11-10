@@ -16,7 +16,9 @@
 """Input relayout helper from large to compact layout."""
 
 import jax
+import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
+from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 
@@ -42,6 +44,9 @@ def input_pack(
   spec = spec_lib.ActivationSpec(
       row_size=row_size, col_size=col_size, dtype=x.dtype, quant=None
   )
+  pad_cols = (-col_size) % (layout_util.get_packing(x.dtype) * 128)
+  if pad_cols:
+    x = jnp.pad(x, ((0, 0), (0, pad_cols)))
   return arg.ActivationWrapper(
       data=x.reshape(spec.physical_compact_shape), scale=None, spec=spec
   )

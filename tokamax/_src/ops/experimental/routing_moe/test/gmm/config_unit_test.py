@@ -232,6 +232,18 @@ class OutSpecAndValidationTest(parameterized.TestCase):
     with self.assertRaisesRegex(NotImplementedError, expected_regex):
       _make_config(8, custom_plan, out_format=fmt, size_n=1024)
 
+  def test_partial_chunk_unquantized_out_uses_ceiling_chunks(self):
+    out_spec = _make_config(8, size_n=640).out.spec
+    self.assertEqual(out_spec.logical_compact_shape, (80, 3, 2, 128))
+    self.assertEqual(out_spec.num_logical_chunks, 3)
+
+  def test_partial_chunk_quantized_out_raises(self):
+    fmt = out_format_lib.ActivationFormat(
+        dtype=jnp.float8_e4m3fn, quant=out_format_lib.auto_quant
+    )
+    with self.assertRaisesRegex(ValueError, "must fill whole"):
+      _make_config(8, out_format=fmt, size_n=640)
+
 
 if __name__ == "__main__":
   absltest.main()

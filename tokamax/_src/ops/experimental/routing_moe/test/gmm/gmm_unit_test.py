@@ -672,6 +672,119 @@ class RoutingGmmUnitTest(parameterized.TestCase):
           _rel_diff(deq, np.asarray(expected, np.float32)), 2**-3
       )
 
+  @parameterized.product(
+      w_dtype=[None, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+      fuse_up_and_down=[None, False],
+  )
+  def test_partial_chunk_intermediate(
+      self,
+      w_dtype: jax.typing.DTypeLike | None,
+      fuse_up_and_down: bool | None,
+  ):
+    dt = None if w_dtype is None else jnp.dtype(w_dtype)
+    shape = helper_shapes.MoEShape(
+        "partial_chunk_640",
+        num_experts=16,
+        top_k=4,
+        hidden_size=2560,
+        intermediate_size=640,
+        w_dtype=dt,
+        w_quant_block_size=128 if dt is not None else None,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.Case(
+            "partial_chunk_640",
+            shape,
+            num_tokens=32,
+            sharding=helper_cases.MoESharding(ep=2),
+        ),
+        balanced_ep=2,
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    rows = np.asarray(routing.scattered_rows)
+    actual_arr = np.asarray(gmm_test_lib.to_large_layout(actual))[rows]
+    expected_arr = np.asarray(expected)
+    if dt == jnp.float4_e2m1fn:
+      self.assertLessEqual(_rel_diff(actual_arr, expected_arr), 2**-3)
+    else:
+      np.testing.assert_allclose(actual_arr, expected_arr, rtol=6e-2, atol=6e-2)
+
+  @parameterized.product(
+      w_dtype=[None, jnp.float8_e4m3fn],
+      fuse_act=[None, "silu"],
+  )
+  def test_partial_chunk_single_stage(
+      self, w_dtype: jax.typing.DTypeLike | None, fuse_act: str | None
+  ):
+    dt = None if w_dtype is None else jnp.dtype(w_dtype)
+    shape = helper_shapes.MoEShape(
+        "partial_chunk_single_640",
+        num_experts=16,
+        top_k=4,
+        hidden_size=2560,
+        intermediate_size=640,
+        w_dtype=dt,
+        w_quant_block_size=128 if dt is not None else None,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.Case(
+            "partial_chunk_single_640",
+            shape,
+            num_tokens=32,
+            sharding=helper_cases.MoESharding(ep=2),
+        ),
+        balanced_ep=2,
+    )
+    routing = case.routing
+    w1 = case.w1
+    expected_n = 640
+    if fuse_act is None:
+      w1 = dataclasses.replace(
+          w1,
+          weight=w1.weight[..., :expected_n],
+          scale=None if w1.scale is None else w1.scale[..., :expected_n],
+          spec=dataclasses.replace(
+              w1.spec, out_size=expected_n, fused_gate_up=False
+          ),
+      )
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        w1,
+        gather=routing.gather,
+        fuse_act=fuse_act,
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        w1,
+        routing.local_group_sizes,
+        fuse_act=fuse_act,
+    )
+    rows = np.asarray(routing.sorted_rows)
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[rows],
+        expected,
+        rtol=6e-2,
+        atol=6e-2,
+    )
+
   @parameterized.parameters(
       gmm_plan.RoutingGmmPlan(tile_m=4),
       gmm_plan.RoutingGmmPlan(tile_m=16, bucket_base=4),

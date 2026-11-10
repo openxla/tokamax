@@ -41,10 +41,9 @@ def skip_unless_supported(
 
 def check_gmm_supported(case: helper_cases.Case) -> None:
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
-  if case.local_intermediate_size % 256 != 0:
+  if case.local_intermediate_size % 128 != 0:
     raise absltest.SkipTest(
-        "TODO: Fix gmm/plan.py raising error if intermediate is not"
-        " multiple of 256 even when up & down can be fused."
+        "local_intermediate_size must be a multiple of 128 lanes."
     )
 
 
