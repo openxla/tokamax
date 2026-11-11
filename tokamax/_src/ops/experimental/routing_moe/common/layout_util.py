@@ -45,12 +45,12 @@ def to_compact_shape(
   """Returns compact layout shape of a given large layout shape."""
   assert len(large_shape) == 2
   rows, cols = large_shape
-  packing = 4 // jnp.dtype(dtype).itemsize
-  assert cols % (packing * lanes) == 0, (
-      f"cols ({cols}) must be a positive multiple of packing * lanes"
-      f" ({packing * lanes})."
+  packing = get_packing(jnp.dtype(dtype))
+  assert cols > 0 and cols % lanes == 0, (
+      f"cols ({cols}) must be a positive multiple of lanes ({lanes})."
   )
-  return (rows, cols // (packing * lanes), packing, lanes)
+  chunk_cols = packing * lanes
+  return (rows, (cols + chunk_cols - 1) // chunk_cols, packing, lanes)
 
 
 def to_large_shape(compact_shape: Sequence[int]) -> tuple[int, int]:
@@ -93,14 +93,21 @@ def load_compact_to_large(
   itemsize = dtype.itemsize
   uint_dtype = get_uint_dtype(itemsize)
   stride, packing, lanes = vmem.shape[1:]
+  assert real_cols > 0 and real_cols % lanes == 0, (
+      f"real_cols ({real_cols}) must be a positive multiple of lanes ({lanes})."
+  )
   words = vmem.bitcast(jnp.uint32).reshape(-1, lanes)
 
+  chunk_cols = packing * lanes
+  num_chunks = (real_cols + chunk_cols - 1) // chunk_cols
   chunks = []
-  for c in range(real_cols // (packing * lanes)):
+  for c in range(num_chunks):
     packed = words[c::stride]
     if packing > 1:
       unpacked_list = []
       for p in range(packing):
+        if c * chunk_cols + p * lanes >= real_cols:
+          break
         shift = p * (itemsize * 8)
         unpacked_shifted = jnp.bitwise_right_shift(packed, shift)
         # .astype groups "packing" number of elements from second last dim,
@@ -124,6 +131,16 @@ def store_large_to_compact(vmem: hijax.TransformedRef, vreg: jax.Array) -> None:
   uint_dtype = get_uint_dtype(itemsize)
   stride, packing, lanes = vmem.shape[1:]
   words = vmem.bitcast(jnp.uint32).reshape(-1, lanes)
+  cols = vreg.shape[-1]
+  assert cols > 0 and cols % lanes == 0, (
+      f"vreg cols ({cols}) must be a positive multiple of lanes ({lanes})."
+  )
+  pad_cols = (-cols) % (lanes * packing)
+  if pad_cols:
+    vreg = jnp.concat(
+        [vreg, jnp.zeros((vreg.shape[0], pad_cols), dtype=vreg.dtype)],
+        axis=-1,
+    )
   blocks = vreg.shape[-1] // (lanes * packing)
 
   chunks = jnp.split(vreg, blocks, axis=-1)

@@ -472,6 +472,20 @@ class ConvertTorchToJaxViaMetaTest(parameterized.TestCase):
     self.assertIsNone(torch_utils.to_jax_dtype(None))
     self.assertIsNone(torch_utils.to_torch_dtype(None))
 
+  def test_float4_e2m1fn_x2_meta_and_dtype_conversion(self):
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+      self.skipTest("torch.float4_e2m1fn_x2 not available.")
+    fp4_x2 = getattr(torch, "float4_e2m1fn_x2")
+    t = torch.empty((4, 256, 320), dtype=fp4_x2, device="meta")
+    meta = torch_utils.convert_torch_to_jax_via_meta(t)
+    self.assertEqual(meta.shape, (4, 256, 640))
+    self.assertEqual(meta.dtype, jnp.float4_e2m1fn)
+    self.assertEqual(torch_utils.dtype_to_str(fp4_x2), "float4_e2m1fn")
+    self.assertEqual(
+        torch_utils.to_jax_dtype(fp4_x2), jnp.dtype(jnp.float4_e2m1fn)
+    )
+    self.assertEqual(torch_utils.to_torch_dtype(jnp.float4_e2m1fn), fp4_x2)
+
 
 class TorchOpTest(parameterized.TestCase):
 

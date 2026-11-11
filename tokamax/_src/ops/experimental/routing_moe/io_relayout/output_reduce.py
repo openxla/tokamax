@@ -91,7 +91,7 @@ class Config:
 
   @property
   def acc_chunks(self) -> int:
-    return self.hidden_size // (self.acc_packing * self.lanes)
+    return pl.cdiv(self.hidden_size, self.acc_packing * self.lanes)
 
   @property
   def lanes(self) -> int:
@@ -146,6 +146,13 @@ class Config:
     if spec.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn):
       raise ValueError(
           f"rows dtype must be bfloat16 or float8_e4m3fn, got {spec.dtype}"
+      )
+    if spec.quant is not None and spec.col_size % (
+        cfg.in_packing * cfg.lanes
+    ):
+      raise ValueError(
+          f"Quantized rows col_size ({spec.col_size}) must fill whole"
+          f" {spec.dtype} chunks."
       )
     if weights.ndim != 2:
       raise ValueError(f"weights must be 2D [T, K], got {weights.shape}")
@@ -286,6 +293,7 @@ def _reduce_token(
       )
       weight = jnp.where(weight != 0, weight * scale, 0)
     input_row = pltpu.bitcast(row_u32, cfg.in_dtype).astype(cfg.acc_dtype)
+    input_row = input_row[: cfg.acc_chunks * cfg.acc_packing]
     weighted_row = input_row * weight
     weighted_row = jnp.where(weight != 0, weighted_row, 0)
     acc = weighted_row if acc is None else acc + weighted_row

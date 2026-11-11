@@ -202,6 +202,49 @@ class OutputReduceUnitTest(parameterized.TestCase):
     with self.assertRaisesRegex(NotImplementedError, "LaneStridedQuantSpec"):
       _ = spec.quant_col_size
 
+  @parameterized.parameters(128, 384, 640)
+  def test_partial_chunk_hidden_size(self, hidden_size: int):
+    shape = helper_shapes.MoEShape("partial_chunk", 512, 4, hidden_size, 256)
+    case_spec = helper_cases.Case(
+        "partial_chunk",
+        shape,
+        num_tokens=64,
+        sharding=helper_cases.MoESharding(),
+    )
+    self._assert_matches_reference(case_spec, jnp.bfloat16)
+
+  @parameterized.parameters(128, 384, 640)
+  def test_partial_chunk_unquantized_fp8_hidden_size(self, hidden_size: int):
+    num_tokens, top_k = 64, 4
+    key = jax.random.key(7)
+    rows_bf16 = jax.random.normal(
+        key, (num_tokens * top_k, hidden_size), dtype=jnp.bfloat16
+    )
+    rows_fp8 = rows_bf16.astype(jnp.float8_e4m3fn)
+    weights = jax.random.uniform(key, (num_tokens, top_k), dtype=jnp.float32)
+    actual = kernel.output_reduce_unpack(
+        input_pack.input_pack(rows_fp8), weights, out_dtype=jnp.bfloat16
+    )
+    expected = helper_reference.topk_reduce(
+        rows_fp8.astype(jnp.float32), weights, jnp.bfloat16
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
+
+  def test_partial_chunk_quantized_raises(self):
+    num_tokens, top_k, hidden_size = 16, 4, 640
+    rows_packed = input_pack.input_pack(
+        jnp.zeros((num_tokens * top_k, hidden_size), dtype=jnp.float8_e4m3fn)
+    )
+    q_spec = dataclasses.replace(
+        rows_packed.spec,
+        quant=spec_lib.LaneStridedQuantSpec(block_col_size=hidden_size),
+    )
+    data = jnp.zeros(q_spec.physical_compact_shape, dtype=jnp.float8_e4m3fn)
+    rows_q = dataclasses.replace(rows_packed, data=data, spec=q_spec)
+    weights = jnp.ones((num_tokens, top_k), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, "must fill whole"):
+      kernel.output_reduce_unpack(rows_q, weights)
+
 
 if __name__ == "__main__":
   absltest.main()

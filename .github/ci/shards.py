@@ -394,6 +394,8 @@ SHARDS: ShardMap = {
     ),
     'experimental-routing-moe-layer-unit': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/routing_moe/base_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_plan_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',

@@ -158,7 +158,8 @@ class GmmCase:
 
 def to_large_layout(out: arg.ActivationWrapper[jax.Array]) -> jax.Array:
   """Reshapes `out` to the `[rows, cols]` layout."""
-  return out.data.reshape(out.spec.large_shape)
+  rows, cols = out.spec.large_shape
+  return out.data.reshape(rows, -1)[:, :cols]
 
 
 def split_scaled_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:

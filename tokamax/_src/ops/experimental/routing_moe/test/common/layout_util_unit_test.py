@@ -95,6 +95,35 @@ class CompactLayoutTest(parameterized.TestCase):
     np.testing.assert_array_equal(_as_bits(compact)[:, :blocks], expected)
     np.testing.assert_array_equal(_as_bits(large), _as_bits(x))
 
+  @parameterized.product(
+      dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
+      cols=[128, 384, 640],
+      extra_stride=[0, 1],
+  )
+  def test_partial_chunk_store_matches_layout_and_load_round_trips(
+      self, dtype: jax.typing.DTypeLike, cols: int, extra_stride: int
+  ):
+    dtype = jnp.dtype(dtype)
+    rows = 8
+    packing = layout_util.get_packing(dtype)
+    _, num_chunks, _, _ = layout_util.to_compact_shape((rows, cols), dtype)
+    x = _random_bits((rows, cols), dtype)
+
+    compact, large = jax.jit(_store_and_load, static_argnums=1)(
+        x, num_chunks + extra_stride
+    )
+
+    num_lane_blocks = cols // _LANES
+    expected_blocks = _as_bits(x).reshape(rows, num_lane_blocks, _LANES)
+    compact_blocks = _as_bits(compact)[:, :num_chunks].reshape(
+        rows, num_chunks * packing, _LANES
+    )
+    np.testing.assert_array_equal(
+        compact_blocks[:, :num_lane_blocks], expected_blocks
+    )
+    np.testing.assert_array_equal(compact_blocks[:, num_lane_blocks:], 0)
+    np.testing.assert_array_equal(_as_bits(large), _as_bits(x))
+
 
 if __name__ == "__main__":
   absltest.main()
