@@ -26,11 +26,11 @@ from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.layer import modular
 from tokamax._src.ops.experimental.routing_moe.layer import monolithic
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
@@ -52,7 +52,7 @@ class WeightLayout:
       == 1` and for entries that take an external top-k.
   """
 
-  sharding: test_cases.MoESharding = test_cases.MoESharding()
+  sharding: helper_cases.MoESharding = helper_cases.MoESharding()
   use_sp: bool = False
   fold_shared_expert: bool = False
 
@@ -76,8 +76,8 @@ def _scale_block_axis(scale: jax.Array | None, axis: AxisSpec) -> AxisSpec:
 
 
 def _shard_inputs(
-    moe_in: test_inputs.MoEInputs, mesh: Mesh, layout: WeightLayout
-) -> test_inputs.MoEInputs:
+    moe_in: helper_inputs.MoEInputs, mesh: Mesh, layout: WeightLayout
+) -> helper_inputs.MoEInputs:
   """Places `moe_in` on `mesh` as the layer expects for `layout`."""
   sharding_spec = layout.sharding
   if sharding_spec.tp > 1:
@@ -108,7 +108,7 @@ def _shard_inputs(
   w2_block = _scale_block_axis(moe_in.w2_scale, tp)
   w2_shared_block = _scale_block_axis(moe_in.w2_shared_scale, red)
 
-  return test_inputs.MoEInputs(
+  return helper_inputs.MoEInputs(
       hidden_states=_maybe_put(moe_in.hidden_states, act),
       gating_output=_maybe_put(moe_in.gating_output, act),
       w1=_maybe_put(moe_in.w1, (ep, None, tp)),
@@ -130,13 +130,13 @@ def _shard_inputs(
 
 
 def _make_raw_inputs(
-    shape: test_shapes.MoEShape,
+    shape: helper_shapes.MoEShape,
     num_tokens: int,
     layout: WeightLayout,
     *,
     seed: int,
     max_to_mean_load: float = 1.0,
-) -> test_inputs.MoEInputs:
+) -> helper_inputs.MoEInputs:
   """Generates, folds, and quantizes the unsharded inputs of one layer call."""
   if layout.fold_shared_expert and (
       not shape.has_shared_expert or layout.sharding.ep > 1
@@ -144,7 +144,7 @@ def _make_raw_inputs(
     raise ValueError(
         "fold_shared_expert requires has_shared_expert and sharding.ep == 1."
     )
-  moe = test_inputs.MoEInputs.generate(
+  moe = helper_inputs.MoEInputs.generate(
       shape, num_tokens, seed=seed, max_to_mean_load=max_to_mean_load
   )
   if layout.fold_shared_expert:
@@ -170,7 +170,7 @@ def _shared_expert_local(
   """Computes the shared expert on one shard and optionally reduces it."""
   if use_sp:
     x = jax.lax.all_gather(x, axis_name=axis, axis=0, tiled=True)
-  out = test_reference.shared_expert(
+  out = helper_reference.shared_expert(
       x, w1, w2, w1_scale, w2_scale, w_gate, activation=activation
   )
   if not reduce_output:
@@ -183,7 +183,7 @@ def _shared_expert_local(
 
 
 def _shared_expert(
-    moe: test_inputs.MoEInputs,
+    moe: helper_inputs.MoEInputs,
     *,
     mesh: Mesh,
     layout: WeightLayout,
@@ -266,10 +266,10 @@ def _reduce(out: jax.Array, *, mesh: Mesh, layout: WeightLayout) -> jax.Array:
     )
 )
 def _run_moe(
-    moe: test_inputs.MoEInputs,
+    moe: helper_inputs.MoEInputs,
     *,
     mode: Mode,
-    shape: test_shapes.MoEShape,
+    shape: helper_shapes.MoEShape,
     layout: WeightLayout,
     mesh: Mesh,
     reduce_output: bool = True,
@@ -306,7 +306,7 @@ def _run_moe(
           **routed_kwargs,
       )
     case "modular":
-      topk_weights, topk_indices = test_reference.compute_topk(
+      topk_weights, topk_indices = helper_reference.compute_topk(
           moe, shape, fold_shared_expert=layout.fold_shared_expert
       )
       out = modular.routing_moe(
@@ -341,9 +341,9 @@ class MoECase:
     mesh: Device mesh for `sharded`.
   """
 
-  raw: test_inputs.MoEInputs
-  sharded: test_inputs.MoEInputs
-  shape: test_shapes.MoEShape
+  raw: helper_inputs.MoEInputs
+  sharded: helper_inputs.MoEInputs
+  shape: helper_shapes.MoEShape
   layout: WeightLayout
   mesh: Mesh
 
@@ -375,7 +375,7 @@ class MoECase:
       moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
   ) -> None:
     """Asserts that `actual` matches `reference_moe` on `raw`."""
-    expected = test_reference.reference_moe(
+    expected = helper_reference.reference_moe(
         self.raw, self.shape, fold_shared_expert=self.layout.fold_shared_expert
     )
     is_scatter_quant = (
@@ -391,7 +391,7 @@ class MoECase:
   @classmethod
   def make_case(
       cls,
-      case: test_cases.Case,
+      case: helper_cases.Case,
       layout: WeightLayout | None = None,
       *,
       moe_plan: moe_plan_lib.RoutingMoEPlan | None = None,
@@ -403,12 +403,12 @@ class MoECase:
     else:
       case = dataclasses.replace(case, sharding=layout.sharding)
     remote_scatter = moe_plan is not None and bool(moe_plan.remote_scatter)
-    test_util.check_moe_supported(case, remote_scatter=remote_scatter)
+    helper_util.check_moe_supported(case, remote_scatter=remote_scatter)
     aligned = dataclasses.replace(
         case.shape,
         intermediate_size=case.local_intermediate_size * layout.sharding.tp,
     )
-    mesh = test_inputs.make_mesh(layout.sharding)
+    mesh = helper_inputs.make_mesh(layout.sharding)
     raw = _make_raw_inputs(
         aligned,
         case.num_tokens,

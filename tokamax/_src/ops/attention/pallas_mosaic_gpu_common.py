@@ -400,10 +400,24 @@ def commit_cp_async_group(_):
   nvvm.cp_async_commit_group()
 
 
-def cp_async_gmem_to_smem(src, dst):
-  """Issues a 2D tiled `cp.async` from any strided GMEM slice into SMEM."""
-  swizzle = next(t.swizzle for t in dst.transforms if hasattr(t, "swizzle"))
-  tiling = next(t.tiling for t in dst.transforms if hasattr(t, "tiling"))
+def cp_async_gmem_to_smem(src, dst, swizzle: int | None = None):
+  """Issues a 2D tiled `cp.async` from any strided GMEM slice into SMEM.
+
+  SMEM scratch refs no longer carry their tiling/swizzle in `dst.transforms`,
+  so the swizzle must be supplied to match the allocation. A mismatch raises a
+  "Transform mismatch" error during lowering.
+
+  Args:
+    src: The GMEM source ref (2D, contiguous minor dimension).
+    dst: The SMEM destination ref, allocated with
+      `mosaic_gpu.tiled_swizzled_smem` (default `tiling_prefix`).
+    swizzle: The swizzle used for the `dst` allocation. Defaults to
+      `tiled_swizzled_smem`'s default; pass it when the allocation overrides it.
+  """
+  elem_bits = mgpu_lib.num_bits(dst.dtype)
+  if swizzle is None:
+    swizzle = plgpu.find_swizzle(dst.shape[-1] * elem_bits)
+  tiling = (8, 8 * swizzle // elem_bits)
   src_kw: dict[str, Any] = (
       {"write": False} if hasattr(plgpu.RefType, "write") else {}
   )

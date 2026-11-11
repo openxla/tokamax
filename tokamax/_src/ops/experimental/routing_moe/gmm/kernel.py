@@ -157,6 +157,7 @@ def routing_gmm(
       num_global_groups=group_sizes.size,
       fuse_act=fuse_act,
       size_ep=size_ep,
+      size_row_group=0 if row_group is None else row_group.size,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       out_format,
@@ -172,6 +173,10 @@ def routing_gmm(
       tpu_info=tpu_info,
   )
   if w2 is not None and not resolved_plan.fuse_up_and_down:
+    # Even though plan has resolved to disable up and down fusion, we do not
+    # override custom plan as we need to respect user's custom plan.
+    # TODO: Figure out a better way to handle this. Maybe simply
+    # raise error if up down fusion is not possible.
     gmm1_res = routing_gmm(
         x=x,
         w=w,

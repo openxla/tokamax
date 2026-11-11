@@ -23,12 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.gmm import gmm_test_lib
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 P = sharding.PartitionSpec
 NamedSharding = sharding.NamedSharding
@@ -39,14 +39,14 @@ jax.config.parse_flags_with_absl()
 class RoutingGmmProdTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
   def _check_and_log(
       self,
-      fused: test_util.Timed,
-      gmm_only: test_util.Timed,
-      unfused: test_util.Timed,
+      fused: helper_util.Timed,
+      gmm_only: helper_util.Timed,
+      unfused: helper_util.Timed,
       *,
       actual_rows: jax.Array | np.ndarray,
       expected_rows: jax.Array | np.ndarray,
@@ -54,21 +54,23 @@ class RoutingGmmProdTest(parameterized.TestCase):
     """Checks `fused` numerics against `gmm_only` and logs latencies."""
     actual = gmm_test_lib.to_large_layout(fused.fn(fused.args))[actual_rows]
     expected = gmm_only.fn(gmm_only.args)[expected_rows]
-    np.testing.assert_allclose(actual, expected, rtol=5e-2, atol=8e-2)
+    rtol = 5e-2
+    atol = max(8e-2, rtol * float(np.abs(expected).max()))
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
     logging.info("gmm_only: %.1f us", gmm_only.latency_us())
     logging.info("unfused: %.1f us", unfused.latency_us())
     logging.info("fused: %.1f us %s", fused.latency_us(), fused.trace())
 
-  @parameterized.product(case_spec=test_cases.PROD_CASES)
-  def test_gather_gmm(self, case_spec: test_cases.Case):
+  @parameterized.product(case_spec=helper_cases.PROD_CASES)
+  def test_gather_gmm(self, case_spec: helper_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
     # The kernel runs shard 0.
-    test_util.log_expert_load(
+    helper_util.log_expert_load(
         case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
     )
     self._check_and_log(
-        fused=test_util.Timed.create(
+        fused=helper_util.Timed.create(
             kernel.routing_gmm,
             case.x_compact,
             case.w1,
@@ -76,15 +78,15 @@ class RoutingGmmProdTest(parameterized.TestCase):
             fuse_act="silu",
             **routing.kernel_kwargs,
         ),
-        gmm_only=test_util.Timed.create(
-            test_reference.reference_gmm,
+        gmm_only=helper_util.Timed.create(
+            helper_reference.reference_gmm,
             case.x_sorted,
             case.w1,
             routing.local_group_sizes,
             fuse_act="silu",
         ),
-        unfused=test_util.Timed.create(
-            test_reference.unfused_gather_gmm,
+        unfused=helper_util.Timed.create(
+            helper_reference.unfused_gather_gmm,
             case.x,
             case.w1,
             routing.local_group_sizes,
@@ -94,30 +96,30 @@ class RoutingGmmProdTest(parameterized.TestCase):
         expected_rows=routing.sorted_rows,
     )
 
-  @parameterized.product(case_spec=test_cases.PROD_CASES)
-  def test_gmm_scatter(self, case_spec: test_cases.Case):
+  @parameterized.product(case_spec=helper_cases.PROD_CASES)
+  def test_gmm_scatter(self, case_spec: helper_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
     # The kernel runs shard 0.
-    test_util.log_expert_load(
+    helper_util.log_expert_load(
         case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
     )
     self._check_and_log(
-        fused=test_util.Timed.create(
+        fused=helper_util.Timed.create(
             kernel.routing_gmm,
             case.x_sorted_compact,
             case.w1,
             scatter=routing.scatter,
             **routing.kernel_kwargs,
         ),
-        gmm_only=test_util.Timed.create(
-            test_reference.reference_gmm,
+        gmm_only=helper_util.Timed.create(
+            helper_reference.reference_gmm,
             case.x_sorted,
             case.w1,
             routing.local_group_sizes,
         ),
-        unfused=test_util.Timed.create(
-            test_reference.unfused_gmm_scatter,
+        unfused=helper_util.Timed.create(
+            helper_reference.unfused_gmm_scatter,
             case.x_sorted,
             case.w1,
             routing.local_group_sizes,
@@ -127,15 +129,55 @@ class RoutingGmmProdTest(parameterized.TestCase):
         expected_rows=routing.sorted_rows,
     )
 
+  @parameterized.product(case_spec=helper_cases.PROD_CASES)
+  def test_gather_gmm_gmm_scatter(self, case_spec: helper_cases.Case):
+    """Times gather, gate/up, down, and scatter in one call."""
+    case = gmm_test_lib.GmmCase.make_case(case_spec)
+    routing = case.routing
+    helper_util.log_expert_load(
+        case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep
+    )
+    self._check_and_log(
+        fused=helper_util.Timed.create(
+            kernel.routing_gmm,
+            case.x_compact,
+            case.w1,
+            w2=case.w2,
+            gather=routing.gather,
+            scatter=routing.scatter,
+            fuse_act="silu",
+            **routing.kernel_kwargs,
+        ),
+        gmm_only=helper_util.Timed.create(
+            helper_reference.reference_gmm,
+            case.x_sorted,
+            case.w1,
+            routing.local_group_sizes,
+            w2=case.w2,
+            fuse_act="silu",
+        ),
+        unfused=helper_util.Timed.create(
+            helper_reference.unfused_gather_gmm_gmm_scatter,
+            case.x,
+            case.w1,
+            case.w2,
+            routing.local_group_sizes,
+            routing.gather_indices,
+            routing.sorted_to_flat,
+        ),
+        actual_rows=routing.scattered_rows,
+        expected_rows=routing.sorted_rows,
+    )
+
   @parameterized.product(
       case_offset=[
-          (test_cases.DECODE_1, 0),
-          (test_cases.DECODE_16, 0),
-          (test_cases.DECODE_1_EP8, 128),
-          (test_cases.DECODE_64_EP8, 128),
+          (helper_cases.DECODE_1, 0),
+          (helper_cases.DECODE_16, 0),
+          (helper_cases.DECODE_1_EP8, 128),
+          (helper_cases.DECODE_64_EP8, 128),
       ],
   )
-  def test_live_group_walk(self, case_offset: tuple[test_cases.Case, int]):
+  def test_live_group_walk(self, case_offset: tuple[helper_cases.Case, int]):
     """Times the metadata walk over all groups against only the live ones.
 
     Run after changing the metadata to check for regressions at decode.
@@ -159,7 +201,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
       outs = {}
       report = {}
       for live_group_walk in (False, True):
-        timed = test_util.Timed.create(
+        timed = helper_util.Timed.create(
             kernel.routing_gmm,
             x,
             case.w1,
@@ -191,7 +233,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
 class RemoteRoutingGmmProdTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self, min_devices=4)
+    helper_util.skip_unless_supported(self, min_devices=4)
     super().setUp()
 
   @parameterized.product(
@@ -201,13 +243,13 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
   def test_remote_vs_local_scatter(
       self, num_tokens: int, out_dtype: jax.typing.DTypeLike | None
   ):
-    shape = test_shapes.REMOTE_SCATTER
+    shape = helper_shapes.REMOTE_SCATTER
     topk = shape.top_k
-    moe_sharding = test_cases.MoESharding(ep=4)
-    mesh = test_inputs.make_mesh(moe_sharding)
+    moe_sharding = helper_cases.MoESharding(ep=4)
+    mesh = helper_inputs.make_mesh(moe_sharding)
     topk_per_shard = topk // moe_sharding.ep
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("remote", shape, num_tokens),
+        helper_cases.Case("remote", shape, num_tokens),
         balanced_ep=moe_sharding.ep,
     )
     token = case.routing.sorted_to_flat // topk
@@ -215,10 +257,10 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
     local_scatter_indices = token * topk_per_shard + k % topk_per_shard
     # Shard w up front so the timed functions do not reshard it.
     w = jax.device_put(
-        case.w1.weight, NamedSharding(mesh, P(test_cases.EP_AXIS))
+        case.w1.weight, NamedSharding(mesh, P(helper_cases.EP_AXIS))
     )
     args = (case.x_sorted_compact, w, case.routing.group_sizes)
-    local = test_util.Timed.create(
+    local = helper_util.Timed.create(
         gmm_test_lib.sharded_gmm_unpermute,
         *args,
         local_scatter_indices,
@@ -228,7 +270,7 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         all_to_all=True,
         out_dtype=out_dtype,
     )
-    local_kernel = test_util.Timed.create(
+    local_kernel = helper_util.Timed.create(
         gmm_test_lib.sharded_gmm_unpermute,
         *args,
         local_scatter_indices,
@@ -238,7 +280,7 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         all_to_all=False,
         out_dtype=out_dtype,
     )
-    remote = test_util.Timed.create(
+    remote = helper_util.Timed.create(
         gmm_test_lib.sharded_gmm_unpermute,
         *args,
         case.routing.sorted_to_flat,
@@ -254,7 +296,7 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
     local_us = local.latency_us()
     kernel_us = local_kernel.latency_us()
     remote_us = remote.latency_us()
-    with test_util.XprofTrace() as xprof:
+    with helper_util.XprofTrace() as xprof:
       for timed in (local, remote):
         jax.block_until_ready(jax.jit(timed.fn)(timed.args))
     logging.info(

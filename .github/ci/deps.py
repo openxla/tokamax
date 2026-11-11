@@ -12,18 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Which tests a change can affect, from the import graph.
+"""Selects affected test files from the package import graph.
 
-`.github/ci/shards.py` decides what the shards *are*; this decides which of
-them a pull request has to run. A test has to run if it imports a changed
-module, directly or transitively -- so this builds the import graph of the
-`tokamax` package with `ast` and runs the corresponding tests.
-
-What the graph cannot see is handled by triggering a full run.
+Builds a static AST import graph of the `tokamax` package to identify test
+files that directly or transitively import changed modules. Changes that cannot
+be safely narrowed trigger a full test run.
 
 Usage:
-  python3 .github/ci/deps.py tokamax/_src/triton_utils.py  # explain a change
-  python3 .github/ci/deps.py --graph                       # fan-in summary
+  python3 .github/ci/deps.py <changed_path>...
+  python3 .github/ci/deps.py --graph
 """
 
 import argparse
@@ -35,60 +32,33 @@ import re
 import sys
 from typing import Final
 
-# A file and the package files it imports directly. Keyed and valued by
-# repo-relative paths.
+# Forward import edges: file path -> directly imported package file paths.
 type ImportEdges = Mapping[str, set[str]]
 
 PACKAGE_ROOT: Final[str] = 'tokamax'
 
-# Files that select every shard when changed, because no import edge would
-# reveal what they affect.
-#
-#   conftest.py    a session-scoped autouse fixture that sets JAX and XLA
-#                  flags for the whole suite. pytest loads it by location, so
-#                  nothing imports it and it has no dependents to find.
-#   data           any non-Python file in the package, read at runtime by
-#                  path, so a behavioural input with no import edge at all.
-#                  The autotuning tables are the exception; see below.
-#
-# Both are named by the rules in `full_run_reason` rather than listed here;
-# this comment is what they are.
-#
-# A package `__init__.py` is the other file the import graph cannot see by
-# name. Python runs it for every import that passes through the package, but
-# no statement names it: `from a.b import c` records edges to `a.b` and
-# `a.b.c`, so the package being imported *from* is covered, but `a`, and every
-# package above it, is not, even though python runs all of their `__init__.py`
-# files first. pytest likewise runs the `__init__.py` files between a test file
-# and the nearest directory above it that has none, since it imports the test
-# by its dotted name from there. The missing edges are always to enclosing
-# packages, so they can be read off the tree instead: `execution_edges` adds
-# an edge from every file to every enclosing `__init__.py` -- for pytest, more
-# than it runs when a directory on the way has no `__init__.py`, which can
-# only widen a selection -- and a changed `__init__.py` selects every test whose
-# closure over that graph runs it. Only a *deleted* `__init__.py` still selects
-# every shard; see `full_run_reason`.
+# Changes that cannot be traced via import edges (conftest.py, package data,
+# deleted __init__.py) force a full test run via full_run_reason().
 
-# `all_test_files` in shards.py matches pytest's `python_files`; the same
-# universe, kept in one place there and mirrored here rather than imported, so
-# `deps.py` stays usable on its own.
+# Matches pytest's default python_files naming patterns.
 TEST_FILE_SUFFIX: Final[str] = '_test.py'
 TEST_FILE_PREFIX: Final[str] = 'test_'
 
-# Non-Python files that cannot change what a test does, and so do not force a
-# full run.
+# Non-Python files that do not affect test execution.
 INERT_SUFFIXES: Final[tuple[str, ...]] = ('.md', '.rst', '.pdf', '.ipynb')
 
-# The workflow this module selects shards for. Every other workflow runs on its
-# own trigger (a schedule, `workflow_run`, or by hand), and CI-Build neither
-# calls nor executes it, so running every shard tests nothing about a change to
-# one; `deps_test.py` checks that `ci-build.yml` calls no local workflow or
-# action, which is what would make one matter.
+# Files under these directories never affect a test, whatever their type.
+# `docs/` is the documentation site, which nothing in the package reads.
+INERT_DIRS: Final[tuple[str, ...]] = ('docs/',)
+
+# Workflows other than ci-build.yml are inert: CI-Build never calls them, and
+# `deps_test.py` checks that it calls no local workflow or action.
 WORKFLOWS_DIR: Final[str] = '.github/workflows/'
 CI_BUILD_WORKFLOW: Final[str] = f'{WORKFLOWS_DIR}ci-build.yml'
 
-# `_src/autotuning/cache.py` reads `<device_kind>/<op_name>.json` for the op
-# whose snake-cased class name is `<op_name>`. Narrowed by op only, not runner.
+# `_src/autotuning/cache.py` reads `<device_kind>/<op_name>.json`, where
+# `<op_name>` is the op's snake-cased class name. Selection narrows by op only,
+# not by device.
 AUTOTUNING_DATA: Final[str] = f'{PACKAGE_ROOT}/data/autotuning'
 AUTOTUNING_CACHE_TEST: Final[str] = (
     f'{PACKAGE_ROOT}/_src/autotuning/cache_test.py'
@@ -98,15 +68,13 @@ _CAMEL_TO_SNAKE: Final[re.Pattern[str]] = re.compile(r'(?!^)([A-Z])')
 
 
 def python_files(root: str = PACKAGE_ROOT) -> list[str]:
-  """Every `.py` file in the package, repo-relative and slash-separated.
+  """Returns sorted repo-relative paths of all `.py` files under `root`.
 
   Args:
-    root: Directory to walk. Repo-relative, and the returned paths keep that
-      prefix, so they compare directly against `git diff --name-only` output.
+    root: Directory to walk, defaulting to PACKAGE_ROOT.
 
   Returns:
-    Sorted paths, `/`-separated on every platform. `__pycache__` is skipped:
-    a stale `.pyc` beside a deleted source would otherwise become a node.
+    Sorted repo-relative paths with `/` separators.
   """
   found = []
   for dirpath, _, filenames in os.walk(root):
@@ -119,45 +87,41 @@ def python_files(root: str = PACKAGE_ROOT) -> list[str]:
 
 
 def is_test_file(path: str) -> bool:
-  """Whether pytest would collect `path` as a test module.
+  """Returns True if `path` matches pytest test file naming conventions.
 
   Args:
-    path: Repo-relative path to a Python file.
+    path: Path to a Python file.
 
   Returns:
-    True if the basename matches `TEST_FILE_SUFFIX` or `TEST_FILE_PREFIX`,
-    the same pair pytest's `python_files` setting uses.
+    True if the filename matches pytest test file patterns.
   """
   name = os.path.basename(path)
   return name.endswith(TEST_FILE_SUFFIX) or name.startswith(TEST_FILE_PREFIX)
 
 
 def _is_package_init(path: str) -> bool:
-  """Whether `path` is a package `__init__.py`."""
+  """Returns True if `path` is an __init__.py file."""
   return os.path.basename(path) == '__init__.py'
 
 
 def module_name(path: str) -> str:
   """`tokamax/_src/ops/op.py` -> `tokamax._src.ops.op`.
 
-  A package's `__init__.py` is the package itself, so that importing
-  `tokamax._src.ops` and importing `tokamax._src.ops.op` both resolve to a
-  file: the first to the `__init__`, the second to the module. Importing the
-  second executes the first, which is why `imported_modules` records both.
+  A package's `__init__.py` maps to the package name, so the package and its
+  `__init__.py` are one node in the graph.
 
   Args:
     path: Repo-relative path to a `.py` file under the package root.
 
   Returns:
-    The dotted module name, with a trailing `.__init__` stripped so that a
-    package and its `__init__.py` are one node in the graph rather than two.
+    The dotted module name, with any trailing `.__init__` stripped.
   """
   mod = path[: -len('.py')].replace('/', '.')
   return mod.removesuffix('.__init__') if mod.endswith('.__init__') else mod
 
 
 def _parse(path: str) -> ast.Module | None:
-  """`path` parsed by `ast`, or `None` if it does not parse."""
+  """Parses `path` with `ast`, or returns None on error."""
   try:
     with open(path, encoding='utf-8') as f:
       return ast.parse(f.read(), filename=path)
@@ -166,19 +130,13 @@ def _parse(path: str) -> ast.Module | None:
 
 
 def imported_modules(path: str) -> set[str] | None:
-  """Absolute module names `path` imports, or `None` if it does not parse.
-
-  Names are emitted without checking that they exist. `import_graph` keeps
-  only the ones that resolve to a file in the package, so third-party and
-  stdlib imports fall away there rather than needing a list here.
+  """Returns absolute module names `path` imports, or None if unparseable.
 
   Args:
     path: Repo-relative path to a `.py` file.
 
   Returns:
-    Absolute module names, including ones that resolve to nothing --
-    `import_graph` is what discards those. `None` if the file did not parse,
-    which is distinct from an empty set: empty means it imports nothing.
+    Absolute module names imported by `path`, or None if parsing fails.
   """
   if (tree := _parse(path)) is None:
     return None
@@ -197,7 +155,7 @@ def imported_modules(path: str) -> set[str] | None:
         target = f'{base}.{node.module}' if node.module else base
       else:
         target = node.module or ''
-      # `from a.b import c` reaches `a.b`, and `a.b.c` if that is a module.
+      # 'from a.b import c' may import package a.b or submodule a.b.c.
       modules.add(target)
       modules.update(f'{target}.{alias.name}' for alias in node.names)
     elif (
@@ -222,14 +180,11 @@ def import_graph(
   """Builds the forward import graph of the package.
 
   Args:
-    files: Files to parse. Defaults to every `.py` file in the package.
+    files: Files to parse. Defaults to all package `.py` files.
 
   Returns:
-    `(edges, unparsed)`. `edges` maps each file to the package files it
-    imports directly; imports that do not resolve to a file in the package are
-    dropped, which is how third-party and stdlib names fall away. `unparsed`
-    is the files `ast` could not read, which `full_run_reason` turns into a
-    full run when one of them is itself in the changeset.
+    A tuple of (edges, unparsed), where edges maps each file to directly
+    imported package files, and unparsed contains unparseable files.
   """
   files = python_files() if files is None else files
   by_module = {module_name(f): f for f in files}
@@ -250,23 +205,16 @@ def import_graph(
 def module_referrers(
     files: Sequence[str] | None = None,
 ) -> dict[str, set[str]]:
-  """Inverts `imported_modules`: module name -> the files that name it.
+  """Maps each imported module name to the package files that import it.
 
-  Unlike `import_graph`, this retains unresolved module names so that references
-  to deleted or renamed modules can still be tracked. Surviving files with raw
-  `import` statements matching the deleted module name are read by
-  `affected_tests` to find broken dependents.
-
-  Third-party and standard library module names are also included, as
-  callers query specific module names directly.
+  Unlike `import_graph`, this keeps names that resolve to no file, so
+  `affected_tests` can find files that still import a deleted or renamed module.
 
   Args:
-    files: Files to parse. Defaults to every `.py` file in the package.
+    files: Files to parse. Defaults to all package `.py` files.
 
   Returns:
-    Module name to the files whose imports mention it. A file that did not
-    parse contributes nothing, which costs no coverage: `full_run_reason`
-    turns any unparsed file into a full run before this is ever consulted.
+    Mapping from imported module name to files that import it.
   """
   files = python_files() if files is None else files
   index = collections.defaultdict(set)
@@ -293,7 +241,7 @@ def op_name(class_name: str) -> str:
 
 
 def op_modules(files: Sequence[str] | None = None) -> dict[str, set[str]]:
-  """Snake-cased class name -> the `_src/ops/` files that define it."""
+  """Maps snake_case op class names to the `_src/ops/` files defining them."""
   files = python_files() if files is None else files
   index = collections.defaultdict(set)
   for path in files:
@@ -310,15 +258,14 @@ def op_modules(files: Sequence[str] | None = None) -> dict[str, set[str]]:
 
 
 def _reachable(start: str, edges: ImportEdges) -> set[str]:
-  """Every file `start` imports, transitively.
+  """Returns all package files transitively imported by `start`.
 
   Args:
-    start: File to walk out from.
+    start: File path to walk from.
     edges: Forward import graph, as built by `import_graph`.
 
   Returns:
-    The files reachable from `start`, not including `start` itself unless a
-    cycle leads back to it. Cycle-safe: each file is pushed at most once.
+    All package files reachable from `start`.
   """
   seen, stack = set(), [start]
   while stack:
@@ -332,40 +279,36 @@ def _reachable(start: str, edges: ImportEdges) -> set[str]:
 def dependents(
     edges: ImportEdges, files: Sequence[str] | None = None
 ) -> dict[str, set[str]]:
-  """Inverts the graph: file -> the test files that transitively import it.
+  """Inverts the import graph to map each file to test files reaching it.
+
+  Test files map to themselves so editing a test runs it.
 
   Args:
     edges: Forward import graph, as built by `import_graph`.
-    files: Files to index. Defaults to every `.py` file in the package.
+    files: Files to index. Defaults to all package `.py` files.
 
   Returns:
-    A mapping from file to the test files that reach it. A test file maps to
-    itself as well: editing a test has to run it. Files no test reaches are
-    absent rather than mapped to an empty set.
+    Mapping from each file to test files that transitively import it.
   """
   files = python_files() if files is None else files
   index = collections.defaultdict(set)
   for test in (f for f in files if is_test_file(f)):
-    # A test depends on itself: editing it must run it.
     for dep in _reachable(test, edges) | {test}:
       index[dep].add(test)
   return index
 
 
 def enclosing_inits(path: str, known: Collection[str]) -> set[str]:
-  """The `__init__.py` files python runs before it can run `path`.
+  """Returns enclosing package `__init__.py` files present in `known`.
 
-  Importing `a.b.c` runs `a/__init__.py`, then `a/b/__init__.py`, then
-  `a/b/c.py`. An `__init__.py` is its package, so its own enclosing packages
-  are the ones above that.
+  Importing a submodule executes parent package `__init__.py` files first.
 
   Args:
     path: Repo-relative path to a `.py` file.
-    known: The files that exist. A directory without an `__init__.py` is a
-      namespace package, which runs nothing, so it contributes nothing.
+    known: Collection of known existing file paths.
 
   Returns:
-    Every enclosing package `__init__.py` in `known`, up to the package root.
+    Enclosing package `__init__.py` files in `known`, up to the package root.
   """
   directory = os.path.dirname(path)
   if _is_package_init(path):
@@ -381,24 +324,17 @@ def enclosing_inits(path: str, known: Collection[str]) -> set[str]:
 def execution_edges(
     edges: ImportEdges, files: Sequence[str] | None = None
 ) -> dict[str, set[str]]:
-  """`edges` plus each file's edges to its enclosing `__init__.py` files.
+  """Returns `edges` plus edges from each file to its enclosing `__init__.py`s.
 
-  These are the edges `import_graph` cannot record, because no statement names
-  them; see the comment on `__init__.py` at the top of the module. Over this
-  graph, a test reaches an `__init__.py` whenever importing it can run that
-  `__init__.py` -- directly, or because something it imports, or something an
-  `__init__.py` on the way imports, lives in that package.
-
-  Used only for a changed `__init__.py`. Every test runs `tokamax/__init__.py`
-  and whatever it imports, so selecting ordinary edits over this graph would
-  select nearly every test for any change to those modules.
+  Used only when an `__init__.py` changes, to find tests that execute it without
+  over-selecting tests on ordinary edits.
 
   Args:
     edges: Forward import graph, as built by `import_graph`.
-    files: Files to cover. Defaults to every `.py` file in the package.
+    files: Files to cover. Defaults to all package `.py` files.
 
   Returns:
-    A new forward graph; `edges` is not modified.
+    A new forward import graph including edges to enclosing `__init__.py` files.
   """
   files = python_files() if files is None else files
   known = set(files)
@@ -414,35 +350,22 @@ def full_run_reason(
     known: Collection[str] | None = None,
     ops: Mapping[str, Collection[str]] | None = None,
 ) -> str | None:
-  """Why `changed` requires every shard, or `None` if it does not.
+  """Returns why `changed` requires running every shard, or None.
 
-  The exception is `INERT_SUFFIXES`, checked before anything else: those files
-  cannot affect a test wherever they live (think documentation). Nor can a
-  workflow other than `CI_BUILD_WORKFLOW`.
-
-  `known` is the file set the graph was built from. Changed paths absent from
-  `known` represent deleted files. Most deletions do not force a full run
-  because `affected_tests` identifies their surviving referrers.
-
-  A deleted `__init__.py` forces a full run. An edited or added one does not:
-  `affected_tests` selects its dependents over `execution_edges`. Without
-  `known` the two cannot be told apart, so any `__init__.py` forces a full run.
-
-  `unparsed` is not checked against `changed`: it is a property of the graph,
-  and forces a full run if the collection is non-empty
+  Files with an `INERT_SUFFIXES` suffix or under `INERT_DIRS`, and workflows
+  other than `CI_BUILD_WORKFLOW`, never force a full run. Any unparsed file does, whether
+  or not it changed. Of the deleted `.py` files (changed paths missing from
+  `known`), only an `__init__.py` forces one. With `known=None`, every changed
+  `__init__.py` forces one, since a deletion cannot be ruled out.
 
   Args:
-    changed: Repo-relative paths of the changed files.
-    unparsed: Files `ast` could not read, from `import_graph`. Any at all makes
-      the whole graph untrustworthy.
-    known: The file set the graph was built from. `None` makes every changed
-      `__init__.py` force a full run, since it might have been deleted.
-    ops: Op name to defining files, from `op_modules`.
+    changed: Repo-relative paths of changed files.
+    unparsed: Files that failed AST parsing, from `import_graph`.
+    known: Known package files, or None if deletions cannot be verified.
+    ops: Mapping from op names to defining files, from `op_modules`.
 
   Returns:
-    A human-readable reason to run every shard, or `None` if the changeset can
-    be narrowed. The string is what the workflow prints, so it names the file
-    that forced the decision.
+    Reason string to run every shard, or None if tests can be narrowed.
   """
   unparsed = set(unparsed)
   known = None if known is None else set(known)
@@ -456,7 +379,7 @@ def full_run_reason(
     )
 
   for path in sorted(changed):
-    if path.endswith(INERT_SUFFIXES):
+    if path.endswith(INERT_SUFFIXES) or path.startswith(INERT_DIRS):
       continue
     if path.startswith(WORKFLOWS_DIR) and path != CI_BUILD_WORKFLOW:
       continue
@@ -473,11 +396,8 @@ def full_run_reason(
       continue
     if not path.endswith('.py'):
       return f'{path} is package data, which no import edge covers'
-    # A deleted `__init__.py` is not one module going away: `module_name`
-    # collapses an `__init__.py` to the package itself, so removing it changes
-    # how every sibling resolves, and leaves a namespace package behind so the
-    # imports that named it may still work rather than failing loudly. An
-    # edited or added one is selected over `execution_edges` instead.
+    # Deleting __init__.py converts the package to a namespace package,
+    # affecting how sibling imports resolve.
     if _is_package_init(path):
       if known is None:
         return (
@@ -495,23 +415,17 @@ def affected_tests(
     unparsed: Collection[str] | None = None,
     files: Sequence[str] | None = None,
 ) -> tuple[set[str] | None, str | None]:
-  """Test files a change can affect, or `None` meaning "run everything".
-
-  Any `None` outputs will be documented with a `full_run_reason`.
+  """Returns `(tests, reason)` for `changed`; `tests` is None for a full run.
 
   Args:
-    changed: Repo-relative paths of the changed files. Iterated more than once,
-      so a generator will not do.
+    changed: Repo-relative paths of changed files.
     edges: Forward import graph. Built from `files` if omitted.
-    unparsed: Files that did not parse. Built from `files` if omitted --
-      independently of `edges`, so that supplying one without the other cannot
-      quietly cost the fail-open rule.
-    files: Files the graph covers. Defaults to every `.py` file in the package.
+    unparsed: Files that failed AST parsing. Built from `files` if omitted.
+    files: Files to cover. Defaults to all package `.py` files.
 
   Returns:
-    `(tests, reason)`. `tests` is the affected test files, or `None` when
-    every shard has to run, in which case `reason` says why. Exactly one of
-    the two is ever `None`.
+    A tuple of (tests, reason). `tests` is affected test files, or None for
+    a full run with `reason` explaining why.
   """
   files = python_files() if files is None else files
   if edges is None or unparsed is None:
@@ -528,13 +442,11 @@ def affected_tests(
   index = dependents(edges, files)
   known = set(files)
   tests = set()
-  # Filter to `.py` files because non-Python files (such as documentation) may
-  # pass `full_run_reason`, but cannot be converted via `module_name`.
+  # Non-Python files that pass full_run_reason have no module name.
   deleted = [p for p in changed if p not in known and p.endswith('.py')]
   for path in changed:
     tests |= index.get(path, set())
-  # `full_run_reason` has already failed a deleted `__init__.py` open, so
-  # these all exist.
+  # Deleted __init__.py files trigger a full run above, so surviving ones exist.
   if inits := [p for p in changed if _is_package_init(p)]:
     run_by = dependents(execution_edges(edges, files), files)
     for path in inits:
@@ -552,10 +464,7 @@ def affected_tests(
     tests |= index.get(AUTOTUNING_CACHE_TEST, set())
 
   if deleted:
-    # A deleted file has no node in `edges`. Find surviving files that still
-    # import the deleted module, treat them as broken/changed, and include
-    # their transitive dependents. Unreferenced deleted files produce no
-    # additional test dependencies.
+    # Surviving files that still import a deleted module, and their dependents.
     referrers = module_referrers(files)
     for path in deleted:
       for referrer in referrers.get(module_name(path), ()):
@@ -564,14 +473,13 @@ def affected_tests(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-  """Command-line entry point.
+  """CLI entry point for querying affected test files.
 
   Args:
-    argv: Argument list. Defaults to `sys.argv[1:]`.
+    argv: Command-line arguments, defaulting to `sys.argv[1:]`.
 
   Returns:
-    A process exit code, always 0. This is a reporting tool: the full runs and
-    coverage gaps it describes are findings, not failures of its own.
+    Process exit code, always 0.
   """
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('changed', nargs='*', help='changed file paths')
@@ -593,7 +501,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         f' {sys.version.split()[0]}'
     )
     if unparsed:
-      # Expected to be empty - will cause full runs until fixed.
       print(f'unparsed ({len(unparsed)}, forcing a full run for any change):')
       for path in sorted(unparsed):
         print(f'  {path}')

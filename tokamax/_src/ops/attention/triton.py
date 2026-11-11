@@ -741,7 +741,8 @@ def _split_qarray(x):
   """Returns the values and scales (or `None`) of a possibly quantized array."""
   if not isinstance(x, QArray):
     return x, None
-  if x.qvalue.dtype not in (jnp.int8, jnp.int4):
+  # bfloat16 qvalue with a separate scale is used by shared K=V KV caches
+  if x.qvalue.dtype not in (jnp.int8, jnp.int4, jnp.bfloat16):
     raise NotImplementedError(f"Unsupported quantized dtype: {x.qvalue.dtype}")
   if any(s not in (1, d) for s, d in zip(x.scale.shape[:-1], x.shape[:-1])):
     raise NotImplementedError(

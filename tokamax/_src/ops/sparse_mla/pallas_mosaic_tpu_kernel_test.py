@@ -18,16 +18,18 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.dsv4_compressor import csa_cache_layout
 from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu_kernel as sparse_mla
+from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu_tc_kernel as tc_sparse_mla
 from tokamax._src.ops.sparse_mla.pallas_mosaic_tpu_kernel import (
     align_to,
     cdiv,
     get_kv_cache_shape,
 )
-from tokamax._src.ops.dsv4_compressor import csa_cache_layout
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
@@ -163,7 +165,7 @@ def gen_random(rng, shape, dtype):
 
 
 # The nope record carries one e8m0 scale per lane of a 64-lane period, so
-# quantization group j is {d : d % 64 == j} (see sparse_mla._dequant_dsv4_fp8).
+# quantization group j is {d : d % 64 == j} (see sparse_mla.dequant_dsv4_fp8).
 NOPE_SCALE_PERIOD = 64
 
 
@@ -223,10 +225,19 @@ class CorrectnessTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    if backend.get_default_device().device_kind != "TPU7x":
-      self.skipTest("Only tested on TPU7x.")
+    if (
+        backend.get_default_device().platform != "tpu"
+        or pltpu.get_tpu_info().generation < 7
+    ):
+      self.skipTest("Only tested on TPU7x and newer.")
 
-  def test_correctness(self):
+  @parameterized.parameters(False, True)
+  def test_correctness(self, use_tc_gather: bool):
+    if not use_tc_gather and (
+        pltpu.get_tpu_info().generation >= 8
+        or pltpu.get_tpu_info().sparse_core is None
+    ):
+      self.skipTest("SparseCore kernel requires a SparseCore.")
     topk = 1024
     rng = np.random.default_rng()
 
@@ -313,7 +324,12 @@ class CorrectnessTest(parameterized.TestCase):
         swa_m,
         sm_scale=1.0,
     )
-    out_agent = sparse_mla.sparse_ragged_paged_attention(
+    kernel_fn = (
+        tc_sparse_mla.sparse_ragged_paged_attention
+        if use_tc_gather
+        else sparse_mla.sparse_ragged_paged_attention
+    )
+    out_agent = kernel_fn(
         q,
         cache_kv_nope,
         cache_kv_rope,
@@ -340,7 +356,13 @@ class CorrectnessTest(parameterized.TestCase):
     print(f"Max Diff Out: {np.max(diff_out)}")
     np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
-  def test_correctness_with_padding(self):
+  @parameterized.parameters(False, True)
+  def test_correctness_with_padding(self, use_tc_gather: bool):
+    if not use_tc_gather and (
+        pltpu.get_tpu_info().generation >= 8
+        or pltpu.get_tpu_info().sparse_core is None
+    ):
+      self.skipTest("SparseCore kernel requires a SparseCore.")
     topk = 1024
     rng = np.random.default_rng()
 
@@ -426,7 +448,12 @@ class CorrectnessTest(parameterized.TestCase):
         swa_m[:actual_tokens],
         sm_scale=1.0,
     )
-    out_agent = sparse_mla.sparse_ragged_paged_attention(
+    kernel_fn = (
+        tc_sparse_mla.sparse_ragged_paged_attention
+        if use_tc_gather
+        else sparse_mla.sparse_ragged_paged_attention
+    )
+    out_agent = kernel_fn(
         q,
         cache_kv_nope,
         cache_kv_rope,
@@ -450,6 +477,280 @@ class CorrectnessTest(parameterized.TestCase):
     print(f"Max Diff Out: {np.max(diff_out)}")
     np.testing.assert_allclose(
         out_base, out_agent[:actual_tokens], rtol=0.1, atol=0.1
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="hbm_mode",
+          vmem_limit_mb=16,
+          expected_mode="hbm",
+      ),
+      dict(
+          testcase_name="quant_vmem_mode",
+          vmem_limit_mb=18,
+          expected_mode="quant_vmem",
+      ),
+      dict(
+          testcase_name="dequant_vmem_mode",
+          vmem_limit_mb=32,
+          expected_mode="dequant_vmem",
+      ),
+  )
+  def test_tc_gather_kv_cache_modes(
+      self, vmem_limit_mb: int, expected_mode: str
+  ):
+    rng = np.random.default_rng(42)
+    topk = 1024
+    batch_size = 4
+    num_heads = 64
+    head_dim = 512
+    page_size = 64
+    q_len = 32
+    kv_len_val = 2048
+    total_tokens = batch_size * q_len
+
+    cu_q_lens = jnp.arange(0, total_tokens + 1, q_len, dtype=jnp.int32)
+    kv_lens = jnp.full((batch_size,), kv_len_val, dtype=jnp.int32)
+    q = gen_random(rng, (total_tokens, num_heads, head_dim), jnp.bfloat16)
+
+    topk_indices = jnp.asarray(
+        [rng.permutation(kv_len_val)[:topk] for _ in range(total_tokens)],
+        dtype=jnp.int32,
+    )
+    pages_per_seq = cdiv(kv_len_val, page_size) + 4
+    total_pages = batch_size * pages_per_seq
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+
+    cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+        rng, total_pages, page_size, head_dim, jnp.bfloat16
+    )
+    distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+    attention_sinks = generate_attention_sinks(rng, num_heads)
+    swa_accumution = gen_random(
+        rng, (total_tokens, num_heads, head_dim), jnp.bfloat16
+    )
+    swa_l = gen_random(rng, (total_tokens, num_heads), jnp.float32)
+    swa_m = gen_random(rng, (total_tokens, num_heads), jnp.float32)
+
+    call_kwargs = dict(
+        sm_scale=1.0,
+        attention_kernel_batch_size=16,
+        vmem_limit_bytes=vmem_limit_mb * 1024 * 1024,
+    )
+    hlo_text = tc_sparse_mla.sparse_ragged_paged_attention.lower(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        **call_kwargs,
+    ).as_text()
+    self.assertIn(f"SparseMLA-TCGather-{expected_mode}-", hlo_text)
+
+    out_base = ref_implementation(
+        q,
+        cache_kv_base,
+        kv_lens,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        sm_scale=1.0,
+    )
+    out_agent = tc_sparse_mla.sparse_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        **call_kwargs,
+    )
+    np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="dense_vmem_h64",
+          batch_size=1,
+          actual_batch_size=1,
+          q_len=64,
+          page_size=64,
+          kv_len_val=512,
+          topk=512,
+          num_heads=64,
+          expected_mode="dense_vmem",
+      ),
+      dict(
+          testcase_name="dense_vmem_h128",
+          batch_size=1,
+          actual_batch_size=1,
+          q_len=36,
+          page_size=64,
+          kv_len_val=512,
+          topk=512,
+          num_heads=128,
+          expected_mode="dense_vmem",
+      ),
+      dict(
+          testcase_name="seq_pages_h64",
+          batch_size=20,
+          actual_batch_size=18,
+          q_len=1,
+          page_size=256,
+          kv_len_val=1024,
+          topk=1024,
+          num_heads=64,
+          expected_mode="seq_pages",
+      ),
+      dict(
+          testcase_name="seq_pages_h128",
+          batch_size=20,
+          actual_batch_size=17,
+          q_len=1,
+          page_size=256,
+          kv_len_val=1024,
+          topk=1024,
+          num_heads=128,
+          expected_mode="seq_pages",
+      ),
+  )
+  def test_tc_gather_dense_and_seq_pages_with_duplicates(
+      self,
+      batch_size: int,
+      actual_batch_size: int,
+      q_len: int,
+      page_size: int,
+      kv_len_val: int,
+      topk: int,
+      num_heads: int,
+      expected_mode: str,
+  ):
+    rng = np.random.default_rng(123)
+    head_dim = 512
+    total_tokens = batch_size * q_len
+    actual_tokens = actual_batch_size * q_len
+
+    cu_q_lens = jnp.arange(0, total_tokens + 1, q_len, dtype=jnp.int32)
+    q = (
+        gen_random(rng, (total_tokens, num_heads, head_dim), jnp.bfloat16)
+        * (head_dim**-0.5)
+    ).astype(jnp.bfloat16)
+
+    raw_topk = rng.integers(
+        -64, kv_len_val, size=(total_tokens, topk), dtype=np.int32
+    )
+    raw_topk = np.where(raw_topk < 0, -1, raw_topk)
+    raw_topk[actual_tokens:] = -1
+    topk_indices = jnp.asarray(raw_topk, dtype=jnp.int32)
+
+    pages_per_seq = cdiv(kv_len_val, page_size) + 2
+    total_pages = batch_size * pages_per_seq
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+
+    cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+        rng, total_pages, page_size, head_dim, jnp.bfloat16
+    )
+    num_decode = actual_batch_size if q_len == 1 else 0
+    distribution = jnp.array(
+        [num_decode, num_decode, actual_batch_size], dtype=jnp.int32
+    )
+    attention_sinks = generate_attention_sinks(rng, num_heads)
+    swa_accumution = gen_random(
+        rng, (total_tokens, num_heads, head_dim), jnp.bfloat16
+    )
+    swa_l = (
+        gen_random(rng, (total_tokens, num_heads), jnp.float32) + 1.0
+    )
+    swa_m = gen_random(rng, (total_tokens, num_heads), jnp.float32)
+
+    hlo_text = tc_sparse_mla.sparse_ragged_paged_attention.lower(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        sm_scale=1.0,
+    ).as_text()
+    self.assertIn(f"SparseMLA-TCGather-{expected_mode}-", hlo_text)
+
+    out_agent = tc_sparse_mla.sparse_ragged_paged_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        sm_scale=1.0,
+    )
+
+    kv_flat = cache_kv_base.reshape(total_pages, page_size, head_dim)
+    fp8_q, sf_q = _quantize_lane_periodic(kv_flat[..., :448])
+    fp8_deq = (
+        fp8_q.astype(jnp.bfloat16) * sf_q[..., None, :].astype(jnp.bfloat16)
+    ).reshape(total_pages, page_size, 448)
+    kv_deq = jnp.concatenate([fp8_deq, kv_flat[..., 448:512]], axis=-1)
+    page_table = page_indices.reshape(batch_size, pages_per_seq)
+    seq_ids = jnp.repeat(
+        jnp.arange(actual_batch_size, dtype=jnp.int32), q_len
+    )
+    valid = topk_indices[:actual_tokens] != -1
+    safe_topk = jnp.where(valid, topk_indices[:actual_tokens], 0)
+    phys_pages = jnp.take_along_axis(
+        page_table[seq_ids], safe_topk // page_size, axis=-1
+    )
+    kv_g = jnp.where(
+        valid[..., None], kv_deq[phys_pages, safe_topk % page_size], 0
+    )
+    attn = jnp.einsum(
+        "tnh,tkh->tnk",
+        q[:actual_tokens],
+        kv_g,
+        preferred_element_type=jnp.float32,
+    )
+    attn = jnp.where(valid[:, None, :], attn, jnp.finfo(jnp.float32).min)
+    m = jnp.maximum(swa_m[:actual_tokens], jnp.max(attn, axis=-1))
+    p = jnp.exp(attn - m[..., None])
+    l = (
+        swa_l[:actual_tokens] * jnp.exp(swa_m[:actual_tokens] - m)
+        + jnp.sum(p, axis=-1)
+        + jnp.exp(attention_sinks[None, :] - m)
+    )
+    acc = (
+        swa_accumution[:actual_tokens].astype(jnp.float32)
+        * jnp.exp(swa_m[:actual_tokens] - m)[..., None]
+        + jnp.einsum(
+            "tnk,tkh->tnh", p, kv_g, preferred_element_type=jnp.float32
+        )
+    )
+    out_ref = (acc / l[..., None]).astype(q.dtype)
+    np.testing.assert_allclose(
+        out_ref, out_agent[:actual_tokens], rtol=0.1, atol=0.1
     )
 
 

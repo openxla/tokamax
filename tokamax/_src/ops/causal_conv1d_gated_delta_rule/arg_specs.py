@@ -97,12 +97,11 @@ def make_gdn_spec(
         f"max_reqs ({max_reqs}) must be >= len(lengths) ({num_seqs})"
     )
   # Speculative verify windows: every sequence holds up to `window` tokens
-  # and owns `window` consecutive state slots (one checkpoint per position).
+  # in decode mode or larger prefill/mixed chunks during warmup, and owns
+  # `window` consecutive state slots (one checkpoint per position).
   window = num_spec_tokens + 1
-  if num_spec_tokens > 0 and any(not 1 <= l <= window for l in lengths):
-    raise ValueError(
-        f"spec-decode lengths must be in [1, {window}]; got {lengths}"
-    )
+  if num_spec_tokens > 0 and any(l <= 0 for l in lengths):
+    raise ValueError(f"spec-decode lengths must be positive; got {lengths}")
 
   num_tokens = sum(lengths)
   dim_size = 2 * n_kq * d_k + n_v * d_v
@@ -135,20 +134,27 @@ def make_gdn_spec(
     s_lens = np.pad(s_lens, (0, max_reqs - len(s_lens)), constant_values=0)
 
   # Build sequence distribution [decode_end, prefill_end, mixed_end].
+  max_decode_len = window if num_spec_tokens > 0 else 1
   if distribution is not None:
     dist_array = np.array(distribution, dtype=np.int32)
   else:
     if num_decode_seqs is None:
-      if num_spec_tokens > 0:
-        num_decode_seqs = num_seqs
-      else:
-        num_decode_seqs = 0
-        for l in lengths:
-          if l == 1:
-            num_decode_seqs += 1
-          else:
-            break
+      num_decode_seqs = next(
+          (i for i, l in enumerate(lengths) if l > max_decode_len), num_seqs
+      )
+      if any(l <= max_decode_len for l in lengths[num_decode_seqs:]):
+        raise ValueError(
+            f"decode sequences must precede prefills; got {lengths}"
+        )
     dist_array = np.array([num_decode_seqs, num_seqs, num_seqs], dtype=np.int32)
+  num_batched = int(dist_array[0])
+  if not 0 <= num_batched <= num_seqs or any(
+      l > max_decode_len for l in lengths[:num_batched]
+  ):
+    raise ValueError(
+        f"batched decode prefix lengths[:{num_batched}] must be in"
+        f" [1, {max_decode_len}]; got {lengths}"
+    )
 
   state_indices = np.arange(1, 1 + max_reqs * window, window, dtype=np.int32)
 
@@ -195,18 +201,16 @@ def make_gdn_spec(
   )
 
 
-_make_gdn_spec = make_gdn_spec
-
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     # Qwen3.5-397B TP8
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_prefill_1024",
         lengths=[1024],
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_prefill_2048",
         lengths=[2048],
@@ -214,14 +218,14 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_prefill_4096",
         lengths=[4096],
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_prefill_8192",
         lengths=[8192],
@@ -229,7 +233,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "ci_tests", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_64",
         lengths=[1] * 64,
@@ -237,21 +241,21 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "ci_tests", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_128",
         lengths=[1] * 128,
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_256",
         lengths=[1] * 256,
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_512",
         lengths=[1] * 512,
@@ -259,7 +263,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
     ),
     # Decode with non-zero prior context (has_initial_state=True)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_4_ctx8192",
         lengths=[1] * 4,
@@ -268,7 +272,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_8_ctx8192",
         lengths=[1] * 8,
@@ -277,7 +281,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_16_ctx8192",
         lengths=[1] * 16,
@@ -286,7 +290,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_32_ctx8192",
         lengths=[1] * 32,
@@ -295,7 +299,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_64_ctx1024",
         lengths=[1] * 64,
@@ -303,7 +307,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_64_ctx8192",
         lengths=[1] * 64,
@@ -312,7 +316,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_decode_cached_128_ctx8192",
         lengths=[1] * 128,
@@ -322,7 +326,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         tags=("primary", "forward_only"),
     ),
     # Mixed batch: 63 decode requests + 1 prefill request (total 8192 tokens)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_mixed_64_t8192",
         lengths=[1] * 63 + [8129],
@@ -331,7 +335,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         tags=("primary", "forward_only"),
     ),
     # Unit test shapes from base_test.py / pallas_mosaic_tpu_test.py
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_mixed_3x512",
         lengths=[256, 128, 128],
@@ -339,7 +343,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "ci_tests", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_mixed_prefill_decode_11",
         lengths=[1] * 8 + [128, 128, 256],
@@ -347,7 +351,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "ci_tests", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_padded_mixed_16",
         lengths=[128, 64, 32, 16, 8],
@@ -356,7 +360,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "ci_tests", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_padded_decode_64_max512",
         lengths=[1] * 64,
@@ -366,14 +370,14 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         tags=("primary", "ci_tests", "forward_only"),
     ),
     # Qwen3.5-397B ATTN_DP4, EP8
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_prefill_1024",
         lengths=[1024],
         n_kq=8,
         n_v=32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_prefill_2048",
         lengths=[2048],
@@ -381,7 +385,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=32,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_decode_16_ctx1024",
         lengths=[1] * 16,
@@ -389,7 +393,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=8,
         n_v=32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_decode_32_ctx1024",
         lengths=[1] * 32,
@@ -397,7 +401,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=8,
         n_v=32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_decode_64_ctx8192",
         lengths=[1] * 64,
@@ -406,7 +410,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=32,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_decode_128_ctx1024",
         lengths=[1] * 128,
@@ -414,7 +418,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=8,
         n_v=32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_mixed_16_t1024",
         lengths=[1] * 15 + [1009],
@@ -422,7 +426,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=8,
         n_v=32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_mixed_32_t2048",
         lengths=[1] * 31 + [2017],
@@ -431,35 +435,35 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=32,
     ),
     # Qwen3.5-397B ATTN_DP8, EP8
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_decode_8",
         lengths=[1] * 8,
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_decode_64",
         lengths=[1] * 64,
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_mixed_8_t1024",
         lengths=[1] * 7 + [1017],
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_mixed_64_t1024",
         lengths=[1] * 63 + [961],
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_prefill_512",
         lengths=[512],
@@ -467,28 +471,28 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_prefill_1024",
         lengths=[1024],
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_prefill_2048",
         lengths=[2048],
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_prefill_4096",
         lengths=[4096],
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_decode_16_ctx8192",
         lengths=[1] * 16,
@@ -496,7 +500,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_decode_32_ctx8192",
         lengths=[1] * 32,
@@ -505,7 +509,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_decode_128_ctx1024",
         lengths=[1] * 128,
@@ -513,7 +517,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=16,
         n_v=64,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_mixed_32_t512",
         lengths=[1] * 31 + [481],
@@ -522,7 +526,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_mixed_32_t2048",
         lengths=[1] * 31 + [2017],
@@ -532,7 +536,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         tags=("primary", "forward_only"),
     ),
     # Long-context continuation and multi-sequence decode
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_delta_prefill_1536_ctx65536",
         lengths=[1536],
@@ -540,7 +544,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=2,
         n_v=8,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_delta_prefill_2048_ctx131072",
         lengths=[2048],
@@ -549,7 +553,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_delta_prefill_2048_ctx65536",
         lengths=[2048],
@@ -558,7 +562,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
     ),
     # Concurrent decode batches
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_multi_seq_decode_8_ctx32768",
         lengths=[1] * 8,
@@ -567,7 +571,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
     ),
     # Mixed decode + prefill batch
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_mixed_decode_8_prefill_2048",
         lengths=[1] * 7 + [2048],
@@ -576,7 +580,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
     ),
     # Qwen3.5-35B and Qwen3.8-Max
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_35b",
         name="tp8_prefill_2048",
         lengths=[2048],
@@ -584,7 +588,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=4,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_35b",
         name="tp8_decode_64_ctx1024",
         lengths=[1] * 64,
@@ -593,14 +597,14 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=4,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_prefill_2048",
         lengths=[2048],
         n_kq=2,
         n_v=16,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_decode_64_ctx1024",
         lengths=[1] * 64,
@@ -610,7 +614,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     ),
     # Qwen3.8-Max (16 QK heads, 128 V heads; d_k=128, d_v=128)
     # TP2 (n_kq=8, n_v=64)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_b1_prefill",
         lengths=[8192],
@@ -621,7 +625,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_b48_decode",
         lengths=[1] * 48,
@@ -633,7 +637,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
         tags=("primary", "forward_only"),
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_b80_decode",
         lengths=[1] * 80,
@@ -644,7 +648,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_b93_decode",
         lengths=[1] * 93,
@@ -655,7 +659,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_mixed_b48_t8192",
         lengths=[1] * 48 + [8192 - 48],
@@ -668,7 +672,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         tags=("primary", "forward_only"),
     ),
     # TP4 (n_kq=4, n_v=32)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b1_prefill",
         lengths=[8192],
@@ -678,7 +682,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b8_prefill",
         lengths=[8192] * 8,
@@ -688,7 +692,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b111_decode",
         lengths=[1] * 111,
@@ -699,7 +703,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b243_decode",
         lengths=[1] * 243,
@@ -710,7 +714,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b512_decode",
         lengths=[1] * 512,
@@ -721,7 +725,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_mixed_b188_t8192",
         lengths=[1] * 188 + [8192 - 188],
@@ -733,7 +737,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
     ),
     # TP8 (n_kq=2, n_v=16)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_b2_prefill",
         lengths=[8192] * 2,
@@ -743,7 +747,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_b178_decode",
         lengths=[1] * 178,
@@ -754,7 +758,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_b328_decode",
         lengths=[1] * 328,
@@ -765,7 +769,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_mixed_b328_t8192",
         lengths=[1] * 328 + [8192 - 328],
@@ -776,7 +780,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_mixed_b328_t16384",
         lengths=[1] * 328 + [8192, 8192 - 328],
@@ -788,7 +792,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
     ),
     # TP16 (n_kq=1, n_v=8)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp16_b4_prefill",
         lengths=[8192] * 4,
@@ -799,7 +803,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
     ),
     # TP32 (n_kq=1, n_v=4; QK heads replicated 2x)
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_b7_prefill",
         lengths=[8192] * 7,
@@ -809,7 +813,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_b257_decode",
         lengths=[1] * 257,
@@ -820,7 +824,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_b512_decode",
         lengths=[1] * 512,
@@ -831,7 +835,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_mixed_b512_t8192",
         lengths=[1] * 512 + [8192 - 512],
@@ -842,7 +846,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_mixed_b512_t57344",
         lengths=[1] * 512 + [8192] * 6 + [8192 - 512],
@@ -855,7 +859,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     ),
     # Additional decode batch sizes across TP1 (n_kq=16, n_v=128), TP2, TP4,
     # TP8, TP16, TP32, and TP64 (n_kq=1, n_v=2; QK heads replicated 4x).
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b188_decode",
         lengths=[1] * 188,
@@ -866,7 +870,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp16_b448_decode",
         lengths=[1] * 448,
@@ -877,7 +881,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp2_b120_decode",
         lengths=[1] * 120,
@@ -888,7 +892,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp4_b332_decode",
         lengths=[1] * 332,
@@ -899,7 +903,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp8_b528_decode",
         lengths=[1] * 528,
@@ -910,7 +914,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp16_b704_decode",
         lengths=[1] * 704,
@@ -921,7 +925,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp32_b800_decode",
         lengths=[1] * 800,
@@ -932,7 +936,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp64_b896_decode",
         lengths=[1] * 896,
@@ -943,7 +947,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_state_dtype=jnp.float32,
         conv_weight_dtype=jnp.float32,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_8_max",
         name="tp1_b14_decode",
         lengths=[1] * 14,
@@ -955,7 +959,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         conv_weight_dtype=jnp.float32,
     ),
     # Speculative decoding verify windows (W = num_spec_tokens + 1).
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec3_decode_4_ctx1024",
         lengths=[4] * 4,
@@ -964,7 +968,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec3_decode_8_ctx1024",
         lengths=[4] * 8,
@@ -973,7 +977,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec3_decode_16_ctx1024",
         lengths=[4] * 16,
@@ -982,7 +986,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec3_decode_32_ctx1024",
         lengths=[4] * 32,
@@ -991,7 +995,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec3_decode_64_ctx1024",
         lengths=[4] * 64,
@@ -1000,7 +1004,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec1_decode_16_ctx1024",
         lengths=[2] * 16,
@@ -1009,7 +1013,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=1,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec1_decode_64_ctx1024",
         lengths=[2] * 64,
@@ -1018,7 +1022,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=1,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec7_decode_16_ctx1024",
         lengths=[8] * 16,
@@ -1027,7 +1031,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=7,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="tp8_spec7_decode_64_ctx1024",
         lengths=[8] * 64,
@@ -1036,7 +1040,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=8,
         num_spec_tokens=7,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_spec3_decode_16_ctx1024",
         lengths=[4] * 16,
@@ -1045,7 +1049,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=32,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp4_ep8_spec3_decode_32_ctx1024",
         lengths=[4] * 32,
@@ -1054,7 +1058,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=32,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_spec3_decode_8_ctx1024",
         lengths=[4] * 8,
@@ -1063,7 +1067,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_spec3_decode_32_ctx1024",
         lengths=[4] * 32,
@@ -1072,7 +1076,7 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_v=64,
         num_spec_tokens=3,
     ),
-    _make_gdn_spec(
+    make_gdn_spec(
         project="qwen3_5_397b",
         name="dp8_ep8_spec3_decode_64_ctx1024",
         lengths=[4] * 64,
@@ -1080,5 +1084,28 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         n_kq=16,
         n_v=64,
         num_spec_tokens=3,
+    ),
+    make_gdn_spec(
+        project="qwen3_5_397b",
+        name="dcp4_mtp3_warmup_16_max16",
+        lengths=[16],
+        context_lens=1024,
+        max_reqs=16,
+        n_kq=2,
+        n_v=8,
+        num_spec_tokens=3,
+    ),
+    make_gdn_spec(
+        project="qwen3_5_397b",
+        name="pcp2_tp8_prefill_2048",
+        lengths=[2048],
+        context_lens=2048,
+        max_reqs=16,
+        n_kq=2,
+        n_v=8,
+        act_dtype=jnp.bfloat16,
+        recurrent_state_dtype=jnp.float32,
+        conv_state_dtype=jnp.float32,
+        conv_weight_dtype=jnp.bfloat16,
     ),
 )

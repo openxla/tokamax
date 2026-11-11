@@ -42,17 +42,14 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
   """Tokamax operator that invokes the Pallas kernel for Multi-Head Latent Attention."""
 
   config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   @override
   @jaxtyping.jaxtyped
   def _fwd(
       self,
-      ql_nope: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"
-      ],
-      q_pe: Float[
-          Array, "max_num_tokens actual_num_q_heads actual_r_dim"
-      ],
+      ql_nope: Float[Array, "max_num_tokens actual_num_q_heads actual_lkv_dim"],
+      q_pe: Float[Array, "max_num_tokens actual_num_q_heads actual_r_dim"],
       new_kv_c: Float[Array, "max_num_tokens actual_lkv_dim"],
       new_k_pe: Float[Array, "max_num_tokens actual_r_dim"],
       cache_kv: Float[
@@ -72,12 +69,21 @@ class PallasTpuMultiHeadLatentAttention(base.MultiHeadLatentAttention):
       k_scale: float | None = None,
       v_scale: float | None = None,
       s_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      layout: base.MlaLayout = base.MlaLayout.TOKEN_MAJOR,
+      schedules: base.OpaqueMetadata = None,
       debug_mode: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[tuple[jax.Array, jax.Array], None]:
 
     assert config is not None, "Config must be specified."
+    if layout != base.MlaLayout.TOKEN_MAJOR:
+      raise NotImplementedError(
+          f"{type(self).__name__} only supports {base.MlaLayout.TOKEN_MAJOR},"
+          f" got {layout=}."
+      )
+    # This kernel handles every band in one launch and builds its own metadata.
+    del schedules
 
     return (
         pallas_mosaic_tpu_kernel.mla_ragged_paged_attention(

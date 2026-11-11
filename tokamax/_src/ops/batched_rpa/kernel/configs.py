@@ -136,14 +136,9 @@ class RpaCase(enum.StrEnum):
                 return distribution[1], distribution[2]
 
 
-# Inputs need three slots. The fetch for a tile is issued throughout the
-# preceding tile rather than all at once at its start, so it cannot be waited
-# on right away -- it needs one extra tile in flight for the DMA to land.
+# Triple-buffer inputs because fetch spans the preceding tile and needs an extra
+# tile in flight; double-buffer outputs since writeback completes within one step.
 NUM_INPUT_SLOTS = 3
-
-# Outputs only need two. The writeback issued at step N is waited at the top of
-# step N + 2, which is exactly when slot N % 2 comes back around, so the DMA
-# still gets all of step N + 1 to land.
 NUM_OUTPUT_SLOTS = 2
 
 
@@ -286,9 +281,7 @@ class RpaConfigs:
             28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
         )
         bytes_per_step *= self.block.batch_size
-        # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in,
-        # total_wait_kv_out, total_wait_q_in, total_wait_o_out, total_wait_lse_out)
-        # which are 1D arrays (not multiplied by batch_size).
+        # Add bytes for the 5 total_wait 1D fields (not scaled by batch_size).
         bytes_per_step += 20
 
         max_steps_ub = available_bytes // bytes_per_step
@@ -445,12 +438,8 @@ class RpaConfigs:
     @property
     def kv_vmem_lanes(self) -> int:
         """Lane-dim size of the KV VMEM buffer; SEQ_ALONG_LANE only."""
-        # o = kv from cache, n = kv from new, - = pad. Each [] is a 128-lane cell:
-        #
-        #   want  [onnn][nnnn]
-        #   got   [o---][---n][nnnn][nn--]
-        #
-        # because we fetch at 128-lane boundary, we need 2 extra padding slots
+        # Fetches align to 128-lane boundaries, requiring up to 2 extra padding
+        # slots when stitching cache and new KV: [o---][---n][nnnn][nn--].
         return self.block.bkv_sz + 2 * self.kv_token_align
 
     @property

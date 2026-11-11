@@ -36,16 +36,26 @@ def _read_streams_2d(
   ]
 
 
-def _fold_to_128_lanes(x: jax.Array, embedding: int) -> jax.Array:
-  """Folds `(sub_tokens, embedding)` into `(sub_tokens, 128)` in bf16.
+def _fold_to_num_lanes(
+    x: jax.Array, embedding: int, num_lanes: int
+) -> jax.Array:
+  """Folds `(sub_tokens, embedding)` into `(sub_tokens, num_lanes)` in bf16.
 
-  Accumulates `embedding // 128` strided 128-lane bands on the VPU with zero
-  cross-lane shuffles:
-    `S_tilde[t, c] = sum_{b=0}^{D/128 - 1} x[t, 128*b + c]` for `c in [0, 128)`.
+  Accumulates `embedding // num_lanes` strided `num_lanes`-lane bands on the VPU
+  with zero cross-lane shuffles:
+    `S_tilde[t, c] = sum_{b=0}^{D/L - 1} x[t, L*b + c]` for `c in [0, L)`.
+
+  Args:
+    x: Input 2D array of shape `(sub_tokens, embedding)`.
+    embedding: Feature dimension (multiple of `num_lanes`).
+    num_lanes: Number of TPU vector lanes.
+
+  Returns:
+    Folded `bfloat16` array of shape `(sub_tokens, num_lanes)`.
   """
-  acc = x[:, 0:128]
-  for col in range(128, embedding, 128):
-    acc = acc + x[:, col : col + 128]
+  acc = x[:, 0:num_lanes]
+  for col in range(num_lanes, embedding, num_lanes):
+    acc = acc + x[:, col : col + num_lanes]
   return acc.astype(jnp.bfloat16)
 
 
@@ -70,29 +80,32 @@ def _post_bwd_2d_mxu_core(
     `Y[t, j, e] = h_post[t, j] * L[t, e] + sum_k H_res[t, j, k] * X[t, k, e]`
   using VPU subtile loops for activation cotangents (`dL`, `dX`) and a two-stage
   reduction for gate/residual cotangents (`dh_post`, `dH_res`):
-    - Stage A (VPU 128-lane fold, `D -> 128` per stream): folds elementwise
-      products across `D // 128` bands into `S_tilde_post` and `S_tilde_res^(j)`
-      without cross-lane VPU shuffles.
-    - Stage B (MXU `128 -> 1` systolic contraction): contracts folded bands
-      with binary selector matrices `U_post` and `U_res^(j)`:
+    - Stage A (VPU lane fold, `D -> num_lanes` per stream): folds elementwise
+      products across `D // num_lanes` bands into `S_tilde_post` and
+      `S_tilde_res^(j)` without cross-lane VPU shuffles.
+    - Stage B (MXU `num_lanes -> 1` systolic contraction): contracts folded
+      bands with binary selector matrices `U_post` and `U_res^(j)`:
         `dh_post[t, j] = sum_e L[t, e] * dY[t, j, e]`
         `              = (S_tilde_post @ U_post)[t, j]`
         `dH_res[t, j, k] = sum_e dY[t, j, e] * X[t, k, e]`
         `                = sum_j (S_tilde_res^(j) @ U_res^(j))`
   """
+  num_lanes = pltpu.get_tpu_info().num_lanes
   with jax.named_scope("build_mxu_selector_matrices"):
-    folded_cols = streams * 128
+    folded_cols = streams * num_lanes
     row_band_post = (
-        jax.lax.broadcasted_iota(jnp.int32, (folded_cols, streams), 0) // 128
+        jax.lax.broadcasted_iota(jnp.int32, (folded_cols, streams), 0)
+        // num_lanes
     )
     u_post_bf16 = (
-        row_band_post
-        == jax.lax.broadcasted_iota(jnp.int32, (folded_cols, streams), 1)
+        row_band_post == jax.lax.broadcasted_iota(
+            jnp.int32, (folded_cols, streams), 1
+        )
     ).astype(jnp.bfloat16)
 
     row_band_res = (
         jax.lax.broadcasted_iota(jnp.int32, (folded_cols, streams * streams), 0)
-        // 128
+        // num_lanes
     )
     col_id_res = jax.lax.broadcasted_iota(
         jnp.int32, (folded_cols, streams * streams), 1
@@ -141,12 +154,12 @@ def _post_bwd_2d_mxu_core(
                 d_x_ref.dtype
             )
 
-        # Stage A (VPU lane fold, D -> 128 per stream):
-        # S_tilde_post[t, j*128 + c] = sum_b (L * dY_j)[t, 128*b + c]
-        # S_tilde_res^(j)[t, k*128 + c] = sum_b (dY_j * X_k)[t, 128*b + c]
+        # Stage A (VPU lane fold, D -> num_lanes per stream):
+        # S_tilde_post[t, j*L + c] = sum_b (L * dY_j)[t, L*b + c]
+        # S_tilde_res^(j)[t, k*L + c] = sum_b (dY_j * X_k)[t, L*b + c]
         with jax.named_scope("fold_d_h_post_128_lanes"):
           s_post_sub_parts = [
-              _fold_to_128_lanes(l_sub * dy_sub[j], embedding)
+              _fold_to_num_lanes(l_sub * dy_sub[j], embedding, num_lanes)
               for j in range(streams)
           ]
           s_post_rows.append(jnp.concatenate(s_post_sub_parts, axis=1))
@@ -156,7 +169,7 @@ def _post_bwd_2d_mxu_core(
           for x_k in _read_streams_2d(x_ref, s_slice, streams, embedding):
             for j in range(streams):
               s_res_sub_by_j[j].append(
-                  _fold_to_128_lanes(dy_sub[j] * x_k, embedding)
+                  _fold_to_num_lanes(dy_sub[j] * x_k, embedding, num_lanes)
               )
           for j in range(streams):
             s_res_rows_by_j[j].append(
@@ -339,15 +352,19 @@ def _pre_bwd_core(
     )
 
   # Step 4: Accumulate bias db += sum_t dZ_t and alpha
-  # d_alpha += sum_t dZ_t * Z_hat_t (kept at leading dim 8 for VREG sublane
-  # alignment).
+  # d_alpha += sum_t dZ_t * Z_hat_t (kept at leading dim num_sublanes for VREG
+  # sublane alignment).
   with jax.named_scope("accum_d_alpha_and_d_bias"):
+    num_sublanes = pltpu.get_tpu_info().num_sublanes
     d_logits = (
         jnp.pad(d_logits_gates, ((0, 0), (0, num_permutations))) + d_logits_res
     )
     d_ab_tokens = jnp.concatenate((d_logits, d_logits * projected), axis=-1)
     d_ab_ref[...] = d_ab_ref[...] + jnp.sum(
-        d_ab_tokens.reshape(block_tokens // 8, 8, 2 * phi_cols), axis=0
+        d_ab_tokens.reshape(
+            block_tokens // num_sublanes, num_sublanes, 2 * phi_cols
+        ),
+        axis=0,
     )
 
   # Step 5: Folded weight & RMSNorm input gradients:
@@ -557,6 +574,7 @@ def _run_bwd_chunk_pipeline(
 ) -> tuple[tuple[jax.Array, ...], common.MhcWeights]:
   """Emits and executes a 2D chunk-parallel Pallas backward kernel."""
   common.validate_token_block_size(tokens, block_tokens, name="bwd_block_size")
+  num_sublanes = common.get_tpu_info().num_sublanes
   num_blocks = tokens // block_tokens
   num_chunks = math.gcd(num_blocks, 4)
   blocks_per_chunk = num_blocks // num_chunks
@@ -578,14 +596,16 @@ def _run_bwd_chunk_pipeline(
       for shape, _ in token_out_shapes_dtypes
   ) + (
       pl.BlockSpec((None, flattened_size, phi_cols), _chunk_accum_index_map),
-      pl.BlockSpec((None, 8, 2 * phi_cols), _chunk_accum_index_map),
+      pl.BlockSpec((None, num_sublanes, 2 * phi_cols), _chunk_accum_index_map),
   )
   out_shape = tuple(
       jax.ShapeDtypeStruct(shape, dtype)
       for shape, dtype in token_out_shapes_dtypes
   ) + (
       jax.ShapeDtypeStruct((num_chunks, flattened_size, phi_cols), jnp.float32),
-      jax.ShapeDtypeStruct((num_chunks, 8, 2 * phi_cols), jnp.float32),
+      jax.ShapeDtypeStruct(
+          (num_chunks, num_sublanes, 2 * phi_cols), jnp.float32
+      ),
   )
   kernel_main = pltpu.emit_pipeline(
       body_fn,
@@ -725,6 +745,8 @@ def pre_bwd(
 ) -> tuple[jax.Array, common.MhcWeights, None]:
   """Custom-VJP backward rule for `pre`."""
   with jax.named_scope("mhc_pre_bwd"):
+    config = common.resolve_config(config)
+    assert config.bwd_block_size is not None
     (phi, h_pre), (x, weights, permutations) = residuals
     d_layer_input, d_context = cotangents
     tokens, streams = h_pre.shape
@@ -766,6 +788,8 @@ def post_bwd(
     d_output: jax.Array,
 ) -> tuple[jax.Array, common.MHCContext]:
   """Custom-VJP backward rule for `post`."""
+  config = common.resolve_config(config)
+  assert config.bwd_block_size is not None
   layer_output, context = saved
   x, h_post, residual = context.x, context.h_post, context.residual
   embedding = layer_output.shape[-1]
@@ -774,7 +798,7 @@ def post_bwd(
   flattened_size = streams * embedding
   block_tokens = config.bwd_block_size
   common.validate_token_block_size(tokens, block_tokens, name="bwd_block_size")
-  sub_tokens = math.gcd(block_tokens, 32)
+  sub_tokens = math.gcd(block_tokens, 4 * common.get_tpu_info().num_sublanes)
   num_subtiles = block_tokens // sub_tokens
 
   x_in = x.reshape(tokens, flattened_size)
@@ -859,6 +883,8 @@ def post_and_pre_bwd(
 ]:
   """Custom-VJP backward rule for `post_and_pre`."""
   with jax.named_scope("mhc_post_and_pre_bwd"):
+    config = common.resolve_config(config)
+    assert config.bwd_block_size is not None
     (
         (phi, next_h_pre),
         (layer_output, context),
@@ -872,7 +898,7 @@ def post_and_pre_bwd(
     d_next_layer_input, d_next_context = cotangents
 
     block_tokens = config.bwd_block_size
-    sub_tokens = math.gcd(block_tokens, 32)
+    sub_tokens = math.gcd(block_tokens, 4 * common.get_tpu_info().num_sublanes)
     num_subtiles = block_tokens // sub_tokens
     x_in = x.reshape(tokens, flattened_size)
     x_next_in = x_next.reshape(tokens, flattened_size)

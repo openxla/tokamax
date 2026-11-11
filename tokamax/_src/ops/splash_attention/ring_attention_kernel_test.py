@@ -171,6 +171,44 @@ class RingAttentionTest(test_utils.SplashAttentionTestCase):
       self._assert_allclose(dk, dk_ref, rtol=1e-2, atol=1e-2)
       self._assert_allclose(dv, dv_ref, rtol=1e-2, atol=1e-2)
 
+    if head_dim == 128 and not is_segmented and mask_type == "CAUSAL":
+      with self.subTest("bwd_dq_reduction_steps_1"):
+        config_1 = dataclasses.replace(
+            splash_config,
+            block_q_dkv=256,
+            block_kv_dkv=256,
+            block_kv_dkv_compute=256,
+            use_fused_bwd_kernel=True,
+            dq_reduction_steps=1,
+        )
+        ring_kernel_1 = ring_attention_kernel.make_ring_attention(
+            mask,
+            is_mqa=is_mqa,
+            ring_axis=ring_axis,
+            config=config_1,
+            save_residuals=False,
+            q_seq_shards=ring_size,
+            kv_seq_shards=ring_size,
+        )
+        ring_attn_1 = jax.shard_map(
+            lambda rk, q_, k_, v_, s_: rk(q_, k_, v_, s_),
+            mesh=mesh,
+            in_specs=(
+                ring_kernel_1.manual_sharding_spec(),
+                q_spec,
+                kv_spec,
+                kv_spec,
+                segment_ids_spec,
+            ),
+            out_specs=q_spec,
+            check_vma=False,
+        )
+        _, out_vjp_1 = jax.vjp(ring_attn_1, ring_kernel_1, q, k, v, segment_ids)
+        _, dq_1, dk_1, dv_1, _ = out_vjp_1(do)
+        self._assert_allclose(dq_1, dq_ref, rtol=1e-2, atol=1e-2)
+        self._assert_allclose(dk_1, dk_ref, rtol=1e-2, atol=1e-2)
+        self._assert_allclose(dv_1, dv_ref, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -21,8 +21,6 @@ from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.layer import modular
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 
-Mesh = sharding.Mesh
-
 
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
   """Applies the router scoring function to gating logits."""
@@ -63,7 +61,7 @@ def gated_routing_moe(
     w2_bias: jax.Array | None,
     topk: int,
     renormalize: bool,
-    mesh: Mesh,
+    mesh: sharding.Mesh,
     activation: str,
     scoring_fn: str,
     tp_axis: str | None,

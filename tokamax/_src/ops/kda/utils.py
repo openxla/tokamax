@@ -225,7 +225,8 @@ def _align_seqs(
       for idx, a in enumerate(aligned_3d):
         per_batch_3d[idx].append(a)
       padded_cus.append(padded_cu_b)
-      t_aligned_sizes.append(aligned_4d[0].shape[2])
+      _, _, aligned_t, _ = aligned_4d[0].shape
+      t_aligned_sizes.append(aligned_t)
 
     T_max = max(t_aligned_sizes)
 
@@ -233,7 +234,8 @@ def _align_seqs(
     def _pad_and_cat_4d(tensors_per_batch):
       padded = []
       for t in tensors_per_batch:
-        pad_len = T_max - t.shape[2]
+        _, _, cur_t, _ = t.shape
+        pad_len = T_max - cur_t
         if pad_len > 0:
           t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
         padded.append(t)
@@ -242,7 +244,8 @@ def _align_seqs(
     def _pad_and_cat_3d(tensors_per_batch):
       padded = []
       for t in tensors_per_batch:
-        pad_len = T_max - t.shape[2]
+        _, _, cur_t = t.shape
+        pad_len = T_max - cur_t
         if pad_len > 0:
           t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len)))
         padded.append(t)
@@ -255,7 +258,7 @@ def _align_seqs(
 
   # --- Single-batch path (original) ---
   N = cu_seqlens.shape[0] - 1
-  T_old = tensors_4d[0].shape[2]
+  _, _, T_old, _ = tensors_4d[0].shape
 
   seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
   if aligned_cu_seqlens is None:

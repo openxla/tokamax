@@ -42,19 +42,25 @@ class OperandRef:
   scale: Any | None = None
 
 
-TileTgmmFn = Callable[
-    [
-        gmm_v2.Dimensions,
-        gmm_v2.InputConfigs,
-        gmm_v2.InputConfigs,
-        int,
-        jnp.dtype,
-        jnp.dtype,
-        int,
-        bool,
-    ],
-    gmm_v2.TileSizes,
-]
+@dataclasses.dataclass(frozen=True)
+class TgmmTilingRequest:
+  """Inputs passed to a TGMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: gmm_v2.Dimensions
+  lhs_cfgs: gmm_v2.InputConfigs
+  rhs_cfgs: gmm_v2.InputConfigs
+  vmem_limit_bytes: int
+  out_dtype: jnp.dtype
+  acc_dtype: jnp.dtype
+  target_zero_ref_bytes: int
+  has_partial_sum: bool = False
+
+
+TileTgmmFn = Callable[[TgmmTilingRequest], gmm_v2.TileSizes]
 
 
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
@@ -78,6 +84,22 @@ def get_cost_estimate(cfgs: gmm_v2.GmmConfigs) -> pl.CostEstimate:
       flops=flops,
       bytes_accessed=lhs_bytes + rhs_bytes + out_bytes,
       transcendentals=0,
+  )
+
+
+def calculate_tgmm_tiling_from_request(
+    req: TgmmTilingRequest,
+) -> gmm_v2.TileSizes:
+  """Default `TileTgmmFn` for `tgmm_v2`: calls `calculate_tgmm_tiling`."""
+  return calculate_tgmm_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.out_dtype,
+      req.acc_dtype,
+      req.target_zero_ref_bytes,
+      req.has_partial_sum,
   )
 
 
@@ -182,11 +204,38 @@ def calculate_tgmm_tiling(
         f" tiles=({tile_m},{tile_k},{tile_n}), vmem={vmem_limit_bytes}"
     )
 
-  max_num_buckets = 4
+  # In MegaCore mode both the n and k grid dimensions are parallel (see
+  # `tgmm_kernel_main`), and the grid is split across TensorCores along the
+  # first of them whose tile count is a multiple of `num_cores`. If neither is,
+  # split the larger of k and n, so that each core re-reads only the operand of
+  # the smaller one. Splitting only shrinks tiles, so VMEM usage stays in limit.
+  num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
+  if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
+    tile_k_lower_bound = min(
+        pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
+    )
+    split_k = gmm_v2.split_for_cores(
+        dims.size_k, num_k_tiles, num_cores, num_lanes, tile_k_lower_bound
+    )
+    split_n = gmm_v2.split_for_cores(
+        dims.size_n, num_n_tiles, num_cores, num_lanes, tile_n_lower_bound
+    )
+    if split_k is not None and (dims.size_k >= dims.size_n or split_n is None):
+      num_k_tiles, tile_k = split_k
+    elif split_n is not None:
+      num_n_tiles, tile_n = split_n
+
+  # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
+  # full-tile int32 masks alongside the accumulator in VREGs, causing severe
+  # register spills. Also cap tile_m at the average group size so small-group
+  # shapes do not pad past typical group boundaries.
+  max_num_buckets = 2
   bucket_base = tile_m
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if not within_vmem_limit(new_tile_m, tile_k, tile_n):
       break
@@ -285,15 +334,17 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        # pyrefly: ignore[bad-argument-type]
-        vmem_limit_bytes,
-        out_dtype,
-        acc_dtype,
-        target_zero_ref_bytes,
-        partial_sum is not None,
+        TgmmTilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            out_dtype=out_dtype,
+            acc_dtype=acc_dtype,
+            target_zero_ref_bytes=target_zero_ref_bytes,
+            has_partial_sum=partial_sum is not None,
+        )
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
       f"tile_m ({tiles.tile_m}) must be divisible by bucket_base"
@@ -750,7 +801,9 @@ def tgmm_v2(
     group_offset: jax.Array | None = None,
     partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
-    tile_info: gmm_v2.TileSizes | TileTgmmFn = calculate_tgmm_tiling,
+    tile_info: gmm_v2.TileSizes | TileTgmmFn = (
+        calculate_tgmm_tiling_from_request
+    ),
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -776,7 +829,7 @@ def tgmm_v2(
       Must have the output dtype; the output is written in place over this
       buffer.
     tile_info: Specifies the tiling strategy. Can be a `TileSizes` object or a
-      function to calculate it.
+      function that takes a `TgmmTilingRequest` and returns one.
     vmem_limit_bytes: The VMEM limit in bytes for the kernel.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.

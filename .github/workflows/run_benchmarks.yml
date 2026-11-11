@@ -46,10 +46,10 @@ permissions:
 jobs:
   run_benchmarks:
     name: Run Tokamax benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@6101cd7bc2bdef27c44e53789a63292f13386437 # main
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@df45de4a2390d7510af1e9d747f47cd6f6b9bb94 # main
     with:
       registry_file: "tokamax/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "6101cd7bc2bdef27c44e53789a63292f13386437"
+      bap_ref: "df45de4a2390d7510af1e9d747f47cd6f6b9bb94"
       ab_mode: ${{ inputs.ab_mode }}
       baseline_ref: ${{ inputs.baseline_ref }}
       experiment_ref: ${{ inputs.experiment_ref }}

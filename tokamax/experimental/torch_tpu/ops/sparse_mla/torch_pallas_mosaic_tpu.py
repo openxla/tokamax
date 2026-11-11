@@ -41,17 +41,22 @@ class _PallasMosaicTpuSparseMla(
   @override
   def deconstruct_config(  # pyrefly: ignore[bad-override]
       self, config: Config | None
-  ) -> tuple[int, int, int] | None:
+  ) -> tuple[int, ...] | None:
     """Deconstructs a Config object into a 3-int tuple for jax_op."""
     if config is None:
       return None
     assert len(dataclasses.fields(config)) == 3, (
         f"Expected 3 fields in Config, got {len(dataclasses.fields(config))}."
     )
+    vmem_limit = (
+        -1
+        if config.vmem_limit_bytes is None
+        else int(config.vmem_limit_bytes)
+    )
     return (
         config.gather_and_attention_chunk_size,
         config.attention_kernel_batch_size,
-        config.vmem_limit_bytes,
+        vmem_limit,
     )
 
   @override
@@ -66,7 +71,7 @@ class _PallasMosaicTpuSparseMla(
     return Config(
         gather_and_attention_chunk_size=int(flat[0]),
         attention_kernel_batch_size=int(flat[1]),
-        vmem_limit_bytes=int(flat[2]),
+        vmem_limit_bytes=None if flat[2] <= 0 else int(flat[2]),
     )
 
   @override

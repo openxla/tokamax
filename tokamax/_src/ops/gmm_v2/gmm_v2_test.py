@@ -336,6 +336,50 @@ class GmmTest(parameterized.TestCase):
 
     assert_arrays_all_close(fused, unfused)
 
+  @parameterized.parameters(False, True)
+  def test_gmm_tile_fn_receives_tiling_request(self, use_partial_sum):
+    """A custom `tile_info` callback is called with a `TilingRequest`."""
+    batch_size, in_size, out_size, num_groups = 128, 512, 512, 16
+    key = jax.random.key(0)
+    k0, k1, k2 = jax.random.split(key, 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    partial_sum = None
+    if use_partial_sum:
+      partial_sum = jax.random.normal(
+          k2, (batch_size, out_size), dtype=jnp.bfloat16
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    vmem_limit_bytes = 32 * 1024 * 1024
+
+    requests = []
+
+    def tile_fn(req):
+      requests.append(req)
+      return gmm_v2.calculate_tiling_from_request(req)
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        partial_sum=partial_sum,
+        tile_info=tile_fn,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    self.assertNotEmpty(requests)
+    req = requests[0]
+    self.assertIsInstance(req, gmm_v2.TilingRequest)
+    self.assertEqual(req.dims.size_k, in_size)
+    self.assertEqual(req.dims.size_n, out_size)
+    self.assertEqual(req.vmem_limit_bytes, vmem_limit_bytes)
+    self.assertIsNone(req.fuse_act)
+    self.assertEqual(req.has_partial_sum, use_partial_sum)
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, partial_sum=partial_sum)
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[73, 117],
       out_size=[255, 512],
@@ -609,6 +653,55 @@ class GmmTest(parameterized.TestCase):
             int(gmm_v2.select_bucket_idx(jnp.int32(rows), bucket_base)),
             expected,
         )
+
+  @parameterized.parameters(False, True)
+  def test_tgmm_tile_fn_receives_tiling_request(self, use_partial_sum):
+    """A custom `tile_info` callback is called with a `TgmmTilingRequest`."""
+    batch_size, in_size, out_size, num_groups = 256, 1024, 1024, 16
+    key = jax.random.key(0)
+    key1, key2, key3 = jax.random.split(key, 3)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    partial_sum = None
+    if use_partial_sum:
+      partial_sum = jax.random.normal(
+          key3, (num_groups, in_size, out_size), dtype=jnp.bfloat16
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    vmem_limit_bytes = 32 * 1024 * 1024
+
+    requests = []
+
+    def tile_fn(req):
+      requests.append(req)
+      return tgmm_v2.calculate_tgmm_tiling_from_request(req)
+
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        partial_sum=partial_sum,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=tile_fn,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    self.assertNotEmpty(requests)
+    req = requests[0]
+    self.assertIsInstance(req, tgmm_v2.TgmmTilingRequest)
+    self.assertEqual(req.dims.size_k, in_size)
+    self.assertEqual(req.dims.size_n, out_size)
+    self.assertEqual(req.vmem_limit_bytes, vmem_limit_bytes)
+    self.assertEqual(req.out_dtype, jnp.bfloat16)
+    self.assertEqual(req.acc_dtype, jnp.float32)
+    self.assertEqual(req.has_partial_sum, use_partial_sum)
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1), grad, group_sizes, num_groups
+    )
+    if use_partial_sum:
+      expected = expected + partial_sum
+    assert_arrays_all_close(actual, expected)
 
   @parameterized.product(
       rows_per_group=[64, 128, 192, 256],
@@ -2278,6 +2371,43 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
 
+_VMEM_LIMIT_BYTES = int(64 * 1024 * 1024 * 0.9)
+
+
+def _make_dims(size_m: int, size_k: int, size_n: int) -> gmm_v2.Dimensions:
+  return gmm_v2.Dimensions(
+      size_m=size_m,
+      size_k=size_k,
+      size_n=size_n,
+      size_group=128,
+      size_lhs_group=128,
+      size_lhs_sublane=8,
+  )
+
+
+def _bf16_input_configs(is_transposed: bool = False) -> gmm_v2.InputConfigs:
+  return gmm_v2.InputConfigs(
+      dtype=jnp.dtype(jnp.bfloat16),
+      quant_dtype=None,
+      has_scale=False,
+      has_bias=False,
+      quant_block_size=None,
+      is_transposed=is_transposed,
+  )
+
+
+def _mock_tpu_info(num_cores: int, generation: int = 5) -> mock.Mock:
+  mock_tpu_info = mock.create_autospec(
+      gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
+  )
+  mock_tpu_info.num_lanes = 128
+  mock_tpu_info.mxu_column_size = 128
+  mock_tpu_info.generation = generation
+  mock_tpu_info.num_cores = num_cores
+  mock.seal(mock_tpu_info)
+  return mock_tpu_info
+
+
 class GmmV2CalculateTilingTest(parameterized.TestCase):
   """Tests for calculate_tiling edge cases regarding vmem floor limits."""
 
@@ -2415,6 +2545,444 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
     self.assertEqual(tiles_tight.tile_n, tiles_large.tile_n)
     self.assertEqual(tiles_tight.tile_k, tiles_large.tile_k)
 
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_calculate_tiling_tpu_gen8(self, mock_get_tpu_info):
+    mock_tpu_info = mock.create_autospec(
+        gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
+    )
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 128
+    mock_tpu_info.generation = 8
+    mock.seal(mock_tpu_info)
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    # 1. qwen_3_5_prefill_down: 81920 tokens, 64 groups of 1280
+    dims_down = gmm_v2.Dimensions(
+        size_m=81920,
+        size_k=1024,
+        size_n=4096,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs_down = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=1024,
+        is_transposed=False,
+    )
+    vmem_limit_bytes = int(192 * 1024 * 1024 * 0.9)
+    tiles_down = gmm_v2.calculate_tiling(
+        dims=dims_down,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_down,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # At most 2 buckets on TPU8, to stay within instruction memory.
+    self.assertEqual(tiles_down.tile_m, 512)
+    self.assertEqual(tiles_down.bucket_base, 256)
+
+    # 2. qwen_3_5_prefill_conc8_gate_up: 163840 tokens, 64 groups of 2560
+    dims_conc8 = gmm_v2.Dimensions(
+        size_m=163840,
+        size_k=4096,
+        size_n=2048,
+        size_group=64,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    rhs_cfgs_gateup = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=4096,
+        is_transposed=False,
+    )
+    tiles_conc8 = gmm_v2.calculate_tiling(
+        dims=dims_conc8,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs_gateup,
+        vmem_limit_bytes=vmem_limit_bytes,
+        fuse_act="silu",
+    )
+    self.assertEqual(tiles_conc8.tile_m, 512)
+    self.assertEqual(tiles_conc8.bucket_base, 256)
+    self.assertGreaterEqual(tiles_conc8.lhs_buffer_count, 3)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="fwd",
+          size_k=2048,
+          size_n=1280,
+          is_transposed=False,
+          fuse_act=None,
+          expected_tile_n=640,
+      ),
+      dict(
+          testcase_name="fwd_fused_act",
+          size_k=2048,
+          size_n=2 * 1280,
+          is_transposed=False,
+          fuse_act="silu",
+          expected_tile_n=640,
+      ),
+      dict(
+          testcase_name="dlhs",
+          size_k=1280,
+          size_n=2048,
+          is_transposed=True,
+          fuse_act=None,
+          expected_tile_n=1024,
+      ),
+  )
+  def test_calculate_tiling_megacore_splits_n(
+      self,
+      size_k: int,
+      size_n: int,
+      is_transposed: bool,
+      fuse_act: str | None,
+      expected_tile_n: int,
+  ) -> None:
+    # With MegaCore, only the n grid dimension is split across TensorCores, so
+    # the n tiles must be a multiple of num_cores even when a single n tile
+    # fits in VMEM.
+    dims = _make_dims(size_m=98304, size_k=size_k, size_n=size_n)
+    rhs_cfgs = _bf16_input_configs(is_transposed=is_transposed)
+    size_n_per_rhs = size_n // 2 if fuse_act else size_n
+
+    for num_cores, disable_multi_core_mode, want_tile_n in (
+        (1, False, size_n_per_rhs),
+        (2, True, size_n_per_rhs),
+        (2, False, expected_tile_n),
+    ):
+      with self.subTest(
+          num_cores=num_cores, disable_multi_core_mode=disable_multi_core_mode
+      ):
+        with (
+            mock.patch.object(
+                gmm_v2.pltpu,
+                "get_tpu_info",
+                return_value=_mock_tpu_info(num_cores=num_cores),
+            ),
+            config.disable_multi_core_mode(disable_multi_core_mode),
+        ):
+          tiles = gmm_v2.calculate_tiling(
+              dims=dims,
+              lhs_cfgs=_bf16_input_configs(),
+              rhs_cfgs=rhs_cfgs,
+              vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+              fuse_act=fuse_act,
+          )
+        self.assertEqual(tiles.tile_n, want_tile_n)
+        self.assertEqual(tiles.tile_k, size_k)
+        self.assertEqual(size_n_per_rhs % tiles.tile_n, 0)
+
+  @parameterized.named_parameters(
+      # A split into 2 tiles of 256 would not cover 384 exactly.
+      dict(testcase_name="indivisible", size_n=384),
+      # Tiles of 128 would be below the MXU-stall floor of 256.
+      dict(testcase_name="below_tile_n_floor", size_n=256),
+  )
+  def test_calculate_tiling_megacore_keeps_unsplittable_n(
+      self, size_n: int
+  ) -> None:
+    dims = _make_dims(size_m=4096, size_k=1024, size_n=size_n)
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(2)
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=False),
+          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+      )
+    self.assertEqual(tiles.tile_n, size_n)
+
+  def test_calculate_tiling_megacore_rounds_up_vmem_split(self) -> None:
+    # VMEM pressure alone yields 3 n tiles; MegaCore rounds that up to 4.
+    dims = _make_dims(size_m=4096, size_k=4096, size_n=4096)
+    vmem_limit_bytes = 48 * 1024 * 1024
+    with mock.patch.object(
+        gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(1)
+    ):
+      single_core_tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=False),
+          vmem_limit_bytes=vmem_limit_bytes,
+      )
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(2)
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      megacore_tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=False),
+          vmem_limit_bytes=vmem_limit_bytes,
+      )
+    self.assertEqual(pl.cdiv(4096, single_core_tiles.tile_n), 3)
+    self.assertEqual(megacore_tiles.tile_n, 1024)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="avg_32_clamped_to_base", size_m=4096, want_tile_m=256),
+      dict(testcase_name="avg_256", size_m=32768, want_tile_m=256),
+      dict(testcase_name="avg_768", size_m=98304, want_tile_m=768),
+      dict(testcase_name="avg_1024", size_m=131072, want_tile_m=1024),
+  )
+  def test_calculate_tiling_transposed_caps_tile_m_at_avg_group_size(
+      self, size_m: int, want_tile_m: int
+  ) -> None:
+    dims = _make_dims(size_m=size_m, size_k=1280, size_n=2048)
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(2)
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=True),
+          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+      )
+    self.assertEqual(tiles.tile_m, want_tile_m)
+    self.assertEqual(tiles.bucket_base, 256)
+    self.assertEqual(tiles.tile_n, 1024)
+
+  def test_calculate_tiling_transposed_uses_global_group_count_for_ep(
+      self,
+  ) -> None:
+    # Under expert parallelism `size_lhs_group` holds the global group count
+    # across which `size_m` rows are routed (`131072 // 512 == 256`).
+    dims = gmm_v2.Dimensions(
+        size_m=131072,
+        size_k=1280,
+        size_n=2048,
+        size_group=64,
+        size_lhs_group=512,
+        size_lhs_sublane=8,
+    )
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(2)
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=True),
+          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+      )
+    self.assertEqual(tiles.tile_m, 256)
+
+  @parameterized.parameters(2048, 4096, 16384, 32768)
+  def test_calculate_tiling_forward_preserves_tile_m_on_small_m(
+      self, size_m: int
+  ) -> None:
+    dims = _make_dims(size_m=size_m, size_k=2048, size_n=1280)
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(2)
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(is_transposed=False),
+          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+      )
+    self.assertEqual(tiles.tile_m, 512)
+    self.assertEqual(tiles.bucket_base, 128)
+    self.assertEqual(tiles.tile_n, 640)
+
+
+class SplitForCoresTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      dict(size=1280, num_tiles=1, min_tile=256, expected=(2, 640)),
+      dict(size=2048, num_tiles=1, min_tile=256, expected=(2, 1024)),
+      dict(size=4096, num_tiles=3, min_tile=256, expected=(4, 1024)),
+      # 1536 / 2 = 768 is lane-aligned.
+      dict(size=1536, num_tiles=1, min_tile=256, expected=(2, 768)),
+      # 640 is 5 lanes, which cannot be split into an even number of equal
+      # lane-aligned tiles.
+      dict(size=640, num_tiles=1, min_tile=256, expected=None),
+      dict(size=640, num_tiles=1, min_tile=128, expected=None),
+      dict(size=384, num_tiles=1, min_tile=128, expected=None),
+      dict(size=100, num_tiles=1, min_tile=100, expected=None),
+  )
+  def test_split_for_cores(
+      self,
+      size: int,
+      num_tiles: int,
+      min_tile: int,
+      expected: tuple[int, int] | None,
+  ) -> None:
+    self.assertEqual(
+        gmm_v2.split_for_cores(
+            size, num_tiles, num_cores=2, num_lanes=128, min_tile=min_tile
+        ),
+        expected,
+    )
+
+
+class TgmmV2CalculateTilingTest(parameterized.TestCase):
+
+  def _calculate_tgmm_tiling(
+      self, size_k: int, size_n: int, num_cores: int, size_m: int = 98304
+  ) -> gmm_v2.TileSizes:
+    dims = _make_dims(size_m=size_m, size_k=size_k, size_n=size_n)
+    with (
+        mock.patch.object(
+            gmm_v2.pltpu,
+            "get_tpu_info",
+            return_value=_mock_tpu_info(num_cores=num_cores),
+        ),
+        config.disable_multi_core_mode(False),
+    ):
+      return tgmm_v2.calculate_tgmm_tiling(
+          dims=dims,
+          lhs_cfgs=_bf16_input_configs(),
+          rhs_cfgs=_bf16_input_configs(),
+          vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+          out_dtype=jnp.dtype(jnp.bfloat16),
+          acc_dtype=jnp.dtype(jnp.float32),
+          target_zero_ref_bytes=2 * 1024 * 1024,
+      )
+
+  @parameterized.named_parameters(
+      # Split the larger dimension so each core re-reads only the smaller
+      # operand.
+      dict(
+          testcase_name="split_k",
+          size_k=2048,
+          size_n=1280,
+          expected_tile_k=1024,
+          expected_tile_n=1280,
+      ),
+      dict(
+          testcase_name="split_n",
+          size_k=1280,
+          size_n=2048,
+          expected_tile_k=1280,
+          expected_tile_n=1024,
+      ),
+      # 640 cannot be split into lane-aligned halves, so split n instead.
+      dict(
+          testcase_name="split_n_when_k_is_unsplittable",
+          size_k=640,
+          size_n=512,
+          expected_tile_k=640,
+          expected_tile_n=256,
+      ),
+  )
+  def test_calculate_tgmm_tiling_megacore(
+      self,
+      size_k: int,
+      size_n: int,
+      expected_tile_k: int,
+      expected_tile_n: int,
+  ) -> None:
+    single_core_tiles = self._calculate_tgmm_tiling(size_k, size_n, 1)
+    self.assertEqual(single_core_tiles.tile_k, size_k)
+    self.assertEqual(single_core_tiles.tile_n, size_n)
+
+    tiles = self._calculate_tgmm_tiling(size_k, size_n, 2)
+    self.assertEqual(tiles.tile_k, expected_tile_k)
+    self.assertEqual(tiles.tile_n, expected_tile_n)
+    num_parallel_tiles = (size_k // tiles.tile_k) * (size_n // tiles.tile_n)
+    self.assertEqual(num_parallel_tiles % 2, 0)
+
+  def test_calculate_tgmm_tiling_megacore_keeps_unsplittable(self) -> None:
+    tiles = self._calculate_tgmm_tiling(256, 256, 2)
+    self.assertEqual(tiles.tile_k, 256)
+    self.assertEqual(tiles.tile_n, 256)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="avg_32_clamped_to_base", size_m=4096, want_tile_m=256),
+      dict(testcase_name="avg_256", size_m=32768, want_tile_m=256),
+      dict(testcase_name="avg_768_capped_at_512", size_m=98304, want_tile_m=512),
+      dict(
+          testcase_name="avg_1024_capped_at_512", size_m=131072, want_tile_m=512
+      ),
+  )
+  def test_calculate_tgmm_tiling_caps_tile_m(
+      self, size_m: int, want_tile_m: int
+  ) -> None:
+    tiles = self._calculate_tgmm_tiling(2048, 1280, num_cores=2, size_m=size_m)
+    self.assertEqual(tiles.tile_m, want_tile_m)
+    self.assertEqual(tiles.bucket_base, 256)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="tpu7", generation=7, expected_num_buckets=4),
+      # TPU8 has enough VMEM for tiles whose unrolled buckets would exceed
+      # instruction memory, so it uses fewer buckets.
+      dict(testcase_name="tpu8", generation=8, expected_num_buckets=2),
+  )
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_calculate_tiling_max_num_buckets(
+      self, mock_get_tpu_info, generation, expected_num_buckets
+  ):
+    mock_tpu_info = mock.MagicMock()
+    mock_tpu_info.generation = generation
+    mock_tpu_info.num_lanes = 128
+    mock_tpu_info.mxu_column_size = 256
+    mock_get_tpu_info.return_value = mock_tpu_info
+
+    # DeepSeek-V3-like FFI: fp8 weights, bf16 activations, fused gate and up.
+    dims = gmm_v2.Dimensions(
+        size_m=8192,
+        size_k=7168,
+        size_n=2048,
+        size_group=1,
+        size_lhs_group=1,
+        size_lhs_sublane=8,
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant_dtype=None,
+        has_scale=False,
+        has_bias=False,
+        quant_block_size=None,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        has_scale=True,
+        has_bias=False,
+        quant_block_size=256,
+        is_transposed=False,
+    )
+
+    # VMEM and size_m are large enough that only the bucket cap limits tile_m.
+    tiles = gmm_v2.calculate_tiling(
+        dims=dims,
+        lhs_cfgs=lhs_cfgs,
+        rhs_cfgs=rhs_cfgs,
+        vmem_limit_bytes=1 << 34,
+        fuse_act="silu",
+    )
+
+    self.assertEqual(tiles.tile_m, tiles.bucket_base * expected_num_buckets)
+
 
 class GmmV2VmemStressTest(parameterized.TestCase):
   """AOT compilation and VMEM stress tests for GMM v2.
@@ -2467,7 +3035,7 @@ class GmmV2VmemStressTest(parameterized.TestCase):
       in_size,
       out_size,
       transpose_rhs,
-      tile_info=gmm_v2.calculate_tiling,
+      tile_info=gmm_v2.calculate_tiling_from_request,
   ):
     group_sizes = get_group_sizes(batch_size, num_groups)
     lhs_spec = jax.ShapeDtypeStruct((batch_size, in_size), jnp.bfloat16)

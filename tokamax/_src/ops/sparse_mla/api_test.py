@@ -20,6 +20,7 @@ import jax
 from jax.extend import backend
 from tokamax._src import hlo_utils
 from tokamax._src.ops.sparse_mla import api
+from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu
 from tokamax._src.ops.sparse_mla import test_base
 
 
@@ -32,9 +33,11 @@ class ApiTest(parameterized.TestCase):
   def test_basic_api(self, pad_tokens: bool, impl: api.Implementation):
     if (
         impl == "mosaic_tpu"
-        and backend.get_default_device().device_kind != "TPU7x"
+        and not pallas_mosaic_tpu.PallasTpuSparseMla().supported_on(
+            backend.get_default_device()
+        )
     ):
-      self.skipTest("Only tested on TPU7x.")
+      self.skipTest("mosaic_tpu is not supported on this device.")
 
     inputs, actual_tokens = test_base.make_inputs(
         batch_size=4, topk=512, pad_tokens=pad_tokens

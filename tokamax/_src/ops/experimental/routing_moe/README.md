@@ -10,14 +10,20 @@
 
 ## Status
 
-- Fully supports in-kernel random local HBM read/write.
-- Provides basic compiler based helper functions.
+- Supports in-kernel random local HBM gather/scatter and remote EP HBM scatter.
+- Fuses gate/up, activation, and down projections when tiles fit in VMEM.
+  - Falls back to a two-kernel split through compact HBM layout otherwise.
+- Provides `output_reduce_unpack` for top-k reduction and layout unpacking.
+  - Supports ragged reduction and optional per-lane FP8 dequantization.
+- Supports quantized FP8 local and remote scatter with lane-strided scales.
+- Supports subchannel weight quantization with dynamic activation quantization.
 
 ## Roadmap
 
-- Support FP8 remote HBM read/write to minimize penalty of pre-topk reduce collective.
-- Support subchannel quantized weight and bias.
-- Support calculating near-optimal routing strategy at compile time for good OOTB experience.
+- Support FP8 input using `io_relayout/input_pack.py`.
+- Support K dimension tiling, including `k2` tiling for fused up/down kernels.
+- Support compile-time heuristics for near-optimal OOTB routing strategies.
+- Optimizations low-batch decode.
 
 ## Folder Structure
 
@@ -25,38 +31,37 @@
 routing_moe/
 ├── common/
 │   ├── arg.py: PyTree wrappers pairing tensor data with static specs.
-│   ├── dataclass_util.py: Decorators enforcing invariants on unresolved and resolved dataclasses.
+│   ├── dataclass_util.py: Invariant decorators for unresolved/resolved classes.
 │   ├── layout_util.py: Utility for compact and large layout transformation.
 │   ├── out_format.py: Target representation formats for kernel outputs.
 │   ├── quant_util.py: Dynamic activation quantization helpers.
-│   └── spec.py: Static specifications of materialized kernel inputs and outputs.
+│   └── spec.py: Static specs of materialized kernel inputs and outputs.
 ├── gmm/
-│   ├── __init__.py: Public API of the routing GMM kernel.
 │   ├── compute.py: Stateless matrix multiplication logic.
-│   ├── config.py: Compile time static configuration object.
-│   ├── kernel.py: gmm entry point that expects compact layout for activations.
+│   ├── config.py: Compile-time static configuration object.
+│   ├── kernel.py: GMM entry point expecting compact layout for activations.
 │   ├── memory_ref.py: Memory module that handles buffer management and DMA.
-│   ├── metadata.py: Dynamic per-step metadata consumed by pipeline and memory module.
-│   ├── pipeline.py: Main Orchestrator for stateful DMA and stateless compute.
-│   ├── plan.py: Tunable parameters for kernel execution that have no impact on outputs.
+│   ├── metadata.py: Per-step metadata for pipeline and memory modules.
+│   ├── pipeline.py: Main orchestrator for stateful DMA and stateless compute.
+│   ├── plan.py: Tunable execution parameters with no impact on outputs.
 │   └── spec.py: Validated problem specification of the routing GMM kernel.
 ├── io_relayout/
 │   ├── input_pack.py: Handles large -> compact layout transformation.
-│   └── output_reduce.py: Handles topk reduce and compact -> large transformation.
+│   └── output_reduce.py: Handles top-k reduce and compact -> large relayout.
 ├── layer/
-│   ├── __init__.py: Public API of the routing MoE layer.
-│   ├── config.py: Compile time static configuration object for MoE layer.
-│   ├── modular.py: Modular MoE entry point accepting pre-computed top-k weights and indices.
-│   ├── monolithic.py: Monolithic MoE entry point that computes routing and invokes modular MoE.
-│   └── plan.py: Tunable parameters for MoE layer execution that have no impact on outputs.
+│   ├── config.py: Compile-time static configuration object for MoE layer.
+│   ├── modular.py: Modular MoE entry point for pre-computed top-k routing.
+│   ├── monolithic.py: Monolithic MoE entry point computing routing + MoE.
+│   └── plan.py: Tunable MoE execution parameters with no impact on outputs.
 └── test/
-    ├── common/
-    │   ├── test_shapes.py: Static model configs (dims, experts, top-k, dtype).
-    │   ├── test_cases.py: Serving-time cases (model config + token/shard count).
-    │   ├── test_inputs.py: Shared input and routing tensor generators.
-    │   ├── test_reference.py: Pure-XLA reference implementations.
-    │   └── test_util.py: Feature-support checks and benchmarking helpers.
-    └── {gmm, io_relayout, layer}/
+    ├── helper/
+    │   ├── helper_shapes.py: Static model configs (dims, experts, top-k).
+    │   ├── helper_cases.py: Serving-time cases (model config + token/shard).
+    │   ├── helper_inputs.py: Shared input and routing tensor generators.
+    │   ├── helper_reference.py: Pure-XLA reference implementations.
+    │   ├── helper_util.py: Feature-support checks and benchmarking helpers.
+    │   └── *_unit_test.py: Unit tests for shared test helpers.
+    └── {commmon, gmm, io_relayout, layer}/
         ├── *_test_lib.py: Case generation and reference validation helpers.
         ├── *_unit_test.py: Synthetic edge-case and stress tests.
         └── *_prod_test.py: Production model shapes and benchmarks.
