@@ -38,6 +38,59 @@ def get_dtype_packing(dtype):
   return 32 // bits
 
 
+def transpose_kv_cache_to_seq_along_lane(
+    cache_kv: jax.Array,
+    kv_packing: int | None = None,
+) -> jax.Array:
+  """Converts the packed cache to tokens along lanes.
+
+  Args:
+    cache_kv: `[pages, page_size // packing, packing, kv_dim]`.
+    kv_packing: If given, must match the cache's packing.
+
+  Returns:
+    `[pages, kv_dim, page_size]`.
+  """
+  if cache_kv.ndim != 4:
+    raise ValueError(
+        "Expected a [pages, page_size // packing, packing, kv_dim] cache, got"
+        f" {cache_kv.shape=}."
+    )
+  num_pages, page_size_per_packing, packing, kv_dim = cache_kv.shape
+  if kv_packing is not None and kv_packing != packing:
+    raise ValueError(f"{kv_packing=} does not match {cache_kv.shape=}.")
+  flat_tokens = cache_kv.reshape(
+      (num_pages, page_size_per_packing * packing, kv_dim)
+  )
+  return flat_tokens.transpose((0, 2, 1))
+
+
+def transpose_kv_cache_from_seq_along_lane(
+    transposed_cache_kv: jax.Array,
+    kv_packing: int | None = None,
+) -> jax.Array:
+  """Converts a tokens-along-lanes cache back to the packed layout.
+
+  Args:
+    transposed_cache_kv: `[pages, kv_dim, page_size]`.
+    kv_packing: Tokens per 32-bit word; defaults to the dtype's packing.
+
+  Returns:
+    `[pages, page_size // packing, packing, kv_dim]`.
+  """
+  if transposed_cache_kv.ndim != 3:
+    raise ValueError(
+        "Expected a [pages, kv_dim, page_size] cache, got"
+        f" {transposed_cache_kv.shape=}."
+    )
+  num_pages, kv_dim, page_size = transposed_cache_kv.shape
+  if kv_packing is None:
+    kv_packing = get_dtype_packing(transposed_cache_kv.dtype)
+  return transposed_cache_kv.transpose((0, 2, 1)).reshape(
+      (num_pages, page_size // kv_packing, kv_packing, kv_dim)
+  )
+
+
 def generate_mla_inputs(
     seq_lens,  # List[(q_len, kv_len)]
     num_heads,

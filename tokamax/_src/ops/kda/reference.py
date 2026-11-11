@@ -171,7 +171,7 @@ def kimi_delta_attention(
     beta_h = gather_time_axis(beta_h, 2)
     if segment_ids is not None:
       segment_ids = gather_time_axis(segment_ids, 1)
-    seq_len = q_h.shape[2]
+    _, _, seq_len, _ = q_h.shape
 
   num_states = _state_count(
       segment_ids=segment_ids,

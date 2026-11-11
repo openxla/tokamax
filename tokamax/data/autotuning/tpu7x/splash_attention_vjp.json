@@ -1,47 +1,227 @@
 {
-  "{\"residuals\":[\"f32[64,8192]\",\"f32[64,8192]\"],\"out\":\"bf16[64,8192,128]\",\"dout\":\"bf16[64,8192,128]\",\"q\":\"bf16[64,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[64,8192]\",\"f32[64,8192]\"],\"out\":\"bf16[64,8192,128]\",\"dout\":\"bf16[64,8192,128]\",\"q\":\"bf16[64,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1529.9054780043662,
-      "lower_time_ms": 28.559962986037135,
+      "compile_time_ms": 1647.991689009359,
+      "lower_time_ms": 37.62358099629637,
       "evaluation_times_ms": [
-        46.012,
-        46.017,
-        46.018,
-        46.011,
-        46.022
+        46.337,
+        46.295,
+        46.291,
+        46.281,
+        46.282
       ],
       "metadata": {},
       "peak_memory_mb": 35303.4568
     }
   },
-  "{\"residuals\":[\"f32[128,8192]\",\"f32[128,8192]\"],\"out\":\"bf16[128,8192,128]\",\"dout\":\"bf16[128,8192,128]\",\"q\":\"bf16[128,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 2495.953585999814,
-      "lower_time_ms": 28.602221002074657,
+      "compile_time_ms": 1458.0991539405659,
+      "lower_time_ms": 34.41342094447464,
       "evaluation_times_ms": [
-        99.225,
-        99.214,
-        99.203,
-        99.208,
-        99.213
+        23.487,
+        23.474,
+        23.447,
+        23.451,
+        23.463
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17718.83728
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 13562.263550935313,
+      "lower_time_ms": 52.54236003383994,
+      "evaluation_times_ms": [
+        166.087,
+        166.07,
+        166.071,
+        166.06,
+        166.069
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17718.839328
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1568.3858699630946,
+      "lower_time_ms": 36.64673201274127,
+      "evaluation_times_ms": [
+        24.125,
+        24.101,
+        24.121,
+        24.094,
+        24.091
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17836.277792
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 12512.948186995345,
+      "lower_time_ms": 54.05467200034764,
+      "evaluation_times_ms": [
+        167.54,
+        167.495,
+        167.484,
+        167.488,
+        167.487
+      ],
+      "metadata": {},
+      "peak_memory_mb": 17836.27984
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2048.061111010611,
+      "lower_time_ms": 34.748708945699036,
+      "evaluation_times_ms": [
+        24.784,
+        24.753,
+        24.751,
+        24.758,
+        24.749
+      ],
+      "metadata": {},
+      "peak_memory_mb": 18188.599328
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 14507.319888100028,
+      "lower_time_ms": 52.502022008411586,
+      "evaluation_times_ms": [
+        166.965,
+        166.928,
+        166.927,
+        166.926,
+        166.926
+      ],
+      "metadata": {},
+      "peak_memory_mb": 18188.601376
+    }
+  },
+  "{\"residuals\":[\"f32[128,8192]\",\"f32[128,8192]\"],\"out\":\"bf16[128,8192,128]\",\"dout\":\"bf16[128,8192,128]\",\"q\":\"bf16[128,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 2664.25502000493,
+      "lower_time_ms": 35.20433799712919,
+      "evaluation_times_ms": [
+        98.457,
+        98.411,
+        98.433,
+        98.395,
+        98.418
       ],
       "metadata": {},
       "peak_memory_mb": 70472.69584
     }
   },
-  "{\"residuals\":[\"f32[128,4096]\",\"f32[128,4096]\"],\"out\":\"bf16[128,4096,128]\",\"dout\":\"bf16[128,4096,128]\",\"q\":\"bf16[128,4096,192]\",\"k\":\"bf16[128,4096,192]\",\"v\":\"bf16[128,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[128,4096]\",\"f32[128,4096]\"],\"out\":\"bf16[128,4096,128]\",\"dout\":\"bf16[128,4096,128]\",\"q\":\"bf16[128,4096,192]\",\"k\":\"bf16[128,4096,192]\",\"v\":\"bf16[128,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1335.8666009989975,
-      "lower_time_ms": 27.21057300004759,
+      "compile_time_ms": 1420.7937530009076,
+      "lower_time_ms": 33.38273894041777,
       "evaluation_times_ms": [
-        22.466,
-        22.462,
-        22.467,
-        22.462,
-        22.469
+        22.272,
+        22.248,
+        22.247,
+        22.25,
+        22.248
       ],
       "metadata": {},
       "peak_memory_mb": 18526.2408
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1092.7302010823041,
+      "lower_time_ms": 34.97515490744263,
+      "evaluation_times_ms": [
+        7.133,
+        7.12,
+        7.123,
+        7.119,
+        7.112
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4530.896928
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 7414.617914007977,
+      "lower_time_ms": 53.232233971357346,
+      "evaluation_times_ms": [
+        41.298,
+        41.261,
+        41.258,
+        41.261,
+        41.262
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4530.898976
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1197.4087379639968,
+      "lower_time_ms": 36.32845391985029,
+      "evaluation_times_ms": [
+        7.852,
+        7.846,
+        7.846,
+        7.842,
+        7.841
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4589.617184
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 7198.770161019638,
+      "lower_time_ms": 54.35327399754897,
+      "evaluation_times_ms": [
+        41.817,
+        41.779,
+        41.778,
+        41.781,
+        41.773
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4589.619232
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1575.5421030335128,
+      "lower_time_ms": 34.74786097649485,
+      "evaluation_times_ms": [
+        5.946,
+        5.939,
+        5.944,
+        5.936,
+        5.938
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4782.555168
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 9573.188285925426,
+      "lower_time_ms": 52.77413595467806,
+      "evaluation_times_ms": [
+        41.894,
+        41.891,
+        41.891,
+        41.892,
+        41.901
+      ],
+      "metadata": {},
+      "peak_memory_mb": 4782.557216
     }
   }
 }

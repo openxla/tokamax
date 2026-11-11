@@ -276,6 +276,26 @@ class FailOpenTest(DepsTestCase):
     self.assertIsNone(tests)
     self.assertIn('install_deps.sh', reason)
 
+  def test_any_file_under_docs_is_inert(self):
+    # The site's table of contents is YAML, which no suffix rule covers, and
+    # every docs change that touched it used to run every shard.
+    for path in ('docs/_toc.yaml', 'docs/ops/kda/images/diagram.png'):
+      with self.subTest(path=path):
+        tests, reason = self.affected(path)
+        self.assertEqual(tests, set())
+        self.assertIsNone(reason)
+
+  def test_only_the_top_level_docs_directory_is_inert(self):
+    # Package data that happens to sit in a `docs` directory is still package
+    # data, and a sibling whose name merely starts with `docs` is not docs.
+    self.assert_full_run('tokamax/docs/table.yaml')
+    self.assert_full_run('docs_build/config.yaml')
+
+  def test_docs_do_not_exempt_the_rest_of_the_changeset(self):
+    tests, reason = self.affected('docs/_toc.yaml', 'pyproject.toml')
+    self.assertIsNone(tests)
+    self.assertIn('pyproject.toml', reason)
+
   def test_inert_files_do_not_exempt_the_rest_of_the_changeset(self):
     # Skipping an inert path must not skip the loop. The docs-only case is
     # cheap precisely because it is only reached when nothing else is there.

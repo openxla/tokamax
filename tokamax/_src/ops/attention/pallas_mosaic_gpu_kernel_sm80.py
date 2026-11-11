@@ -433,8 +433,8 @@ def get_heuristics_config(
   )
 
 
-def _async_copy_gmem_to_smem(src, dst):
-  common.cp_async_gmem_to_smem(src, dst)
+def _async_copy_gmem_to_smem(src, dst, swizzle: int | None = None):
+  common.cp_async_gmem_to_smem(src, dst, swizzle)
 
 
 def _cta_barrier():
@@ -545,14 +545,16 @@ def _store_via_swizzled_smem(
       (rows, epi_cols), out_dtype, swizzle=epi_swizzle
   )
   for c0 in range(0, cols, epi_cols):
-    plgpu.store(
+    mgpu_lib.store(
         epi_smem,
         val[:, c0 : c0 + epi_cols].astype(out_dtype),
         optimized=False,
     )
     mgpu_lib.warpgroup_barrier()
     staged = plgpu.load(epi_smem, layout=copy_layout, optimized=False)
-    plgpu.store(gmem_ref.at[:, pl.ds(c0, epi_cols)], staged, optimized=False)
+    mgpu_lib.store(
+        gmem_ref.at[:, pl.ds(c0, epi_cols)], staged, optimized=False
+    )
     if c0 + epi_cols < cols:
       mgpu_lib.warpgroup_barrier()
 
@@ -705,6 +707,12 @@ def flash_attention_kernel(
 
   elem_bits = mgpu_lib.num_bits(dtype)
   k_swizzle = _choose_k_swizzle(head_dim, block_kv, elem_bits)
+  # Must match the `q_scratch` swizzle in `_get_scratch_types`.
+  q_swizzle = (
+      k_swizzle
+      if config.q_smem
+      else plgpu.find_swizzle(head_dim * elem_bits, "q")
+  )
   step_d = 8 * k_swizzle // elem_bits
 
   mma_lhs = plgpu.Layout.MMA_LHS(dtype)
@@ -988,8 +996,8 @@ def flash_attention_kernel(
           l_empty = plgpu.layout_cast(
               jnp.zeros((wg_q,), jnp.float32), mma_row
           )
-          plgpu.store(m_gmem.at[hi, qs], m_empty, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_empty, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_empty, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_empty, optimized=False)
 
       @pl.when(cta_active)
       def _active_q_parallel():
@@ -997,7 +1005,7 @@ def flash_attention_kernel(
         k_end_bound = _preload_k_bound(k_end_gmem)
 
         # Stage Q into SMEM (and into registers if `not config.q_smem`).
-        _async_copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem.at[wg])
+        _async_copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem.at[wg], q_swizzle)
         plgpu.wait_gmem_to_smem(0)
         if config.q_smem:
           q_reg = None
@@ -1037,7 +1045,7 @@ def flash_attention_kernel(
               lax.cond(
                   init_ki < ub,
                   lambda init_ki=init_ki, s_idx=s_idx: _async_copy_gmem_to_smem(
-                      load_k_gmem(init_ki), k_smem.at[s_idx]
+                      load_k_gmem(init_ki), k_smem.at[s_idx], k_swizzle
                   ),
                   common.commit_cp_async_group,
               )
@@ -1115,7 +1123,7 @@ def flash_attention_kernel(
                 lax.cond(
                     next_k_ki < ub,
                     lambda: _async_copy_gmem_to_smem(
-                        load_k_gmem(next_k_ki), k_smem.at[k_slot]
+                        load_k_gmem(next_k_ki), k_smem.at[k_slot], k_swizzle
                     ),
                     common.commit_cp_async_group,
                 )
@@ -1151,7 +1159,7 @@ def flash_attention_kernel(
             lax.cond(
                 init_ki < ub,
                 lambda init_ki=init_ki, s_idx=s_idx: _async_copy_gmem_to_smem(
-                    load_k_gmem(init_ki), k_smem.at[s_idx]
+                    load_k_gmem(init_ki), k_smem.at[s_idx], k_swizzle
                 ),
                 common.commit_cp_async_group,
             )
@@ -1166,7 +1174,7 @@ def flash_attention_kernel(
           lax.cond(
               last_init_ki < ub,
               lambda: _async_copy_gmem_to_smem(
-                  load_k_gmem(last_init_ki), k_smem.at[stages - 1]
+                  load_k_gmem(last_init_ki), k_smem.at[stages - 1], k_swizzle
               ),
               common.commit_cp_async_group,
           )
@@ -1218,7 +1226,7 @@ def flash_attention_kernel(
               lax.cond(
                   next_k_ki < ub,
                   lambda: _async_copy_gmem_to_smem(
-                      load_k_gmem(next_k_ki), k_smem.at[slot]
+                      load_k_gmem(next_k_ki), k_smem.at[slot], k_swizzle
                   ),
                   common.commit_cp_async_group,
               )
@@ -1255,13 +1263,15 @@ def flash_attention_kernel(
           def _issue_stage(fetch_ki, slot):
             def _do_copies():
               if effective_wgs == 1:
-                _async_copy_gmem_to_smem(load_k_gmem(fetch_ki), k_smem.at[slot])
+                _async_copy_gmem_to_smem(
+                    load_k_gmem(fetch_ki), k_smem.at[slot], k_swizzle
+                )
                 _async_copy_gmem_to_smem(load_v_gmem(fetch_ki), v_smem.at[slot])
               else:
                 @pl.when(wg == 0)
                 def _cp_k():
                   _async_copy_gmem_to_smem(
-                      load_k_gmem(fetch_ki), k_smem.at[slot]
+                      load_k_gmem(fetch_ki), k_smem.at[slot], k_swizzle
                   )
 
                 @pl.when(wg == 1)
@@ -1352,8 +1362,8 @@ def flash_attention_kernel(
               finfo_min,
               m_final * (1.0 / math.log2(math.e)),
           )
-          plgpu.store(m_gmem.at[hi, qs], m_out, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_final, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_out, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_final, optimized=False)
 
         _write_output_epilogue(
             out_gtile,
@@ -1419,8 +1429,8 @@ def flash_attention_kernel(
           l_empty = plgpu.layout_cast(
               jnp.zeros((block_q,), jnp.float32), mma_row
           )
-          plgpu.store(m_gmem.at[hi, qs], m_empty, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_empty, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_empty, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_empty, optimized=False)
 
       @pl.when(wg == 1)
       def _z1():
@@ -1446,7 +1456,7 @@ def flash_attention_kernel(
       def _wg0():
         k_start_bound = _preload_k_bound(k_start_gmem)
         k_end_bound = _preload_k_bound(k_end_gmem)
-        _async_copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem)
+        _async_copy_gmem_to_smem(q_gmem.at[qs, hi], q_smem, q_swizzle)
         plgpu.wait_gmem_to_smem(0)
         if config.q_smem:
           q_reg = None
@@ -1459,7 +1469,9 @@ def flash_attention_kernel(
           init_ki = lb + s_idx
 
           def _cp_kv0(init_ki=init_ki, s_idx=s_idx):
-            _async_copy_gmem_to_smem(load_k_gmem(init_ki), k_smem.at[s_idx])
+            _async_copy_gmem_to_smem(
+                load_k_gmem(init_ki), k_smem.at[s_idx], k_swizzle
+            )
             _async_copy_gmem_to_smem(
                 load_v_gmem(init_ki, 0, v_split0), v0_smem.at[s_idx]
             )
@@ -1527,7 +1539,7 @@ def flash_attention_kernel(
                 next_ki < ub,
                 lambda: (
                     _async_copy_gmem_to_smem(
-                        load_k_gmem(next_ki), k_smem.at[slot]
+                        load_k_gmem(next_ki), k_smem.at[slot], k_swizzle
                     ),
                     _async_copy_gmem_to_smem(
                         load_v_gmem(next_ki, 0, v_split0), v0_smem.at[slot]
@@ -1558,8 +1570,8 @@ def flash_attention_kernel(
               finfo_min,
               m_final * (1.0 / math.log2(math.e)),
           )
-          plgpu.store(m_gmem.at[hi, qs], m_out, optimized=False)
-          plgpu.store(l_gmem.at[hi, qs], l_final, optimized=False)
+          mgpu_lib.store(m_gmem.at[hi, qs], m_out, optimized=False)
+          mgpu_lib.store(l_gmem.at[hi, qs], l_final, optimized=False)
         _cta_barrier()
         _write_output_epilogue(
             out_gtile.at[:, pl.ds(0, v_split0)],

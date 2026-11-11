@@ -22,6 +22,7 @@ under test. Every implementation is compared against
 
 from collections.abc import Sequence
 import functools
+import itertools
 from typing import Any
 
 from absl.testing import absltest
@@ -32,6 +33,107 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import mosaic_tpu
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import tiling
+
+# Per-chip (n_kq, n_v) of Qwen3.5-397B and Qwen3.5-27B:
+# TP8/PCP8, TP2, DP4TP2, DP8.
+SERVED_GDN_HEADS = ((2, 8), (8, 24), (8, 32), (16, 64))
+# Kimi-K3 TP32, TP8; Kimi-Linear-48B TP8, DP8.
+SERVED_KDA_HEADS = ((3, 3), (12, 12), (4, 4), (32, 32))
+# Union of vLLM token buckets and slot counts across the serving recipes.
+_TOKEN_BUCKETS = (
+    4,
+    8,
+    16,
+    32,
+    48,
+    64,
+    128,
+    256,
+    320,
+    512,
+    1024,
+    2048,
+    3072,
+    3584,
+    4096,
+    4352,
+    8192,
+    16384,
+    32768,
+)
+_SLOT_COUNTS = (8, 16, 32, 64, 128, 256, 384, 512)
+
+
+def reachable_tile_batches(n_kq, n_v, state_dtype, window, attention_mode):
+  """Yields one batch per reachable decode or mixed tile size on this chip.
+
+  Deduplicates already-seen decode and mixed tile sizes so each reachable
+  `decode_tile_size` and `mixed_tile_size` is compiled and verified without
+  redundant Pallas compilations across the (B, N) grid.
+
+  Args:
+    n_kq: Number of key/query heads per chip.
+    n_v: Number of value heads per chip.
+    state_dtype: Recurrent state dtype (bfloat16 or float32).
+    window: Number of speculative tokens + 1 (1 for standard autoregression).
+    attention_mode: GDN or KDA attention mode enum value.
+
+  Yields:
+    Dictionary of test batch kwargs for running the kernel.
+  """
+  seen_decode = set()
+  seen_mixed = set()
+  has_emitted = False
+  for b, n in itertools.product(_TOKEN_BUCKETS, _SLOT_COUNTS):
+    if b <= window:
+      continue
+    dec, mix = tiling.get_tile_sizes(
+        batch_size=b,
+        num_seqs=n,
+        padded_batch_size=b,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+        conv_state_dim_size=2 * n_kq * 128 + n_v * 128,
+        act_out_dtype=jnp.dtype(jnp.bfloat16),
+        recurrent_state_dtype=jnp.dtype(state_dtype),
+        num_lanes=pltpu.get_tpu_info().num_lanes,
+        decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(window),
+        mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        window_size=window,
+        attention_mode=attention_mode,
+    )
+    if (dec in seen_decode and mix in seen_mixed) or (
+        window > 1 and has_emitted and dec in seen_decode
+    ):
+      continue
+    decode_only = (mix in seen_mixed) or (window > 1 and has_emitted)
+    prefill_only = (dec in seen_decode) and not decode_only
+    seen_decode.add(dec)
+    if not decode_only:
+      seen_mixed.add(mix)
+    has_emitted = True
+    if decode_only:
+      num_dec = min(n, max(1, b // window))
+      lengths = [window] * num_dec + [0] * (n - num_dec)
+      distribution = [num_dec, num_dec, num_dec]
+    elif prefill_only:
+      lengths = [b] + [0] * (n - 1)
+      distribution = [0, 1, 1]
+    else:
+      lengths = [window, b - window] + [0] * (n - 2)
+      distribution = [1, 2, 2]
+    yield dict(
+        max_reqs=n,
+        lengths=lengths,
+        q_loc=[0, *np.cumsum(lengths)],
+        distribution=distribution,
+    )
+
 
 # Argument names that must be static for every implementation. `config` is
 # additionally static for `op.Op`-derived implementations.

@@ -28,8 +28,10 @@ from typing import Any, cast
 
 from absl import logging
 import immutabledict
+import jax
 from pydantic_core import core_schema as cs
 from tokamax._src import benchmarking
+from tokamax._src import config as config_lib
 from tokamax._src import numerics
 
 BenchmarkData = benchmarking.BenchmarkData
@@ -91,14 +93,26 @@ class AutotuningData[K](
     return AutotuningData(super().__or__(other))
 
 
-def _compile(fn_factory, config, args, kwargs, *, seed=None):
+def _compile(
+    fn_factory, config, args, kwargs, *, seed=None, auto_input_layouts=False
+):
   fn = fn_factory(config)
   fn, x = benchmarking.standardize_function(fn, *args, kwargs=kwargs, seed=seed)
-  return benchmarking.compile_benchmark(fn, cast(Any, x)), x
+  runner = benchmarking.compile_benchmark(
+      fn, cast(Any, x), auto_input_layouts=auto_input_layouts
+  )
+  return runner, x
 
 
-def _benchmark(fn_factory, config, args, kwargs):
-  runner, x = _compile(fn_factory, config, args, kwargs, seed=0)
+def _benchmark(fn_factory, config, args, kwargs, auto_input_layouts=False):
+  runner, x = _compile(
+      fn_factory,
+      config,
+      args,
+      kwargs,
+      seed=0,
+      auto_input_layouts=auto_input_layouts,
+  )
   return runner(x)
 
 
@@ -134,6 +148,11 @@ class Autotuner:
     """Autotunes over configs for the given arguments."""
     executor = self.executor_fn()
     executor_args = {}
+    # Read the config here, as configs are compiled in worker threads.
+    auto_input_layouts = (
+        config_lib.autotuning_auto_input_layouts.value
+        and jax.default_backend() == "gpu"
+    )
     vlog_exc_info = functools.partial(logging.vlog, 2, exc_info=True)
 
     results = {}
@@ -145,7 +164,14 @@ class Autotuner:
         )
       with self.compile_executor_fn(max_workers=get_max_workers()) as compile_exec:  # pyrefly: ignore[unexpected-keyword]
         compiled = {
-            compile_exec.submit(_compile, fn_factory, cfg, args, kwargs): cfg
+            compile_exec.submit(
+                _compile,
+                fn_factory,
+                cfg,
+                args,
+                kwargs,
+                auto_input_layouts=auto_input_layouts,
+            ): cfg
             for cfg in configs
         }
         initialized_args = None  # All configs share the same arguments.
@@ -169,7 +195,14 @@ class Autotuner:
             results[config] = e.with_traceback(None)
     else:
       for config in configs:
-        executor_args[config] = (_benchmark, fn_factory, config, args, kwargs)
+        executor_args[config] = (
+            _benchmark,
+            fn_factory,
+            config,
+            args,
+            kwargs,
+            auto_input_layouts,
+        )
 
     with executor:
       future_to_config = {

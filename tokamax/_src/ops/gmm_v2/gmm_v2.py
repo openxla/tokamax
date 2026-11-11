@@ -127,6 +127,50 @@ def align_to(x, a):
   return pl.cdiv(x, a) * a
 
 
+def get_num_cores(tpu_info: Any) -> int:
+  """Returns the number of TensorCores that the kernel grid is split across.
+
+  In MegaCore mode (e.g. TPU v4 and v5p), the parallel grid dimensions are
+  partitioned across `tpu_info.num_cores` TensorCores. When multi-core mode is
+  disabled, the whole grid runs on a single core.
+
+  Args:
+    tpu_info: The `pltpu.TpuInfo` of the current device.
+  """
+  if config.disable_multi_core_mode.value:
+    return 1
+  num_cores = getattr(tpu_info, "num_cores", 1)
+  return num_cores if type(num_cores) is int and num_cores > 1 else 1
+
+
+def split_for_cores(
+    size: int, num_tiles: int, num_cores: int, num_lanes: int, min_tile: int
+) -> tuple[int, int] | None:
+  """Splits `size` into a multiple of `num_cores` equal, lane-aligned tiles.
+
+  Args:
+    size: The size of the dimension to split.
+    num_tiles: The current number of tiles. The result has at least as many.
+    num_cores: The number of TensorCores the tiles are partitioned across.
+    num_lanes: The number of lanes that each tile must be aligned to.
+    min_tile: The smallest allowed tile size.
+
+  Returns:
+    `(num_tiles, tile)` for the fewest tiles that are a multiple of `num_cores`,
+    are at least `min_tile` and exactly cover `size` (rounded up to
+    `num_lanes`), or `None` if no such split exists.
+  """
+  aligned_size = align_to(size, num_lanes)
+  start = align_to(max(num_tiles, 1), num_cores)
+  for cand in range(start, aligned_size // num_lanes + 1, num_cores):
+    tile = align_to(size, cand * num_lanes) // cand
+    if tile < min_tile:
+      break
+    if tile * cand == aligned_size:
+      return cand, tile
+  return None
+
+
 def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
   """Sublane block size the kernel processes lhs rows in."""
   size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
@@ -346,9 +390,23 @@ class GmmConfigs:
       return self.dims.size_n // 2
 
 
-TileFn = Callable[
-    [Dimensions, InputConfigs, InputConfigs, int, str | None, bool], TileSizes
-]
+@dataclasses.dataclass(frozen=True)
+class TilingRequest:
+  """Inputs passed to a GMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: Dimensions
+  lhs_cfgs: InputConfigs
+  rhs_cfgs: InputConfigs
+  vmem_limit_bytes: int
+  fuse_act: str | None = None
+  has_partial_sum: bool = False
+
+
+TileFn = Callable[[TilingRequest], TileSizes]
 
 
 class IndexMaps:
@@ -1155,6 +1213,18 @@ def kernel_main(
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
 
 
+def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
+  """Default `TileFn` for `gmm_v2`: calls `calculate_tiling` with `req`."""
+  return calculate_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.fuse_act,
+      req.has_partial_sum,
+  )
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1171,11 +1241,17 @@ def calculate_tiling(
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
+  tpu_info = pltpu.get_tpu_info()
+
   # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
-  # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
+  gen = getattr(tpu_info, "generation", None)
+  tpu_generation = gen if type(gen) is int else 0
+  if tpu_generation >= 8:
+    bf16_bf16_tile_m = 256
+  else:
+    bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1184,7 +1260,7 @@ def calculate_tiling(
 
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_limit = tpu_info.mxu_column_size * 2
   tile_n_limit = min(tile_n_limit, dims.size_n)
 
   size_n_per_rhs = dims.size_n
@@ -1266,6 +1342,18 @@ def calculate_tiling(
     num_n_tiles -= 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
+  # In MegaCore mode only the n grid dimension is split across TensorCores (see
+  # `kernel_main`), so use a multiple of `num_cores` n tiles to keep every core
+  # busy. Keep the current tiling if `size_n_per_rhs` cannot be split evenly
+  # into tiles of at least `tile_n_limit`.
+  num_cores = get_num_cores(tpu_info)
+  if num_cores > 1 and num_n_tiles % num_cores:
+    split = split_for_cores(
+        size_n_per_rhs, num_n_tiles, num_cores, num_lanes, tile_n_limit
+    )
+    if split is not None:
+      num_n_tiles, tile_n = split
+
   # If memory is STILL exceeded after tile_n adjustment, we must decrease
   # tile_k.
   if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
@@ -1293,22 +1381,41 @@ def calculate_tiling(
 
   # TODO: max number of bucket was choosen empiirically.
   # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 4
+  # Each bucket adds a fully unrolled copy of the matmul body. On TPU8, the
+  # larger VMEM allows tiles big enough that 3+ buckets can exceed instruction
+  # memory, which can make the kernel >2x slower, so use fewer buckets there.
+  max_num_buckets = 2 if tpu_generation >= 8 else 4
   bucket_base = tile_m
+  # For transposed RHS (dlhs), cap tile_m at the average group size so tiles do
+  # not pad and XLU-transpose rows past typical group boundaries. Keep full
+  # bucket growth for non-transposed forward calls, where larger tile_m avoids
+  # re-streaming hot expert weights under skewed routing.
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = (
+      min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
+      if rhs_cfgs.is_transposed
+      else dims.size_m
+  )
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
       break
     tile_m = new_tile_m
 
-  lhs_buffer_count = (
-      3
-      if _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=3)
-      <= vmem_limit_bytes
-      else 2
-  )
+  # Up to this point, we have found tile_m, tile_n, tile_k for
+  # lhs_buffer_count == 2. So it's guaranteed the for loop below can find an
+  # available lhs_buffer_count.
+  max_lhs_buffers = 4 if tpu_generation >= 8 else 3
+  lhs_buffer_count = 2
+  for count in range(max_lhs_buffers, 2, -1):
+    if (
+        _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=count)
+        <= vmem_limit_bytes
+    ):
+      lhs_buffer_count = count
+      break
 
   return TileSizes(
       tile_m=tile_m,
@@ -1608,12 +1715,15 @@ def make_gmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        vmem_limit_bytes,  # pyrefly: ignore[bad-argument-type]
-        fuse_act,
-        partial_sum is not None,
+        TilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            fuse_act=fuse_act,
+            has_partial_sum=partial_sum is not None,
+        )
     )
 
   return GmmConfigs(
@@ -1666,7 +1776,7 @@ def gmm_v2(
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
     partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
-    tile_info: TileSizes | TileFn = calculate_tiling,
+    tile_info: TileSizes | TileFn = calculate_tiling_from_request,
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -1705,7 +1815,8 @@ def gmm_v2(
       Not supported together with fuse_act.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
-    tile_info: The tile sizes or tile function to use.
+    tile_info: The tile sizes, or a function that takes a `TilingRequest` and
+      returns them.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.

@@ -14,6 +14,8 @@
 # ==============================================================================
 """Tests for Triton Triangle Multiplication."""
 
+import functools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -345,8 +347,10 @@ class TritonTriangleMultiplicationTest(parameterized.TestCase):
     dout = jax.random.normal(jax.random.key(0), (n, n, 64), dtype=dtype)
 
     if use_api:
-      # The default implementation tries Triton first.
-      fn = api.triangle_multiplication
+      # Pin Triton: the API tries Mosaic GPU first where it is available.
+      fn = functools.partial(
+          api.triangle_multiplication, implementation="triton"
+      )
     else:
       fn = self._op
 

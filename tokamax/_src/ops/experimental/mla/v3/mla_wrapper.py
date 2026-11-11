@@ -312,6 +312,15 @@ def mla_ragged_paged_attention(
       logging.info("blocks: %s, mode: %s", cfgs.block, mode)
     if schedules is not None and mode in schedules:
       schedule_hbm = schedules[mode]
+      # A schedule built for other block sizes (or shapes) addresses the wrong
+      # DMAs and silently produces garbage, so reject it here. `cfgs` is static,
+      # so this costs nothing at run time.
+      if schedule_hbm.cfgs != cfgs:
+        raise ValueError(
+            f"The {mode} schedule was built for different configs than this"
+            " call runs under; build it with the same arguments and block"
+            f" sizes.\n  schedule: {schedule_hbm.cfgs}\n  call: {cfgs}"
+        )
     else:
       schedule_hbm = schedule.generate_mla_metadata(
           cu_q_lens, kv_lens, page_indices, distribution, cfgs=cfgs
