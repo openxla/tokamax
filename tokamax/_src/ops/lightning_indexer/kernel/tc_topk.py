@@ -958,6 +958,93 @@ def _key_stats(load_tile, n_blocks, tiles_per_block: int):
   return lax.fori_loop(0, n_blocks, _body, init)
 
 
+def _subsample_prebracket(
+    load_tile,
+    n_blocks: jax.Array | int,
+    tiles_per_block: int,
+    lo_t: jax.Array,
+    hi_t: jax.Array,
+    row_valid: jax.Array,
+    cnt_lo: jax.Array,
+    lane_lo: jax.Array,
+    *,
+    k: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Tightens `[lo_t, hi_t]` in one 3-probe pass using an 8-tile sample."""
+  sign = jnp.int32(EMPTY_ORD_SENTINEL)
+  # Sample 8 evenly spaced tiles (1024 entries per row) and sort descending.
+  n_s = 8
+  sample_o = []
+  for s in range(n_s):
+    b_s = (s * n_blocks) // n_s
+    t_s = (s * (tiles_per_block // n_s)) % tiles_per_block
+    sample_o.append(load_tile(b_s, t_s))
+  zero_i = jnp.zeros((8, 128), dtype=jnp.int32)
+  sample_i = tuple(zero_i + s for s in range(n_s))
+  sorted_o, _ = bitonic_sort_blocks(tuple(sample_o), sample_i, descending=True)
+
+  # Estimate the sample rank corresponding to k valid entries per row.
+  lo_ord = jnp.int32(MIN_VALID_ORD)
+  s_valid_lane = jnp.zeros((8, 128), dtype=jnp.int32)
+  for s in range(n_s):
+    s_valid_lane = s_valid_lane + jnp.where(sample_o[s] >= lo_ord, 1, 0)
+  s_valid = _row_sum(s_valid_lane)
+  total_cap = n_s * 128
+  k_s = jnp.clip(
+      (jnp.int32(k) * s_valid) // jnp.maximum(row_valid, 1),
+      0,
+      total_cap - 1,
+  )
+
+  def _pick_rank(rank: jax.Array) -> jax.Array:
+    blk_idx = rank >> 7
+    lane_idx = rank & 127
+    picked = sorted_o[0]
+    for s in range(1, n_s):
+      picked = jnp.where(blk_idx == s, sorted_o[s], picked)
+    return _gather_lanes(picked, lane_idx)
+
+  r_lo = jnp.minimum(total_cap - 1, jnp.maximum(16, (k_s * 3) // 2 + 8))
+  r_mid = jnp.clip(k_s, 0, total_cap - 1)
+  r_hi = jnp.maximum(0, (k_s * 2) // 3 - 4)
+
+  g_lo = jnp.clip(_pick_rank(r_lo), lo_t, hi_t)
+  g_mid = jnp.clip(_pick_rank(r_mid), lo_t, hi_t)
+  g_hi = jnp.clip(_pick_rank(r_hi), lo_t, hi_t)
+
+  # Count all 3 probes in a single pass over the resident key tiles.
+  num_acc = min(2, tiles_per_block)
+
+  def _probe_body(b, accs):
+    a1, a2, a3 = list(accs[0]), list(accs[1]), list(accs[2])
+    for t in range(tiles_per_block):
+      x = load_tile(b, t)
+      slot = t % num_acc
+      a1[slot] = a1[slot] + jnp.where(x >= g_lo, 1, 0)
+      a2[slot] = a2[slot] + jnp.where(x >= g_mid, 1, 0)
+      a3[slot] = a3[slot] + jnp.where(x >= g_hi, 1, 0)
+    return tuple(a1), tuple(a2), tuple(a3)
+
+  zero = (jnp.zeros((8, 128), jnp.int32),) * num_acc
+  a1, a2, a3 = lax.fori_loop(0, n_blocks, _probe_body, (zero, zero, zero))
+  l1, l2, l3 = a1[0], a2[0], a3[0]
+  for i in range(1, num_acc):
+    l1, l2, l3 = l1 + a1[i], l2 + a2[i], l3 + a3[i]
+  r1, r2, r3 = _row_sum(l1), _row_sum(l2), _row_sum(l3)
+
+  cur_lo, cur_hi = lo_t, hi_t
+  for g_val, r_cnt, l_cnt in ((g_lo, r1, l1), (g_mid, r2, l2), (g_hi, r3, l3)):
+    valid_lo = (r_cnt >= k) & (g_val > cur_lo) & (g_val <= cur_hi)
+    cur_lo = jnp.where(valid_lo, g_val, cur_lo)
+    cnt_lo = jnp.where(valid_lo, r_cnt, cnt_lo)
+    lane_lo = jnp.where(valid_lo, l_cnt, lane_lo)
+    valid_hi = (r_cnt < k) & (g_val > cur_lo) & (g_val <= cur_hi)
+    g_minus_1 = lax.bitwise_xor(lax.bitwise_xor(g_val, sign) - 1, sign)
+    cur_hi = jnp.where(valid_hi, g_minus_1, cur_hi)
+
+  return cur_lo, cur_hi, cnt_lo, lane_lo
+
+
 def select_threshold(
     load_tile,
     n_blocks: jax.Array | int,
@@ -1028,8 +1115,41 @@ def select_threshold(
     return done, lo_u, hi_u, cnt_lo, lane_lo
 
   done = jnp.all(_converged(lo_u, hi_u, row_valid))
+  cnt_lo, lane_lo = row_valid, lane_valid
+  if tiles_per_block >= 8:
+
+    def _pre(state):
+      l_u, h_u, c_l, ln_l = state
+      lo_t = lax.bitwise_xor(l_u, sign)
+      hi_t = lax.bitwise_xor(h_u, sign)
+      lo_t, hi_t, c_l, ln_l = _subsample_prebracket(
+          load_tile,
+          n_blocks,
+          tiles_per_block,
+          lo_t,
+          hi_t,
+          row_valid,
+          c_l,
+          ln_l,
+          k=k,
+      )
+      return (
+          lax.bitwise_xor(lo_t, sign),
+          lax.bitwise_xor(hi_t, sign),
+          c_l,
+          ln_l,
+      )
+
+    lo_u, hi_u, cnt_lo, lane_lo = lax.cond(
+        jnp.logical_not(done),
+        _pre,
+        lambda s: s,
+        (lo_u, hi_u, cnt_lo, lane_lo),
+    )
+    done = jnp.all(_converged(lo_u, hi_u, cnt_lo))
+
   _, lo_u, _, row_cnt, lane_cnt = lax.while_loop(
-      _cond, _body, (done, lo_u, hi_u, row_valid, lane_valid)
+      _cond, _body, (done, lo_u, hi_u, cnt_lo, lane_lo)
   )
   t = lax.bitwise_xor(lo_u, sign)
   return t, row_cnt, lane_cnt
@@ -1277,9 +1397,29 @@ def _gather_into_top(
     else:
       _gather_rounds()
 
+  max_cnt = jnp.max(lane_cnt)
+
   def _extra_round(rnd, _):
-    ords, idxs = _fill_ranks(rnd * num_blocks, num_blocks)
-    _merge_into_top(top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs)
+    if num_blocks > _FILL_BUCKETS:
+
+      def _small_rem():
+        ords, idxs = _fill_ranks(rnd * num_blocks, _FILL_BUCKETS)
+        _merge_into_top(
+            top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs
+        )
+
+      def _full_rem():
+        ords, idxs = _fill_ranks(rnd * num_blocks, num_blocks)
+        _merge_into_top(
+            top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs
+        )
+
+      lax.cond(
+          max_cnt - rnd * num_blocks <= _FILL_BUCKETS, _small_rem, _full_rem
+      )
+    else:
+      ords, idxs = _fill_ranks(rnd * num_blocks, num_blocks)
+      _merge_into_top(top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs)
     return None
 
   lax.fori_loop(max_chunks, num_rounds, _extra_round, None)
@@ -1303,12 +1443,17 @@ def _merge_into_top(
     top_ord_ref, top_idx_ref, q_group, num_blocks: int, ords, idxs
 ) -> None:
   """Merges up to `num_blocks` unsorted candidate blocks into the top refs."""
-  pad = num_blocks - len(ords)
+  sort_blocks = max(1, next_power_of_2(len(ords)))
+  sort_pad = sort_blocks - len(ords)
   cand_o, cand_i = bitonic_sort_blocks(
-      tuple(ords) + (_empty_ord_block(),) * pad,
-      tuple(idxs) + (_empty_idx_block(),) * pad,
+      tuple(ords) + (_empty_ord_block(),) * sort_pad,
+      tuple(idxs) + (_empty_idx_block(),) * sort_pad,
       descending=False,
   )
+  rem_pad = num_blocks - sort_blocks
+  if rem_pad > 0:
+    cand_o = (_empty_ord_block(),) * rem_pad + cand_o
+    cand_i = (_empty_idx_block(),) * rem_pad + cand_i
   cur_o = tuple(top_ord_ref[q_group, r] for r in range(num_blocks))
   cur_i = tuple(top_idx_ref[q_group, r] for r in range(num_blocks))
   _write_top(
@@ -1357,7 +1502,7 @@ def select_topk_vmem(
   """
   k_cap = 128 * num_blocks
   t, row_cnt, lane_cnt = select_threshold(
-      load_tile, n_blocks, tiles_per_block, k=k, slack=max(128, k_cap // 4)
+      load_tile, n_blocks, tiles_per_block, k=k, slack=max(64, k_cap // 8)
   )
   heavy_ties = jnp.any(row_cnt > 2 * k_cap)
 

@@ -101,7 +101,6 @@ _TC_MAX_DECODE_BATCH = 16
 # Upper bound on decode batch size times KV positions per block.
 _TC_MAX_DECODE_STEP_POSITIONS = 65536
 
-
 # Fraction of the TensorCore VMEM capacity used as the scoped VMEM limit. XLA
 # reserves part of the VMEM for itself, so the full capacity is not available.
 _TC_VMEM_LIMIT_FRACTION = 0.95
@@ -119,6 +118,30 @@ def _tc_page_bytes(ba: op.BoundArguments) -> int:
   return math.prod(cache_kv.shape[1:]) * cache_kv.dtype.itemsize
 
 
+_TC_LARGE_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+_TC_LARGE_VMEM_MAX_KV_BLOCK_BYTES = 48 * 1024 * 1024
+_TC_LARGE_VMEM_QBLOCK_STREAM_BLOCK_POSITIONS = 16384
+
+
+def _tc_is_large_vmem(vmem_limit_bytes: int) -> bool:
+  """Returns True if the target TPU has large VMEM capacity."""
+  return vmem_limit_bytes >= _TC_LARGE_VMEM_LIMIT_BYTES
+
+
+def _tc_max_kv_block_bytes(vmem_limit_bytes: int) -> int:
+  """Returns the maximum bytes of one KV block for the given VMEM limit."""
+  if _tc_is_large_vmem(vmem_limit_bytes):
+    return _TC_LARGE_VMEM_MAX_KV_BLOCK_BYTES
+  return _TC_MAX_KV_BLOCK_BYTES
+
+
+def _tc_qblock_stream_block_positions(vmem_limit_bytes: int) -> int:
+  """Returns prefill/mixed stream block positions for the given VMEM limit."""
+  if _tc_is_large_vmem(vmem_limit_bytes):
+    return _TC_LARGE_VMEM_QBLOCK_STREAM_BLOCK_POSITIONS
+  return _TC_QBLOCK_STREAM_BLOCK_POSITIONS
+
+
 def _tc_block_pages(
     *,
     pages_per_seq: int,
@@ -131,7 +154,7 @@ def _tc_block_pages(
 ) -> int:
   """Returns KV pages per block for `seqs_per_block` sequences per block."""
   max_block_bytes = min(
-      _TC_MAX_KV_BLOCK_BYTES,
+      _tc_max_kv_block_bytes(vmem_limit_bytes),
       vmem_limit_bytes // (2 * max(kernel_config.DEFAULT_BUFFER_COUNT)),
   )
   max_pages = max(1, max_block_bytes // (page_bytes * seqs_per_block))
@@ -167,17 +190,18 @@ def _tc_heuristics_config(ba: op.BoundArguments) -> Config:
   decode_bs = _tc_decode_batch_size(max_num_seqs, ba.arguments["q"].shape[1])
 
   def decode_pages(seqs_per_block: int) -> int:
+    stream_pos = (
+        _TC_BATCHED_DECODE_STREAM_BLOCK_POSITIONS
+        if seqs_per_block >= _TC_MIN_DECODE_BATCH
+        else _TC_DECODE_STREAM_BLOCK_POSITIONS
+    )
     return _tc_block_pages(
         pages_per_seq=pages_per_seq,
         page_size=page_size,
         page_bytes=page_bytes,
         seqs_per_block=seqs_per_block,
         max_single_block_positions=_TC_DECODE_MAX_SINGLE_BLOCK_POSITIONS,
-        stream_block_positions=(
-            _TC_BATCHED_DECODE_STREAM_BLOCK_POSITIONS
-            if seqs_per_block >= _TC_MIN_DECODE_BATCH
-            else _TC_DECODE_STREAM_BLOCK_POSITIONS
-        ),
+        stream_block_positions=stream_pos,
         vmem_limit_bytes=vmem_limit_bytes,
     )
 
@@ -204,17 +228,22 @@ def _tc_heuristics_config(ba: op.BoundArguments) -> Config:
       page_bytes=page_bytes,
       seqs_per_block=1,
       max_single_block_positions=_TC_QBLOCK_MAX_SINGLE_BLOCK_POSITIONS,
-      stream_block_positions=_TC_QBLOCK_STREAM_BLOCK_POSITIONS,
+      stream_block_positions=_tc_qblock_stream_block_positions(
+          vmem_limit_bytes
+      ),
       vmem_limit_bytes=vmem_limit_bytes,
   )
   # With several sequences, a query block of >= 64 sends every sequence
   # (decode ones included) through one pass with that block size; a small block
   # keeps decode sequences on the batched decode pass unless nearly all tokens
   # are prefill tokens.
+  # On very long context (>= 128k positions per seq), cap bq at 64 to keep
+  # key bytes within select_budget, guaranteeing single-pass threshold selection
+  # rather than falling back to iterative streaming merges.
   if num_tokens >= 64 and (
       max_num_seqs == 1 or num_tokens >= 256 * max_num_seqs
   ):
-    bq = 128
+    bq = 64 if pages_per_seq * page_size >= 128 * 1024 else 128
   elif num_tokens >= 32:
     bq = 32
   else:
@@ -309,11 +338,14 @@ class PallasTpuLightningIndexer(base.LightningIndexer[Config]):
           _tc_topk_shape_params(ba)
       )
       vmem_limit = _tc_vmem_limit_bytes()
-      max_pre_p = 8 if page_size <= 256 else 4
-      kv_pages = sorted({
-          _tc_kv_pages(p, pages_per_seq, page_size)
-          for p in (1, 2, 4, max_pre_p)
-      })
+      pre_p_candidates = [1, 2, 4]
+      if page_size <= 256 or _tc_is_large_vmem(vmem_limit):
+        pre_p_candidates.append(8)
+      if _tc_is_large_vmem(vmem_limit):
+        pre_p_candidates.append(16)
+      kv_pages = sorted(
+          {_tc_kv_pages(p, pages_per_seq, page_size) for p in pre_p_candidates}
+      )
       queries = [8, 16, 32, 64, 128] if num_tokens >= 64 else [8, 16, 32]
       decode_batch_sizes = sorted(
           {1} | {d for d in (4, 8) if d <= max_num_seqs}

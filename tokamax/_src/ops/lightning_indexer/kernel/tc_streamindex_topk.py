@@ -1029,9 +1029,7 @@ def tc_kernel(
   m_part = num_sublanes_bkv // num_partitions
   # Two-level select (per-block lane maxima first) needs enough cells per row
   # and enough tiles per block to pay off.
-  use_two_level = (
-      use_select and m_part >= 4 and num_kv_blocks >= 2 * num_blocks
-  )
+  use_two_level = use_select and m_part >= 4 and num_kv_blocks >= 4 * num_blocks
   subbatch_w = math.gcd(m_part, min(num_blocks, 4))
   num_subbatches = m_part // subbatch_w
   direct_blocks = num_blocks
@@ -1579,6 +1577,14 @@ def tc_kernel(
       assert acc is not None
       return acc
 
+    eff_lens = (
+        [eff_len_ref[g] for g in range(num_q_groups)] if use_select else None
+    )
+    part_col_base = (
+        cur_bkv * bkv_sz + _part_col_offset() if use_select else None
+    )
+    empty_ord = jnp.int32(tc_topk.EMPTY_ORD_SENTINEL)
+
     for c in range(num_lane_chunks):
       keys, scales = load_chunk(c)
       for tb0 in range(0, num_tok_blks, tbs_per_batch):
@@ -1597,18 +1603,34 @@ def tc_kernel(
         for local_tb in range(tbs_per_batch):
           tb = tb0 + local_tb
           acc = reduce_token_block(sts, tb, local_tb) * scales
-          for jj in range(tiles_per_chunk):
-            acc_tile = acc[:, jj * 128 : (jj + 1) * 128]
-            for sg in range(groups_per_tb):
-              grp = tb * groups_per_tb + sg
+          if use_select:
+            assert (
+                eff_lens is not None
+                and part_col_base is not None
+                and select_refs is not None
+            )
+            bits = lax.bitcast_convert_type(acc, jnp.int32)
+            sign_mask = lax.shift_right_arithmetic(bits, jnp.int32(31))
+            ord_acc = lax.bitwise_xor(
+                bits, lax.bitwise_and(sign_mask, jnp.int32(0x7FFFFFFF))
+            )
+            for jj in range(tiles_per_chunk):
               m_p = c * tiles_per_chunk + jj
-              tile = acc_tile[sg * 8 : (sg + 1) * 8]
-              if use_select:
-                _select_ingest_tile(
-                    select_refs, eff_len_ref[grp], grp, cur_bkv, m_p, tile
+              idx_tile = part_col_base + m_p * 128
+              ord_chunk = ord_acc[:, jj * 128 : (jj + 1) * 128]
+              for sg in range(groups_per_tb):
+                grp = tb * groups_per_tb + sg
+                ord_tile = ord_chunk[sg * 8 : (sg + 1) * 8]
+                select_refs[0][grp, cur_bkv * m_part + m_p] = jnp.where(
+                    idx_tile < eff_lens[grp], ord_tile, empty_ord
                 )
-              else:
-                scores_tile_ref[grp, m_p] = tile
+          else:
+            for jj in range(tiles_per_chunk):
+              acc_tile = acc[:, jj * 128 : (jj + 1) * 128]
+              for sg in range(groups_per_tb):
+                grp = tb * groups_per_tb + sg
+                m_p = c * tiles_per_chunk + jj
+                scores_tile_ref[grp, m_p] = acc_tile[sg * 8 : (sg + 1) * 8]
 
     n_act = _active_q_groups(p_id)
     if use_select:
