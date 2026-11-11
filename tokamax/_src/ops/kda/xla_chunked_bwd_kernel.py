@@ -22,8 +22,17 @@ from tokamax._src.ops.kda.xla_chunked_fwd_kernel import (
     chunk_kda_fwd,
 )
 
+# Dimensions.
+#   B: batch size
+#   H: number of heads
+#   T: sequence length
+#   N: max number of segments per batch element
+#   K: key/query head dimension
+#   V: value head dimension
+
 
 def chunk_kda_bwd(
+    # Inputs.
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -42,8 +51,10 @@ def chunk_kda_bwd(
     max_num_segments: int | None,
     chunk_size: int,
     safe_gate: bool,
+    # Outputs.
     output_cotangent: tuple[jax.Array, jax.Array | None],
 ) -> tuple[
+    # Scratch / VJP cotangent outputs.
     jax.Array,
     jax.Array,
     jax.Array,

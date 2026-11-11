@@ -331,85 +331,6 @@ def chunked_gdn(
   return out, state
 
 
-def recurrent_gdn_per_seq(
-    q_compact: jax.Array,  # [num_kq_heads, chunk, 1, kq_head_dim]
-    k_compact: jax.Array,  # [num_kq_heads, chunk, 1, kq_head_dim]
-    k_compact_t: jax.Array,  # [num_kq_heads, chunk, kq_head_dim, 1]
-    v_compact: jax.Array,  # [num_v_heads, chunk, 1, v_head_dim]
-    gating_log: jax.Array,  # [num_v_heads, chunk, 1, 1]
-    beta: jax.Array,  # [num_v_heads, chunk, 1, 1]
-    state: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
-    cfgs: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-  """Perform recurrent GDN over input [num_heads, chunk, 1, head_dim].
-
-  The returned state stacks the post-token state of the last
-  `cfgs.window_size` window positions ([window_size, num_v_heads,
-  kq_head_dim, v_head_dim]); with `window_size == 1` that is just the final
-  state.
-  """
-
-  out_list = []
-  state_list = []
-  for c_idx in range(cfgs.chunk_size):
-    # [num_v_heads, 1, kq_head_dim]
-    q_curr = q_compact[:, c_idx]
-    q_curr = jnp.repeat(q_curr, cfgs.v_per_kq_head, axis=0)
-    k_curr = k_compact[:, c_idx]
-    k_curr = jnp.repeat(k_curr, cfgs.v_per_kq_head, axis=0)
-
-    # [num_v_heads, 1, v_head_dim]
-    v_curr = v_compact[:, c_idx]
-
-    # [num_v_heads, kq_head_dim, 1]
-    k_curr_t = k_compact_t[:, c_idx]
-    k_curr_t = jnp.repeat(k_curr_t, cfgs.v_per_kq_head, axis=0)
-
-    # [num_v_heads, 1, 1]
-    beta_curr = beta[:, c_idx]
-    gating_curr = gating_log[:, c_idx]
-
-    # [num_v_heads, kq_head_dim, v_head_dim]
-    state_updated = state * gating_curr
-
-    # [num_v_heads, 1, v_head_dim]
-    v_updated = jax.lax.dot(
-        k_curr,
-        state_updated,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
-
-    # [num_v_heads, 1, v_head_dim]
-    v_diff = v_curr - v_updated
-    v_new = beta_curr * v_diff
-
-    # [num_v_heads, kq_head_dim, v_head_dim]
-    # NOTE: Multiplication with k_curr_t needs to be deferred as much as
-    # possible as it expands the dimension size by kq_head_dim.
-    state_new = k_curr_t * v_new
-    # [num_v_heads, kq_head_dim, v_head_dim]
-    state = state_updated + state_new
-
-    # [num_v_heads, 1, v_head_dim]
-    out = jax.lax.dot(
-        q_curr,
-        state,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
-
-    out_list.append(out[:, 0, :])
-    # NOTE: Rows past real_sizes are masked out by the caller, so the state
-    # stops changing there and trailing checkpoints simply repeat the state
-    # of the last real token. Checkpoints of the positions dropped here are
-    # dead code the compiler eliminates.
-    if c_idx >= cfgs.chunk_size - cfgs.window_size:
-      state_list.append(state)
-
-  return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
-
-
 def recurrent_gdn(
     real_sizes: jax.Array,
     q_compact: jax.Array,
@@ -436,124 +357,90 @@ def recurrent_gdn(
   )
   mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
-  # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
-  q_compact = jnp.where(mask, q_compact.astype(cfg.dtypes.compute), 0)
-  k_compact = jnp.where(mask, k_compact.astype(cfg.dtypes.compute), 0)
-  # [seqs, num_v_heads, chunk, 1, v_head_dim]
-  v_compact = jnp.where(mask, v_compact.astype(cfg.dtypes.compute), 0)
-
-  b_compact = b_compact.astype(cfg.dtypes.compute)
-  a_compact = a_compact.astype(cfg.dtypes.compute)
-
-  a_log = a_log.reshape(1, 1, 1, 1, -1).astype(cfg.dtypes.compute)
-  dt_bias = dt_bias.reshape(1, 1, 1, 1, -1).astype(cfg.dtypes.compute)
-
-  # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
-  q_compact = l2_norm(q_compact)
+  a_log = a_log.reshape(1, 1, 1, -1).astype(cfg.dtypes.compute)
+  dt_bias = dt_bias.reshape(1, 1, 1, -1).astype(cfg.dtypes.compute)
   q_scale = cfg.kq_head_dim**-0.5
-  q_compact *= q_scale
-  k_compact = l2_norm(k_compact)
-  k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
-  beta = jax.nn.sigmoid(b_compact)
-  gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_compact + dt_bias)
-
-  beta = jnp.where(mask, beta, 0)
-  # NOTE: Masked gating_log will evaluate to jnp.exp(0)=1. gating (decay) must
-  # be masked to 1 since it signifies that strength of state from previous row
-  # will be 1 (i.e., no decay) if current row is invalid.
-  gating_log = jnp.where(mask, gating_log, 0)
-  gating_log = jnp.exp(gating_log)
-
-  beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
-  beta = beta[:, : cfg.num_v_heads]
-  gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
-  gating_log = gating_log[:, : cfg.num_v_heads]
-
-  if cfg.chunk_size == 1 and cfg.window_size == 1:
-    # Optimized decode path: fused [k, q] projection against state.
-    # Shapes:
-    #   q_compact:    [B, n_kq, 1, 1, d_k] -> q_curr:   [B, n_v, 1, d_k]
-    #   k_compact:    [B, n_kq, 1, 1, d_k] -> k_curr:   [B, n_v, 1, d_k]
-    #   k_compact_t:  [B, n_kq, 1, d_k, 1] -> k_curr_t: [B, n_v, d_k, 1]
-    #   v_compact:    [B, n_v, 1, 1, d_v]  -> v_curr:   [B, n_v, 1, d_v]
-    #   beta:         [B, n_v, 1, 1, 1]    -> beta_curr: [B, n_v, 1, 1]
-    #   gating_log:   [B, n_v, 1, 1, 1]    -> gating_curr: [B, n_v, 1, 1]
-    q_curr = jnp.repeat(q_compact[:, :, 0, 0, :], cfg.v_per_kq_head, axis=1)
-    q_curr = jnp.expand_dims(q_curr, axis=2)
-
-    k_curr = jnp.repeat(k_compact[:, :, 0, 0, :], cfg.v_per_kq_head, axis=1)
-    k_curr = jnp.expand_dims(k_curr, axis=2)
-
-    k_curr_t = jnp.repeat(k_compact_t[:, :, 0, :, 0], cfg.v_per_kq_head, axis=1)
-    k_curr_t = jnp.expand_dims(k_curr_t, axis=3)
-
-    v_curr = jnp.expand_dims(v_compact[:, :, 0, 0, :], axis=2)
-    beta_curr = beta[:, :, 0, 0, 0].reshape(
-        cfg.seq_tile_size, cfg.num_v_heads, 1, 1
+  # Contract over kq_head_dim while batching across (seq_tile_size, num_v_heads)
+  # and fusing [k_c, q_c] along the length-2 axis so each token step
+  # issues one MXU contraction instead of two dependent ones.
+  batch_dot_dims = (((3,), (2,)), ((0, 1), (0, 1)))
+  out_list = []
+  state_list = []
+  state = state_prev
+  for c_idx in range(cfg.chunk_size):
+    mask_c = mask[:, :, c_idx]
+    # [seqs, num_kq_heads, 1, kq_head_dim]
+    q_c = jnp.where(
+        mask_c, q_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0
     )
-    gating_curr = gating_log[:, :, 0, 0, 0].reshape(
-        cfg.seq_tile_size, cfg.num_v_heads, 1, 1
+    k_c = jnp.where(
+        mask_c, k_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0
+    )
+    # [seqs, num_v_heads, 1, v_head_dim]
+    v_curr = jnp.where(
+        mask_c, v_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0
     )
 
-    # 1. State decay update
-    state_updated = state_prev * gating_curr
+    q_c = l2_norm(q_c) * q_scale
+    k_c = l2_norm(k_c)
 
-    # 2. Fused [k, q] projection against state
-    b_size, n_v_heads = cfg.seq_tile_size, cfg.num_v_heads
-    kq_merged = jnp.concat([k_curr, q_curr], axis=2)  # [B, n_v, 2, d_k]
-    kq_merged_flat = kq_merged.reshape(-1, 2, cfg.kq_head_dim)
-    state_updated_flat = state_updated.reshape(
-        -1, cfg.kq_head_dim, cfg.v_head_dim
+    b_c = b_compact[:, :, c_idx].astype(cfg.dtypes.compute)
+    a_c = a_compact[:, :, c_idx].astype(cfg.dtypes.compute)
+    beta_c = jnp.where(mask_c, jax.nn.sigmoid(b_c), 0)
+    # NOTE: Masked gating_c will evaluate to jnp.exp(0)=1. gating (decay)
+    # must be masked to 1 since it signifies that strength of state from
+    # previous row will be 1 (i.e., no decay) if current row is invalid.
+    gating_c = jnp.where(
+        mask_c, -jnp.exp(a_log) * jax.nn.softplus(a_c + dt_bias), 0
     )
+    gating_c = jnp.exp(gating_c)
 
-    kq_proj_flat = jax.lax.dot_general(
-        kq_merged_flat,
-        state_updated_flat,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+    # [seqs, num_v_heads, 1, 1]
+    beta_curr = fused_transpose_broadcast(beta_c, src_dim=3, dst_dim=1)[
+        :, : cfg.num_v_heads
+    ]
+    gating_curr = fused_transpose_broadcast(gating_c, src_dim=3, dst_dim=1)[
+        :, : cfg.num_v_heads
+    ]
+
+    # [seqs, num_v_heads, kq_head_dim, v_head_dim]
+    state_updated = state * gating_curr
+
+    # [seqs, num_v_heads, 2, v_head_dim]
+    kq_merged = jnp.repeat(
+        jnp.concat([k_c, q_c], axis=2), cfg.v_per_kq_head, axis=1
+    )
+    kq_proj = jax.lax.dot_general(
+        kq_merged,
+        state_updated,
+        dimension_numbers=batch_dot_dims,
         preferred_element_type=jnp.float32,
-    ).astype(
-        cfg.dtypes.compute
-    )  # [B * n_v, 2, d_v]
-    kq_proj = kq_proj_flat.reshape(b_size, n_v_heads, 2, cfg.v_head_dim)
-
+    ).astype(cfg.dtypes.compute)
     v_updated = kq_proj[:, :, :1, :]
     out_decayed = kq_proj[:, :, 1:, :]
 
-    # 3. Output difference
+    # [seqs, num_v_heads, 1, v_head_dim]
     v_diff = v_curr - v_updated
     v_new = beta_curr * v_diff
-
-    qk_dot = jnp.sum(q_curr * k_curr, axis=-1, keepdims=True)  # [B, n_v, 1, 1]
-    out = out_decayed + qk_dot * v_new  # [B, n_v, 1, d_v]
-
-    # 4. State rank-1 update
-    state_new = k_curr_t * v_new  # [B, n_v, d_k, d_v]
-    new_recurrent_state = state_updated + state_new
-
-    # Match Pallas output shape [B, 1, n_v, d_v]:
-    out = out.swapaxes(1, 2)
-    # Output single checkpoint per sequence, matching [seq, window_size, ...]
-    return out, jnp.expand_dims(new_recurrent_state, axis=1)
-
-  out_list = []
-  new_state_list = []
-
-  for idx in range(cfg.seq_tile_size):
-    out, state = recurrent_gdn_per_seq(
-        q_compact[idx],
-        k_compact[idx],
-        k_compact_t[idx],
-        v_compact[idx],
-        gating_log[idx],
-        beta[idx],
-        state_prev[idx],
-        cfg,
+    qk_dot = jnp.repeat(
+        jnp.sum(q_c * k_c, axis=-1, keepdims=True),
+        cfg.v_per_kq_head,
+        axis=1,
     )
-    out_list.append(out)
-    new_state_list.append(state)
+    out = (out_decayed + qk_dot * v_new).astype(cfg.dtypes.compute)
 
-  out = jnp.stack(out_list, axis=0)
-  new_recurrent_state = jnp.stack(new_state_list, axis=0)
+    # [seqs, num_v_heads, kq_head_dim, v_head_dim]
+    k_curr_t = jnp.repeat(
+        fused_transpose_broadcast(k_c, src_dim=3, dst_dim=2),
+        cfg.v_per_kq_head,
+        axis=1,
+    )
+    state_new = k_curr_t * v_new
+    state = state_updated + state_new
 
-  return out, new_recurrent_state
+    out_list.append(out[:, :, 0, :])
+    if c_idx >= cfg.chunk_size - cfg.window_size:
+      state_list.append(state)
+
+  return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)

@@ -42,15 +42,20 @@ def _local_weight(
     fused_gate_up: bool = False,
     quant_block_size: int | None = None,
     quant_dtype: jnp.dtype | None = None,
+    bias: jax.Array | None = None,
 ) -> arg.SingleWeightWrapper[jax.Array]:
   """Slices this shard's experts from `w` and optionally quantizes them."""
   w = w[group_offset : group_offset + num_local_experts]
+  if bias is not None:
+    bias = bias[group_offset : group_offset + num_local_experts]
   scale = None
   if quantize:
     w, scale = helper_inputs.sub_channel_quantize(
         w, quant_dtype or jnp.float8_e4m3fn, quant_block_size
     )
-  return arg.SingleWeightWrapper.create(w, scale, fused_gate_up=fused_gate_up)
+  return arg.SingleWeightWrapper.create(
+      w, scale, bias, fused_gate_up=fused_gate_up
+  )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +99,7 @@ class GmmCase:
       group_offset: int = 0,
       num_skipped: int = 0,
       balanced_ep: int | None = None,
+      has_bias: bool = False,
   ) -> Self:
     """Builds the layer inputs of `case` for the shard at `group_offset`."""
     helper_util.check_gmm_supported(case)
@@ -107,6 +113,7 @@ class GmmCase:
         max_to_mean_load=case.max_to_mean_load,
         num_skipped=num_skipped,
         force_expert=None if num_skipped or balanced_ep else group_offset,
+        has_bias=has_bias,
     )
     if balanced_ep is not None:
       topk_indices = helper_inputs.balanced_topk_indices(
@@ -133,6 +140,7 @@ class GmmCase:
             **local,
             quant_block_size=shape.w_quant_block_size,
             quant_dtype=shape.w_dtype,
+            bias=layer_inputs.w1_bias,
         ),
         w2=_local_weight(
             layer_inputs.w2,
@@ -140,6 +148,7 @@ class GmmCase:
             **local,
             quant_block_size=shape.w_quant_block_size,
             quant_dtype=shape.w_dtype,
+            bias=layer_inputs.w2_bias,
         ),
         routing=helper_inputs.Routing.make_routing(
             topk_indices, shape.num_experts, **local

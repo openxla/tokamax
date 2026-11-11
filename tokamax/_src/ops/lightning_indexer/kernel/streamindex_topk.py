@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TPU-Friendly StreamIndex Top-K kernel."""
+"""TPU-Friendly StreamIndex Top-K kernel.
+
+Optimization Provenance:
+  Blocked prefill scoring (`_BlockedPrefillConfig` with dual-MXU head-group
+  splitting and strided VMEM score stores), 128-aligned metadata `max_steps`,
+  zero-step `emit_pipeline` guard (`@pl.when(metadata_ref.num_steps[chunk_idx] >
+  0)`),
+  single-pass `uniform_q_len is None` dispatch fast paths, and single-stage
+  `VMEM_SHARED` SparseCore top-k with single-mask (`key > lo_b`) candidate
+  compaction and fused `sparsecore_topk_dcp_merge` developed via Jetski Teamwork
+  + Auto evolutionary RSI optimization.
+"""
 
 import dataclasses
 import functools
@@ -29,7 +40,6 @@ from jax.sharding import PartitionSpec as P
 from tokamax._src.ops.lightning_indexer.kernel import (
     bref_override,
     config,
-    dcp_sc_compact,
     metadata,
     tc_streamindex_topk,
     tc_topk as tc_topk_lib,
@@ -38,6 +48,7 @@ from tokamax._src.ops.topk import pallas_mosaic_tpu_kernel
 
 BITS_NEG_INF = pallas_mosaic_tpu_kernel.BITS_NEG_INF
 sparsecore_topk = pallas_mosaic_tpu_kernel.sparsecore_topk
+sparsecore_topk_dcp_merge = pallas_mosaic_tpu_kernel.sparsecore_topk_dcp_merge
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
@@ -1535,8 +1546,6 @@ def streamindex_topk(
     if num_chunks > 1:
       group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
-    need_scores = cp_size > 1 or return_scores
-
     chunk_starts = (
         (None,)
         if num_chunks == 1
@@ -1554,9 +1563,6 @@ def streamindex_topk(
       # Chunk 0's scoring and the last top-k have no partner.
       tc_group = None if m == 0 else group_base + m - 1
       sc_group = None if m == num_chunks - 1 else group_base + m
-      # Stage 2 lands one group later than its own stage 1, so it overlaps
-      # chunk m + 2's scoring. The last two chunks have no later group.
-      sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
       start = m * chunk_len
       scores = _scores_for_chunk(
@@ -1575,23 +1581,34 @@ def streamindex_topk(
             constant_values=BITS_NEG_INF,
         )
 
-      chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-          scores,
-          k,
-          row_lengths=eff_row_lengths[start : start + chunk_len],
-          write_empty_rows=True,
-          scheduling_group_id=sc_group,
-          stage2_scheduling_group_id=sc2_group,
-          return_scores=True,
-      )
-      topk_idxs.append(chunk_topk_idxs)
-      if need_scores:
+      if return_scores:
+        chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+            scores,
+            k,
+            row_lengths=eff_row_lengths[start : start + chunk_len],
+            write_empty_rows=True,
+            scheduling_group_id=sc_group,
+            return_scores=True,
+        )
         topk_scores_list.append(chunk_topk_scores)
+      else:
+        chunk_topk_idxs = sparsecore_topk(
+            scores,
+            k,
+            row_lengths=eff_row_lengths[start : start + chunk_len],
+            write_empty_rows=True,
+            scheduling_group_id=sc_group,
+            return_scores=False,
+        )
+      topk_idxs.append(chunk_topk_idxs)
 
     out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
     out = out[:max_num_tokens, :k]
 
     if cp_size == 1 and not return_scores:
+      return out
+
+    if not return_scores:
       return out
 
     scores_out = (
@@ -1600,9 +1617,6 @@ def streamindex_topk(
         else jnp.concatenate(topk_scores_list)
     )
     scores_out = scores_out[:max_num_tokens, :k]
-
-    if not return_scores:
-      return out
     return out, scores_out
 
   def _fast_path(_):
@@ -1687,19 +1701,16 @@ def streamindex_topk_dcp(
        on its owner rank. Thus, every true global winner is guaranteed to
        survive into its owner's local candidate list.
     2. Candidate All-Gather: A single `all_gather` along the candidate axis
-       (axis 1) exchanges candidate *scores* only, rank-major:
-       `[T, k] -> [T, dcp_size * k]`. The indices are not exchanged, so they
-       never leave the rank that produced them.
-    3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
-       `[T, dcp_size * k]` scores to select the exact top-k global winners:
-       `[T, dcp_size * k] -> [T, k]`.
-    4. Rank-Local Filtering: `dcp_sc_compact.resolve_owned_winners` keeps the
-       slots whose chunk came from `dcp_rank`, resolves them against this
-       rank's own pre-gather indices at `slot % k`, and left-packs them into a
-       `-1` padded prefix. Those indices are rank-local already -- they never
-       crossed the gather -- so no coordinate conversion is needed and
-       ownership is decided in exactly one place. The ranks' outputs form an
-       exact partition of the global top-k.
+       (axis 1) exchanges only the candidate *scores*:
+       `[T, k] -> [T, dcp_size * k]`. The local candidate indices stay home.
+    3. Fused SparseCore Merge, Owner Filter & Prefix Compaction: Each rank runs
+       `sparsecore_topk_dcp_merge` over the gathered `[T, dcp_size * k]` scores
+       and its pre-gather `idxs[T, k]`. Inside a single SparseCore pass, the
+       kernel finds the exact global top-k threshold across all `dcp_size * k`
+       scores, scans only `[dcp_rank * k, (dcp_rank + 1) * k)` during emission,
+       resolves surviving slots directly to `idxs`, and left-packs them into a
+       `-1`-padded prefix of width `k`. The ranks' outputs form an exact
+       partition of the global top-k.
 
   When `tc_topk=True`, steps 1, 3, and 4 run on TensorCore via
   `tc_streamindex_topk` and `tc_topk.dcp_merge_and_compact_tc`, with the same
@@ -1819,18 +1830,14 @@ def streamindex_topk_dcp(
           inputs_sorted=True,
       )
 
-    # Stage 2. Full width as the row length: -inf entries (unfilled local
-    # slots, padding tokens) are never selected, so they need no masking.
-    slots = sparsecore_topk(
+    # Stage 2. Fused SparseCore global top-k threshold selection, owner
+    # filtering, local index resolution, and prefix compaction.
+    return sparsecore_topk_dcp_merge(
         scores,
+        idxs,
         k,
-        row_lengths=jnp.full(
-            (scores.shape[0],), scores.shape[1], dtype=jnp.int32
-        ),
-        write_empty_rows=True,
-    )
-    return dcp_sc_compact.resolve_owned_winners(
-        idxs, slots, k, dcp_rank, tc_topk=tc_topk
+        dcp_rank=dcp_rank,
+        dcp_size=dcp_size,
     )
 
   replicated = P()

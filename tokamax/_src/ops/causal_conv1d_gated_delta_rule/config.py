@@ -224,6 +224,11 @@ class GDNConfig:
   # descriptors and register spills without reducing per-slot compute.
   DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
   MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
+  # Cap each batched recurrent contraction at 128 (seq, v_head) slices so
+  # intra-step f32 state_updated and state_new live ranges fit tiling.py's
+  # single-state working budget when seq_tile_size * num_v_heads reaches 256.
+  MAX_BATCHED_RECURRENT_HEADS: ClassVar[int] = 128
+
 
   @classmethod
   def get_vmem_limit_bytes(

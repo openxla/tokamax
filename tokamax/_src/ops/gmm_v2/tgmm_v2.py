@@ -204,11 +204,38 @@ def calculate_tgmm_tiling(
         f" tiles=({tile_m},{tile_k},{tile_n}), vmem={vmem_limit_bytes}"
     )
 
-  max_num_buckets = 4
+  # In MegaCore mode both the n and k grid dimensions are parallel (see
+  # `tgmm_kernel_main`), and the grid is split across TensorCores along the
+  # first of them whose tile count is a multiple of `num_cores`. If neither is,
+  # split the larger of k and n, so that each core re-reads only the operand of
+  # the smaller one. Splitting only shrinks tiles, so VMEM usage stays in limit.
+  num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
+  if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
+    tile_k_lower_bound = min(
+        pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
+    )
+    split_k = gmm_v2.split_for_cores(
+        dims.size_k, num_k_tiles, num_cores, num_lanes, tile_k_lower_bound
+    )
+    split_n = gmm_v2.split_for_cores(
+        dims.size_n, num_n_tiles, num_cores, num_lanes, tile_n_lower_bound
+    )
+    if split_k is not None and (dims.size_k >= dims.size_n or split_n is None):
+      num_k_tiles, tile_k = split_k
+    elif split_n is not None:
+      num_n_tiles, tile_n = split_n
+
+  # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
+  # full-tile int32 masks alongside the accumulator in VREGs, causing severe
+  # register spills. Also cap tile_m at the average group size so small-group
+  # shapes do not pad past typical group boundaries.
+  max_num_buckets = 2
   bucket_base = tile_m
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if not within_vmem_limit(new_tile_m, tile_k, tile_n):
       break

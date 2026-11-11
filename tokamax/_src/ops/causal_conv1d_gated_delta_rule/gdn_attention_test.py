@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import arg_specs
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import compute_gdn
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import config
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import memory_ref
 from tokamax._src.ops.causal_conv1d_gated_delta_rule import test_base
@@ -1568,11 +1569,6 @@ class GDNAttentionTest(parameterized.TestCase):
 
   def test_state_pipeline_has_no_dma_race(self):
     """Pallas interpret-mode vector-clock detector finds zero DMA races."""
-    if jax.__version_info__ < (0, 11, 2):
-      self.skipTest(
-          "Pallas TPU interpret mode requires jax >= 0.11.2 to unwrap"
-          " TransformedRef views."
-      )
     n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
     dim = 2 * n_kq * d_k + n_v * d_v
     # 6 decode sequences, then 3 one-token prefill sequences (one PER_SEQ tile
@@ -3284,6 +3280,151 @@ class GDNArgSpecsTest(absltest.TestCase):
           num_spec_tokens=3,
           distribution=[1, 1, 1],
       )
+
+  def test_recurrent_gdn_batched_multi_token_window_with_ragged_masks(self):
+    """Batched recurrent_gdn matches explicit per-sequence 2-dot reference across W=1, 4 and ragged real_sizes."""
+    for w_sz in (1, 4):
+      for comp_dt, tol in ((jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)):
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(
+                act_in=jnp.dtype(comp_dt),
+                act_out=jnp.dtype(comp_dt),
+                compute=jnp.dtype(comp_dt),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            ),
+            batch_size=8 * w_sz,
+            dim_size=1536,
+            kernel_size=4,
+            tile_size=8,
+            num_kq_heads=2,
+            num_v_heads=8,
+            kq_head_dim=128,
+            v_head_dim=128,
+            num_buffers=2,
+            window_size=w_sz,
+            attention_mode=config.AttentionMode.GDN,
+        )
+        real_sizes = jnp.array(
+            [w_sz, max(1, w_sz - 1), w_sz, 1, w_sz, w_sz, 0, w_sz],
+            dtype=jnp.int32,
+        )
+        q_c = jax.random.normal(
+            jax.random.key(42), (8, 2, w_sz, 1, 128), dtype=comp_dt
+        )
+        k_c = jax.random.normal(
+            jax.random.key(43), (8, 2, w_sz, 1, 128), dtype=comp_dt
+        )
+        v_c = jax.random.normal(
+            jax.random.key(44), (8, 8, w_sz, 1, 128), dtype=comp_dt
+        )
+        b_c = jax.random.normal(
+            jax.random.key(45), (8, 1, w_sz, 1, 128), dtype=comp_dt
+        )
+        a_c = jax.random.normal(
+            jax.random.key(46), (8, 1, w_sz, 1, 128), dtype=comp_dt
+        )
+        s_prev = jax.random.normal(
+            jax.random.key(47), (8, 8, 128, 128), dtype=jnp.float32
+        )
+        a_log = jax.random.normal(jax.random.key(48), (128,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(
+            jax.random.key(49), (128,), dtype=jnp.float32
+        )
+
+        with jax.default_matmul_precision("highest"):
+          out, state = compute_gdn.recurrent_gdn(
+              real_sizes, q_c, k_c, v_c, b_c, a_c, s_prev, a_log, dt_bias, cfg
+          )
+          # Build explicit per-sequence 2-dot reference across all 8 sequence slots.
+          mask_dt = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
+          iota = jax.lax.broadcasted_iota(mask_dt, (8, 1, w_sz, 1, 1), 2)
+          mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dt)
+          q_m = compute_gdn.l2_norm(jnp.where(mask, q_c.astype(comp_dt), 0)) * (
+              128**-0.5
+          )
+          k_m = compute_gdn.l2_norm(jnp.where(mask, k_c.astype(comp_dt), 0))
+          k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
+          v_m = jnp.where(mask, v_c.astype(comp_dt), 0)
+          beta_m = compute_gdn.fused_transpose_broadcast(
+              jnp.where(mask, jax.nn.sigmoid(b_c.astype(comp_dt)), 0),
+              src_dim=4,
+              dst_dim=1,
+          )[:, :8]
+          g_m = compute_gdn.fused_transpose_broadcast(
+              jnp.exp(
+                  jnp.where(
+                      mask,
+                      -jnp.exp(a_log.reshape(1, 1, 1, 1, -1).astype(comp_dt))
+                      * jax.nn.softplus(
+                          a_c.astype(comp_dt)
+                          + dt_bias.reshape(1, 1, 1, 1, -1).astype(comp_dt)
+                      ),
+                      0,
+                  )
+              ),
+              src_dim=4,
+              dst_dim=1,
+          )[:, :8]
+          ref_outs, ref_states = [], []
+          for s_i in range(8):
+            st = s_prev[s_i]
+            o_seq, s_seq = [], []
+            for c_i in range(w_sz):
+              qc = jnp.repeat(q_m[s_i, :, c_i], 4, axis=0)
+              kc = jnp.repeat(k_m[s_i, :, c_i], 4, axis=0)
+              kt = jnp.repeat(k_t[s_i, :, c_i], 4, axis=0)
+              st_u = st * g_m[s_i, :, c_i]
+              vu = jax.lax.dot(
+                  kc,
+                  st_u,
+                  dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                  preferred_element_type=jnp.float32,
+              ).astype(comp_dt)
+              vn = beta_m[s_i, :, c_i] * (v_m[s_i, :, c_i] - vu)
+              st = st_u + kt * vn
+              ot = jax.lax.dot(
+                  qc,
+                  st,
+                  dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                  preferred_element_type=jnp.float32,
+              ).astype(comp_dt)
+              o_seq.append(ot[:, 0, :])
+              s_seq.append(st)
+            ref_outs.append(jnp.stack(o_seq, axis=0))
+            ref_states.append(jnp.stack(s_seq, axis=0))
+          ref_out = jnp.stack(ref_outs, axis=0)
+          ref_state = jnp.stack(ref_states, axis=0)
+
+        np.testing.assert_allclose(
+            np.asarray(out, np.float32),
+            np.asarray(ref_out, np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+        np.testing.assert_allclose(
+            np.asarray(state, np.float32),
+            np.asarray(ref_state, np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out[6], np.float32), 0.0, atol=tol
+        )
+        if w_sz == 4:
+          np.testing.assert_allclose(
+              np.asarray(state[1, 3], np.float32),
+              np.asarray(state[1, 2], np.float32),
+              rtol=tol,
+              atol=tol,
+          )
+          np.testing.assert_allclose(
+              np.asarray(state[3, 3], np.float32),
+              np.asarray(state[3, 0], np.float32),
+              rtol=tol,
+              atol=tol,
+          )
 
 
 if __name__ == "__main__":

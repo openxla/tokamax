@@ -76,9 +76,7 @@ class SparseMlaBenchmark(parameterized.TestCase):
             jax.devices()[0]
         )
     ):
-      self.skipTest(
-          'PallasTpuSparseMla is only supported on TPU v7+ with SparseCore.'
-      )
+      self.skipTest('PallasTpuSparseMla is only supported on TPU v7+.')
 
     example = EXAMPLES[args_spec_name] | {'implementation': implementation}
     fn, args = tokamax.standardize_function(

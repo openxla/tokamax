@@ -35,27 +35,16 @@ def skip_unless_supported(
     test_case.skipTest("Only supported on TPUs.")
   if pltpu.get_tpu_info().generation < 7:
     test_case.skipTest("Only tested on TPUv7x for now.")
-  if jax.__version_info__ < (0, 11, 2):
-    test_case.skipTest("routing_moe requires JAX >= 0.11.2.")
   if jax.device_count() < min_devices:
     test_case.skipTest(f"Requires at least {min_devices} devices.")
 
 
-def check_gmm_supported(
-    case: helper_cases.Case, *, live_group_walk: bool = False
-) -> None:
+def check_gmm_supported(case: helper_cases.Case) -> None:
   """Skips the test if `case` uses features unsupported by `routing_gmm`."""
-  if case.shape.has_bias:
-    raise absltest.SkipTest("TODO: Support bias in routing_moe.")
   if case.local_intermediate_size % 256 != 0:
     raise absltest.SkipTest(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"
         " multiple of 256 even when up & down can be fused."
-    )
-  if live_group_walk and case.num_tokens >= 65536:
-    raise absltest.SkipTest(
-        "TODO: live_group_walk places row_group in SMEM, which overflows"
-        " at 64k tokens."
     )
 
 
@@ -64,6 +53,8 @@ def check_moe_supported(
 ) -> None:
   """Skips the test if `case` or the mesh layout is unsupported."""
   check_gmm_supported(case)
+  if case.shape.has_bias:
+    raise absltest.SkipTest("TODO: Support bias in routing_moe.")
   if remote_scatter and case.sharding.ep > 1 and case.sharding.tp > 1:
     raise absltest.SkipTest(
         "TODO: Support remote_scatter with hybrid parallelism."

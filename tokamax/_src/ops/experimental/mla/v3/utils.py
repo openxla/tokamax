@@ -21,6 +21,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.mla import utils as mla_utils
 
 
 def align_to(a: Any, b: int) -> Any:
@@ -85,48 +86,10 @@ def get_kv_cache_shape(total_num_pages, page_size, kv_dim, kv_dtype):
   )
 
 
-def transpose_kv_cache_to_seq_along_lane(
-    cache_kv: jax.Array,
-    kv_packing: int | None = None,
-) -> jax.Array:
-  """Transposes KV cache to 3D transposed format [pages, kv_dim, page_size]."""
-  if cache_kv.ndim == 4:
-    total_num_pages, page_size_per_packing, packing, kv_dim = cache_kv.shape
-    if kv_packing is not None:
-      assert kv_packing == packing
-    page_size = page_size_per_packing * packing
-    flat_tokens = cache_kv.reshape((total_num_pages, page_size, kv_dim))
-  else:
-    total_num_pages, page_size, kv_dim = cache_kv.shape
-    flat_tokens = cache_kv
-
-  return flat_tokens.transpose((0, 2, 1))
-
-
-def transpose_kv_cache_from_seq_along_lane(
-    transposed_cache_kv: jax.Array,
-    kv_packing: int | None = None,
-) -> jax.Array:
-  """Transposes 3D transposed KV cache [pages, kv_dim, page_size]
-
-  back to untransposed 4D KV cache [pages, page_size // P, P, kv_dim].
-  """
-  if transposed_cache_kv.ndim == 4:
-    total_num_pages, kv_sublanes, packing, page_size = transposed_cache_kv.shape
-    if kv_packing is not None:
-      assert kv_packing == packing
-    kv_dim = kv_sublanes * packing
-    flat_channels = transposed_cache_kv.reshape(
-        (total_num_pages, kv_dim, page_size)
-    )
-  else:
-    total_num_pages, kv_dim, page_size = transposed_cache_kv.shape
-    flat_channels = transposed_cache_kv
-    if kv_packing is None:
-      kv_packing = get_dtype_packing(transposed_cache_kv.dtype)
-    packing = kv_packing
-
-  untransposed_2d = flat_channels.transpose((0, 2, 1))
-  return untransposed_2d.reshape(
-      (total_num_pages, page_size // packing, packing, kv_dim)
-  )
+# Shared with the MLA base op's XLA reference; re-exported for v3 callers.
+transpose_kv_cache_to_seq_along_lane = (
+    mla_utils.transpose_kv_cache_to_seq_along_lane
+)
+transpose_kv_cache_from_seq_along_lane = (
+    mla_utils.transpose_kv_cache_from_seq_along_lane
+)

@@ -314,8 +314,11 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     'ops-flex-attention': Spec(
-        paths=('tokamax/_src/ops/experimental/flex_attention/base_test.py',),
-        minutes=2,
+        paths=(
+            'tokamax/_src/ops/experimental/flex_attention/api_test.py',
+            'tokamax/_src/ops/experimental/flex_attention/base_test.py',
+        ),
+        minutes=3,
         compat_minutes=1,
     ),
     'ops-triangle-multiplication': Spec(
@@ -374,6 +377,7 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-gmm-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/common/dataclass_util_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/common/layout_util_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/module_scope_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/out_format_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
@@ -493,10 +497,12 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/lightning_indexer/kernel/metadata_test.py',
             'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_dcp_test.py',
             'tokamax/_src/ops/lightning_indexer/kernel/streamindex_topk_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/tc_streamindex_topk_test.py',
+            'tokamax/_src/ops/lightning_indexer/kernel/tc_topk_test.py',
             'tokamax/_src/ops/lightning_indexer/pallas_mosaic_tpu_test.py',
         ),
-        minutes=4,
-        compat_minutes=2,
+        minutes=10,
+        compat_minutes=3,
     ),
     'experimental-mhc-lite': Spec(
         paths=(
@@ -515,6 +521,23 @@ SHARDS: ShardMap = {
         ),
         minutes=4,
         compat_minutes=3,
+    ),
+    'experimental-dedup-moe': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/dedup_moe/test/dedup_plan/dedup_plan_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/dedup_plan/source_plan_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/dedup_plan/topology_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/dispatch/wave_dispatch_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/dispatch/wave_order_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/dedup_moe_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/layer_interpret_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/mode_registry_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/modular_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/padding_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/plan_test.py',
+            'tokamax/_src/ops/experimental/dedup_moe/test/layer/tpu_correctness_test.py',
+        ),
+        minutes=3,
     ),
     'experimental-deepseek-rope': Spec(
         paths=(
@@ -600,6 +623,14 @@ SHARDS: ShardMap = {
         minutes=1,
         compat_minutes=1,
     ),
+    'experimental-gdn2': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/gdn2/base_test.py',
+            'tokamax/_src/ops/experimental/gdn2/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
     'experimental-mla-v3': Spec(
         paths=(
             'tokamax/_src/ops/experimental/mla/v3/flash_attention_test.py',
@@ -607,6 +638,42 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/mla/v3/schedule_test.py',
         ),
         minutes=40,
+        compat_minutes=1,
+    ),
+    # See experimental-gdn2.
+    'experimental-moba': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/moba/base_test.py',
+            'tokamax/_src/ops/experimental/moba/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
+    # See experimental-gdn2.
+    'experimental-nsa': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/nsa/base_test.py',
+            'tokamax/_src/ops/experimental/nsa/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
+    # See experimental-gdn2.
+    'experimental-raven': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/raven/base_test.py',
+            'tokamax/_src/ops/experimental/raven/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=1,
+        compat_minutes=1,
+    ),
+    # See experimental-gdn2.
+    'experimental-rwkv7': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/rwkv7/base_test.py',
+            'tokamax/_src/ops/experimental/rwkv7/pallas_mosaic_tpu_test.py',
+        ),
+        minutes=1,
         compat_minutes=1,
     ),
     # Separated from experimental-topk-kernel to isolate TPU-only tests.

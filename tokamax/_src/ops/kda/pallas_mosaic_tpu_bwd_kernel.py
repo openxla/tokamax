@@ -34,6 +34,7 @@ from tokamax._src.ops.kda.common import (
     chunk_gated_delta_rule_fwd_h,
     estimate_mini_batch,
     get_tpu_limits,
+    get_vmem_limit_bytes,
     kda_gate_chunk_cumsum,
 )
 from tokamax._src.ops.kda.cp_utils import (
@@ -59,38 +60,50 @@ from tokamax._src.ops.kda.utils import (
 # Context-parallel backward pre-process
 # =============================================================================
 
+# Dimensions.
+#   B: batch size
+#   H: number of value heads (H_QK for query/key heads when GQA is active)
+#   MB: mini-batch of heads/chunks processed per grid point
+#   T: sequence length
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (64 or 128)
+#   BC: sub-chunk block size (16)
+#   N: max number of segments per batch element
+#   K: key/query head dimension
+#   V: value head dimension
+#   GW: gate channel width (1 for scalar gate, K for per-channel gate)
+
 
 def _chunk_gated_delta_rule_bwd_dhu_pre_process_kernel(
-  chunk_active_ref,   # SMEM [NT] int32 -- per-chunk activeness mask
-  q_ref,              # HBM [H*NT*BT, K]
-  k_ref,              # HBM [H*NT*BT, K]
-  w_ref,              # HBM [H*NT*BT, K]
-  do_ref,             # HBM [H*NT*BT, V]
-  dv_ref,             # HBM [H*NT*BT, V]
-  gk_ref,             # HBM [H*NT*BT, K]
-  # outputs
-  dS_ext_ref,         # HBM [H, K, V]
-  dM_ref,             # HBM [H, K, K]
-  # scratch: 6 double-buffered inputs (with MB batch dim)
-  q_scratch_ref,      # VMEM [2, MB, BT, K]
-  k_scratch_ref,      # VMEM [2, MB, BT, K]
-  w_scratch_ref,      # VMEM [2, MB, BT, K]
-  do_scratch_ref,     # VMEM [2, MB, BT, V]
-  dv_scratch_ref,     # VMEM [2, MB, BT, V]
-  gk_scratch_ref,     # VMEM [2, MB, BT, K]
-  # scratch: accumulators (with MB batch dim)
-  dh_acc_ref,         # VMEM [MB, K, V] fp32
-  M_acc_ref,          # VMEM [MB, K, K] fp32
-  # semaphores
-  sems,               # DMA [8, 2]
-  *,
-  H,
-  NT,
-  BT,
-  K,
-  MB,
-  SCALE,
-  USE_EXP2,
+    # Inputs.
+    chunk_active_ref,  # SMEM [NT] int32 -- per-chunk activeness mask
+    q_ref,  # HBM [H*NT*BT, K]
+    k_ref,  # HBM [H*NT*BT, K]
+    w_ref,  # HBM [H*NT*BT, K]
+    do_ref,  # HBM [H*NT*BT, V]
+    dv_ref,  # HBM [H*NT*BT, V]
+    gk_ref,  # HBM [H*NT*BT, K]
+    # Outputs.
+    dS_ext_ref,  # HBM [H, K, V]
+    dM_ref,  # HBM [H, K, K]
+    # Scratch.
+    q_scratch_ref,  # VMEM [2, MB, BT, K]
+    k_scratch_ref,  # VMEM [2, MB, BT, K]
+    w_scratch_ref,  # VMEM [2, MB, BT, K]
+    do_scratch_ref,  # VMEM [2, MB, BT, V]
+    dv_scratch_ref,  # VMEM [2, MB, BT, V]
+    gk_scratch_ref,  # VMEM [2, MB, BT, K]
+    dh_acc_ref,  # VMEM [MB, K, V] fp32
+    M_acc_ref,  # VMEM [MB, K, K] fp32
+    sems,  # DMA [8, 2]
+    *,
+    H,
+    NT,
+    BT,
+    K,
+    MB,
+    SCALE,
+    USE_EXP2,
 ):
   """Reverse-time chunk-recurrence kernel with hand-pipelined DMA.
 
@@ -316,19 +329,15 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
   chunk_seg_ids = seg.reshape(NT, BT)[:, 0]
   chunk_active = ((chunk_seg_ids == first_seg_id) & has_real).astype(jnp.int32)
 
-  # ── Auto MB: maximise VMEM utilisation, capped at min(H, 16) ──
+  # ── Auto MB: maximise VMEM utilisation ──
   q_elem = 2 if q.dtype == jnp.bfloat16 else 4
   gk_elem = 2 if gk.dtype == jnp.bfloat16 else 4
   do_elem = 2 if do.dtype == jnp.bfloat16 else 4
   per_head = (
-    2 * BT * (3 * K * q_elem + K * gk_elem + 2 * V * do_elem)
-    + (K * V + K * K) * 4
+      2 * BT * (3 * K * q_elem + K * gk_elem + 2 * V * do_elem)
+      + (K * V + K * K) * 4
   )
-  vmem_budget = 8 * 1024 * 1024
-  MB = max(1, vmem_budget // per_head)
-  MB = min(MB, H, 16)
-  while H % MB != 0 and MB > 1:
-    MB -= 1
+  MB = estimate_mini_batch(per_head, H)
 
   # ── Reshape inputs: [H, 1, T, dim] → [H*NT*BT, dim] (no transpose) ──
   q_r = q.reshape(H * NT * BT, K)
@@ -745,11 +754,12 @@ def fused_recompute_w_u_vnew_from_h_pallas(
   total = H * B * NT
   total_orig = total  # saved for unpadding before _ir reshape
 
+  _, _, h_num_chunks, _, _ = h.shape
   assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
   assert A.shape[-1] == BT, (
       f"A.shape[-1]={A.shape[-1]} must equal chunk_size={BT}"
   )
-  assert h.shape[2] == NT, f"h has NT={h.shape[2]}, expected {NT}"
+  assert h_num_chunks == NT, f"h has NT={h_num_chunks}, expected {NT}"
 
   def _r(x, d):
     return x.reshape(total, BT, d)
@@ -768,9 +778,9 @@ def fused_recompute_w_u_vnew_from_h_pallas(
     in_bytes = (3 * BT * K + BT * V + BT + BT * BT + K * V) * elem_size  # beta: BT bytes (2D)
     out_bytes = (3 * BT * K + BT * V) * elem_size
     per_chunk = in_bytes + out_bytes
-    vmem_budget = 8 * 1024 * 1024
+    vmem_budget = get_vmem_limit_bytes()
     hw_mb = max(1, vmem_budget // per_chunk)
-    MB = min(hw_mb, total)
+    MB = min(hw_mb, total, 32)
     # align upward to block_align_minor (TPU dim=-2 constraint)
     MB = min(align_up(MB, align_minor), total)
     # try to make total divisible by MB; reduce MB first, pad as fallback
@@ -967,13 +977,13 @@ def compute_intra_backward(
   q_hat = q_b * row_d
   k_hat = k_b * beta_b * row_d
 
-  K = bq.shape[2]
-  MB = bq.shape[0]
+  MB, _, K = bq.shape
   NM = NC * MB
   _b1 = (((2,), (1,)), ((0,), (0,)))
   _b1t = (((1,), (1,)), ((0,), (0,)))
   def _f(x):
-    return x.reshape(NM, x.shape[2], x.shape[3])
+    _, _, d2, d3 = x.shape
+    return x.reshape(NM, d2, d3)
 
   _sc_row = lambda x: _f(row_d) * x
   _sc_col = lambda x: _f(col_d) * x
@@ -1666,8 +1676,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     if h.shape != (B, NT, H, K, V):
       raise ValueError(f"h.shape={h.shape}, expected {(B, NT, H, K, V)}.")
   else:
-    if h.shape[2] != NT:
-      raise ValueError(f"h has NT={h.shape[2]}, expected {NT}.")
+    _, _, h_num_chunks, _, _ = h.shape
+    if h_num_chunks != NT:
+      raise ValueError(f"h has NT={h_num_chunks}, expected {NT}.")
   if not use_exp2:
     raise NotImplementedError(
         "fused_dhu_wy_intra_cumsum_pallas currently expects log2 gates and"
@@ -1746,15 +1757,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         * 4
     )
     per_head = io_per_head + io_per_head * 3 // 2
-    hw = get_tpu_limits()
-    vmem_budget = hw.vmem_limit_bytes
+    vmem_budget = get_vmem_limit_bytes()
     # Scale down VMEM budget for chunk sizes > 64 (override via KDA_BWD_VMEM_FRACTION).
     _frac = float(os.environ.get("KDA_BWD_VMEM_FRACTION", "0") or 0)
     if _frac > 0:
       vmem_budget = int(vmem_budget * _frac)
     elif BT > 64:
       vmem_budget = (vmem_budget * 64) // BT
-    if (
+    is_stateless_bf16_scalar = (
         act_dtype == jnp.bfloat16
         and not per_channel_gate
         and not has_qg_kg_w
@@ -1763,16 +1773,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
         and not return_dh0
         and dqkv_out_dtype == jnp.bfloat16
         and BT <= 64
-    ) or (per_channel_gate and hw.vmem_limit_bytes > 64 * 1024 * 1024):
-      max_mb = 32
-    else:
-      max_mb = 16
-    MB = max(1, vmem_budget // per_head)
-    MB = max(gqa_repeats, min(MB, H, max(max_mb, gqa_repeats)))
-    while MB > gqa_repeats:
-      if H % MB == 0 and MB % gqa_repeats == 0:
-        break
-      MB -= 1
+    )
+    MB = estimate_mini_batch(
+        per_head,
+        H,
+        max_mb=32 if is_stateless_bf16_scalar else None,
+        vmem_budget=vmem_budget,
+        multiple_of=gqa_repeats,
+    )  # pylint: disable=invalid-name
   else:
     MB = mini_batch
   if H % MB != 0:
@@ -2250,11 +2258,7 @@ def chunk_kda_bwd_dAv_kernel(
     in_bytes = (2 * BT * V + BT * BT) * elem_size
     out_bytes = (BT * BT * 4 + BT * V * 2)
     per_chunk = in_bytes + out_bytes
-    # Pin MB=1 for BT > 64. `per_chunk` above counts only the pipelined I/O
-    # blocks, not the in-kernel f32 [MB, BT, BT] intermediates (masked A and
-    # the dA accumulator), which grow quadratically with BT.
-    max_mb = 1 if BT > 64 else 32
-    MB = estimate_mini_batch(per_chunk, total, max_mb=max_mb)
+    MB = estimate_mini_batch(per_chunk, total, chunk_size=BT)
   else:
     MB = mini_batch
     assert total % MB == 0, f"total={total} must be divisible by mini_batch={MB}"
@@ -2454,7 +2458,7 @@ def chunk_kda_bwd_custom(
   cu_seqlens_bwd = None
   T_orig = None
   if cu_seqlens is not None:
-    T_orig = do.shape[2]
+    _, _, T_orig, _ = do.shape
     [do], [], _, _ = _align_seqs(
         [do],
         [],
@@ -2526,8 +2530,9 @@ def chunk_kda_bwd_custom(
     raise ValueError(
         "`max_num_segments` is required when segment metadata is unavailable."
     )
-  if do.shape[2] != T:
-    raise ValueError(f"aligned do has T={do.shape[2]}, expected {T}")
+  _, _, do_seq_len, _ = do.shape
+  if do_seq_len != T:
+    raise ValueError(f"aligned do has T={do_seq_len}, expected {T}")
   if Aqk.shape[-1] != BT or Akk.shape[-1] != BT:
     raise ValueError(f"Aqk/Akk block size must equal chunk_size={BT}")
 
@@ -2565,8 +2570,9 @@ def chunk_kda_bwd_custom(
 
     if h is None:
       raise ValueError("saved h is required when recompute is disabled")
-    if h.shape[2] != NT:
-      raise ValueError(f"saved h has NT={h.shape[2]}, expected {NT}")
+    _, _, h_num_chunks, _, _ = h.shape
+    if h_num_chunks != NT:
+      raise ValueError(f"saved h has NT={h_num_chunks}, expected {NT}")
 
     assert g is not None
     if v_new is not None:
@@ -2637,8 +2643,9 @@ def chunk_kda_bwd_custom(
         use_exp2=True,
     )
     # Varlen: pad h from NT_total to NT chunks (padding chunks get zero state)
-    if cu_seqlens is not None and h.shape[2] < NT:
-      h = jnp.pad(h, ((0, 0), (0, 0), (0, NT - h.shape[2]), (0, 0), (0, 0)))
+    _, _, h_num_chunks, _, _ = h.shape
+    if cu_seqlens is not None and h_num_chunks < NT:
+      h = jnp.pad(h, ((0, 0), (0, 0), (0, NT - h_num_chunks), (0, 0), (0, 0)))
 
   assert v_new is not None
   # ---- Stage 1: dAqk and initial dv ----
@@ -2660,7 +2667,7 @@ def chunk_kda_bwd_custom(
       raise ValueError("backward CP requires post_num_ranks")
     if context_parallel_metadata.is_last_rank is None:
       raise ValueError("backward CP requires is_last_rank")
-    # pre_process requires segment_ids length == aligned T (q.shape[2]).
+    # pre_process requires segment_ids length == aligned T.
     # Caller's segment_ids is un-aligned (length T_orig); pad with 0
     # (= padding seg id, OOB chunks naturally inactive).
     if segment_ids.ndim == 1:

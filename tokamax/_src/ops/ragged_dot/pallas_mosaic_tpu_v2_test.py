@@ -14,6 +14,8 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU v2 Ragged Dot (GMM v2)."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -645,6 +647,98 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     self.assertTrue(all(c.tile_k % 128 == 0 for c in drhs_configs))
     self.assertTrue(all(c.lhs_buffer_count is None for c in drhs_configs))
 
+
+class PallasMosaicTpuV2VjpConfigTest(parameterized.TestCase):
+  """Verifies which tiling the dlhs sub-op of the custom vjp uses."""
+
+  def setUp(self) -> None:
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 5:
+      self.skipTest("Only supported on TPU gen 5+.")
+    super().setUp()
+
+  def _grads_and_dlhs_tile_infos(
+      self,
+      op: pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot,
+      lhs: jax.Array,
+      rhs: jax.Array,
+      group_sizes: jax.Array,
+  ) -> tuple[tuple[jax.Array, jax.Array], list[object]]:
+    """Returns the vjp grads and the `tile_info` of each dlhs kernel call."""
+
+    def loss(x: jax.Array, w: jax.Array) -> jax.Array:
+      out = op(x, w, group_sizes=group_sizes, preferred_element_type=x.dtype)
+      return jnp.sum(out.astype(jnp.float32))
+
+    jax.clear_caches()
+    with mock.patch.object(
+        gmm_backend, "gmm_v2", wraps=gmm_backend.gmm_v2
+    ) as gmm_spy:
+      grads = jax.grad(loss, argnums=(0, 1))(lhs, rhs)
+    tile_infos = [
+        call.kwargs["tile_info"]
+        for call in gmm_spy.call_args_list
+        if call.kwargs.get("transpose_rhs")
+    ]
+    return grads, tile_infos
+
+  def _inputs(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+    m, k, n, num_groups = 384, 768, 512, 3
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+    return lhs, rhs, group_sizes
+
+  def test_forward_config_is_not_swapped_into_dlhs(self) -> None:
+    # A forward tiling that splits `n` (e.g. across MegaCore TensorCores) must
+    # not be swapped into the dlhs tiling, where `n` is the contracting
+    # dimension and the forward `k` is the output dimension.
+    lhs, rhs, group_sizes = self._inputs()
+    fwd_config = pallas_mosaic_tpu_v2.Config(
+        tile_m=128, tile_k=768, tile_n=256, bucket_base=128
+    )
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(config=fwd_config)
+    (dlhs, drhs), tile_infos = self._grads_and_dlhs_tile_infos(
+        op, lhs, rhs, group_sizes
+    )
+    self.assertLen(tile_infos, 1)
+    self.assertIs(tile_infos[0], gmm_backend.calculate_tiling_from_request)
+
+    (expected_dlhs, expected_drhs), _ = self._grads_and_dlhs_tile_infos(
+        pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(),
+        lhs,
+        rhs,
+        group_sizes,
+    )
+    chex.assert_trees_all_close(dlhs, expected_dlhs, atol=2e-1, rtol=2e-2)
+    chex.assert_trees_all_close(drhs, expected_drhs, atol=2e-1, rtol=2e-2)
+
+  def test_explicit_dlhs_config_is_used(self) -> None:
+    lhs, rhs, group_sizes = self._inputs()
+    dlhs_config = pallas_mosaic_tpu_v2.Config(
+        tile_m=128, tile_k=512, tile_n=384, bucket_base=64, lhs_buffer_count=2
+    )
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(
+        config=pallas_mosaic_tpu_v2.Config(
+            tile_m=128, tile_k=768, tile_n=256, bucket_base=128
+        ),
+        dlhs_config=dlhs_config,
+    )
+    _, tile_infos = self._grads_and_dlhs_tile_infos(op, lhs, rhs, group_sizes)
+    self.assertEqual(
+        tile_infos,
+        [
+            gmm_backend.TileSizes(
+                tile_m=128,
+                tile_k=512,
+                tile_n=384,
+                bucket_base=64,
+                lhs_buffer_count=2,
+            )
+        ],
+    )
 
 
 if __name__ == "__main__":

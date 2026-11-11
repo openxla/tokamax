@@ -62,6 +62,7 @@ def _make_spec(
       num_global_groups=num_experts,
       fuse_act="silu" if with_down else None,
       size_ep=1,
+      size_row_group=routed_rows,
   )
 
 

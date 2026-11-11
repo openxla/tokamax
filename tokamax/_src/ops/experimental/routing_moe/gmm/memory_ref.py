@@ -884,6 +884,13 @@ class PipelineIndexMaps:
     del k_id
     return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, 0, n_id)
 
+  def bias_index(
+      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+  ) -> tuple[jax.Array, int, jax.Array | int]:
+    """Returns the block index tuple for a bias tensor."""
+    del k_id
+    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, n_id)
+
   def idx_index(
       self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
   ) -> jax.Array:
@@ -971,6 +978,23 @@ class PipelineBlockSpecs:
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,
+        memory_space=pltpu.VMEM,
+        # TODO: This is redundant in later JAX versions, remove this
+        # after JAX version update.
+        pipeline_mode=pl.Buffered(
+            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
+        ),
+    )
+
+  def get_bias_spec(
+      self, w_spec: spec_lib.WeightSpec, _: int, tile_n: int
+  ) -> pl.BlockSpec:
+    """Returns the BlockSpec for a bias tensor."""
+    assert w_spec.has_bias
+    block_shape = (None, 1, tile_n)
+    return pl.BlockSpec(
+        block_shape=block_shape,
+        index_map=self.index_map_provider.bias_index,
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
@@ -1085,7 +1109,19 @@ class PipelineAllocs:
           use_lookahead=True,
           grid_rank=3,
       )
-      w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=None)
+      bias_bref = None
+      if w_spec.has_bias:
+        assert w_hbm_ref.bias is not None
+        bias_bref = pltpu.BufferedRef.input(
+            spec=pipeline_block_specs.get_bias_spec(w_spec, tile_k, tile_n),
+            dtype_or_type=w_hbm_ref.bias.dtype,
+            buffer_count=cfg.plan.num_w_buffers,
+            use_lookahead=True,
+            grid_rank=3,
+        )
+      w_bref = SingleWeightRef(
+          weight=weight_bref, scale=scale_bref, bias=bias_bref
+      )
       if fuse_act:
         w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
       return w_bref

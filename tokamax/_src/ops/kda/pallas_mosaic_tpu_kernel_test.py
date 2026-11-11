@@ -31,6 +31,14 @@ from tokamax._src.ops.kda import api
 from tokamax._src.ops.kda import pallas_mosaic_tpu
 from tokamax._src.ops.kda.cp_utils import ContextParallelMetadata
 
+# Dimensions.
+#   B: batch size
+#   H: number of heads
+#   T: sequence length
+#   K: key/query head dimension
+#   V: value head dimension
+# Kernel test helpers validate # Inputs., # Outputs., and # Scratch. contracts.
+
 
 def compute_ulp(
     x: np.ndarray, dtype: jax.typing.DTypeLike
