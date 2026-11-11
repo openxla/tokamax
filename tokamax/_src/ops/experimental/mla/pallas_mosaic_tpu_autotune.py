@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Regenerates the MLA v3 op's autotuning cache. Not a regular test.
+"""Regenerates the MLA op's autotuning cache. Not a regular test.
 
-Autotunes every `arg_specs.V3_ARG_SPECS` entry on the current TPU, one test case
+Autotunes every `arg_specs.ARG_SPECS` entry on the current TPU, one test case
 (and so roughly one shard) per spec. The op's search space varies the decode and
 the prefill/mixed knobs in two separate sweeps; this script then merges the two
 sweeps' winners into one config and times it against them and the heuristic.
 The passes share no knobs, so the merge is the best of both. It writes each
 spec's cache entry to `$TEST_UNDECLARED_OUTPUTS_DIR/<spec name>.json`. Merge
 those JSON objects into
-`tokamax/data/autotuning/<device kind>/pallas_tpu_multi_head_latent_attention_v3.json`.
+`tokamax/data/autotuning/<device kind>/pallas_tpu_multi_head_latent_attention.json`.
 
-Run the `pallas_mosaic_tpu_v3_autotune` test target for the TPU generation to
+Run the `pallas_mosaic_tpu_autotune` test target for the TPU generation to
 tune. The target is tagged `manual`: it regenerates the cache rather than
 testing anything, and ties up a TPU shard per spec for about 15-20 minutes.
 """
@@ -38,12 +38,12 @@ import jax
 from tokamax._src.autotuning import api as autotuning_api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops.experimental.mla import arg_specs
-from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_v3
+from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu
 
 # The fastest config must beat the heuristic by this fraction to replace it.
 _MIN_GAIN = 0.04
 
-_Config = pallas_mosaic_tpu_v3.Config
+_Config = pallas_mosaic_tpu.Config
 _FIELDS = [f.name for f in dataclasses.fields(_Config)]
 _DECODE_FIELDS = [f for f in _FIELDS if f.startswith("decode_")]
 _PREFILL_FIELDS = [f for f in _FIELDS if f.startswith("prefill_")]
@@ -72,14 +72,12 @@ def _pick(timings, heuristic: _Config, candidates) -> _Config:
 class RegenerateAutotuningCache(parameterized.TestCase):
 
   @parameterized.named_parameters(
-      (spec.name, spec) for spec in arg_specs.V3_ARG_SPECS
+      (spec.name, spec) for spec in arg_specs.ARG_SPECS
   )
   def test_autotune(self, spec):
     if jax.default_backend() != "tpu":
       self.skipTest("Requires a TPU.")
-    ba = pallas_mosaic_tpu_v3.PallasTpuMultiHeadLatentAttentionV3().bind(
-        **spec.args
-    )
+    ba = pallas_mosaic_tpu.PallasTpuMultiHeadLatentAttention().bind(**spec.args)
     logging.info(
         "Autotuning %s over %d configs", spec.name, len(ba.autotuning_configs)
     )

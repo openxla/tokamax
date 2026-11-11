@@ -26,8 +26,8 @@ import numpy as np
 
 jax.config.update("jax_numpy_dtype_promotion", "standard")
 
-# Shared by the v2 and v3 kernel tests. Defined once here because absl flags are
-# process-global and pytest imports every test module into one process.
+# Defined once here because absl flags are process-global and pytest imports
+# every test module into one process.
 DEBUG_MODE = flags.DEFINE_bool("debug_mode", False, "Run in debug mode.")
 
 
@@ -71,7 +71,7 @@ def generate_mla_inputs(
     jax.Array,
     jax.Array,
 ]:
-  """Generates inputs for the MLA kernel.
+  """Generates inputs for the MLA op, kernel and reference.
 
   Args:
     seq_lens: List of (q_len, kv_len) for each sequence.
@@ -86,11 +86,12 @@ def generate_mla_inputs(
 
   Returns:
     A tuple containing:
-      - ql_nope: Query linear part without positional encoding.
-      - q_pe: Query positional encoding part.
-      - new_kv_c: New KV cache data.
-      - new_k_pe: New Key positional encoding.
-      - cache_kv: The existing KV cache.
+      - ql_nope: `[heads, tokens, lkv_dim]` query linear part without
+        positional encoding.
+      - q_pe: `[tokens, heads, r_dim]` query positional encoding part.
+      - new_kv_c: `[tokens, lkv_dim]` new KV cache data.
+      - new_k_pe: `[tokens, r_dim]` new key positional encoding.
+      - cache_kv: `[pages, kv_dim, page_size]` existing KV cache.
       - kv_lens: Array of KV lengths for each sequence.
       - page_indices: Indices mapping sequence pages to cache pages.
       - cu_q_lens: Cumulative query lengths.
@@ -123,7 +124,6 @@ def generate_mla_inputs(
   padded_r_dim = align_to(r_dim, 128)
   padded_lkv_dim = align_to(lkv_dim, 128)
   padded_kv_dim = padded_lkv_dim + padded_r_dim
-  packing = get_dtype_packing(kv_dtype)
   q_lens = [s[0] for s in seq_lens]
   kv_lens_list = [s[1] for s in seq_lens]
   total_q_len = sum(q_lens)
@@ -144,15 +144,12 @@ def generate_mla_inputs(
 
   total_num_pages = max(num_pages, page_count)
 
-  ql_nope = gen_random((total_q_len, num_heads, lkv_dim), q_dtype)
+  ql_nope = gen_random((num_heads, total_q_len, lkv_dim), q_dtype)
   q_pe = gen_random((total_q_len, num_heads, r_dim), q_dtype)
   new_kv_c = gen_random((total_q_len, lkv_dim), kv_dtype)
   new_k_pe = gen_random((total_q_len, r_dim), kv_dtype)
 
-  cache_kv = gen_random(
-      (total_num_pages, page_size // packing, packing, padded_kv_dim),
-      kv_dtype,
-  )
+  cache_kv = gen_random((total_num_pages, padded_kv_dim, page_size), kv_dtype)
   kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
   page_indices = jnp.array(page_indices_list, dtype=jnp.int32)
   cu_q_lens = jnp.array(cu_q_lens_list, dtype=jnp.int32)

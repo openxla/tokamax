@@ -23,7 +23,7 @@ from jax import shard_map
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
-from tokamax._src.ops.experimental.mla.v2.transpose import (
+from tokamax._src.ops.experimental.mla.kernel.transpose import (
     prev_closest_valid_divisor,
     xpose_full,
     xpose_pipeline,
@@ -205,7 +205,7 @@ class TestXposePipelineTiling(parameterized.TestCase):
     # We patch the module-level logger and force a JIT retrace so the
     # warning fires regardless of absltest's logging capture behavior.
     with patch(
-        'tokamax._src.ops.experimental.mla.v2.transpose.logger'
+        "tokamax._src.ops.experimental.mla.kernel.transpose.logger"
     ) as mock_logger:
       result = xpose_pipeline(
           input_data, transpose_axes=(1, 0, 2), n_tile=160, m_tile=64
@@ -245,8 +245,8 @@ class TestXposePipelineTiling(parameterized.TestCase):
         jax.random.PRNGKey(0), shape, dtype=jnp.float8_e4m3fn
     )
     with self.assertNoLogs(
-        'tokamax._src.ops.experimental.mla.v2.transpose',
-        level='WARNING',
+        "tokamax._src.ops.experimental.mla.kernel.transpose",
+        level="WARNING",
     ):
       result = xpose_pipeline(
           input_data, transpose_axes=(1, 0, 2), n_tile=160, m_tile=64
@@ -260,7 +260,7 @@ class TestXposePipelineTiling(parameterized.TestCase):
     # n_tile=128, m_tile=64 needs ~33.6 MiB of scoped VMEM, which exceeds
     # XLA's 32 MiB default (--xla_tpu_scoped_vmem_limit_kib) and fails
     # compilation with E1001 CompileTimeScopedVmemOom. This is the exact
-    # shape the MLA v2 kernel's prepare_outputs transpose produces.
+    # shape the MLA kernel's prepare_outputs transpose produces.
     # vmem_limit_bytes raises the limit for this pallas_call only, without
     # any global XLA flag.
     shape = (384, 128, 512)

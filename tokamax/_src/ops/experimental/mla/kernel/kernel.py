@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TPU-Friendly MLA Ragged Paged Attention kernel v3 (Transposed KV Cache)."""
+"""TPU-Friendly MLA Ragged Paged Attention kernel (Transposed KV Cache)."""
 
 import dataclasses
 import functools
@@ -23,21 +23,20 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v2 import transpose as v2_transpose
-from tokamax._src.ops.experimental.mla.v3 import bref_override
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import flash_attention
-from tokamax._src.ops.experimental.mla.v3 import schedule
-from tokamax._src.ops.experimental.mla.v3 import stitch_utils
-from tokamax._src.ops.experimental.mla.v3 import utils
+from tokamax._src.ops.experimental.mla.kernel import bref_override
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import flash_attention
+from tokamax._src.ops.experimental.mla.kernel import schedule
+from tokamax._src.ops.experimental.mla.kernel import stitch_utils
+from tokamax._src.ops.experimental.mla.kernel import transpose
+from tokamax._src.ops.experimental.mla.kernel import utils
 
 MlaCase = configs.MlaCase
 
-# Tiles for the layout-transpose helper (v2 `xpose_pipeline`), which runs
-# outside the attention kernel to move q_nope into and the output out of
+# Tiles for the layout-transpose helper (`transpose.xpose_pipeline`), which
+# runs outside the attention kernel to move q_nope into and the output out of
 # token-major layout. These are not attention-kernel tunables, and
-# `xpose_pipeline` snaps them down to valid sublane-aligned divisors. The
-# output-side values are carried over from v2.
+# `xpose_pipeline` snaps them down to valid sublane-aligned divisors.
 _Q_XPOSE_N_TILE = 128
 _Q_XPOSE_M_TILE = 32
 _OUT_XPOSE_N_TILE = 160
@@ -265,25 +264,24 @@ def _physical_transpose(
     m_tile: int,
     vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
-  """(N, T, D) <-> (T, N, D) via v2's pipelined transpose kernel.
+  """(N, T, D) <-> (T, N, D) via the pipelined transpose kernel.
 
   A plain `jnp.transpose` feeding a Pallas call cannot be folded into the
   producing fusion -- Pallas fixes its operand layouts -- so XLA materializes a
   layout-changing copy of the whole tensor, once per attention layer on both the
   q_nope and the output side. `xpose_pipeline` instead tiles and double-buffers
-  the movement, which is why v2 treats `jnp.transpose` as the fallback it warns
-  about (v2/kernel.py `prepare_q_nope_inputs` / `prepare_outputs`).
+  the movement, which is why `jnp.transpose` is only the fallback it warns
+  about.
 
   `vmem_limit_bytes` must be forwarded: left as None the transpose is capped at
   XLA's scoped-VMEM default (32 MiB), which the double-buffered in/out tiles
   (e.g. 160x64x512 bf16 on the output side) exceed at compile time -- a
   compile error, not a ValueError, so the fallback below would not catch it.
 
-  Falls back on ValueError for the same reason v2 does: the kernel rejects
-  shapes it cannot tile.
+  Falls back on ValueError: the kernel rejects shapes it cannot tile.
   """
   try:
-    return v2_transpose.xpose_pipeline(
+    return transpose.xpose_pipeline(
         x,
         transpose_axes=(1, 0, 2),
         n_tile=n_tile,
@@ -536,7 +534,7 @@ def mla_body(
 
 def get_kernel_name(cfgs: configs.MlaConfigs) -> str:
   serve = cfgs.serve
-  name = f"V3-MLA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
+  name = f"MLA{cfgs.mode.symbol}-snh-p{serve.page_size}"
   name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
   if cfgs.model.sliding_window:
     name += f"-sw{cfgs.model.sliding_window}"

@@ -21,8 +21,6 @@ from tokamax._src.ops.experimental.fused_moe.pallas_mosaic_tpu import Config as 
 from tokamax._src.ops.experimental.fused_moe.pallas_mosaic_tpu import PallasMosaicTpuFusedMoe as FusedMoe
 from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import Config as MultiHeadLatentAttentionConfig
 from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import PallasTpuMultiHeadLatentAttention as MultiHeadLatentAttention
-from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu_v3 import Config as MultiHeadLatentAttentionV3Config
-from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu_v3 import PallasTpuMultiHeadLatentAttentionV3 as MultiHeadLatentAttentionV3
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import Config as MlaSwaConfig
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import PallasTpuMlaSwa as MlaSwa
 
@@ -37,6 +35,4 @@ __all__ = (
     "MlaSwaConfig",
     "MultiHeadLatentAttention",
     "MultiHeadLatentAttentionConfig",
-    "MultiHeadLatentAttentionV3",
-    "MultiHeadLatentAttentionV3Config",
 )

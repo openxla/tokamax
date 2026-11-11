@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Wrapper for MLA v3 kernel to orchestrate multi-phase batch execution."""
+"""Wrapper for MLA kernel to orchestrate multi-phase batch execution."""
 
 from absl import logging
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import kernel
-from tokamax._src.ops.experimental.mla.v3 import schedule
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import kernel
+from tokamax._src.ops.experimental.mla.kernel import schedule
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
@@ -89,7 +89,6 @@ def mode_configs(
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     q_split: int = 1,
-    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
     modes: tuple[configs.MlaCase, ...] = ALL_MODES,
 ) -> dict[configs.MlaCase, configs.MlaConfigs]:
   """Returns the `MlaConfigs` each pass runs under, keyed by mode.
@@ -137,7 +136,6 @@ def mode_configs(
       scale_q=q_scale,
       scale_k=k_scale,
       scale_v=v_scale,
-      kv_layout=kv_layout,
   )
   default_decode, default_prefill = calculate_block_sizes(
       serve_cfgs,
@@ -210,7 +208,6 @@ def mla_ragged_paged_attention(
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     q_split: int = 1,
-    kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
     schedules: dict[configs.MlaCase, schedule.MlaSchedule] | None = None,
     modes: tuple[configs.MlaCase, ...] = ALL_MODES,
     debug_mode: bool = False,
@@ -264,7 +261,6 @@ def mla_ragged_paged_attention(
       prefill_block_sizes=prefill_block_sizes,
       vmem_limit_bytes=vmem_limit_bytes,
       q_split=q_split,
-      kv_layout=kv_layout,
       modes=modes,
   )
 

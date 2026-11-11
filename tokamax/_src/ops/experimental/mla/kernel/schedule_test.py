@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for the Batched MLA v3 metadata scheduler."""
+"""Unit tests for the Batched MLA metadata scheduler."""
 
 from collections.abc import Sequence
 import dataclasses
@@ -21,8 +21,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import schedule
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import schedule
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,7 +135,6 @@ class MlaScheduleTest(parameterized.TestCase):
             dtype_q=jnp.bfloat16,
             dtype_kv=jnp.bfloat16,
             dtype_out=jnp.bfloat16,
-            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
             smem_fraction_limit_for_schedule_generation=smem_fraction_limit,
         ),
         mode=mode,

@@ -24,7 +24,7 @@ from typing import Any
 
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from tokamax._src.ops.experimental.mla.v3 import utils
+from tokamax._src.ops.experimental.mla.kernel import utils
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,31 +93,14 @@ class MlaModelConfigs:
   sliding_window: int | None = None
 
 
-class KVLayout(enum.StrEnum):
-  """Memory layout of the paged KV cache in HBM and VMEM.
-
-  - SEQ_ALONG_LANE: Sequence tokens are packed along the 128 TPU physical lanes;
-      latent dimension is on sublanes.
-
-  This is the only layout v3 implements, and the enum exists to name it rather
-  than to offer a choice.
-  """
-
-  SEQ_ALONG_LANE = enum.auto()
-
-  @property
-  def symbol(self) -> str:
-    return "snh"
-
-
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
   """Workload and serving batch configuration parameters.
 
   Attributes:
     num_seqs: Maximum number of active sequences in the current batch.
-    page_size: Paged memory page size in tokens (must be multiple of 128 for
-      SEQ_ALONG_LANE).
+    page_size: Paged memory page size in tokens (must be a multiple of 128, as
+      tokens are packed along the lanes).
     total_q_tokens: Total flattened query tokens across all sequences (sum of
       q_lens).
     num_page_indices: Size of the flattened page index table (num_seqs *
@@ -128,7 +111,6 @@ class ServingConfigs:
     scale_q: Optional scalar quantization multiplier for Q.
     scale_k: Optional scalar quantization multiplier for K.
     scale_v: Optional scalar quantization multiplier for V.
-    kv_layout: Paged memory layout. Only SEQ_ALONG_LANE is implemented.
     smem_fraction_limit_for_schedule_generation: SMEM budget limit fraction.
     max_schedule_size_multiplier: Floor on the multiplier sizing the HBM
       schedule, in units of `MlaConfigs.max_steps_ub`. Raising it only
@@ -146,7 +128,6 @@ class ServingConfigs:
   scale_q: float | None = None
   scale_k: float | None = None
   scale_v: float | None = None
-  kv_layout: KVLayout = KVLayout.SEQ_ALONG_LANE
   smem_fraction_limit_for_schedule_generation: float = 0.33
   max_schedule_size_multiplier: int = 16
 
@@ -171,6 +152,7 @@ class ServingConfigs:
   def packing_kv(self) -> int:
     """Number of elements packed per 32-bit word (e.g. 2 for bfloat16)."""
     return utils.get_dtype_packing(self.dtype_kv)
+
 
 class MlaCase(enum.StrEnum):
   """Execution mode for the MLA kernel.

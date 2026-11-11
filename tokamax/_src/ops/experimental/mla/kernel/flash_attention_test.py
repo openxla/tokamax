@@ -23,8 +23,8 @@ from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.mla import reference
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import flash_attention
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import flash_attention
 
 
 def _ref_mla_attention(
@@ -65,14 +65,17 @@ def _ref_mla_attention(
       out *= scale_v
     return out
 
-  ql_nope_3d = q_nope.reshape(n_tokens, num_q_heads, d_nope).astype(jnp.float32)
+  # Head-major queries; one page of `kv_len` tokens along the last axis.
+  ql_nope_3d = jnp.swapaxes(
+      q_nope.reshape(n_tokens, num_q_heads, d_nope), 0, 1
+  ).astype(jnp.float32)
   q_pe_3d = q_pe.reshape(n_tokens, num_q_heads, d_pe).astype(jnp.float32)
 
   r_dim_padded = reference.align_to(d_pe, 128)
-  k_pe_padded = jnp.pad(k_pe.T, ((0, 0), (0, r_dim_padded - d_pe)))
-  cache_kv = jnp.concatenate([k_nope.T, k_pe_padded], axis=-1)[
-      None, :, None, :
-  ].astype(jnp.float32)
+  k_pe_padded = jnp.pad(k_pe, ((0, r_dim_padded - d_pe), (0, 0)))
+  cache_kv = jnp.concatenate([k_nope, k_pe_padded], axis=0)[None].astype(
+      jnp.float32
+  )
 
   new_kv_c = k_nope.T[-n_tokens:].astype(jnp.float32)
   new_k_pe = k_pe.T[-n_tokens:].astype(jnp.float32)
@@ -93,7 +96,7 @@ def _ref_mla_attention(
       v_scale=scale_v,
       s_dtype=jnp.float32,
   )
-  return out.reshape(n_q, d_nope)
+  return jnp.swapaxes(out, 0, 1).reshape(n_q, d_nope)
 
 
 class FlashAttentionMathTest(parameterized.TestCase):
@@ -155,7 +158,6 @@ class FlashAttentionMathTest(parameterized.TestCase):
             scale_q=scale_q,
             scale_k=scale_k,
             scale_v=scale_v,
-            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         ),
         mode=mode,
     )

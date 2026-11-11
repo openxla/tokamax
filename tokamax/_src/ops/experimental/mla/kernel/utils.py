@@ -21,7 +21,6 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla import utils as mla_utils
 
 
 def align_to(a: Any, b: int) -> Any:
@@ -63,33 +62,3 @@ def get_dtype_packing(dtype: jax.typing.DTypeLike) -> int:
   """Returns number of packed elements per 32-bit word."""
   return 32 // jax.dtypes.itemsize_bits(dtype)
 
-
-def get_kv_cache_shape(total_num_pages, page_size, kv_dim, kv_dtype):
-  """KV cache shape for v3's SEQ_ALONG_LANE layout.
-
-  v1/v2 store tokens on sublanes as
-  `[pages, page_size // packing, packing, kv_dim]`. v3 puts tokens on the lane
-  axis instead, so the cache is the 3D transpose `[pages, kv_dim, page_size]`
-  and the packing factor no longer appears in the shape -- it is implied by the
-  dtype. Every DMA in `bref_override` slices this as `[p, :, ds(off, sz)]`,
-  which is why `page_size` has to be the minormost dimension.
-
-  The signature matches `v1.kernel.get_kv_cache_shape` so the runner can swap
-  between them; `kv_dtype` is unused here and kept only for that reason.
-  """
-  del kv_dtype
-  # Mirrors `MlaConfigs.kv_dim_align`.
-  return (
-      total_num_pages,
-      align_to(kv_dim, pltpu.get_tpu_info().num_lanes),
-      page_size,
-  )
-
-
-# Shared with the MLA base op's XLA reference; re-exported for v3 callers.
-transpose_kv_cache_to_seq_along_lane = (
-    mla_utils.transpose_kv_cache_to_seq_along_lane
-)
-transpose_kv_cache_from_seq_along_lane = (
-    mla_utils.transpose_kv_cache_from_seq_along_lane
-)

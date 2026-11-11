@@ -28,8 +28,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import schedule
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import schedule
 
 # To support older JAX versions.
 if hasattr(pltpu, "BufferType"):
@@ -103,7 +103,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     assert buffer_type == BufferType.INPUT_OUTPUT
     if not SUPPORTS_IN_OUT_BUFFER_COUNT:
       raise NotImplementedError(
-          "The MLA v3 kernel needs a JAX with separate (in, out) Pallas"
+          "The MLA kernel needs a JAX with separate (in, out) Pallas"
           f" buffer counts, which jax {jax.__version__} lacks."
       )
 

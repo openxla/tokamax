@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Stitch utilities for Batched MLA v3 (Transposed KV Cache).
+"""Stitch utilities for Batched MLA (Transposed KV Cache).
 
 Handles rolling and merging unpaged new KV tokens into contiguous VMEM blocks
 for SEQ_ALONG_LANE memory layout.
@@ -24,8 +24,8 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import utils
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import utils
 
 
 def _stitch_decode_lane(

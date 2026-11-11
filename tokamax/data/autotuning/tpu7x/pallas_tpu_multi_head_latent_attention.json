@@ -1,0 +1,62 @@
+{
+  "{\"ql_nope\":\"f8_e4m3fn[128,4,512]\",\"q_pe\":\"f8_e4m3fn[4,128,64]\",\"new_kv_c\":\"f8_e4m3fn[4,512]\",\"new_k_pe\":\"f8_e4m3fn[4,64]\",\"cache_kv\":\"f8_e4m3fn[448,640,1024]\",\"kv_lens\":\"i32[32]\",\"page_indices\":\"i32[448]\",\"cu_q_lens\":\"i32[33]\",\"distribution\":\"i32[3]\",\"sm_scale\":0.07216878364870322,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":1.0,\"k_scale\":1.0,\"v_scale\":1.0,\"s_dtype\":\"jax.numpy.bfloat16\",\"schedules\":null,\"debug_mode\":false,\"return_residuals\":false}": {
+    "{\"decode_num_kv_pages_per_block\":2,\"decode_batch_size\":2,\"decode_n_buffer\":2,\"prefill_num_kv_pages_per_block\":1,\"prefill_num_queries_per_block\":16,\"prefill_q_split\":1,\"prefill_n_buffer\":2,\"vmem_limit_bytes\":null}": {
+      "compile_time_ms": 339993.54216083884,
+      "lower_time_ms": 186980.66645185463,
+      "evaluation_times_ms": [
+        0.206,
+        0.206,
+        0.206,
+        0.205,
+        0.206
+      ],
+      "metadata": {},
+      "peak_memory_mb": 593.158176
+    }
+  },
+  "{\"ql_nope\":\"f8_e4m3fn[128,8,512]\",\"q_pe\":\"f8_e4m3fn[8,128,64]\",\"new_kv_c\":\"f8_e4m3fn[8,512]\",\"new_k_pe\":\"f8_e4m3fn[8,64]\",\"cache_kv\":\"f8_e4m3fn[448,640,1024]\",\"kv_lens\":\"i32[32]\",\"page_indices\":\"i32[448]\",\"cu_q_lens\":\"i32[33]\",\"distribution\":\"i32[3]\",\"sm_scale\":0.07216878364870322,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":1.0,\"k_scale\":1.0,\"v_scale\":1.0,\"s_dtype\":\"jax.numpy.bfloat16\",\"schedules\":null,\"debug_mode\":false,\"return_residuals\":false}": {
+    "{\"decode_num_kv_pages_per_block\":2,\"decode_batch_size\":4,\"decode_n_buffer\":2,\"prefill_num_kv_pages_per_block\":1,\"prefill_num_queries_per_block\":16,\"prefill_q_split\":1,\"prefill_n_buffer\":2,\"vmem_limit_bytes\":null}": {
+      "compile_time_ms": 251116.30045389757,
+      "lower_time_ms": 329818.55057389475,
+      "evaluation_times_ms": [
+        0.226,
+        0.227,
+        0.226,
+        0.226,
+        0.226
+      ],
+      "metadata": {},
+      "peak_memory_mb": 594.045472
+    }
+  },
+  "{\"ql_nope\":\"f8_e4m3fn[128,32,512]\",\"q_pe\":\"f8_e4m3fn[32,128,64]\",\"new_kv_c\":\"f8_e4m3fn[32,512]\",\"new_k_pe\":\"f8_e4m3fn[32,64]\",\"cache_kv\":\"f8_e4m3fn[448,640,1024]\",\"kv_lens\":\"i32[32]\",\"page_indices\":\"i32[448]\",\"cu_q_lens\":\"i32[33]\",\"distribution\":\"i32[3]\",\"sm_scale\":0.07216878364870322,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":1.0,\"k_scale\":1.0,\"v_scale\":1.0,\"s_dtype\":\"jax.numpy.bfloat16\",\"schedules\":null,\"debug_mode\":false,\"return_residuals\":false}": {
+    "{\"decode_num_kv_pages_per_block\":2,\"decode_batch_size\":4,\"decode_n_buffer\":2,\"prefill_num_kv_pages_per_block\":1,\"prefill_num_queries_per_block\":16,\"prefill_q_split\":1,\"prefill_n_buffer\":2,\"vmem_limit_bytes\":null}": {
+      "compile_time_ms": 316473.27286493964,
+      "lower_time_ms": 316992.870693095,
+      "evaluation_times_ms": [
+        0.292,
+        0.292,
+        0.292,
+        0.292,
+        0.293
+      ],
+      "metadata": {},
+      "peak_memory_mb": 599.369248
+    }
+  },
+  "{\"ql_nope\":\"f8_e4m3fn[128,1024,512]\",\"q_pe\":\"f8_e4m3fn[1024,128,64]\",\"new_kv_c\":\"f8_e4m3fn[1024,512]\",\"new_k_pe\":\"f8_e4m3fn[1024,64]\",\"cache_kv\":\"f8_e4m3fn[448,640,1024]\",\"kv_lens\":\"i32[32]\",\"page_indices\":\"i32[448]\",\"cu_q_lens\":\"i32[33]\",\"distribution\":\"i32[3]\",\"sm_scale\":0.07216878364870322,\"sliding_window\":null,\"soft_cap\":null,\"mask_value\":null,\"q_scale\":1.0,\"k_scale\":1.0,\"v_scale\":1.0,\"s_dtype\":\"jax.numpy.bfloat16\",\"schedules\":null,\"debug_mode\":false,\"return_residuals\":false}": {
+    "{\"decode_num_kv_pages_per_block\":2,\"decode_batch_size\":4,\"decode_n_buffer\":2,\"prefill_num_kv_pages_per_block\":1,\"prefill_num_queries_per_block\":32,\"prefill_q_split\":4,\"prefill_n_buffer\":2,\"vmem_limit_bytes\":null}": {
+      "compile_time_ms": 19944.431688869372,
+      "lower_time_ms": 3288.7631128542125,
+      "evaluation_times_ms": [
+        0.717,
+        0.716,
+        0.718,
+        0.718,
+        0.717
+      ],
+      "metadata": {},
+      "peak_memory_mb": 819.92656
+    }
+  }
+}

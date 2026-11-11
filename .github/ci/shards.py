@@ -344,11 +344,6 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     # -- experimental ------------------------------------------------------
-    'experimental-mla-v2-kernel': Spec(
-        paths=('tokamax/_src/ops/experimental/mla/v2/mla_kernel_v2_test.py',),
-        minutes=35,
-        compat_minutes=4,
-    ),
     # TPU-only kernel test; separated from experimental-kda to isolate runtimes.
     'experimental-kda-kernel': Spec(
         paths=('tokamax/_src/ops/kda/pallas_mosaic_tpu_kernel_test.py',),
@@ -429,13 +424,14 @@ SHARDS: ShardMap = {
         minutes=6,
         compat_minutes=2,
     ),
-    'experimental-mla-v2': Spec(
+    'experimental-mla': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/mla/v2/mla_transpose_test.py',
-            'tokamax/_src/ops/experimental/mla/v2/test_mla_tuned_params.py',
+            'tokamax/_src/ops/experimental/mla/base_test.py',
+            'tokamax/_src/ops/experimental/mla/kernel/transpose_test.py',
+            'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',
         ),
-        minutes=6,
-        compat_minutes=1,
+        minutes=10,
+        compat_minutes=3,
     ),
     'experimental-mhc': Spec(
         paths=(
@@ -560,15 +556,6 @@ SHARDS: ShardMap = {
         minutes=2,
         compat_minutes=1,
     ),
-    'experimental-mla': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/mla/base_test.py',
-            'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_kernel_test.py',
-            'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=2,
-        compat_minutes=2,
-    ),
     'experimental-router-topk': Spec(
         paths=(
             'tokamax/_src/ops/router_topk/api_test.py',
@@ -621,11 +608,11 @@ SHARDS: ShardMap = {
         minutes=1,
         compat_minutes=1,
     ),
-    'experimental-mla-v3': Spec(
+    'experimental-mla-kernel': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/mla/v3/flash_attention_test.py',
-            'tokamax/_src/ops/experimental/mla/v3/mla_kernel_v3_test.py',
-            'tokamax/_src/ops/experimental/mla/v3/schedule_test.py',
+            'tokamax/_src/ops/experimental/mla/kernel/flash_attention_test.py',
+            'tokamax/_src/ops/experimental/mla/kernel/kernel_test.py',
+            'tokamax/_src/ops/experimental/mla/kernel/schedule_test.py',
         ),
         minutes=40,
         compat_minutes=1,

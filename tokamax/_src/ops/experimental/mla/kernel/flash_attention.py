@@ -28,8 +28,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v3 import configs
-from tokamax._src.ops.experimental.mla.v3 import utils
+from tokamax._src.ops.experimental.mla.kernel import configs
+from tokamax._src.ops.experimental.mla.kernel import utils
 
 
 def _carry(
@@ -52,7 +52,7 @@ def _carry(
 
 
 # TODO: Generalize flash attention helpers between BatchedRPA and
-# MLAv3/create a shared utility.
+# the MLA kernel, or create a shared utility.
 def flash_attention_qk_softmax(
     q: jax.Array,  # [B, bq_sz * H_q, d_q]
     k: jax.Array,  # [B, d_kv, S] (SEQ_ALONG_LANE)

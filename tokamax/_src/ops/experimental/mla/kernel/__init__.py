@@ -13,5 +13,4 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Multi-Head Latent Attention (MLA) v3 kernel for TPU.
-"""
+"""Multi-Head Latent Attention (MLA) kernel for TPU."""

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for Multi-Head Latent Attention (MLA) V3 kernel."""
+"""Tests for Multi-Head Latent Attention (MLA) kernel."""
 
 import gc
 import sys
@@ -22,18 +22,17 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.mla import reference
 from tokamax._src.ops.experimental.mla import test_base
-from tokamax._src.ops.experimental.mla.v2 import kernel as kernel_v2
-from tokamax._src.ops.experimental.mla.v3 import bref_override
-from tokamax._src.ops.experimental.mla.v3 import mla_wrapper
-from tokamax._src.ops.experimental.mla.v3 import utils
+from tokamax._src.ops.experimental.mla.kernel import bref_override
+from tokamax._src.ops.experimental.mla.kernel import mla_wrapper
 
 
 jax.config.parse_flags_with_absl()
 jax.config.update("jax_numpy_dtype_promotion", "standard")
 
 
-class MlaRaggedPagedAttentionKernelV3Test(
+class MlaRaggedPagedAttentionKernelTest(
     test_base.MlaRaggedPagedAttentionTestBase
 ):
 
@@ -67,7 +66,7 @@ class MlaRaggedPagedAttentionKernelV3Test(
       self.skipTest("Expect TPU")
     if page_size % 128 != 0:
       self.skipTest(
-          "V3 kernel requires page_size to be a multiple of 128 (got"
+          "The kernel requires page_size to be a multiple of 128 (got"
           f" {page_size})."
       )
     rng = np.random.default_rng(1234)
@@ -104,7 +103,6 @@ class MlaRaggedPagedAttentionKernelV3Test(
     padded_r_dim = test_base.align_to(r_dim, 128)
     padded_lkv_dim = test_base.align_to(lkv_dim, 128)
     padded_kv_dim = padded_lkv_dim + padded_r_dim
-    packing = test_base.get_dtype_packing(kv_dtype)
     total_q_len = sum(s[0] for s in seq_lens)
     kv_lens_list = [s[1] for s in seq_lens]
     max_kv_len = max(kv_lens_list) if kv_lens_list else 0
@@ -113,36 +111,31 @@ class MlaRaggedPagedAttentionKernelV3Test(
         sum(test_base.cdiv(kv_len, page_size) for kv_len in kv_lens_list),
     )
 
-    expected_out, expected_updated_kv = (
-        kernel_v2.ref_mla_ragged_paged_attention(
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            cache_kv.copy(),
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            sm_scale=sm_scale,
-            sliding_window=sliding_window,
-            soft_cap=soft_cap,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-    )
-
-    v3_cache_kv = utils.transpose_kv_cache_to_seq_along_lane(
-        cache_kv.copy(), packing
-    )
-
-    kernel_out, kernel_updated_kv = mla_wrapper.mla_ragged_paged_attention(
-        jnp.transpose(ql_nope, (1, 0, 2)),
+    expected_out, expected_updated_kv = reference.mla_attention(
+        ql_nope,
         q_pe,
         new_kv_c,
         new_k_pe,
-        v3_cache_kv,
+        cache_kv.copy(),
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        s_dtype=jnp.float32,
+    )
+
+    kernel_out, kernel_updated_kv = mla_wrapper.mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv.copy(),
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -157,10 +150,6 @@ class MlaRaggedPagedAttentionKernelV3Test(
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
         debug_mode=test_base.DEBUG_MODE.value,
-    )
-    kernel_out = jnp.transpose(kernel_out, (1, 0, 2))
-    kernel_updated_kv_untransposed = (
-        utils.transpose_kv_cache_from_seq_along_lane(kernel_updated_kv, packing)
     )
     with np.printoptions(threshold=sys.maxsize):
       logging.vlog(2, "new_kv_c: %s", new_kv_c)
@@ -177,20 +166,13 @@ class MlaRaggedPagedAttentionKernelV3Test(
       )
 
     self.assertEqual(
-        expected_out.shape, (total_q_len, num_heads, padded_lkv_dim)
+        expected_out.shape, (num_heads, total_q_len, padded_lkv_dim)
     )
     self.assertEqual(
         expected_updated_kv.shape,
-        (total_num_pages, page_size // packing, packing, padded_kv_dim),
-    )
-    self.assertEqual(
-        kernel_updated_kv.shape,
         (total_num_pages, padded_kv_dim, page_size),
     )
-    self.assertEqual(
-        kernel_updated_kv_untransposed.shape,
-        expected_updated_kv.shape,
-    )
+    self.assertEqual(kernel_updated_kv.shape, expected_updated_kv.shape)
     self.assertEqual(expected_out.dtype, q_dtype)
     self.assertEqual(expected_updated_kv.dtype, kv_dtype)
     self.assertEqual(kernel_updated_kv.dtype, kv_dtype)
@@ -215,14 +197,11 @@ class MlaRaggedPagedAttentionKernelV3Test(
             else page_size
         )
 
-        for token_idx_in_page in range(tokens_on_this_page):
-          row = token_idx_in_page // packing
-          col = token_idx_in_page % packing
-          mask[page_idx, row, col, :] = True
+        mask[page_idx, :, :tokens_on_this_page] = True
     true_count = np.sum(mask)
     self.assertEqual(true_count, sum(kv_lens_list) * padded_kv_dim)
     expected_valid = np.array(expected_updated_kv)[mask]
-    kernel_valid = np.array(kernel_updated_kv_untransposed)[mask]
+    kernel_valid = np.array(kernel_updated_kv)[mask]
     np.testing.assert_array_equal(
         kernel_valid,
         expected_valid,

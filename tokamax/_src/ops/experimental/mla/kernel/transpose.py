@@ -23,7 +23,7 @@ import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src.ops.experimental.mla.v2.kv_utils import get_dtype_packing
+from tokamax._src.ops.experimental.mla.kernel.utils import get_dtype_packing
 
 logger = logging
 
