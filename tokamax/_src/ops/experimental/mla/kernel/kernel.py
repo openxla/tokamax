@@ -443,6 +443,7 @@ def create_allocs(
 
 
 def mla_body(
+    step_info: pltpu.PipelineStep,
     q_vref: Any,
     kv_in_vref: Any,
     o_vref: Any,
@@ -456,7 +457,7 @@ def mla_body(
     cfgs: configs.MlaConfigs,
 ):
   """Inner step execution body of the MLA Pallas pipeline."""
-  step = pl.program_id(0)
+  step = step_info.index[0]
 
   with jax.named_scope("prep_math"):
     q_abs_start = []
@@ -729,6 +730,7 @@ def _mla_ragged_paged_attention_kernel(
                 kv_cache_alloc.spec,
             ),
             out_specs=(o_alloc.spec,),
+            _explicit_indices=True,
         )
         pipeline_func(
             (ql_nope_hbm_ref, q_pe_hbm_ref, schedule_ref),
