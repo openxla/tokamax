@@ -104,14 +104,8 @@ def flash_attention_qk_softmax(
         l_next_b = alpha_list[b_idx] * l_prev + p_rowsum[b_idx]
         l_next_list.append(l_next_b)
         if cfgs.fuse_accum:
-            # Reset with a select rather than relying on alpha == 0 (since
-            # 0 * NaN == NaN). Note: these NaNs are not produced by this kernel
-            # itself; they are observed mid-batch during decode when a corrupted
-            # MTP draft writes NaN into one sequence's KV cache, which would
-            # otherwise leak into every subsequent sequence in the batch. The
-            # normal/default prefill path (`not cfgs.fuse_accum`) is unaffected
-            # and skips this select to avoid extra vector ops across `bq_c`
-            # query chunks.
+            # Reset via select so decode NaNs from a corrupted MTP draft cannot
+            # poison alpha * acc (0 * NaN == NaN); prefill skips this select.
             l_prev = jnp.where(is_last_k[step, b_idx], 0.0, l_next_b)
         else:
             l_prev = l_next_b

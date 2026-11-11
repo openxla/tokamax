@@ -322,10 +322,10 @@ class SplashConfig:
   # The fused bwd kernel accumulates dq at every grid step. To safely avoid
   # read/write conflicts we conservatively avoid *any* in-kernel reductions.
   # This parameter allows to override this behavior and specifies the number of
-  # reduction steps. For now, only 3 or all the kv steps are supported. 1
-  # accumulates dq in VMEM; it requires a dynamic dkv grid that visits every q
-  # block in one run of consecutive steps (see
-  # `mask_info_lib.dkv_q_blocks_are_contiguous`).
+  # reduction steps. Only 1, 3, or all kv steps (None) are supported: 1
+  # coalesces consecutive steps for the same q block in fp32 VMEM and reduces
+  # non-contiguous revisits into a single pl.Buffered(1) q.shape buffer in HBM,
+  # trading unpipelined dq DMAs for 3x lower dq HBM usage than 3.
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
@@ -393,6 +393,10 @@ class SplashConfig:
   # The kernel skips its own q scaling and returns dq, dk w.r.t. the
   # pre-scaled input (both divided by LOG2E). Subsumes dkv_reuse_scaled_q.
   q_prescaled_log2e: bool = False
+  # Set by _make_splash_attention when the static dkv schedule visits every q
+  # block in a single contiguous run, allowing dq_reduction_steps=1 to write dq
+  # directly from VMEM without HBM read-modify-write aliasing.
+  dkv_q_blocks_are_contiguous: bool = False
 
   @property
   def active_dropout_block_q(self) -> int:
@@ -2077,7 +2081,8 @@ def _flash_attention_dkv_kernel(
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
     if use_vmem_dq_reduction:
-      # A q block's kv steps are consecutive, so dq stays in VMEM across them.
+      # Coalesce consecutive steps for the same q block in VMEM; non-contiguous
+      # revisits accumulate via dq_alias in HBM.
       col = lambda g: active_cols_ref[g].astype(jnp.int32)
       last = pl.num_programs(1) - 1
       should_initialize_dq = jnp.logical_or(
@@ -2103,6 +2108,9 @@ def _flash_attention_dkv_kernel(
     grid_idx = (kv_index * q_steps) + q_index
     should_initialize = q_index == 0
     should_write = True if q_steps <= 2 else q_index == q_steps - 1
+    if use_vmem_dq_reduction:
+      should_initialize_dq = kv_index == 0
+      should_write_dq = kv_index == kv_steps - 1
     if q_heads_per_kv_head > 1:
       q_head_index_per_kv_head = lax.rem(q_head, q_heads_per_kv_head)
       should_initialize = jnp.logical_and(
@@ -2385,7 +2393,9 @@ def _flash_attention_dkv_kernel(
       else:
         # Compute block size == memory block size
         if dq_alias is not None:
-          dq_ref[...] = dq_alias[...] + dq.astype(dq_ref.dtype)
+          dq_ref[...] = (dq_alias[...].astype(jnp.float32) + dq).astype(
+              dq_ref.dtype
+          )
         else:
           dq_ref[...] = dq.astype(dq_ref.dtype)
 
@@ -2419,7 +2429,9 @@ def _flash_attention_dkv_kernel(
     @pl.when(should_write_dq)
     def _write_dq_scratch():
       if dq_alias is not None:
-        dq_ref[...] = dq_alias[...] + dq_scratch_ref[...].astype(dq_ref.dtype)
+        dq_ref[...] = (
+            dq_alias[...].astype(jnp.float32) + dq_scratch_ref[...]
+        ).astype(dq_ref.dtype)
       else:
         dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
@@ -2673,17 +2685,38 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
-  use_vmem_dq_reduction = dynamic_grid and config.dq_reduction_steps == 1
-  dq_reduction_steps = 3 if dynamic_grid else config.dq_reduction_steps
-  if use_vmem_dq_reduction:
-    dq_reduction_steps = None  # dq is not accumulated or aliased in HBM.
+  use_vmem_dq_reduction = (
+      dynamic_grid or (num_q_heads == 1 and q_steps == 1)
+  ) and config.dq_reduction_steps == 1
+  q_blocks_are_contiguous = segment_ids is None and (
+      config.dkv_q_blocks_are_contiguous
+      or (
+          dynamic_grid
+          and not isinstance(mask_info.active_cols, jax.core.Tracer)
+          and not isinstance(mask_info.num_active_blocks, jax.core.Tracer)
+          and mask_info_lib.dkv_q_blocks_are_contiguous(mask_info, q_steps)
+      )
+  )
+  dq_in_vmem_only = use_vmem_dq_reduction and (
+      not dynamic_grid or q_blocks_are_contiguous
+  )
+  dq_reduction_steps = config.dq_reduction_steps
+  if dq_reduction_steps is None and dynamic_grid:
+    dq_reduction_steps = 3
   if not dynamic_grid and kv_steps <= 3 and dq_reduction_steps == 3:
     dq_reduction_steps = None
 
   dq = dq_alias_spec = None
-  if use_vmem_dq_reduction:
+  if dq_in_vmem_only:
     dq_spec = pl.BlockSpec((None, bq, head_dim_qk), o_index_map)
     dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
+  elif dq_reduction_steps == 1:
+    dq_spec = pl.BlockSpec(
+        (None, bq, head_dim_qk), o_index_map, pipeline_mode=pl.Buffered(1)
+    )
+    dq_alias_spec = dq_spec
+    dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
+    dq = jnp.zeros_like(dq_shape)
   elif dq_reduction_steps == 3:
     dq_index_map = (
         (lambda h, g, r, c, *_: (g % 3, h, to_i32(c[g]), 0))
@@ -2706,6 +2739,8 @@ def _splash_attention_bwd_dkv(
 
   in_specs += [dq_alias_spec]
 
+  # `use_vmem_dq_reduction` also provides `dq_scratch` for `diag_band_skip`
+  # when `bkv == bkv_compute`.
   if bkv == bkv_compute and not use_vmem_dq_reduction:
     dq_scratch = None
   else:
@@ -2797,7 +2832,7 @@ def _splash_attention_bwd_dkv(
   ]
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
-  if dq_reduction_steps == 3:
+  if dq_alias_spec is not None:
     if alias_dkv:
       input_output_aliases = {num_args: 0, num_args + 1: 1, num_args + 2: 2}
     else:
@@ -2907,9 +2942,7 @@ def _splash_attention_bwd_dkv(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",) * len(grid),
             vmem_limit_bytes=(
-                64 * 1024 * 1024
-                if (use_vmem_dq_reduction or bkv_compute >= 2048)
-                else None
+                64 * 1024 * 1024 if (bq >= 2048 or bkv >= 2048) else None
             ),
         ),
         name=kernel_name,
@@ -2917,7 +2950,7 @@ def _splash_attention_bwd_dkv(
         interpret=config.interpret,
         metadata=metadata,
     )(*args, dq, dk, dv)
-  dq = dq_unreduced if use_vmem_dq_reduction else dq_unreduced.sum(axis=0)
+  dq = dq_unreduced if dq_reduction_steps == 1 else dq_unreduced.sum(axis=0)
   if reduce_dkv_over_q_heads:
     dk = dk.reshape(
         num_kv_heads, q_heads_per_kv_head, kv_seq_len, head_dim_qk
@@ -3202,17 +3235,12 @@ def _make_splash_attention(
     )
     assert bq_dkv is not None
     q_blocks_per_shard = mask.shape[0] // q_seq_shards // bq_dkv
-    if config.dq_reduction_steps == 1 and not (
-        mask_info_lib.dkv_q_blocks_are_contiguous(
+    config = dataclasses.replace(
+        config,
+        dkv_q_blocks_are_contiguous=mask_info_lib.dkv_q_blocks_are_contiguous(
             dkv_mask_info, q_blocks_per_shard
-        )
-    ):
-      raise ValueError(
-          "dq_reduction_steps=1 requires the dkv grid to visit every q block in"
-          " one run of consecutive steps, which this mask and block sizes do"
-          " not. Use dq_reduction_steps=3 or None."
-      )
-
+        ),
+    )
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
     dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
@@ -3269,8 +3297,13 @@ def _make_dynamic_splash_attention(
         " assumes a static pure CausalMask with offset 0)."
     )
 
-  # This is the only mode that supports the dynamic grid.
-  config = dataclasses.replace(config, dq_reduction_steps=3)
+  config = dataclasses.replace(
+      config,
+      dq_reduction_steps=(
+          3 if config.dq_reduction_steps is None else config.dq_reduction_steps
+      ),
+      dkv_q_blocks_are_contiguous=False,
+  )
 
   def process_mask_shard(mask):
     process_mask_fn = functools.partial(

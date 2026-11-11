@@ -322,6 +322,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           initial_state=initial_state[:, :, :, :-1],
       )
 
+    _, batch, seq_len, _ = q.shape
     with self.subTest(name="segment_ids"), self.assertRaises(
         jt.TypeCheckError
     ):
@@ -331,7 +332,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           v,
           g,
           beta,
-          segment_ids=jnp.ones((q.shape[1], q.shape[2] + 1), jnp.int32),
+          segment_ids=jnp.ones((batch, seq_len + 1), jnp.int32),
           max_num_segments=1,
       )
 

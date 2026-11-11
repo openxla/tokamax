@@ -324,7 +324,7 @@ table.ops-table code {
     </tr>
     <tr>
       <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/triangle_multiplication"><code>triangle_multiplication</code></a></td>
-      <td>GPU</td>
+      <td>GPU, TPU</td>
       <td align="center" style="text-align: center;"></td>
       <td align="center" style="text-align: center;">✅</td>
       <td>Computes the triangle multiplicative update on 2D pair representations for structure prediction models such as <a href="https://www.nature.com/articles/s41586-021-03819-2">AlphaFold 2</a> and AlphaFold 3.</td>

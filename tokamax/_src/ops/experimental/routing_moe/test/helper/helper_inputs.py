@@ -23,8 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import arg
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 
 Mesh = jax.sharding.Mesh
 
@@ -41,13 +41,13 @@ def mesh_devices() -> list[jax.Device]:
 
 
 def make_mesh(
-    sharding: test_cases.MoESharding = test_cases.MoESharding(),
+    sharding: helper_cases.MoESharding = helper_cases.MoESharding(),
 ) -> Mesh:
   """Creates a `(dp, ep, tp)` device mesh for `sharding`."""
   devices = mesh_devices()[: sharding.num_cores]
   return Mesh(
       np.array(devices).reshape(sharding),
-      axis_names=test_cases.MESH_AXES,
+      axis_names=helper_cases.MESH_AXES,
   )
 
 
@@ -232,13 +232,14 @@ class MoEInputs:
   @classmethod
   def generate(
       cls,
-      shape: test_shapes.MoEShape,
+      shape: helper_shapes.MoEShape,
       num_tokens: int,
       *,
       seed: int = 0,
       max_to_mean_load: float = 1.0,
       num_skipped: int = 0,
       force_expert: int | None = None,
+      has_bias: bool = False,
   ) -> Self:
     """Generates unsharded, unquantized bfloat16 inputs for `shape`."""
     keys = jax.random.split(jax.random.key(seed), 8)
@@ -259,7 +260,7 @@ class MoEInputs:
         w1=_random_normal(keys[3], (e, h, 2 * i)),
         w2=_random_normal(keys[4], (e, i, h)),
     )
-    if shape.has_bias:
+    if shape.has_bias or has_bias:
       inputs = dataclasses.replace(
           inputs,
           w1_bias=_random_normal(keys[5], (e, 1, 2 * i)),

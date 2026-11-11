@@ -24,10 +24,10 @@ import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce as kernel
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 from tokamax._src.ops.experimental.routing_moe.test.io_relayout import output_reduce_test_lib
 
 jax.config.parse_flags_with_absl()
@@ -36,12 +36,12 @@ jax.config.parse_flags_with_absl()
 class OutputReduceUnitTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
   def _assert_matches_reference(
       self,
-      case_spec: test_cases.Case,
+      case_spec: helper_cases.Case,
       out_dtype: jax.typing.DTypeLike,
       *,
       in_dtype: jax.typing.DTypeLike = jnp.bfloat16,
@@ -65,13 +65,13 @@ class OutputReduceUnitTest(parameterized.TestCase):
     case.assert_close(actual)
 
   @parameterized.product(
-      case_spec=test_cases.UNIT_CASES,
+      case_spec=helper_cases.UNIT_CASES,
       in_dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
       out_dtype=[jnp.bfloat16, jnp.float32],
   )
   def test_unit_cases(
       self,
-      case_spec: test_cases.Case,
+      case_spec: helper_cases.Case,
       in_dtype: jax.typing.DTypeLike,
       out_dtype: jax.typing.DTypeLike,
   ):
@@ -92,9 +92,9 @@ class OutputReduceUnitTest(parameterized.TestCase):
       in_dtype: jax.typing.DTypeLike,
       out_dtype: jax.typing.DTypeLike,
   ):
-    shape = dataclasses.replace(test_shapes.BASIC, top_k=top_k)
-    case_spec = test_cases.Case(
-        "edge", shape, num_tokens, test_cases.MoESharding(ep=ep_size)
+    shape = dataclasses.replace(helper_shapes.BASIC, top_k=top_k)
+    case_spec = helper_cases.Case(
+        "edge", shape, num_tokens, helper_cases.MoESharding(ep=ep_size)
     )
     self._assert_matches_reference(case_spec, out_dtype, in_dtype=in_dtype)
 
@@ -107,9 +107,9 @@ class OutputReduceUnitTest(parameterized.TestCase):
       self, num_tokens: int, top_k: int, ep_size: int
   ):
     """Top-k > 10 and many tokens: the SMEM ring must not overflow or spill."""
-    shape = test_shapes.MoEShape("stress", 512, top_k, 1024, 1024)
-    case_spec = test_cases.Case(
-        "stress", shape, num_tokens, test_cases.MoESharding(ep=ep_size)
+    shape = helper_shapes.MoEShape("stress", 512, top_k, 1024, 1024)
+    case_spec = helper_cases.Case(
+        "stress", shape, num_tokens, helper_cases.MoESharding(ep=ep_size)
     )
     self._assert_matches_reference(case_spec, jnp.bfloat16)
 
@@ -118,13 +118,13 @@ class OutputReduceUnitTest(parameterized.TestCase):
     """Each shard reduces only its picks, so the shard outputs sum to all."""
     in_dtype = jnp.dtype(in_dtype)
     ep_size = 8
-    shape = test_shapes.MoEShape("ep", 512, 10, 2048, 1024)
+    shape = helper_shapes.MoEShape("ep", 512, 10, 2048, 1024)
     case = output_reduce_test_lib.ReduceCase.make_case(
-        test_cases.Case(
+        helper_cases.Case(
             "ep",
             shape,
             num_tokens=256,
-            sharding=test_cases.MoESharding(ep=ep_size),
+            sharding=helper_cases.MoESharding(ep=ep_size),
         ),
         in_dtype=in_dtype,
         seed=99,
@@ -133,7 +133,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
 
     shard_sum = jnp.zeros((256, shape.hidden_size), dtype=jnp.float32)
     for shard in range(ep_size):
-      w_shard = test_reference.local_pick_weights(
+      w_shard = helper_reference.local_pick_weights(
           case.topk_weights, case.topk_indices, shard * local, local
       )
       valid = w_shard.reshape(-1) != 0
@@ -156,7 +156,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
       self.assertFalse(bool(jnp.isnan(out_shard).any()))
       shard_sum = shard_sum + out_shard
 
-    dense = test_reference.topk_reduce(
+    dense = helper_reference.topk_reduce(
         case.dequantized_rows, case.topk_weights, jnp.float32
     )
     np.testing.assert_allclose(shard_sum, dense, rtol=2e-2, atol=2e-2)

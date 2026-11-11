@@ -18,10 +18,12 @@ import dataclasses
 import functools
 import itertools
 import math
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.mhc_lite import api as mhc_api
@@ -30,6 +32,13 @@ from tokamax._src.ops.experimental.mhc_lite import common as mhc_common
 
 def _interpret() -> bool:
   return jax.default_backend() != "tpu"
+
+
+def _mock_tpu_info(**overrides) -> pltpu.TpuInfo:
+  """Constructs a hermetic `TpuInfo` object with overrides."""
+  base_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+  overrides.setdefault("vmem_capacity_bytes", 128 * 1024 * 1024)
+  return dataclasses.replace(base_info, **overrides)
 
 
 def _get_permutation_matrices(streams: int) -> jax.Array:
@@ -331,6 +340,60 @@ class TestMhcCostEstimates(absltest.TestCase):
     self.assertEqual(post_bwd.transcendentals, 0)
     self.assertEqual(pre_bwd.flops, 2 * pre_fwd.flops)
     self.assertEqual(post_bwd.flops, 2 * post_fwd.flops)
+
+
+class TestTpuInfoConfigAndValidation(parameterized.TestCase):
+  """Unit tests for hardware-dependent `get_tpu_info()` resolution and validation."""
+
+  def test_resolve_config_uses_tpu_info_defaults(self):
+    mock_info = _mock_tpu_info(
+        num_lanes=256,
+        num_sublanes=16,
+        vmem_capacity_bytes=64 * 1024 * 1024,
+    )
+    with mock.patch.object(
+        mhc_common.pltpu, "get_tpu_info", return_value=mock_info
+    ):
+      resolved = mhc_common.resolve_config(mhc_common.MhcKernelConfig())
+      self.assertEqual(resolved.block_size, 256)
+      self.assertEqual(resolved.bwd_block_size, 512)
+      self.assertEqual(resolved.vmem_limit_bytes, 64 * 1024 * 1024)
+
+      explicit = mhc_common.MhcKernelConfig(
+          block_size=128,
+          bwd_block_size=256,
+          vmem_limit_bytes=32 * 1024 * 1024,
+      )
+      resolved_explicit = mhc_common.resolve_config(explicit)
+      self.assertEqual(resolved_explicit.block_size, 128)
+      self.assertEqual(resolved_explicit.bwd_block_size, 256)
+      self.assertEqual(resolved_explicit.vmem_limit_bytes, 32 * 1024 * 1024)
+
+  def test_validate_inputs_and_block_size_with_mock_tpu_info(self):
+    mock_info = _mock_tpu_info(num_lanes=256, num_sublanes=16)
+    with mock.patch.object(
+        mhc_common.pltpu, "get_tpu_info", return_value=mock_info
+    ):
+      # Embedding 128 is not a multiple of num_lanes=256.
+      x_bad_emb = jnp.zeros((1, 256, 4, 128), dtype=jnp.bfloat16)
+      with self.assertRaisesRegex(
+          mhc_common.UnsupportedInputError,
+          "Expected embedding dim to be a multiple of 256",
+      ):
+        mhc_common.validate_inputs(x_bad_emb)
+
+      # Embedding 256 is valid, but block_size=24 is not a multiple of
+      # num_sublanes=16.
+      x_good_emb = jnp.zeros((1, 256, 4, 256), dtype=jnp.bfloat16)
+      with self.assertRaisesRegex(
+          mhc_common.UnsupportedInputError,
+          "Expected block_size to be a positive multiple of 16",
+      ):
+        mhc_common.validate_inputs(x_good_emb, block_size=24)
+
+      # Valid with default block_size (256) and explicit multiple of 16 (32).
+      mhc_common.validate_inputs(x_good_emb)
+      mhc_common.validate_inputs(x_good_emb, block_size=32)
 
 
 if __name__ == "__main__":

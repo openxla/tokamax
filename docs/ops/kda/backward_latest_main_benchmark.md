@@ -1,5 +1,5 @@
-> Compatibility update (2026-11-04): this branch now includes upstream main
-> `cad8bab4dd0409605c0229a553b47610d449539a`. The measurements below remain
+> Compatibility update (2026-11-11): this branch now includes upstream main
+> `9827bb1860e7feab372bb553bcd3f9f6273cc4c9`. The measurements below remain
 > pinned to the October 27 revisions. They are not timings or native TPU
 > acceptance results for the compatibility update; benchmark again after CI.
 

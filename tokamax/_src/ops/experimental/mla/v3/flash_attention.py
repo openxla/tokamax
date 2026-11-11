@@ -26,6 +26,7 @@ from typing import Any
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mla.v3 import configs
 from tokamax._src.ops.experimental.mla.v3 import utils
@@ -276,7 +277,7 @@ def _normalize(
   if cfgs.serve.dtype_out == jnp.float32:
     result = lax.div(acc, l_val)
   else:
-    result = acc * pl.reciprocal(l_val, approx=True)
+    result = acc * pltpu.reciprocal(l_val, approx=True)
   return result.astype(cfgs.serve.dtype_out)
 
 

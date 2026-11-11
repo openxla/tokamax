@@ -114,6 +114,87 @@ class BatchingTest(parameterized.TestCase):
     self.assertEqual(seen_batched_args[-1], expected_batched_args)
     self.assertEqual(seen_batched_kwargs[-1], expected_batched_kwargs)
 
+  def test_capture_batched_args_squeezes_unit_axes(self):
+    """Checks that the wrapper squeezes a vmap axis of size 1.
+
+    Some primitives have no general batching rule. For example,
+    `ragged_dot_general` requires every operand to be batched at dim 0. Under
+    `vmap(grad(...))` the cotangent is not batched. Under `shard_map` with
+    `spmd_axis_name`, each device can hold one replica. The wrapper squeezes a
+    vmap axis of size 1 and applies the function once, so such primitives do
+    not see a batch axis. The inner `custom_vmap` rule below raises if JAX
+    batches the function, so the test detects any attempt to batch it.
+    """
+
+    @jax.custom_batching.custom_vmap
+    def inner(a, b):
+      return a * b
+
+    @inner.def_vmap
+    def _(axis_size, in_batched, a, b):
+      del axis_size, in_batched, a, b  # Unused.
+      raise AssertionError('inner vmap rule must not run for a unit axis')
+
+    seen_batched_args = []
+
+    @batching.capture_batched_args
+    def f(a, b, *, batched_args):
+      seen_batched_args.append(batched_args.args)
+      return inner(a, b)
+
+    a = jnp.arange(12).reshape(3, 4)
+    b = jnp.flip(a)
+    expected = a * b
+
+    def expected_batched_args(vmap_axes):
+      return tuple(
+          batching.BatchedShapeDtype(x.shape, x.dtype, vmap_axes)
+          for x in (a, b)
+      )
+
+    with self.subTest('unit_axis'):
+      out = jax.vmap(f)(a[None], b[None])
+      chex.assert_trees_all_equal(out, expected[None])
+      self.assertEqual(seen_batched_args[-1], expected_batched_args(((0, 1),)))
+
+    with self.subTest('unit_axis_with_unbatched_arg'):
+      # This is the `vmap(grad(...))` case: the vmap axis runs over the
+      # residuals, but not over the cotangent. The squeeze applies to the
+      # batched arguments only.
+      out = jax.vmap(f, in_axes=(0, None))(a[None], b)
+      chex.assert_trees_all_equal(out, expected[None])
+      self.assertEqual(
+          seen_batched_args[-1],
+          (
+              batching.BatchedShapeDtype(a.shape, a.dtype, ((0, 1),)),
+              batching.BatchedShapeDtype(b.shape, b.dtype, (None,)),
+          ),
+      )
+
+    with self.subTest('axis_of_size_2_still_batches'):
+      with self.assertRaisesRegex(
+          AssertionError, 'inner vmap rule must not run for a unit axis'
+      ):
+        jax.vmap(f)(jnp.stack([a, b]), jnp.stack([b, a]))
+
+    with self.subTest('nested_unit_axes'):
+      out = jax.vmap(jax.vmap(f))(a[None, None], b[None, None])
+      chex.assert_trees_all_equal(out, expected[None, None])
+      self.assertEqual(
+          seen_batched_args[-1], expected_batched_args(((0, 1), (0, 1)))
+      )
+
+    with self.subTest('nested_axis_of_size_2_still_batches'):
+      # A unit axis at either nesting level does not stop the batching of the
+      # size-2 axis.
+      stacked = (jnp.stack([a, b]), jnp.stack([b, a]))
+      for unit_axis in (0, 1):
+        args = tuple(jnp.expand_dims(x, unit_axis) for x in stacked)
+        with self.assertRaisesRegex(
+            AssertionError, 'inner vmap rule must not run for a unit axis'
+        ):
+          jax.vmap(jax.vmap(f))(*args)
+
   def test_batched_shape_dtype_equality(self):
     x = jax.ShapeDtypeStruct((3, 4), jnp.float32)
     x_batched = batching.BatchedShapeDtype((3, 4), jnp.float32, vmap_axes=())

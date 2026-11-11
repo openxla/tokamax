@@ -1,422 +1,422 @@
 {
-  "{\"residuals\":[\"f32[64,8192]\",\"f32[64,8192]\"],\"out\":\"bf16[64,8192,128]\",\"dout\":\"bf16[64,8192,128]\",\"q\":\"bf16[64,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 6241.61565292161,
-      "lower_time_ms": 443.66948993410915,
-      "evaluation_times_ms": [
-        8.261,
-        8.262,
-        8.261,
-        8.261,
-        8.261
-      ],
-      "metadata": {},
-      "peak_memory_mb": 1111.494176
-    }
-  },
-  "{\"residuals\":[\"f32[64,16384]\",\"f32[64,16384]\"],\"out\":\"bf16[64,16384,128]\",\"dout\":\"bf16[64,16384,128]\",\"q\":\"bf16[64,16384,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 6316.5455010021105,
-      "lower_time_ms": 5675.453927950002,
-      "evaluation_times_ms": [
-        37.552,
-        37.548,
-        37.558,
-        37.548,
-        37.554
-      ],
-      "metadata": {},
-      "peak_memory_mb": 4102.032928
-    }
-  },
-  "{\"residuals\":[\"f32[128,8192]\",\"f32[128,8192]\"],\"out\":\"bf16[128,8192,128]\",\"dout\":\"bf16[128,8192,128]\",\"q\":\"bf16[128,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 6384.861840982921,
-      "lower_time_ms": 370.57815096341074,
-      "evaluation_times_ms": [
-        16.476,
-        16.474,
-        16.474,
-        16.474,
-        16.475
-      ],
-      "metadata": {},
-      "peak_memory_mb": 2088.767008
-    }
-  },
-  "{\"residuals\":[\"f32[128,4096]\",\"f32[128,4096]\"],\"out\":\"bf16[128,4096,128]\",\"dout\":\"bf16[128,4096,128]\",\"q\":\"bf16[128,4096,192]\",\"k\":\"bf16[128,4096,192]\",\"v\":\"bf16[128,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[64,8192]\",\"f32[64,8192]\"],\"out\":\"bf16[64,8192,128]\",\"dout\":\"bf16[64,8192,128]\",\"q\":\"bf16[64,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
-      "compile_time_ms": 1624.018041882664,
-      "lower_time_ms": 837.0617639739066,
+      "compile_time_ms": 4989.3011239910265,
+      "lower_time_ms": 832.7491300005931,
       "evaluation_times_ms": [
-        6.274,
-        6.273,
-        6.275,
-        6.271,
-        6.267
+        7.987,
+        7.983,
+        7.985,
+        7.983,
+        7.986
       ],
       "metadata": {},
-      "peak_memory_mb": 2973.765152
+      "peak_memory_mb": 709.103136
     }
   },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
-      "compile_time_ms": 1354.686148930341,
-      "lower_time_ms": 192.69003393128514,
-      "evaluation_times_ms": [
-        1.254,
-        1.254,
-        1.254,
-        1.254,
-        1.254
-      ],
-      "metadata": {},
-      "peak_memory_mb": 303.04208
-    }
-  },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2335.027801000251,
-      "lower_time_ms": 1863.3091950000562,
-      "evaluation_times_ms": [
-        1.418,
-        1.418,
-        1.417,
-        1.418,
-        1.419
-      ],
-      "metadata": {},
-      "peak_memory_mb": 303.043104
-    }
-  },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
-      "compile_time_ms": 7196.62259798497,
-      "lower_time_ms": 405.0741109531373,
-      "evaluation_times_ms": [
-        1.503,
-        1.502,
-        1.502,
-        1.503,
-        1.503
-      ],
-      "metadata": {},
-      "peak_memory_mb": 445.645856
-    }
-  },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 3092.682746006176,
-      "lower_time_ms": 791.8153030332178,
-      "evaluation_times_ms": [
-        1.703,
-        1.702,
-        1.702,
-        1.703,
-        1.702
-      ],
-      "metadata": {},
-      "peak_memory_mb": 546.312736
-    }
-  },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
-      "compile_time_ms": 7251.784418942407,
-      "lower_time_ms": 183.11854801140726,
-      "evaluation_times_ms": [
-        1.393,
-        1.394,
-        1.395,
-        1.393,
-        1.394
-      ],
-      "metadata": {},
-      "peak_memory_mb": 470.81168
-    }
-  },
-  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 3209.893212886527,
-      "lower_time_ms": 2000.6940269377083,
-      "evaluation_times_ms": [
-        1.578,
-        1.578,
-        1.578,
-        1.578,
-        1.578
-      ],
-      "metadata": {},
-      "peak_memory_mb": 605.032992
-    }
-  },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[64,16384]\",\"f32[64,16384]\"],\"out\":\"bf16[64,16384,128]\",\"dout\":\"bf16[64,16384,128]\",\"q\":\"bf16[64,16384,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 6226.038208929822,
-      "lower_time_ms": 313.77292796969414,
+      "compile_time_ms": 5583.810820942745,
+      "lower_time_ms": 5887.354540056549,
       "evaluation_times_ms": [
-        4.132,
-        4.132,
-        4.134,
-        4.133,
-        4.134
+        37.132,
+        37.135,
+        37.139,
+        37.142,
+        37.122
       ],
       "metadata": {},
-      "peak_memory_mb": 606.080544
+      "peak_memory_mb": 4102.557216
     }
   },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2270.9530738648027,
-      "lower_time_ms": 422.41798201575875,
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 4932.717518997379,
+      "lower_time_ms": 908.3393509499729,
       "evaluation_times_ms": [
-        4.745,
-        4.746,
-        4.744,
-        4.744,
-        4.745
+        4.015,
+        4.014,
+        4.017,
+        4.018,
+        4.018
+      ],
+      "metadata": {},
+      "peak_memory_mb": 421.793312
+    }
+  },
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 2323.639599024318,
+      "lower_time_ms": 2389.786401996389,
+      "evaluation_times_ms": [
+        4.73,
+        4.731,
+        4.729,
+        4.731,
+        4.732
       ],
       "metadata": {},
       "peak_memory_mb": 606.081568
     }
   },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 1727.4149309378117,
-      "lower_time_ms": 1281.0271510388702,
+      "compile_time_ms": 6594.221313949674,
+      "lower_time_ms": 883.0599619541317,
       "evaluation_times_ms": [
-        4.792,
-        4.792,
-        4.791,
-        4.793,
-        4.791
+        4.659,
+        4.663,
+        4.662,
+        4.661,
+        4.662
       ],
       "metadata": {},
-      "peak_memory_mb": 1092.619808
+      "peak_memory_mb": 1109.659168
     }
   },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2886.02160604205,
-      "lower_time_ms": 568.8884570263326,
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,128]\",\"dout\":\"bf16[32,8192,128]\",\"q\":\"bf16[32,8192,192]\",\"k\":\"bf16[8,8192,192]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":1024,\"dropout_block_q\":1024,\"dropout_block_kv\":1024,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
+      "compile_time_ms": 2362.615171005018,
+      "lower_time_ms": 2739.154688999406,
       "evaluation_times_ms": [
-        5.411,
-        5.412,
-        5.414,
-        5.412,
-        5.411
+        5.388,
+        5.385,
+        5.389,
+        5.385,
+        5.387
       ],
       "metadata": {},
       "peak_memory_mb": 1092.620832
     }
   },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 1610.1817559683695,
-      "lower_time_ms": 610.4477769695222,
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 8136.535626021214,
+      "lower_time_ms": 750.1480480423197,
       "evaluation_times_ms": [
-        4.616,
-        4.617,
-        4.616,
-        4.616,
-        4.617
+        4.556,
+        4.555,
+        4.555,
+        4.554,
+        4.556
       ],
       "metadata": {},
-      "peak_memory_mb": 1210.06032
+      "peak_memory_mb": 1227.09968
     }
   },
-  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2929.3548119985644,
-      "lower_time_ms": 2802.3459640007786,
+  "{\"residuals\":[\"f32[32,8192]\",\"f32[32,8192]\"],\"out\":\"bf16[32,8192,256]\",\"dout\":\"bf16[32,8192,256]\",\"q\":\"bf16[32,8192,256]\",\"k\":\"bf16[8,8192,256]\",\"v\":\"bf16[8,8192,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 3030.45588999521,
+      "lower_time_ms": 2588.002008968033,
       "evaluation_times_ms": [
-        5.107,
-        5.108,
-        5.108,
-        5.109,
-        5.105
+        5.144,
+        5.143,
+        5.143,
+        5.145,
+        5.143
       ],
       "metadata": {},
       "peak_memory_mb": 1210.061344
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,128]\",\"k\":\"bf16[8,32768,128]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,128]\",\"k\":\"bf16[8,32768,128]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
     "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 6219.1582300001755,
-      "lower_time_ms": 1989.5938509998814,
+      "compile_time_ms": 5866.6523629799485,
+      "lower_time_ms": 3562.220180989243,
       "evaluation_times_ms": [
-        52.958,
-        52.959,
-        52.955,
-        52.954,
-        52.958
+        52.878,
+        52.874,
+        52.868,
+        52.867,
+        52.873
       ],
       "metadata": {},
-      "peak_memory_mb": 2491.421216
+      "peak_memory_mb": 2492.469792
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,128]\",\"k\":\"bf16[8,32768,128]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 10064.345486998718,
-      "lower_time_ms": 867.6292060008564,
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,128]\",\"k\":\"bf16[8,32768,128]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 10832.320237066597,
+      "lower_time_ms": 3387.451024958864,
       "evaluation_times_ms": [
-        59.897,
-        59.901,
-        59.903,
-        59.905,
-        59.899
+        60.148,
+        60.149,
+        60.147,
+        60.143,
+        60.142
       ],
       "metadata": {},
-      "peak_memory_mb": 2491.42224
+      "peak_memory_mb": 2492.471328
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,192]\",\"k\":\"bf16[8,32768,192]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 3192.028137971647,
-      "lower_time_ms": 3249.629733967595,
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,192]\",\"k\":\"bf16[8,32768,192]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 8346.508243936114,
+      "lower_time_ms": 3510.608921991661,
       "evaluation_times_ms": [
-        58.299,
-        58.3,
-        58.298,
-        58.294,
-        58.298
+        55.966,
+        55.978,
+        55.97,
+        55.966,
+        55.972
       ],
       "metadata": {},
-      "peak_memory_mb": 4437.58032
+      "peak_memory_mb": 4438.626848
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,192]\",\"k\":\"bf16[8,32768,192]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 5330.938969971612,
-      "lower_time_ms": 3972.4607249954715,
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,128]\",\"dout\":\"bf16[32,32768,128]\",\"q\":\"bf16[32,32768,192]\",\"k\":\"bf16[8,32768,192]\",\"v\":\"bf16[8,32768,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 12359.519263030961,
+      "lower_time_ms": 3900.6996160605922,
       "evaluation_times_ms": [
-        65.004,
-        65.0,
-        65.006,
-        65.0,
-        64.995
+        63.658,
+        63.659,
+        63.665,
+        63.658,
+        63.662
       ],
       "metadata": {},
-      "peak_memory_mb": 4437.581344
+      "peak_memory_mb": 4438.628384
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,256]\",\"dout\":\"bf16[32,32768,256]\",\"q\":\"bf16[32,32768,256]\",\"k\":\"bf16[8,32768,256]\",\"v\":\"bf16[8,32768,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
-      "compile_time_ms": 4846.147141885012,
-      "lower_time_ms": 4616.723060142249,
+  "{\"residuals\":[\"f32[128,8192]\",\"f32[128,8192]\"],\"out\":\"bf16[128,8192,128]\",\"dout\":\"bf16[128,8192,128]\",\"q\":\"bf16[128,8192,128]\",\"k\":\"bf16[8,8192,128]\",\"v\":\"bf16[8,8192,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 5195.535542006837,
+      "lower_time_ms": 808.0063819943462,
       "evaluation_times_ms": [
-        58.346,
-        58.346,
-        58.355,
-        58.351,
-        58.354
+        15.939,
+        15.94,
+        15.94,
+        15.941,
+        15.936
       ],
       "metadata": {},
-      "peak_memory_mb": 4907.342368
+      "peak_memory_mb": 1283.722784
     }
   },
-  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,256]\",\"dout\":\"bf16[32,32768,256]\",\"q\":\"bf16[32,32768,256]\",\"k\":\"bf16[8,32768,256]\",\"v\":\"bf16[8,32768,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2663.374876836315,
-      "lower_time_ms": 2915.307925082743,
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,256]\",\"dout\":\"bf16[32,32768,256]\",\"q\":\"bf16[32,32768,256]\",\"k\":\"bf16[8,32768,256]\",\"v\":\"bf16[8,32768,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 8158.430290990509,
+      "lower_time_ms": 3451.891403994523,
       "evaluation_times_ms": [
-        68.7,
-        68.701,
-        68.702,
-        68.707,
-        68.699
+        55.477,
+        55.476,
+        55.473,
+        55.47,
+        55.474
       ],
       "metadata": {},
-      "peak_memory_mb": 4907.349024
+      "peak_memory_mb": 4908.388896
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 5676.070858025923,
-      "lower_time_ms": 41519.68635292724,
+  "{\"residuals\":[\"f32[32,32768]\",\"f32[32,32768]\"],\"out\":\"bf16[32,32768,256]\",\"dout\":\"bf16[32,32768,256]\",\"q\":\"bf16[32,32768,256]\",\"k\":\"bf16[8,32768,256]\",\"v\":\"bf16[8,32768,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 6854.3390278937295,
+      "lower_time_ms": 5114.33815502096,
       "evaluation_times_ms": [
-        794.654,
-        794.644,
-        794.654,
-        794.685,
-        794.658
+        63.045,
+        63.045,
+        63.044,
+        63.051,
+        63.047
       ],
       "metadata": {},
-      "peak_memory_mb": 9965.701152
+      "peak_memory_mb": 4908.39248
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 8259.953673928976,
-      "lower_time_ms": 20850.222350796685,
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 7012.616178999906,
+      "lower_time_ms": 42358.056987000055,
       "evaluation_times_ms": [
-        894.42,
-        894.665,
-        894.647,
-        894.654,
-        894.668
+        794.836,
+        794.833,
+        794.839,
+        794.832,
+        794.843
       ],
       "metadata": {},
-      "peak_memory_mb": 9965.702176
+      "peak_memory_mb": 9969.895456
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,192]\",\"k\":\"bf16[8,131072,192]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 8115.983227035031,
-      "lower_time_ms": 20824.72917600535,
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,128]\",\"k\":\"bf16[8,131072,128]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 10777.530033956282,
+      "lower_time_ms": 42316.56471698079,
       "evaluation_times_ms": [
-        877.433,
-        877.502,
-        877.573,
-        877.639,
-        877.712
+        894.881,
+        894.872,
+        894.881,
+        894.831,
+        894.851
       ],
       "metadata": {},
-      "peak_memory_mb": 17750.329376
+      "peak_memory_mb": 9969.896992
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,192]\",\"k\":\"bf16[8,131072,192]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":256,\"dropout_block_q\":2048,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 10947.294235927984,
-      "lower_time_ms": 20943.157862173393,
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,192]\",\"k\":\"bf16[8,131072,192]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 8584.501460078172,
+      "lower_time_ms": 42037.924937088974,
       "evaluation_times_ms": [
-        983.406,
-        983.428,
-        983.419,
-        983.405,
-        983.409
+        818.089,
+        818.062,
+        818.072,
+        818.071,
+        818.085
       ],
       "metadata": {},
-      "peak_memory_mb": 17750.3304
+      "peak_memory_mb": 17754.52368
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,256]\",\"dout\":\"bf16[32,131072,256]\",\"q\":\"bf16[32,131072,256]\",\"k\":\"bf16[8,131072,256]\",\"v\":\"bf16[8,131072,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
-    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
-      "compile_time_ms": 1448.6679339315742,
-      "lower_time_ms": 20183.76929219812,
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,128]\",\"dout\":\"bf16[32,131072,128]\",\"q\":\"bf16[32,131072,192]\",\"k\":\"bf16[8,131072,192]\",\"v\":\"bf16[8,131072,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":2048,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 12950.808531953953,
+      "lower_time_ms": 42521.39865490608,
       "evaluation_times_ms": [
-        951.813,
-        951.912,
-        951.88,
-        951.815,
-        951.794
+        927.251,
+        927.215,
+        927.266,
+        927.294,
+        927.254
       ],
       "metadata": {},
-      "peak_memory_mb": 19629.445152
+      "peak_memory_mb": 17754.525216
     }
   },
-  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,256]\",\"dout\":\"bf16[32,131072,256]\",\"q\":\"bf16[32,131072,256]\",\"k\":\"bf16[8,131072,256]\",\"v\":\"bf16[8,131072,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
-    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3}": {
-      "compile_time_ms": 2588.6077161412686,
-      "lower_time_ms": 20384.390549967065,
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,256]\",\"dout\":\"bf16[32,131072,256]\",\"q\":\"bf16[32,131072,256]\",\"k\":\"bf16[8,131072,256]\",\"v\":\"bf16[8,131072,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":512,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 9530.85853799712,
+      "lower_time_ms": 42081.37675700709,
       "evaluation_times_ms": [
-        1042.236,
-        1042.263,
-        1042.372,
-        1042.371,
-        1042.381
+        818.816,
+        818.855,
+        818.845,
+        818.826,
+        818.852
       ],
       "metadata": {},
-      "peak_memory_mb": 19629.446176
+      "peak_memory_mb": 19633.571872
+    }
+  },
+  "{\"residuals\":[\"f32[32,131072]\",\"f32[32,131072]\"],\"out\":\"bf16[32,131072,256]\",\"dout\":\"bf16[32,131072,256]\",\"q\":\"bf16[32,131072,256]\",\"k\":\"bf16[8,131072,256]\",\"v\":\"bf16[8,131072,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 6884.297340991907,
+      "lower_time_ms": 44905.21082596388,
+      "evaluation_times_ms": [
+        929.067,
+        929.051,
+        929.051,
+        929.047,
+        929.058
+      ],
+      "metadata": {},
+      "peak_memory_mb": 19633.595936
+    }
+  },
+  "{\"residuals\":[\"f32[128,4096]\",\"f32[128,4096]\"],\"out\":\"bf16[128,4096,128]\",\"dout\":\"bf16[128,4096,128]\",\"q\":\"bf16[128,4096,192]\",\"k\":\"bf16[128,4096,192]\",\"v\":\"bf16[128,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 5432.524346048012,
+      "lower_time_ms": 589.1170970862731,
+      "evaluation_times_ms": [
+        5.125,
+        5.124,
+        5.13,
+        5.127,
+        5.129
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2453.802016
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 5242.087124031968,
+      "lower_time_ms": 482.43285599164665,
+      "evaluation_times_ms": [
+        1.006,
+        1.005,
+        1.005,
+        1.006,
+        1.006
+      ],
+      "metadata": {},
+      "peak_memory_mb": 311.561248
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,128]\",\"k\":\"bf16[8,4096,128]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":512,\"dropout_block_q\":1024,\"dropout_block_kv\":512,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 2325.9403710253537,
+      "lower_time_ms": 1870.6801729276776,
+      "evaluation_times_ms": [
+        1.409,
+        1.41,
+        1.41,
+        1.41,
+        1.41
+      ],
+      "metadata": {},
+      "peak_memory_mb": 303.043104
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 5720.199306961149,
+      "lower_time_ms": 961.7476230487227,
+      "evaluation_times_ms": [
+        1.254,
+        1.254,
+        1.254,
+        1.254,
+        1.253
+      ],
+      "metadata": {},
+      "peak_memory_mb": 571.608096
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,128]\",\"dout\":\"bf16[32,4096,128]\",\"q\":\"bf16[32,4096,192]\",\"k\":\"bf16[8,4096,192]\",\"v\":\"bf16[8,4096,128]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":1024,\"dropout_block_q\":1024,\"dropout_block_kv\":1024,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":false}": {
+      "compile_time_ms": 2429.0155520138796,
+      "lower_time_ms": 2243.512618006207,
+      "evaluation_times_ms": [
+        1.676,
+        1.676,
+        1.676,
+        1.675,
+        1.675
+      ],
+      "metadata": {},
+      "peak_memory_mb": 546.312736
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.0,\"prng_key\":null,\"return_residuals\":false}": {
+    "{\"block_q_dkv\":2048,\"block_kv_dkv\":2048,\"block_kv_dkv_compute\":2048,\"dropout_block_q\":null,\"dropout_block_kv\":null,\"use_base2_exp\":true,\"dq_reduction_steps\":1,\"qk_diag_skip\":true,\"qk_diag_grid\":4,\"diag_band_skip\":true}": {
+      "compile_time_ms": 5752.0021189702675,
+      "lower_time_ms": 656.960771069862,
+      "evaluation_times_ms": [
+        1.155,
+        1.155,
+        1.154,
+        1.155,
+        1.156
+      ],
+      "metadata": {},
+      "peak_memory_mb": 613.551136
+    }
+  },
+  "{\"residuals\":[\"f32[32,4096]\",\"f32[32,4096]\"],\"out\":\"bf16[32,4096,256]\",\"dout\":\"bf16[32,4096,256]\",\"q\":\"bf16[32,4096,256]\",\"k\":\"bf16[8,4096,256]\",\"v\":\"bf16[8,4096,256]\",\"mask\":{\"bool_mask\":null,\"is_causal\":true,\"offset\":0,\"q_seq_axis\":null},\"segment_ids\":null,\"sinks\":null,\"is_mqa\":false,\"mask_value\":-2.381976426469702e+38,\"attn_logits_soft_cap\":null,\"dropout_rate\":0.1,\"prng_key\":\"u32[2]\",\"return_residuals\":false}": {
+    "{\"block_q_dkv\":1024,\"block_kv_dkv\":1024,\"block_kv_dkv_compute\":256,\"dropout_block_q\":1024,\"dropout_block_kv\":256,\"use_base2_exp\":true,\"dq_reduction_steps\":3,\"qk_diag_skip\":false,\"qk_diag_grid\":2,\"diag_band_skip\":false}": {
+      "compile_time_ms": 2978.745584958233,
+      "lower_time_ms": 2152.6342800352722,
+      "evaluation_times_ms": [
+        1.57,
+        1.572,
+        1.572,
+        1.571,
+        1.572
+      ],
+      "metadata": {},
+      "peak_memory_mb": 605.032992
     }
   }
 }

@@ -26,8 +26,7 @@ from tokamax._src.ops.batched_rpa.kernel import configs
 
 class _BaseBufferedRef(pltpu.BufferedRef):
     def __post_init__(self):
-        # pallas doesn't allow you to set buffer_count > 2 for output refs, so
-        # we override to bypass this check.
+        # Allow buffer_count > 2 for output refs.
         pass
 
 
@@ -185,10 +184,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 sz = jnp.where(is_no_op, 0, sz)
                 dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
-                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
-                #     packing, page_size)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
-                #     packing, page_size)
+                # kv_cache_hbm and vmem_dst_lane shape:
+                # (pages_or_batch, 2 * num_kv_heads, kv_head_dim // packing, packing, page_size)
                 pltpu.make_async_copy(
                     kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
                     vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
@@ -201,8 +198,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             src_new_off = pl.multiple_of(dma_entry.fetch_hbm[...], num_lanes)
             dst_vmem_off = pl.multiple_of(dma_entry.fetch_vmem[...], num_lanes)
             sz = pl.multiple_of(jnp.where(is_no_op, 0, dma_entry.fetch_val), num_lanes)
-            # new_kv_hbm:
-            # (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
+            # new_kv_hbm: (2 * num_kv_heads, kv_head_dim // packing, packing, total_new_tokens)
             pltpu.make_async_copy(
                 new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
                 vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
@@ -335,10 +331,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         vmem_dst = cast(
             jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
         )
-        # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
-        #     packing, page_size)
-        # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
-        #     packing, page_size)
+        # Flatten page and head dimensions for strided copy.
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         for b in range(self.cfgs.batch_size):
@@ -600,7 +593,6 @@ class BatchingLSERef(_BypassRef):
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
-        # wait_lanes = pl.multiple_of(wait_lanes, 8)
 
         ref_u32 = lse_hbm.bitcast(jnp.uint32)
         flat_ref = ref_u32.reshape((-1, 128))

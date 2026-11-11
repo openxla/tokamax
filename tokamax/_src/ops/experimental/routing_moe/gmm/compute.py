@@ -15,11 +15,7 @@
 
 """Functions required to perform matrix multiplication."""
 
-from collections.abc import Callable
-
 import jax
-from jax.experimental import hijax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
@@ -188,6 +184,53 @@ def _quantized_matmul(
   return jnp.concat(list_acc, axis=1)
 
 
+def _scale_after_matmul(
+    cfg: config.ComputeConfig,
+    x: jax.Array,
+    w: jax.Array,
+    w_scale: jax.Array,
+) -> jax.Array:
+  """Computes unquantized x @ quantized_w for a single tile.
+
+  Args:
+    cfg: Compute config. `cfg.dynamic_quant` must be None.
+    x: Activation tile of shape (tile_m, tile_k), not quantized.
+    w: Quantized weight tile of shape (tile_k, tile_n).
+    w_scale: Weight scale of shape (num_q_blocks, 1, tile_n), where
+      `num_w_blocks` is 1 for per-channel quantization.
+
+  Returns:
+    The product of shape (tile_m, tile_n) in `cfg.acc_dtype`.
+  """
+  assert cfg.dynamic_quant is None
+  mxu_size = cfg.tpu_info.mxu_column_size
+  tile_k, tile_n = w.shape
+  w_num_q_blocks = w_scale.shape[0]
+  assert (
+      tile_k % w_num_q_blocks == 0
+  ), f"{w_num_q_blocks=} must divide {tile_k=}."
+  w_q_block_size = tile_k // w_num_q_blocks
+
+  # w is not cast to x's dtype. Mosaic converts dtype combinations the MXU
+  # does not support natively.
+  list_acc = []
+  for start_n in range(0, tile_n, mxu_size):
+    end_n = min(tile_n, start_n + mxu_size)
+    tile_acc = None
+    for start_k in range(0, tile_k, w_q_block_size):
+      end_k = start_k + w_q_block_size
+      block_acc = jnp.matmul(
+          x[:, start_k:end_k],
+          w[start_k:end_k, start_n:end_n],
+          preferred_element_type=jnp.float32,
+      ).astype(cfg.acc_dtype)
+      scale_idx = start_k // w_q_block_size
+      block_acc *= w_scale[scale_idx, :, start_n:end_n].astype(cfg.acc_dtype)
+      tile_acc = block_acc if tile_acc is None else tile_acc + block_acc
+    list_acc.append(tile_acc)
+  return jnp.concat(list_acc, axis=1)
+
+
 def matmul(
     cfg: config.ComputeConfig,
     x: jax.Array,
@@ -202,47 +245,21 @@ def matmul(
   # TODO: Support multiple N/K tiles.
   assert is_last_k_step and is_first_k_step
 
-  if cfg.dynamic_quant is None:
-    # TODO: Support unquantized matmul with quantized matmul.
-    acc = jnp.matmul(x, w, preferred_element_type=jnp.float32).astype(
-        cfg.acc_dtype
-    )
-  else:
-    assert w_scale is not None
-    acc = _quantized_matmul(cfg, x, w, w_scale)
+  match cfg.matmul_mode:
+    case config.MatmulMode.UNQUANTIZED:
+      acc = jnp.matmul(x, w, preferred_element_type=jnp.float32).astype(
+          cfg.acc_dtype
+      )
+    case config.MatmulMode.QUANTIZED:
+      assert w_scale is not None
+      acc = _quantized_matmul(cfg, x, w, w_scale)
+    case config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER:
+      assert w_scale is not None
+      acc = _scale_after_matmul(cfg, x, w, w_scale)
+    case _:
+      raise NotImplementedError(f"Unsupported matmul mode: {cfg.matmul_mode}")
 
   if w_bias is not None:
-    acc += w_bias
+    acc += w_bias.astype(acc.dtype)
 
   return acc
-
-
-def quantize_rows(
-    dst: hijax.TransformedRef,
-    first_row: int,
-    scale: jax.Array,
-    inv_scale: jax.Array,
-    load_chunk: Callable[[int], jax.Array],
-    out: config.ActivationConfig,
-) -> None:
-  """Quantizes `scale.shape[0]` rows and writes logical and scale chunks.
-
-  Args:
-    dst: Destination compact output VMEM slot.
-    first_row: Starting row index in `dst` for this `scale.shape[0]`-row slice.
-    scale: Per-lane scales of shape `f32[rows, lanes]`.
-    inv_scale: Broadcastable reciprocal scales matching `load_chunk` outputs.
-    load_chunk: Callable returning the unquantized values for logical chunk `c`.
-    out: Output configuration describing logical chunks and quantization dtype.
-  """
-  assert out.spec.quant is not None
-  num_chunks = out.spec.num_logical_chunks
-  layout_util.store_compact_chunk(
-      dst, first_row, num_chunks, pltpu.bitcast(scale, jnp.uint32)
-  )
-  for chunk in range(num_chunks):
-    q_chunk = quant_util.quantize(
-        load_chunk(chunk), inv_scale, out.spec.dtype
-    )
-    words = pltpu.bitcast(q_chunk, jnp.uint32)
-    layout_util.store_compact_chunk(dst, first_row, chunk, words)

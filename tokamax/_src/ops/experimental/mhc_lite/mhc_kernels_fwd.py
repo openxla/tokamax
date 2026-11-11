@@ -38,6 +38,7 @@ def _full_param_block_spec(param: jax.Array) -> pl.BlockSpec:
 
 def _fwd_chunk_tokens(tokens: int, config: common.MhcKernelConfig) -> int:
   """Returns the pipelined token chunk size for forward kernels."""
+  assert config.block_size is not None
   pipelined = config.fwd_pipeline_blocks * config.block_size
   if config.fwd_pipeline_blocks > 1 and tokens % pipelined == 0:
     return pipelined
@@ -181,24 +182,27 @@ def _pre_fwd_pipeline_body(
     h_post_ref[...] = h_post
     residual_ref[...] = residual.astype(residual_ref.dtype)
 
-  # Strip-mined fori_loop stream collapse over 64-token strips and 128-col
-  # bands to bound live float32 vector registers and prevent VMEM register
-  # spills.
+  # Strip-mined fori_loop stream collapse over (num_lanes // 2)-token strips
+  # and num_lanes-col bands to bound live float32 vector registers and prevent
+  # VMEM register spills.
   with jax.named_scope("strip_mined_stream_collapse"):
-    strip_tokens = math.gcd(x_full.shape[0], 64)
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    strip_tokens = math.gcd(x_full.shape[0], num_lanes // 2)
     num_strips = x_full.shape[0] // strip_tokens
 
     def _li_strip_body(strip_idx: jax.Array, _) -> None:
       with jax.named_scope("stream_collapse_strip"):
         t_dslice = pl.dslice(strip_idx * strip_tokens, strip_tokens)
         h_s = h_pre_ref[t_dslice, :]
-        for band_col in range(0, embedding, 128):
-          acc = h_s[:, 0:1] * x_ref[t_dslice, band_col : band_col + 128]
+        for band_col in range(0, embedding, num_lanes):
+          acc = h_s[:, 0:1] * x_ref[t_dslice, band_col : band_col + num_lanes]
           for s in range(1, streams):
             col = s * embedding + band_col
-            acc = acc + h_s[:, s : s + 1] * x_ref[t_dslice, col : col + 128]
-          layer_input_ref[t_dslice, band_col : band_col + 128] = acc.astype(
-              jnp.bfloat16
+            acc = (
+                acc + h_s[:, s : s + 1] * x_ref[t_dslice, col : col + num_lanes]
+            )
+          layer_input_ref[t_dslice, band_col : band_col + num_lanes] = (
+              acc.astype(jnp.bfloat16)
           )
 
     jax.lax.fori_loop(0, num_strips, _li_strip_body, None)
@@ -294,6 +298,7 @@ def _pre_fwd(
     config: common.MhcKernelConfig,
 ):
   """Custom-VJP forward rule for `pre`."""
+  config = common.resolve_config(config)
   common.validate_inputs(x, config.block_size, permutations.shape)
   streams = permutations.shape[-1]
   embedding = weights.norm_scale.shape[0] // streams
@@ -342,6 +347,7 @@ def _post_fwd(
     config: common.MhcKernelConfig,
 ):
   """Custom-VJP forward rule for `post`."""
+  config = common.resolve_config(config)
   x, h_post, residual = context.x, context.h_post, context.residual
   embedding = layer_output.shape[-1]
   tokens = layer_output.size // embedding
@@ -356,7 +362,7 @@ def _post_fwd(
   common.validate_inputs(x_check, config.block_size)
 
   block_tokens = _fwd_chunk_tokens(tokens, config)
-  sub_tokens = math.gcd(block_tokens, 16)
+  sub_tokens = math.gcd(block_tokens, 2 * common.get_tpu_info().num_sublanes)
   (output,) = _run_fwd_pipeline(
       "mhc_post_apply_fwd",
       functools.partial(
@@ -394,6 +400,7 @@ def _post_and_pre_fwd(
     config: common.MhcKernelConfig,
 ):
   """Custom-VJP forward rule for `post_and_pre`."""
+  config = common.resolve_config(config)
   x, h_post, residual = context.x, context.h_post, context.residual
   embedding = layer_output.shape[-1]
   tokens = layer_output.size // embedding
@@ -408,7 +415,7 @@ def _post_and_pre_fwd(
   common.validate_inputs(x_check, config.block_size, permutations.shape)
 
   chunk_tokens = _fwd_chunk_tokens(tokens, config)
-  sub_tokens = math.gcd(chunk_tokens, 16)
+  sub_tokens = math.gcd(chunk_tokens, 2 * common.get_tpu_info().num_sublanes)
   phi, param_args = _prepare_fwd_params(next_weights, permutations)
   next_layer_input, x_next, next_h_pre, next_h_post, next_residual = (
       _run_fwd_pipeline(

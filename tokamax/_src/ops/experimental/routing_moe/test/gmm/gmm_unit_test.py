@@ -20,23 +20,19 @@ from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
-from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
-from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.gmm import gmm_test_lib
-from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 jax.config.parse_flags_with_absl()
 
@@ -54,14 +50,14 @@ def _rel_diff(a: np.ndarray, b: np.ndarray) -> float:
 class RoutingGmmUnitTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
   @parameterized.product(
-      case_spec=test_cases.UNIT_CASES,
+      case_spec=helper_cases.UNIT_CASES,
       tile_n=[None, 512],
   )
-  def test_gather_gmm(self, case_spec: test_cases.Case, tile_n: int | None):
+  def test_gather_gmm(self, case_spec: helper_cases.Case, tile_n: int | None):
     case = gmm_test_lib.GmmCase.make_case(case_spec, quant_w1=True)
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -72,7 +68,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -86,10 +82,10 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     )
 
   @parameterized.product(
-      case_spec=test_cases.UNIT_CASES,
+      case_spec=helper_cases.UNIT_CASES,
       tile_n=[None, 512],
   )
-  def test_gmm_scatter(self, case_spec: test_cases.Case, tile_n: int | None):
+  def test_gmm_scatter(self, case_spec: helper_cases.Case, tile_n: int | None):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -99,7 +95,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -111,8 +107,116 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=1e-2,
     )
 
-  @parameterized.product(case_spec=test_cases.UNIT_CASES)
-  def test_gmm_scatter_fp8(self, case_spec: test_cases.Case):
+  @parameterized.named_parameters(
+      ("basic_256", helper_cases.BASIC_256, 0),
+      ("top1_200", helper_cases.TOP1_200, 0),
+      ("decode_16", helper_cases.DECODE_16, 0),
+      ("decode_64_ep8", helper_cases.DECODE_64_EP8, 128),
+  )
+  def test_gmm_scatter_bias(
+      self, case_spec: helper_cases.Case, group_offset: int
+  ):
+    # gmm_scatter has no activation (fuse_act).
+    # We test whether the bias is fetched and added at all.
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, has_bias=True, group_offset=group_offset
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_sorted_compact,
+        case.w1,
+        scatter=routing.scatter,
+        custom_plan=gmm_plan.RoutingGmmPlan(),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+  @parameterized.product(
+      case_spec=[
+          helper_cases.BASIC_256,
+          helper_cases.TOP1_200,
+          helper_cases.DECODE_16,
+      ],
+      tile_n=[None, 512],
+  )
+  def test_gather_gmm_bias(
+      self, case_spec: helper_cases.Case, tile_n: int | None
+  ):
+    # The test ensures the bias must be interleaved like the gate/up weight.
+    case = gmm_test_lib.GmmCase.make_case(case_spec, has_bias=True)
+    # At ×1 the bias is too small to detect a gate/up mix-up error.
+    assert case.w1.bias is not None
+    w1 = arg.SingleWeightWrapper.create(
+        case.w1.weight, case.w1.scale, case.w1.bias * 10, fused_gate_up=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        w1,
+        gather=routing.gather,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=tile_n),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        w1,
+        routing.local_group_sizes,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.sorted_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+  @parameterized.product(
+      case_spec=[helper_cases.TOP1_200, helper_cases.DECODE_16],
+      fuse_up_and_down=[None, True, False],
+  )
+  def test_gather_gmm_gmm_scatter_bias(
+      self, case_spec: helper_cases.Case, fuse_up_and_down: bool | None
+  ):
+    # Checks the w2 bias in both the fused kernel and the two-call fallback.
+    case = gmm_test_lib.GmmCase.make_case(case_spec, has_bias=True)
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+  @parameterized.product(case_spec=helper_cases.UNIT_CASES)
+  def test_gmm_scatter_fp8(self, case_spec: helper_cases.Case):
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -123,7 +227,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         **routing.kernel_kwargs,
     ).data
     self.assertEqual(actual.dtype, FP8)
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -140,7 +244,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
 
   def test_gmm_scatter_fp8_zero_row_has_zero_scale(self):
     # A zero row has a zero absmax, so its scales and payload are all 0.
-    case = gmm_test_lib.GmmCase.make_case(test_cases.TOP1_200)
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.TOP1_200)
     routing = case.routing
     zeros = 4
     actual = kernel.routing_gmm(
@@ -160,7 +264,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
   def test_gmm_scatter_fp8_large_values(self):
     # Outputs far above the fp8 max need scales above 1, so `1 / scale` is
     # below 1 and any error in it is a large relative error.
-    case = gmm_test_lib.GmmCase.make_case(test_cases.TOP1_200)
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.TOP1_200)
     routing = case.routing
     x = case.x_sorted * 2**13
     actual = kernel.routing_gmm(
@@ -170,7 +274,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         out_format=_FP8_OUT_FORMAT,
         **routing.kernel_kwargs,
     ).data
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         x[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -183,12 +287,12 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     self.assertLessEqual(_rel_diff(deq, expected), 2**-4)
 
   def test_gmm_scatter_fp8_topk_sum(self):
-    case_spec = test_cases.PREFILL_16E
+    case_spec = helper_cases.PREFILL_16E
     case = gmm_test_lib.GmmCase.make_case(case_spec)
     routing = case.routing
     num_tokens, topk = case_spec.num_tokens, routing.topk
     self.assertEqual(routing.row_end - routing.row_start, num_tokens * topk)
-    routed = test_reference.reference_gmm(
+    routed = helper_reference.reference_gmm(
         case.x_sorted, case.w1, routing.local_group_sizes
     )
     # Output row `t * topk + k` is token t's k-th expert.
@@ -210,34 +314,14 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     logging.info("fp8 topk sum: max rel %.4f, mean rel %.4f", max_rel, mean_rel)
     self.assertLessEqual(max_rel, 2**-4)
 
-  def test_quantized_buffered_ref_input_raises(self):
-    cfg = metadata_test_lib.make_gmm_config(
-        num_rows=128,
-        num_global_groups=8,
-        num_local_groups=8,
-        size_k=512,
-        size_n=512,
-    )
-    meta_ref = metadata.SortedMetadataRef.create_scratch_types(cfg)
-    bref = memory_ref.QuantizedBufferedRef.input(
-        spec=pl.BlockSpec((16, 4, 4, 128), lambda i, j, k: (0, 0, 0, 0)),
-        dtype_or_type=FP8,
-        cfg=cfg,
-        metadata_ref=meta_ref,
-    )
-    with self.assertRaisesRegex(AssertionError, "branchless_copy_in"):
-      bref.branchless_copy_in(meta_ref.gm_id_to_num_rows, (0, 0, 0))
-    with self.assertRaisesRegex(AssertionError, "read_vmem"):
-      bref.read_vmem(meta_ref.gm_id_to_num_rows, (0, 0, 0))
-
   @parameterized.product(
-      case_spec=test_cases.PREFILL_CASES,
+      case_spec=helper_cases.PREFILL_CASES,
       quant=[(True, True), (False, False), (True, False)],
       fuse_up_and_down=[None, True, False],
   )
   def test_gather_gmm_gmm_scatter(
       self,
-      case_spec: test_cases.Case,
+      case_spec: helper_cases.Case,
       quant: tuple[bool, bool],
       fuse_up_and_down: bool | None,
   ):
@@ -258,7 +342,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -326,7 +410,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       x_q_block_size: int,
   ):
     # size_n is the fused gate/up width, i.e. 2 * intermediate_size.
-    shape = test_shapes.MoEShape(
+    shape = helper_shapes.MoEShape(
         "sub_channel",
         num_experts=8,
         top_k=2,
@@ -335,7 +419,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         w_quant_block_size=w_q_block_size,
     )
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("sub_channel_256", shape, 256), quant_w1=True
+        helper_cases.Case("sub_channel_256", shape, 256), quant_w1=True
     )
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -346,7 +430,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(x_quant_block_size=x_q_block_size),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -367,7 +451,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       self, w_q_block_size: int, fuse_up_and_down: bool | None
   ):
     # Covers sub-channel scales on both w1 (K=hidden) and w2 (K=intermediate).
-    case_spec = test_cases.PREFILL_8K
+    case_spec = helper_cases.PREFILL_8K
     shape = dataclasses.replace(
         case_spec.shape, w_quant_block_size=w_q_block_size
     )
@@ -389,7 +473,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         ),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -408,7 +492,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     # We pass bf16 activations to the kernel. The kernel sees that matmul_dtype
     # != x.dtype and quantizes the activations to matmul_dtype (fp8)
     # dynamically.
-    shape = test_shapes.MoEShape(
+    shape = helper_shapes.MoEShape(
         "dsv4_fp4",
         num_experts=8,
         top_k=2,
@@ -418,7 +502,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         w_quant_block_size=512,
     )
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("dsv4_fp4_256", shape, 256)
+        helper_cases.Case("dsv4_fp4_256", shape, 256)
     )
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -431,7 +515,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -450,7 +534,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     # We pass bf16 activations to the kernel. For int8 weights, matmul_dtype
     # is int8, so the kernel quantizes the activations to int8 dynamically and
     # accumulates in int32.
-    shape = test_shapes.MoEShape(
+    shape = helper_shapes.MoEShape(
         "int8",
         num_experts=8,
         top_k=2,
@@ -460,7 +544,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         w_quant_block_size=512,
     )
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("int8_256", shape, 256)
+        helper_cases.Case("int8_256", shape, 256)
     )
     routing = case.routing
     actual = kernel.routing_gmm(
@@ -473,7 +557,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
         **routing.kernel_kwargs,
     )
-    expected = test_reference.reference_gmm(
+    expected = helper_reference.reference_gmm(
         case.x_sorted[routing.row_start : routing.row_end],
         case.w1,
         routing.local_group_sizes,
@@ -487,8 +571,127 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=1e-1,
     )
 
+  @parameterized.product(
+      w_dtype=[jnp.float8_e4m3fn, jnp.int8, jnp.float4_e2m1fn],
+      # None is per-channel; 128 is below the MXU column size.
+      w_q_block_size=[None, 128, 512],
+      fuse_up_and_down=[None, False],
+  )
+  def test_weight_only_quant(
+      self,
+      w_dtype: jnp.dtype,
+      w_q_block_size: int | None,
+      fuse_up_and_down: bool | None,
+  ):
+    # Setting matmul_dtype to x's dtype keeps x unquantized, so only the
+    # weights are quantized and their scales must be applied per block.
+    shape = helper_shapes.MoEShape(
+        "weight_only",
+        num_experts=8,
+        top_k=2,
+        hidden_size=2048,
+        intermediate_size=1024,
+        w_dtype=jnp.dtype(w_dtype),
+        w_quant_block_size=w_q_block_size,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.Case("weight_only_256", shape, num_tokens=256)
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(
+            matmul_dtype=case.x.dtype, fuse_up_and_down=fuse_up_and_down
+        ),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+  @parameterized.product(
+      case_spec=(
+          helper_cases.DECODE_1,
+          helper_cases.DECODE_16,
+          helper_cases.QWEN_38_FLASH_NEXT_8,
+      ),
+      out_dtype=[None, FP8],
+  )
+  def test_decode_gather_gmm_gmm_scatter(
+      self,
+      case_spec: helper_cases.Case,
+      out_dtype: jax.typing.DTypeLike | None,
+  ):
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, quant_w1=True, quant_w2=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        out_format=None if out_dtype is None else _FP8_OUT_FORMAT,
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    rows = np.asarray(routing.scattered_rows)
+    if out_dtype is None:
+      np.testing.assert_allclose(
+          gmm_test_lib.to_large_layout(actual)[rows],
+          expected,
+          rtol=6e-2,
+          atol=6e-2,
+      )
+    else:
+      deq = np.asarray(gmm_test_lib.dequantize_rows(actual.data))[rows]
+      self.assertLessEqual(
+          _rel_diff(deq, np.asarray(expected, np.float32)), 2**-3
+      )
+
+  @parameterized.parameters(
+      gmm_plan.RoutingGmmPlan(tile_m=4),
+      gmm_plan.RoutingGmmPlan(tile_m=16, bucket_base=4),
+  )
+  def test_misaligned_tile_m_or_bucket_base_raises(
+      self, custom_plan: gmm_plan.RoutingGmmPlan
+  ):
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.DECODE_16)
+    with self.assertRaisesRegex(ValueError, "must be multiples of"):
+      kernel.routing_gmm(
+          case.x_compact,
+          case.w1,
+          gather=case.routing.gather,
+          fuse_act="silu",
+          custom_plan=custom_plan,
+          **case.routing.kernel_kwargs,
+      )
+
   def test_fuse_up_and_down_without_w2_raises(self):
-    case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.DECODE_16)
     with self.assertRaisesRegex(ValueError, "fuse_up_and_down"):
       kernel.routing_gmm(
           case.x_compact,
@@ -500,7 +703,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
       )
 
   def test_tile_k2_without_fusion_raises(self):
-    case = gmm_test_lib.GmmCase.make_case(test_cases.DECODE_16)
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.DECODE_16)
     with self.assertRaisesRegex(ValueError, "tile_k2"):
       kernel.routing_gmm(
           case.x_compact,
@@ -534,7 +737,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     # The walks themselves are checked in metadata_unit_test. This checks that
     # the kernel plumbs row_group and the plan through to the same output.
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.DECODE_64_EP8, group_offset=128
+        helper_cases.DECODE_64_EP8, group_offset=128
     )
     calls = (
         (case.x_compact, dict(gather=case.routing.gather, fuse_act="silu")),
@@ -550,17 +753,47 @@ class RoutingGmmUnitTest(parameterized.TestCase):
           gmm_test_lib.to_large_layout(expected)[written],
       )
 
+  @parameterized.parameters(True, False)
+  def test_gather_gmm_gmm_scatter_fp8(self, fuse_up_and_down: bool):
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.DECODE_16, quant_w1=True, quant_w2=True
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        out_format=_FP8_OUT_FORMAT,
+        custom_plan=gmm_plan.RoutingGmmPlan(fuse_up_and_down=fuse_up_and_down),
+        **routing.kernel_kwargs,
+    ).data
+    self.assertEqual(actual.dtype, FP8)
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    rows = np.asarray(routing.scattered_rows)
+    deq = np.asarray(gmm_test_lib.dequantize_rows(actual))[rows]
+    expected = np.asarray(expected, np.float32)
+    self.assertLessEqual(_rel_diff(deq, expected), 2**-3)
+
 
 class RemoteRoutingGmmUnitTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self, min_devices=4)
+    helper_util.skip_unless_supported(self, min_devices=4)
     super().setUp()
 
   @parameterized.product(
       sharding=[
-          test_cases.MoESharding(ep=4),
-          test_cases.MoESharding(dp=2, ep=2),
+          helper_cases.MoESharding(ep=4),
+          helper_cases.MoESharding(dp=2, ep=2),
       ],
       num_tokens_topk=[(256, 2), (1024, 4)],
       skip_last_shard=[False, True],
@@ -568,17 +801,17 @@ class RemoteRoutingGmmUnitTest(parameterized.TestCase):
   )
   def test_remote_scatter_matches_single_device(
       self,
-      sharding: test_cases.MoESharding,
+      sharding: helper_cases.MoESharding,
       num_tokens_topk: tuple[int, int],
       skip_last_shard: bool,
       out_dtype: jnp.dtype | None,
   ):
     num_tokens, topk = num_tokens_topk
-    shape = test_shapes.MoEShape("remote", 16, topk, 1024, 256)
-    mesh = test_inputs.make_mesh(sharding)
+    shape = helper_shapes.MoEShape("remote", 16, topk, 1024, 256)
+    mesh = helper_inputs.make_mesh(sharding)
     num_local = shape.num_experts // sharding.ep
     case = gmm_test_lib.GmmCase.make_case(
-        test_cases.Case("remote", shape, num_tokens),
+        helper_cases.Case("remote", shape, num_tokens),
         num_skipped=num_local if skip_last_shard else 0,
     )
     w = case.w1.weight

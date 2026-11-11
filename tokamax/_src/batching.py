@@ -156,7 +156,21 @@ def _unique_not_none_value(*args):
 
 
 def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
-  """Captures the batched arguments shapes and passes them to the function."""
+  """Captures the batched arguments shapes and passes them to the function.
+
+  Under `jax.vmap`, the wrapper squeezes a vmap axis of size 1 and applies `fn`
+  once instead of batching it. The recorded `BatchedShapeDtype` still lists the
+  axis in `vmap_axes`.
+
+  Args:
+    fn: The function to wrap. It must accept a `batched_args` keyword argument.
+      The wrapper passes the bound arguments of each call, with each array
+      replaced by its `BatchedShapeDtype`.
+
+  Returns:
+    The wrapped function. Its `batched_args` parameter is keyword-only and
+    defaults to `None`.
+  """
 
   def bind(*args, **kwargs):
     kwargs.setdefault('batched_args', None)
@@ -200,7 +214,7 @@ def capture_batched_args(fn: Callable[..., Any]) -> Callable[..., Any]:
       @capture_batched_args
       def vmap_fn_flat(*arrays, batched_args):
         fn_flat_closed = functools.partial(fn_flat, batched_args=batched_args)
-        return jax.vmap(fn_flat_closed, in_axes=in_axes)(*arrays)
+        return vmap_maybe_bcast(fn_flat_closed, tuple(in_axes))(*arrays)
 
       out = vmap_fn_flat(*args, batched_args=fn_flat_sig.bind(*new_shapes))
       return out, jax.tree.map(lambda _: True, out)

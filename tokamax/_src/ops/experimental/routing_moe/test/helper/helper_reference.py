@@ -18,8 +18,8 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 
 
 def topk_reduce(
@@ -162,14 +162,32 @@ def unfused_gmm_scatter(
   return jnp.zeros_like(out).at[sorted_to_flat].set(out)
 
 
+@jax.jit
+def unfused_gather_gmm_gmm_scatter(
+    x: jax.Array,
+    w: arg.SingleWeightWrapper[jax.Array],
+    w2: arg.SingleWeightWrapper[jax.Array],
+    group_sizes: jax.Array,
+    gather_indices: jax.Array,
+    sorted_to_flat: jax.Array,
+) -> jax.Array:
+  """Gathers, runs gate/up and down GMMs, and scatters as an XLA baseline."""
+  out = reference_gmm(
+      x[gather_indices], w, group_sizes, w2=w2, fuse_act="silu"
+  )
+  mask = jnp.arange(out.shape[0]) < group_sizes.sum()
+  out = jnp.where(mask[:, None], out, 0)
+  return jnp.zeros_like(out).at[sorted_to_flat].set(out)
+
+
 def compute_topk(
-    moe: test_inputs.MoEInputs,
-    shape: test_shapes.MoEShape,
+    moe: helper_inputs.MoEInputs,
+    shape: helper_shapes.MoEShape,
     *,
     fold_shared_expert: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
   """Computes top-k weights and indices, appending a shared expert if folded."""
-  weights, indices = test_inputs.top_k(
+  weights, indices = helper_inputs.top_k(
       moe.gating_output, shape.top_k, renormalize=shape.renormalize
   )
   if not fold_shared_expert:
@@ -220,8 +238,8 @@ def shared_expert(
 
 @jax.jit(static_argnames=("shape", "fold_shared_expert"))
 def reference_moe(
-    moe: test_inputs.MoEInputs,
-    shape: test_shapes.MoEShape,
+    moe: helper_inputs.MoEInputs,
+    shape: helper_shapes.MoEShape,
     *,
     fold_shared_expert: bool = False,
 ) -> jax.Array:

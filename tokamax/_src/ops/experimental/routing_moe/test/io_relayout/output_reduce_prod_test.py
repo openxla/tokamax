@@ -19,9 +19,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce as kernel
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 from tokamax._src.ops.experimental.routing_moe.test.io_relayout import output_reduce_test_lib
 
 jax.config.parse_flags_with_absl()
@@ -30,21 +30,21 @@ jax.config.parse_flags_with_absl()
 class OutputReduceProdTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
-  @parameterized.product(case=test_cases.PROD_CASES)
-  def test_prod_cases(self, case: test_cases.Case):
+  @parameterized.product(case=helper_cases.PROD_CASES)
+  def test_prod_cases(self, case: helper_cases.Case):
     case_inputs = output_reduce_test_lib.ReduceCase.make_case(case, seed=54321)
-    xla = test_util.Timed.create(
-        test_reference.xla_output_reduce_unpack,
+    xla = helper_util.Timed.create(
+        helper_reference.xla_output_reduce_unpack,
         case_inputs.rows_clean_compact,
         case_inputs.topk_weights,
         case_inputs.topk_indices,
         case_inputs.group_offset.reshape(()),
         num_local_experts=case_inputs.num_local_experts,
     )
-    timed_kernel = test_util.Timed.create(
+    timed_kernel = helper_util.Timed.create(
         kernel.output_reduce_unpack,
         case_inputs.rows_compact,
         case_inputs.topk_weights,

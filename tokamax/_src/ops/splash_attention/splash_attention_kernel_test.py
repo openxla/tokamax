@@ -1754,19 +1754,15 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         self.assertLess(_rel_l2(g, g_ref), 3e-5)
 
   @parameterized.product(
-      # (diag_band_skip, dq_reduction_steps). The band path accumulates dq in
-      # the VMEM scratch, which square dkv tiles only have with
-      # dq_reduction_steps=1, so there is no band-only case here.
-      band_and_dq=((False, 1), (True, 1)),
+      diag_band_skip=(False, True),
       scaled_q=(False, True),
       qk_dtype=("bfloat16", "float8_e4m3fn"),
   )
   def test_diag_band_skip_and_vmem_dq_reduction(
-      self, band_and_dq, scaled_q, qk_dtype
+      self, diag_band_skip, scaled_q, qk_dtype
   ):
     """Row-band diagonal skip and VMEM dq reduction match the stock bwd."""
-    diag_band_skip, dq_reduction_steps = band_and_dq
-    seq_len, num_heads, head_dim_qk, block = 1024, 2, 192, 512
+    seq_len, num_heads, head_dim_qk, block = 2048, 2, 192, 512
     k1, k2, k3, k4 = random.split(random.key(0), 4)
     q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
         qk_dtype
@@ -1799,7 +1795,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
           q_prescaled_log2e=scaled_q,
           qk_diag_skip=optimized,
           diag_band_skip=optimized and diag_band_skip,
-          dq_reduction_steps=dq_reduction_steps if optimized else None,
+          dq_reduction_steps=1 if optimized else None,
       )
       attn = splash.make_splash_mha_single_device(mask, config=config)
 
@@ -1811,6 +1807,199 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
 
     for r, g in zip(grads(False), grads(True)):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
+  @parameterized.product(
+      mask_kind=("causal", "local", "full"),
+      is_mqa=(False, True),
+      bkv_compute_div=(1, 2),
+      dtype=("bfloat16", "float32"),
+  )
+  def test_dq_reduction_steps_1_non_contiguous_grid(
+      self, mask_kind, is_mqa, bkv_compute_div, dtype
+  ):
+    """dq_reduction_steps=1 uses a 1x dq buffer on non-contiguous dkv grids."""
+    seq_len, num_q_heads, num_kv_heads, head_dim, block = 1024, 4, 2, 128, 256
+    bkv_compute = block // bkv_compute_div
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    kv_shape = (
+        (seq_len, head_dim) if is_mqa else (num_kv_heads, seq_len, head_dim)
+    )
+    q = (random.normal(k1, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+    k = (random.normal(k2, kv_shape) * 0.5).astype(dtype)
+    v = (random.normal(k3, kv_shape) * 0.5).astype(dtype)
+    do = (random.normal(k4, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+
+    if mask_kind == "causal":
+      mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    elif mask_kind == "local":
+      mask = mask_lib.LocalMask(
+          shape=(seq_len, seq_len), window_size=(2 * block, 0), offset=0
+      )
+    else:
+      mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+
+    make_fn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    layout = (
+        splash.QKVLayout.SEQ_MINOR
+        if bkv_compute_div == 2 and dtype == "bfloat16"
+        else splash.QKVLayout.HEAD_DIM_MINOR
+    )
+    segment_ids = None
+    if mask_kind == "causal" and is_mqa and bkv_compute_div == 1:
+      # Last q block has segment_id=2 while kv has only {0, 1}, so
+      # _refine_mask_info_with_segments prunes all tiles for the last q block;
+      # dq for that block must remain zero-initialized in HBM.
+      q_seg = jnp.concatenate([
+          jnp.zeros(seq_len - block, dtype=jnp.int32),
+          jnp.full(block, 2, dtype=jnp.int32),
+      ])
+      kv_seg = jnp.concatenate([
+          jnp.zeros(seq_len - block, dtype=jnp.int32),
+          jnp.ones(block, dtype=jnp.int32),
+      ])
+      segment_ids = base.SegmentIds(q=q_seg, kv=kv_seg)
+
+    def run_bwd(dq_reduction_steps, mask_arg=mask, seg_ids=segment_ids):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=bkv_compute,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=bkv_compute,
+          q_layout=layout,
+          k_layout=layout,
+          v_layout=layout,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=dq_reduction_steps,
+          interpret=self.INTERPRET,
+      )
+      attn = make_fn(mask_arg, config=config)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=seg_ids), q, k, v
+        )
+        return vjp(do)
+
+      return bwd
+
+    bwd_1 = run_bwd(1)
+    jaxpr = jax.make_jaxpr(bwd_1)(q, k, v, do)
+    pallas_eqns = [
+        sub_e
+        for e in jaxpr.jaxpr.eqns
+        if e.primitive.name == "jit"
+        for sub_e in e.params["jaxpr"].eqns
+        if sub_e.primitive.name == "pallas_call"
+    ]
+    self.assertLen(pallas_eqns, 2)
+    self.assertEqual(
+        getattr(pallas_eqns[-1].outvars[0].aval, "shape", None), q.shape
+    )
+    self.assertIn(
+        0, dict(pallas_eqns[-1].params["input_output_aliases"]).values()
+    )
+
+    atol = 2e-2 if dtype == "bfloat16" else 1e-3
+    grads_ref = jax.jit(run_bwd(3))(q, k, v, do)
+    grads_1 = jax.jit(bwd_1)(q, k, v, do)
+    for r, g in zip(grads_ref, grads_1):
+      self._assert_allclose(g, r, atol=atol, rtol=atol)
+
+    if (
+        mask_kind == "causal"
+        and not is_mqa
+        and bkv_compute_div == 1
+        and dtype == "bfloat16"
+    ):
+      dyn_config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=bkv_compute,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=bkv_compute,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=1,
+          interpret=self.INTERPRET,
+      )
+      dyn_attn = splash.make_dynamic_splash_mha(
+          jnp.asarray(mask[:, :]), config=dyn_config
+      )
+      grads_dyn = jax.jit(
+          lambda q, k, v, do: jax.vjp(dyn_attn, q, k, v)[1](do)
+      )(q, k, v, do)
+      for r, g in zip(grads_ref, grads_dyn):
+        self._assert_allclose(g, r, atol=atol, rtol=atol)
+
+    if mask_kind == "full" and not is_mqa and dtype == "bfloat16":
+      # Single Q head and single Q block (q_steps=1, num_q_heads=1, kv_steps=4)
+      # on the static 3D grid: consecutive KV steps target the same (h=0, i=0)
+      # output block and must accumulate across all KV steps in VMEM.
+      q_single = q[:1, :block, :]
+      do_single = do[:1, :block, :]
+      k_single = k[:1, :, :]
+      v_single = v[:1, :, :]
+      single_mask = mask_lib.FullMask(_shape=(block, seq_len))
+      grads_single_ref = jax.jit(run_bwd(3, single_mask, None))(
+          q_single, k_single, v_single, do_single
+      )
+      bwd_single_1 = run_bwd(1, single_mask, None)
+      single_jaxpr = jax.make_jaxpr(bwd_single_1)(
+          q_single, k_single, v_single, do_single
+      )
+      single_pallas_eqns = [
+          sub_e
+          for e in single_jaxpr.jaxpr.eqns
+          if e.primitive.name == "jit"
+          for sub_e in e.params["jaxpr"].eqns
+          if sub_e.primitive.name == "pallas_call"
+      ]
+      self.assertNotIn(
+          0,
+          dict(single_pallas_eqns[-1].params["input_output_aliases"]).values(),
+      )
+      grads_single_1 = jax.jit(bwd_single_1)(
+          q_single, k_single, v_single, do_single
+      )
+      for r, g in zip(grads_single_ref, grads_single_1):
+        self._assert_allclose(g, r, atol=atol, rtol=atol)
+
+    if (
+        mask_kind == "local"
+        and not is_mqa
+        and bkv_compute_div == 1
+        and dtype == "bfloat16"
+    ):
+      contig_mask = mask_lib.LocalMask(
+          shape=(seq_len, seq_len), window_size=(block, 0), offset=0
+      )
+      bwd_contig_1 = run_bwd(1, contig_mask, None)
+      contig_jaxpr = jax.make_jaxpr(bwd_contig_1)(q, k, v, do)
+      contig_pallas_eqns = [
+          sub_e
+          for e in contig_jaxpr.jaxpr.eqns
+          if e.primitive.name == "jit"
+          for sub_e in e.params["jaxpr"].eqns
+          if sub_e.primitive.name == "pallas_call"
+      ]
+      self.assertNotIn(
+          0,
+          dict(contig_pallas_eqns[-1].params["input_output_aliases"]).values(),
+      )
+      grads_contig_ref = jax.jit(run_bwd(3, contig_mask, None))(q, k, v, do)
+      grads_contig_1 = jax.jit(bwd_contig_1)(q, k, v, do)
+      for r, g in zip(grads_contig_ref, grads_contig_1):
+        self._assert_allclose(g, r, atol=atol, rtol=atol)
 
 
 if __name__ == "__main__":

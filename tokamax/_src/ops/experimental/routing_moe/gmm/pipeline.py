@@ -82,14 +82,18 @@ def _inner_pipeline(
     # Step 4: Perform computation.
     weight = in_ref.w.get_weight()
     weight_scale = in_ref.w.get_scale() if cfg.spec.w.has_scale else None
-    act = compute.matmul(cfg.compute, act, weight, weight_scale, None)
+    weight_bias = in_ref.w.get_bias() if cfg.spec.w.has_bias else None
+    act = compute.matmul(cfg.compute, act, weight, weight_scale, weight_bias)
     act = compute.apply_act_fn(act, cfg.spec.fuse_act)
     if cfg.spec.w2 is not None:
       assert in_ref.w2 is not None and cfg.compute2 is not None
       act = act.astype(x_ref.dtype)
       weight2 = in_ref.w2.get_weight()
       weight2_scale = in_ref.w2.get_scale() if cfg.spec.w2.has_scale else None
-      act = compute.matmul(cfg.compute2, act, weight2, weight2_scale, None)
+      weight2_bias = in_ref.w2.get_bias() if cfg.spec.w2.has_bias else None
+      act = compute.matmul(
+          cfg.compute2, act, weight2, weight2_scale, weight2_bias
+      )
 
     # Start output DMA for previous step slot after the loads because a remote
     # DMA is a global memory barrier, so issuing it earlier would hold every
@@ -191,9 +195,7 @@ def outer_pipeline(
 
   num_gm = metadata_ref.fill_metadata_and_return_num_gm(metadata_in_ref)
 
-  allocs = memory_ref.PipelineAllocs.create(
-      in_hbm_ref, out_hbm_ref, metadata_ref, cfg
-  )
+  allocs = memory_ref.PipelineAllocs.create(in_hbm_ref, metadata_ref, cfg)
   in_hbm_ref = in_hbm_ref.transform_for_pipeline(cfg)
 
   @functools.partial(pl.run_scoped, final_allocs=allocs)

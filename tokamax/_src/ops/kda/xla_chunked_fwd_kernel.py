@@ -23,6 +23,17 @@ from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-i
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda import utils
 
+# Dimensions.
+#   B: batch size
+#   H: number of heads
+#   T: sequence length
+#   NT: number of chunks
+#   N: max number of segments per batch element
+#   K: key/query head dimension
+#   V: value head dimension
+# Pure-JAX chunked kernel stages organize tensors into:
+#   # Inputs., # Outputs., and # Scratch.
+
 
 def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
   return jnp.promote_types(jnp.dtype(dtype), jnp.float32)
@@ -369,8 +380,9 @@ def chunk_kda_fwd(
         cu_seqlens,
         chunk_size,
     )
+    _, _, aligned_seq_len, _ = query.shape
     valid = _valid_aligned_tokens(
-        cu_seqlens, aligned_cu_seqlens, query.shape[2]
+        cu_seqlens, aligned_cu_seqlens, aligned_seq_len
     )
     valid_4d = valid[None, :, :, None]
     query = jnp.where(valid_4d, query, 0)
@@ -379,7 +391,7 @@ def chunk_kda_fwd(
     beta = jnp.where(valid[None], beta, 0)
     gate = jnp.where(valid_4d, gate, 0)
 
-  seq_len = query.shape[2]
+  _, _, seq_len, _ = query.shape
   if initial_state is None:
     state_count = max_num_segments if segment_ids is not None else 1
     assert state_count is not None

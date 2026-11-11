@@ -34,33 +34,6 @@ def setUpModule() -> None:
   jax.devices()
 
 
-def _skip_if_partial_blocks_on_old_jax(
-    test_case: parameterized.TestCase,
-    *,
-    b_dim: int,
-    h_dim: int,
-    v_dim: int,
-    b_block_size: int,
-    h_block_size: int,
-    v_block_size: int,
-) -> None:
-  """Skips test on JAX < 0.11.1 if any dimension has a partial final block.
-
-  Before jax-ml/jax@4700d0c (released in JAX 0.11.1), emit_pipeline did not
-  round in-bounds BoundedSlice sizes up to the tiling, so the kernel's clamped
-  partial final blocks produce non-tile-aligned DMAs on those versions.
-  """
-  if jax.__version_info__ < (0, 11, 1):
-    if (
-        b_dim % b_block_size != 0
-        or h_dim % h_block_size != 0
-        or v_dim % v_block_size != 0
-    ):
-      test_case.skipTest(
-          "Partial final blocks fail in JAX 0.11.0; fixed in JAX 0.11.1."
-      )
-
-
 class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
 
   def setUp(self):
@@ -359,9 +332,6 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
   def test_kernel_forward_matches_reference(
       self, b_dim, h_dim, v_dim, reduction, dtype=jnp.float32
   ):
-    if jax.__version_info__ < (0, 11, 1):
-      self.skipTest("Test fails in JAX 0.11.0; fixed in JAX 0.11.1.")
-
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim
@@ -626,15 +596,6 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
   )
   def test_kernel_bwd_matches_reference(self, b_dim, h_dim, v_dim, reduction):
     config = kernel.get_heuristic_bwd_config(b_dim, h_dim, v_dim)
-    _skip_if_partial_blocks_on_old_jax(
-        self,
-        b_dim=b_dim,
-        h_dim=h_dim,
-        v_dim=v_dim,
-        b_block_size=config.b_block_size,
-        h_block_size=config.h_block_size,
-        v_block_size=config.v_block_size,
-    )
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim
@@ -721,15 +682,6 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
   def test_bwd_odd_num_v_blocks_multi_core(self):
     b_dim, h_dim, v_dim = 1024, 512, 2560
     b_block_size, h_block_size, v_block_size = 1024, 512, 1024
-    _skip_if_partial_blocks_on_old_jax(
-        self,
-        b_dim=b_dim,
-        h_dim=h_dim,
-        v_dim=v_dim,
-        b_block_size=b_block_size,
-        h_block_size=h_block_size,
-        v_block_size=v_block_size,
-    )
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim
@@ -827,15 +779,6 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
       h_block_size: int,
       v_block_size: int,
   ):
-    _skip_if_partial_blocks_on_old_jax(
-        self,
-        b_dim=b_dim,
-        h_dim=h_dim,
-        v_dim=v_dim,
-        b_block_size=b_block_size,
-        h_block_size=h_block_size,
-        v_block_size=v_block_size,
-    )
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
     labels_shape = numerics.RangedArrayInitializer(
         (b_dim,), jnp.int32, 0, v_dim
@@ -927,16 +870,6 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
       b_block_size = config.b_block_size
       h_block_size = config.h_block_size
       v_block_size = config.v_block_size
-
-    _skip_if_partial_blocks_on_old_jax(
-        self,
-        b_dim=b_dim,
-        h_dim=h_dim,
-        v_dim=v_dim,
-        b_block_size=b_block_size,
-        h_block_size=h_block_size,
-        v_block_size=v_block_size,
-    )
 
     x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), jnp.float32)
     labels_shape = numerics.RangedArrayInitializer(
@@ -1976,15 +1909,6 @@ class NonAlignedVocabBwdTest(parameterized.TestCase):
       w_dtype: jnp.dtype,
       resolved_config: kernel.Config,
   ) -> None:
-    _skip_if_partial_blocks_on_old_jax(
-        self,
-        b_dim=b_dim,
-        h_dim=256,
-        v_dim=119548,
-        b_block_size=resolved_config.b_block_size,
-        h_block_size=resolved_config.h_block_size,
-        v_block_size=resolved_config.v_block_size,
-    )
     rng_key = jax.random.key(42)
     op = pallas_mosaic_tpu.PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         config=resolved_config

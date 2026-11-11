@@ -459,10 +459,6 @@ def ragged_dot_gpu_quant_blackwell_kernel(
   profile = False
   if profile:
     num_sms = 1 + collective
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   f = plgpu.kernel(
       kernel_entry,
@@ -479,7 +475,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           unsafe_no_auto_barriers=True,
           profile_space=80 if profile else 0,
           profile_dir="sponge" if profile else "",
-          lowering_semantics=lowering_semantics,
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
       ),
   )
   return f(

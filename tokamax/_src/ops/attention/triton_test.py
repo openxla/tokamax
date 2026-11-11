@@ -177,6 +177,33 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
 
     self._run_test((2, 64, 2, 5), impl=impl, ref_impl=ref_impl, test_vjp=False)
 
+  def test_quantized_bf16_qvalue_with_scale(self):
+    def quantize(x):
+      scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+      qvalue = (x / jnp.where(scale == 0, 1.0, scale)).astype(jnp.bfloat16)
+      return qwix.QArray(qvalue, scale.astype(jnp.float32))
+
+    def impl(q, k, v, **kwargs):
+      k, v = map(quantize, (k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      def quant_dequant(x):
+        qa = quantize(x)
+        return (qa.qvalue.astype(x.dtype) * qa.scale).astype(q.dtype)
+
+      k, v = map(quant_dequant, (k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test(
+        (2, 64, 2, 64),
+        dtype=jnp.bfloat16,
+        impl=impl,
+        ref_impl=ref_impl,
+        atol=0.02,
+        test_vjp=False,
+    )
+
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
     assert fa is not None

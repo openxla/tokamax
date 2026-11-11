@@ -47,6 +47,18 @@ from tokamax._src.ops.kda.utils import (
 )
 from typing_extensions import override
 
+# Dimensions.
+#   B: batch size
+#   H: number of heads (H_QK for query/key heads, H_V for value heads)
+#   T: sequence length
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (64 or 128)
+#   N: max number of segments per batch element
+#   K: key/query head dimension
+#   V: value head dimension
+#   GW: gate channel width (1 for scalar gate, K for per-channel gate)
+#   W: depthwise conv1d kernel width
+
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
@@ -358,14 +370,14 @@ class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
           cu_seqlens,
           align=chunk_size,
       )
+      _, _, aligned_seq_len, _ = q_aligned.shape
       chunk_indices = prepare_chunk_indices(
           aligned_cu_seqlens,
           chunk_size,
-          max_T=q_aligned.shape[2],
+          max_T=aligned_seq_len,
       )
 
       if use_gate_in_kernel:
-        aligned_seq_len = g_aligned.shape[2]
         original_lengths = jnp.diff(cu_seqlens, axis=-1)
         aligned_starts = aligned_cu_seqlens[..., :-1]
         positions = jnp.arange(aligned_seq_len)

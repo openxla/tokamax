@@ -17,11 +17,12 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_util
 from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 jax.config.parse_flags_with_absl()
 
@@ -29,7 +30,7 @@ jax.config.parse_flags_with_absl()
 class MetadataUnitTest(parameterized.TestCase):
 
   def setUp(self):
-    test_util.skip_unless_supported(self)
+    helper_util.skip_unless_supported(self)
     super().setUp()
 
   @parameterized.product(
@@ -41,23 +42,36 @@ class MetadataUnitTest(parameterized.TestCase):
       plan: gmm_plan.RoutingGmmPlan,
   ):
     case = routing_case.case
-    test_util.check_gmm_supported(
-        case, live_group_walk=bool(plan.live_group_walk)
-    )
+    helper_util.check_gmm_supported(case)
     shape = case.shape
-    gating_output = test_inputs.random_gating(
+    gating_output = helper_inputs.random_gating(
         jax.random.key(0),
         case.num_tokens,
         shape.num_experts,
         num_skipped=routing_case.num_skipped,
     )
-    _, topk_indices = test_inputs.top_k(gating_output, shape.top_k)
-    routing = test_inputs.Routing.make_routing(
+    _, topk_indices = helper_inputs.top_k(gating_output, shape.top_k)
+    routing = helper_inputs.Routing.make_routing(
         topk_indices,
         shape.num_experts,
         group_offset=routing_case.group_offset,
         num_local_experts=case.num_local_experts,
     )
+    tpu_info = pltpu.get_tpu_info()
+    if plan.live_group_walk and (
+        4 * case.num_rows > gmm_plan.smem_budget_bytes(tpu_info)
+    ):
+      # A forced walk whose row_group overflows the SMEM budget is rejected.
+      with self.assertRaisesRegex(ValueError, "row_group"):
+        metadata_test_lib.make_gmm_config(
+            num_rows=case.num_rows,
+            num_global_groups=shape.num_experts,
+            num_local_groups=case.num_local_experts,
+            size_k=shape.hidden_size,
+            size_n=2 * shape.intermediate_size,
+            custom_plan=plan,
+        )
+      return
     cfg = metadata_test_lib.make_gmm_config(
         num_rows=case.num_rows,
         num_global_groups=shape.num_experts,

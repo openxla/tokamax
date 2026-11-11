@@ -25,9 +25,9 @@ from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.test.common import test_cases
-from tokamax._src.ops.experimental.routing_moe.test.common import test_inputs
-from tokamax._src.ops.experimental.routing_moe.test.common import test_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
 
 
 @functools.partial(jax.jit, static_argnames=("dtype",))
@@ -106,7 +106,7 @@ class ReduceCase:
   @property
   def local_weights(self) -> jax.Array:
     """`topk_weights` restricted to this shard's picks."""
-    return test_reference.local_pick_weights(
+    return helper_reference.local_pick_weights(
         self.topk_weights, self.topk_indices, 0, self.num_local_experts
     )
 
@@ -135,7 +135,7 @@ class ReduceCase:
 
   def expected(self, out_dtype: jax.typing.DTypeLike) -> jax.Array:
     """Computes the reference weighted top-k sum in `out_dtype`."""
-    return test_reference.topk_reduce(
+    return helper_reference.topk_reduce(
         self.dequantized_rows, self.local_weights, out_dtype
     )
 
@@ -150,7 +150,7 @@ class ReduceCase:
   @classmethod
   def make_case(
       cls,
-      case: test_cases.Case,
+      case: helper_cases.Case,
       *,
       in_dtype: jax.typing.DTypeLike = jnp.bfloat16,
       seed: int = 1234,
@@ -158,14 +158,14 @@ class ReduceCase:
     """Generates random gmm2 rows and the top-k routing of `case`."""
     shape = case.shape
     k_gate, k_rows = jax.random.split(jax.random.key(seed))
-    gating_output = test_inputs.random_gating(
+    gating_output = helper_inputs.random_gating(
         k_gate,
         case.num_tokens,
         shape.num_experts,
         max_to_mean_load=case.max_to_mean_load,
         dtype=jnp.float32,
     )
-    topk_weights, topk_indices = test_inputs.top_k(
+    topk_weights, topk_indices = helper_inputs.top_k(
         gating_output, shape.top_k, renormalize=shape.renormalize
     )
     rows = jax.random.normal(

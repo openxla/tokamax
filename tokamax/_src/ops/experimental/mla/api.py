@@ -29,3 +29,13 @@ try:
   )
 except ImportError:
   pass
+
+try:
+  from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu_v3  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  # Requires `layout=MlaLayout.HEAD_MAJOR_SEQ_ALONG_LANE`.
+  IMPLEMENTATIONS['mosaic_tpu_v3'] = (
+      pallas_mosaic_tpu_v3.PallasTpuMultiHeadLatentAttentionV3()
+  )
+except ImportError:
+  pass
