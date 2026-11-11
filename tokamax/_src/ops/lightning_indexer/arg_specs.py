@@ -622,12 +622,14 @@ _UNCOMPRESSED_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         batch_size=16,
         q_len=1,
         kv_len=262144,
+        sal_tags=("primary", "forward_only"),
     ),
     *_make_layout_pair(
         base_name="decode_b32_q1_kv262144_k2048",
         batch_size=32,
         q_len=1,
         kv_len=262144,
+        sal_tags=("primary", "forward_only"),
     ),
     *_make_layout_pair(
         base_name="prefill_b1_q1024_kv1024_k2048",
@@ -643,10 +645,11 @@ _UNCOMPRESSED_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         sal_tags=("primary", "forward_only"),
     ),
     *_make_layout_pair(
-        base_name="prefill_b1_q1024_kv262144_k2048",
+        base_name="prefill_b1_q4096_kv262144_k2048",
         batch_size=1,
-        q_len=1024,
+        q_len=4096,
         kv_len=262144,
+        sal_tags=("primary", "forward_only"),
     ),
 )
 
