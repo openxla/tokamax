@@ -50,11 +50,26 @@ class RoutingMode(enum.StrEnum):
   REMOTE = enum.auto()
 
 
+class MatmulMode(enum.StrEnum):
+  """How x and w are fed to the MXU and how their scales are applied."""
+
+  # x and w are both passed in unquantized.
+  UNQUANTIZED = enum.auto()
+  # w is passed in quantized with scales. x is passed in unquantized, and the
+  # kernel quantizes it before the matmul. The output is scaled by both x and w
+  # scales.
+  QUANTIZED = enum.auto()
+  # w is passed in quantized with scales. x is passed in unquantized and stays
+  # unquantized. The output is scaled by w scales.
+  WEIGHT_ONLY_SCALE_AFTER = enum.auto()
+
+
 @dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
 class ComputeConfig:
   """Resolved configuration for a single matrix multiplication."""
 
+  matmul_mode: MatmulMode
   matmul_dtype: jnp.dtype
   acc_dtype: jnp.dtype
   tpu_info: pltpu.TpuInfo
@@ -143,7 +158,17 @@ class RoutingGmmConfig:
           block_size=plan.x_quant_block_size
       )
 
+    if x_quant is not None and spec.w.quant is not None:
+      matmul_mode = MatmulMode.QUANTIZED
+    elif x_quant is None and spec.w.quant is not None:
+      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
+    elif x_quant is None and spec.w.quant is None:
+      matmul_mode = MatmulMode.UNQUANTIZED
+    else:
+      raise NotImplementedError("Quantizing x requires a quantized w.")
+
     compute_cfg = ComputeConfig(
+        matmul_mode=matmul_mode,
         matmul_dtype=plan.matmul_dtype,
         acc_dtype=plan.acc_dtype,
         tpu_info=tpu_info,

@@ -572,6 +572,59 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     )
 
   @parameterized.product(
+      w_dtype=[jnp.float8_e4m3fn, jnp.int8, jnp.float4_e2m1fn],
+      # None is per-channel; 128 is below the MXU column size.
+      w_q_block_size=[None, 128, 512],
+      fuse_up_and_down=[None, False],
+  )
+  def test_weight_only_quant(
+      self,
+      w_dtype: jnp.dtype,
+      w_q_block_size: int | None,
+      fuse_up_and_down: bool | None,
+  ):
+    # Setting matmul_dtype to x's dtype keeps x unquantized, so only the
+    # weights are quantized and their scales must be applied per block.
+    shape = helper_shapes.MoEShape(
+        "weight_only",
+        num_experts=8,
+        top_k=2,
+        hidden_size=2048,
+        intermediate_size=1024,
+        w_dtype=jnp.dtype(w_dtype),
+        w_quant_block_size=w_q_block_size,
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.Case("weight_only_256", shape, num_tokens=256)
+    )
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(
+            matmul_dtype=case.x.dtype, fuse_up_and_down=fuse_up_and_down
+        ),
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.scattered_rows],
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+  @parameterized.product(
       case_spec=(
           helper_cases.DECODE_1,
           helper_cases.DECODE_16,

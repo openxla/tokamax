@@ -36,6 +36,7 @@ def _make_config(
     out_format: out_format_lib.ActivationFormat | None = None,
     size_ep: int = 1,
     size_n: int = 1280,
+    quantize_w: bool = True,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a RoutingGmmConfig for a 512-expert, top-10 MoE layer."""
   num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
@@ -49,8 +50,8 @@ def _make_config(
       group_size=num_experts // ep_size,
       in_size=size_k,
       out_size=size_n,
-      dtype=jnp.dtype(jnp.float8_e4m3fn),
-      quant=spec.SubchannelQuantSpec(block_size=size_k),
+      dtype=jnp.dtype(jnp.float8_e4m3fn if quantize_w else jnp.bfloat16),
+      quant=spec.SubchannelQuantSpec(block_size=size_k) if quantize_w else None,
       has_bias=False,
       fused_gate_up=False,
   )
@@ -94,6 +95,35 @@ def _make_config(
 
 
 class OutSpecAndValidationTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="unquantized",
+          quantize_w=False,
+          custom_plan=None,
+          expected=gmm_config.MatmulMode.UNQUANTIZED,
+      ),
+      dict(
+          testcase_name="quantized",
+          quantize_w=True,
+          custom_plan=None,
+          expected=gmm_config.MatmulMode.QUANTIZED,
+      ),
+      dict(
+          testcase_name="weight_only",
+          quantize_w=True,
+          custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.bfloat16),
+          expected=gmm_config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER,
+      ),
+  )
+  def test_matmul_mode(
+      self,
+      quantize_w: bool,
+      custom_plan: gmm_plan.RoutingGmmPlan | None,
+      expected: gmm_config.MatmulMode,
+  ):
+    cfg = _make_config(8, custom_plan, quantize_w=quantize_w)
+    self.assertEqual(cfg.compute.matmul_mode, expected)
 
   def test_default_out_format_uses_input_dtype_and_unquantized(self):
     out_spec = _make_config(8).out.spec
