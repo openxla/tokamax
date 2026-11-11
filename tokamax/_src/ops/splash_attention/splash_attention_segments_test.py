@@ -356,19 +356,27 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
       self.skipTest("End-to-end Pallas Splash kernel requires TPU.")
 
   @parameterized.named_parameters(
-      ("causal_aligned_mha", True, (256, 256, 256, 256), 2, 2, False),
-      ("causal_straddling_mha", True, (180, 332, 200, 312), 2, 2, False),
-      ("causal_aligned_gqa", True, (256, 256, 256, 256), 4, 2, False),
-      ("causal_short_1step_gqa", True, (64, 64), 4, 2, False),
-      ("causal_short_2step_gqa", True, (128, 128), 4, 2, False),
-      ("causal_short_3step_gqa", True, (128, 128, 128), 4, 2, False),
-      ("causal_short_1step_mqa", True, (64, 64), 4, 1, True),
-      ("causal_short_2step_mqa", True, (128, 128), 4, 1, True),
-      ("full_aligned_mha", False, (256, 256, 256, 256), 2, 2, False),
-      ("full_straddling_gqa", False, (180, 332, 200, 312), 4, 2, False),
+      ("causal_aligned_mha", True, (256, 256, 256, 256), 2, 2, False, None),
+      ("causal_straddling_mha", True, (180, 332, 200, 312), 2, 2, False, None),
+      ("causal_aligned_gqa", True, (256, 256, 256, 256), 4, 2, False, None),
+      ("causal_aligned_gqa_dq1", True, (256, 256, 256, 256), 4, 2, False, 1),
+      ("causal_short_1step_gqa", True, (64, 64), 4, 2, False, None),
+      ("causal_short_1step_gqa_dq1", True, (64, 64), 4, 2, False, 1),
+      ("causal_short_2step_gqa", True, (128, 128), 4, 2, False, None),
+      ("causal_short_3step_gqa", True, (128, 128, 128), 4, 2, False, None),
+      ("causal_short_1step_mqa", True, (64, 64), 4, 1, True, None),
+      ("causal_short_2step_mqa", True, (128, 128), 4, 1, True, None),
+      ("full_aligned_mha", False, (256, 256, 256, 256), 2, 2, False, None),
+      ("full_straddling_gqa", False, (180, 332, 200, 312), 4, 2, False, None),
   )
   def test_fwd_and_bwd_match_reference(
-      self, is_causal, lengths, num_q_heads, num_kv_heads, is_mqa
+      self,
+      is_causal,
+      lengths,
+      num_q_heads,
+      num_kv_heads,
+      is_mqa,
+      dq_reduction_steps,
   ):
     seq_len = sum(lengths)
     head_dim = 128
@@ -399,6 +407,7 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
         block_q_dkv=bq,
         block_kv_dkv=bkv,
         block_kv_dkv_compute=bkv,
+        dq_reduction_steps=dq_reduction_steps,
     )
     make_attn = (
         splash.make_splash_mqa_single_device
@@ -585,21 +594,25 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
       np.testing.assert_allclose(dv[b], dv_ref, atol=8e-2, rtol=8e-2)
 
   @parameterized.named_parameters(
-      ("static_dkv_grid", None),
-      ("dynamic_dkv_grid", 3),
+      ("static_dkv_grid_mha", None, 2, 2),
+      ("dynamic_dkv_grid_mha", 3, 2, 2),
+      ("static_dkv_grid_gqa", None, 4, 2),
+      ("dynamic_dkv_grid_gqa", 3, 4, 2),
   )
-  def test_dropout_matches_the_unpruned_schedule(self, dq_reduction_steps):
+  def test_dropout_matches_the_unpruned_schedule(
+      self, dq_reduction_steps, num_q_heads, num_kv_heads
+  ):
     # Dropout bits are keyed on absolute canonical-block coordinates, so
     # skipping whole tiles must not change which surviving weights are dropped.
     lengths = (180, 332, 200, 312)
     seq_len, head_dim, bq, bkv = sum(lengths), 128, 128, 128
     k1, k2, k3, k4 = jax.random.split(jax.random.key(3), 4)
-    q = jax.random.normal(k1, (2, seq_len, head_dim), jnp.bfloat16) / np.sqrt(
-        head_dim
-    ).astype(jnp.bfloat16)
-    k = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16)
-    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16)
-    do = jax.random.normal(k4, (2, seq_len, head_dim), jnp.bfloat16)
+    q = jax.random.normal(
+        k1, (num_q_heads, seq_len, head_dim), jnp.bfloat16
+    ) / np.sqrt(head_dim).astype(jnp.bfloat16)
+    k = jax.random.normal(k2, (num_kv_heads, seq_len, head_dim), jnp.bfloat16)
+    v = jax.random.normal(k3, (num_kv_heads, seq_len, head_dim), jnp.bfloat16)
+    do = jax.random.normal(k4, (num_q_heads, seq_len, head_dim), jnp.bfloat16)
     segment_ids = _segment_ids(lengths)
     prng_key = jax.random.key(7)
 
@@ -633,14 +646,97 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
     jax.clear_caches()
 
     # Skipped tiles only ever add exact zeros, so any dropout bit that moved
-    # would show up here.
+    # would show up here. Static GQA sums across q blocks before q heads, while
+    # the dynamic GQA grid sums across q heads inside each q block.
     np.testing.assert_array_equal(o, o_ref)
-    np.testing.assert_array_equal(dk, dk_ref)
-    np.testing.assert_array_equal(dv, dv_ref)
+    if dq_reduction_steps is None and num_q_heads != num_kv_heads:
+      np.testing.assert_allclose(dk, dk_ref, atol=1e-2, rtol=1e-2)
+      np.testing.assert_allclose(dv, dv_ref, atol=1e-2, rtol=1e-2)
+    else:
+      np.testing.assert_array_equal(dk, dk_ref)
+      np.testing.assert_array_equal(dv, dv_ref)
     # A pruned dkv grid is dynamic, and a dynamic grid always accumulates dq in
     # three slots of q's dtype (bf16 here) picked by grid step; pruning
     # renumbers the steps, so dq only matches up to bf16 rounding.
     np.testing.assert_allclose(dq, dq_ref, atol=8e-2, rtol=8e-2)
+
+  @parameterized.named_parameters(
+      ("gqa", 4, 2, False),
+      ("mqa", 4, 1, True),
+  )
+  def test_large_dkv_block_gqa_fits_in_vmem(
+      self, num_q_heads, num_kv_heads, is_mqa
+  ):
+    if jax.devices()[0].device_kind != "TPU7x":
+      self.skipTest("Requires 64 MiB VMEM on TPU7x.")
+    seq_len, head_dim = 8192, 512
+    lengths = (2048, 2048, 4096)
+    kv_shape = (
+        (seq_len, head_dim) if is_mqa else (num_kv_heads, seq_len, head_dim)
+    )
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(11), 4)
+    q = jax.random.normal(
+        k1, (num_q_heads, seq_len, head_dim), jnp.bfloat16
+    ) / np.sqrt(head_dim).astype(jnp.bfloat16)
+    k = jax.random.normal(k2, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
+    v = jax.random.normal(k3, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
+    do = jax.random.normal(
+        k4, (num_q_heads, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    segment_ids = _segment_ids(lengths)
+
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    config = splash.SplashConfig(
+        block_q=512,
+        block_kv=512,
+        block_kv_compute=512,
+        block_q_dkv=1024,
+        block_kv_dkv=2048,
+        block_kv_dkv_compute=1024,
+        q_layout=splash.QKVLayout.SEQ_MINOR,
+        k_layout=splash.QKVLayout.SEQ_MINOR,
+        v_layout=splash.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+    )
+    make_attn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    attn = make_attn(mask, config=config)
+    o, attn_vjp = jax.vjp(attn, q, k, v, segment_ids)
+    dq, dk, dv, _ = attn_vjp(do)
+
+    dense_mask = jnp.asarray(mask[:, :])
+    q32, k32, v32, do32 = jax.tree.map(
+        lambda x: x.astype(jnp.float32), (q, k, v, do)
+    )
+    o_ref, stats_ref = base.attention_reference(
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        is_mqa=is_mqa,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+        do32,
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        o_ref,
+        stats_ref["logsumexp"],
+        is_mqa=is_mqa,
+    )
+    np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(dq, dq_ref, atol=5e-2, rtol=5e-2)
+    np.testing.assert_allclose(dk, dk_ref, atol=5e-2, rtol=5e-2)
+    np.testing.assert_allclose(dv, dv_ref, atol=5e-2, rtol=5e-2)
 
 
 if __name__ == "__main__":
