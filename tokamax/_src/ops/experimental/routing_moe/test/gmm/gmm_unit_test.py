@@ -81,6 +81,30 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=5e-2,
     )
 
+  @parameterized.parameters("situ:4.0:none", "situ:4.0:25.0")
+  def test_gather_gmm_situ(self, fuse_act: str):
+    case = gmm_test_lib.GmmCase.make_case(helper_cases.BASIC_256)
+    routing = case.routing
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        gather=routing.gather,
+        fuse_act=fuse_act,
+        **routing.kernel_kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        fuse_act=fuse_act,
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(actual)[routing.sorted_rows],
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
   @parameterized.product(
       case_spec=helper_cases.UNIT_CASES,
       tile_n=[None, 512],

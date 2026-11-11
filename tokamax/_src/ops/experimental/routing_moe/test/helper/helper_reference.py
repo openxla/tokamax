@@ -82,6 +82,12 @@ def _apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
       gate = jnp.clip(gate, max=10.0)
       up = jnp.clip(up, min=-10.0, max=10.0)
       return jax.nn.silu(gate) * up
+    case str() if fuse_act.startswith("situ:"):
+      _, beta, linear_beta = fuse_act.split(":")
+      gate = float(beta) * jnp.tanh(gate / float(beta)) * jax.nn.sigmoid(gate)
+      if linear_beta != "none":
+        up = float(linear_beta) * jnp.tanh(up / float(linear_beta))
+      return gate * up
     case _:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
