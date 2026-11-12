@@ -64,6 +64,12 @@ AUTOTUNING_CACHE_TEST: Final[str] = (
     f'{PACKAGE_ROOT}/_src/autotuning/cache_test.py'
 )
 _OPS_ROOT: Final[str] = f'{PACKAGE_ROOT}/_src/ops/'
+# Checks `ops_list.OPS` against the op directories and the `tokamax.ops`
+# exports by reading source files, so no import reaches it from an op change.
+# Selected for any change under these prefixes other than an inert one, e.g. a
+# README.
+OPS_LIST_TEST: Final[str] = f'{_OPS_ROOT}ops_list_test.py'
+OPS_LIST_PREFIXES: Final[tuple[str, ...]] = (_OPS_ROOT, f'{PACKAGE_ROOT}/ops/')
 _CAMEL_TO_SNAKE: Final[re.Pattern[str]] = re.compile(r'(?!^)([A-Z])')
 
 
@@ -344,6 +350,11 @@ def execution_edges(
   }
 
 
+def _is_inert(path: str) -> bool:
+  """Whether `path` never affects a test, by suffix or directory."""
+  return path.endswith(INERT_SUFFIXES) or path.startswith(INERT_DIRS)
+
+
 def full_run_reason(
     changed: Collection[str],
     unparsed: Collection[str] = (),
@@ -379,7 +390,7 @@ def full_run_reason(
     )
 
   for path in sorted(changed):
-    if path.endswith(INERT_SUFFIXES) or path.startswith(INERT_DIRS):
+    if _is_inert(path):
       continue
     if path.startswith(WORKFLOWS_DIR) and path != CI_BUILD_WORKFLOW:
       continue
@@ -407,6 +418,18 @@ def full_run_reason(
       if path not in known:
         return f'{path} was deleted, which re-resolves the whole package'
   return None
+
+
+def _ops_list_tests(
+    changed: Collection[str], index: Mapping[str, set[str]]
+) -> set[str]:
+  """Returns OPS_LIST_TEST if a non-inert path in `changed` is under the ops."""
+  if any(
+      path.startswith(OPS_LIST_PREFIXES) and not _is_inert(path)
+      for path in changed
+  ):
+    return index.get(OPS_LIST_TEST, set())
+  return set()
 
 
 def affected_tests(
@@ -462,6 +485,7 @@ def affected_tests(
     tests |= op_tests
   if tables:
     tests |= index.get(AUTOTUNING_CACHE_TEST, set())
+  tests |= _ops_list_tests(changed, index)
 
   if deleted:
     # Surviving files that still import a deleted module, and their dependents.
