@@ -393,7 +393,7 @@ def _fwd_kernel(
         qs += (q,)
         q_scales += (q_scale * sm_scale,)
       else:
-        qs += ((_dequantize(q, q_scale) * sm_scale).to(qk_dtype),)
+        qs += (_dequantize(q, q_scale).to(qk_dtype),)
 
     num_k_blocks = tl.cdiv(seq_len_k, block_k)
     # Rows past ``seq_len_q`` get fill values that are neutral for the min/max
@@ -457,6 +457,8 @@ def _fwd_kernel(
             s += triton_utils.dot(
                 qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
             )
+        if not quantize_qk_dot:  # Else `sm_scale` is in `qk_scale`.
+          s *= sm_scale
         s = s.to(logits_dtype)
 
         if bias_ptr is not None:
