@@ -362,13 +362,14 @@ class SplashConfig:
   # sub-tiles fully above the diagonal during dot_general. Redundant with
   # qk_diag_skip, which already skips SV in the forward.
   sv_diag_skip: bool = False
-  # With qk_diag_skip, run the dkv kernel's causal diagonal block as
-  # qk_diag_grid_dkv kv row-bands, each over only the queries it attends to, so
-  # the softmax and dv/dp/dk/dq work also skip the strictly-above-diagonal
-  # tiles. The bands accumulate dq into the VMEM dq scratch, so in the fused
-  # kernel this needs dq_reduction_steps=1 (qk_diag_skip forces square dkv
-  # blocks, which otherwise have no dq scratch); without it the stock path is
-  # used.
+  # With qk_diag_skip, run aligned square causal diagonal blocks as row-bands so
+  # softmax and matmuls skip strictly-above-diagonal tiles:
+  # - Forward (when block_q == block_kv == block_kv_compute): splits into
+  #   qk_diag_grid query row-bands, each attending only to its visible kv
+  #   prefix.
+  # - Backward dkv: splits into qk_diag_grid_dkv kv row-bands, each over only
+  #   the queries it attends to. Accumulates dq in VMEM scratch when present
+  #   (dq_reduction_steps=1), or per query band in f32 registers otherwise.
   diag_band_skip: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
@@ -911,12 +912,18 @@ def flash_attention_kernel(
       return jnp.concatenate(o_rows, axis=0)
     return lax.dot_general(s_flat, v, sv_dims, preferred_element_type=float32)
 
-  def body(kv_compute_index, _, has_partial_mask=False, diag=False):
+  def body(
+      kv_compute_index,
+      _,
+      has_partial_mask=False,
+      diag=False,
+      band: tuple[int, int, int] | None = None,
+  ):
     """Runs the online softmax update for one compute tile of the kv block.
 
     Args:
       kv_compute_index: Index of the compute tile within the kv block; a
-        static int when `diag` is set.
+        static int when `diag` or `band` is set.
       _: Unused loop carry.
       has_partial_mask: Whether the block is partially masked.
       diag: `qk_diag_skip` on an aligned causal diagonal block (bq == bkv,
@@ -926,13 +933,26 @@ def flash_attention_kernel(
         what the online softmax would do with an all-masked row (alpha = 1,
         s = 0). Only rows [r0, bq) are processed, and `qk_matmul` and
         `sv_matmul` skip the sub-tiles above the diagonal.
+      band: `(q0, q1, kv_end)` for `diag_band_skip` on an aligned square causal
+        diagonal block (`bq == bkv == bkv_compute`), running q rows `[q0, q1)`
+        against only the visible kv prefix `[0, kv_end)`.
     """
-    r0 = kv_compute_index * bkv_compute if diag else 0
-    nq = bq - r0
-    # Index of the processed rows [r0, bq) in the (heads, bq, ...) refs.
-    rows = (slice(None), slice(r0, bq), slice(None)) if diag else ...
-    row_view = lambda ref: ref.at[r0:bq] if diag and ref is not None else ref
-    slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+    if band is not None:
+      r0, r1, nk = band
+      k0 = 0
+    else:
+      r0 = kv_compute_index * bkv_compute if diag else 0
+      r1 = bq
+      k0 = kv_compute_index * bkv_compute
+      nk = bkv_compute
+    nq = r1 - r0
+    sliced_q = diag or band is not None
+    # Index of the processed rows [r0, r1) in the (heads, bq, ...) refs.
+    rows = (slice(None), slice(r0, r1), slice(None)) if sliced_q else ...
+    row_view = (
+        lambda ref: ref.at[r0:r1] if sliced_q and ref is not None else ref
+    )
+    slice_k = pl.ds(k0, nk)
     m_prev, l_prev = m_scratch_ref[rows], l_scratch_ref[rows]
     assert m_prev.shape == (num_stacked_q_heads, nq, NUM_LANES)
     assert l_prev.shape == (num_stacked_q_heads, nq, NUM_LANES)
@@ -940,7 +960,10 @@ def flash_attention_kernel(
     if config.q_layout == HEAD_DIM_MINOR:
       q = q_ref[rows]
     else:
-      q = q_ref[(slice(None), slice(None), slice(r0, bq)) if diag else ...].mT
+      q = (
+          q_ref[(slice(None), slice(None), slice(r0, r1)) if sliced_q else ...]
+          .mT
+      )
     if config.use_base2_exp and not config.q_prescaled_log2e:
       if q.dtype == jnp.float8_e4m3fn:
         q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
@@ -959,7 +982,7 @@ def flash_attention_kernel(
       qk_dims = NN_DIM_NUMBERS
 
     qk_flat = qk_matmul(q_flat, k, qk_dims, diag=diag)
-    qk = qk_flat.reshape((num_stacked_q_heads, nq, bkv_compute))
+    qk = qk_flat.reshape((num_stacked_q_heads, nq, nk))
 
     qk = _apply_mask_and_soft_cap(
         qk,
@@ -970,7 +993,7 @@ def flash_attention_kernel(
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
-        k_offset=j * bkv + kv_compute_index * bkv_compute,
+        k_offset=j * bkv + k0,
         bq=nq,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
@@ -984,18 +1007,16 @@ def flash_attention_kernel(
     else:
       m_next = None
 
-    bkv_repeats, rem = divmod(bkv_compute, NUM_LANES)
+    bkv_repeats, rem = divmod(nk, NUM_LANES)
     if rem != 0:
-      raise NotImplementedError(
-          f"{bkv_compute=} should be a multiple of {NUM_LANES}"
-      )
+      raise NotImplementedError(f"{nk=} should be a multiple of {NUM_LANES}")
 
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     if max_logit_estimate is None:
       s_curr = exp(qk - jnp.tile(m_next, (1, 1, bkv_repeats)))  # pyrefly: ignore[bad-argument-type, unsupported-operation]
     else:
       s_curr = exp(qk - max_logit_estimate)  # pyrefly: ignore[unsupported-operation]
-    assert s_curr.shape == (num_stacked_q_heads, nq, bkv_compute)
+    assert s_curr.shape == (num_stacked_q_heads, nq, nk)
 
     l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0, 1))
     assert l_curr.shape == (num_stacked_q_heads, nq, NUM_LANES)
@@ -1037,11 +1058,11 @@ def flash_attention_kernel(
             n_q_blocks=n_q_blocks,
             n_kv_blocks=n_kv_blocks,
         )
-        head_masks.append(head_mask[r0:, :] if diag else head_mask)
+        head_masks.append(head_mask[r0:r1, :nk] if sliced_q else head_mask)
       dropout_scale = jnp.stack(head_masks, axis=0)
       s_curr = s_curr * dropout_scale
 
-    s_curr_flat = s_curr.reshape((num_stacked_q_heads * nq, bkv_compute))
+    s_curr_flat = s_curr.reshape((num_stacked_q_heads * nq, nk))
 
     if config.v_layout == HEAD_DIM_MINOR:
       v = v_ref[slice_k, :]
@@ -1051,7 +1072,11 @@ def flash_attention_kernel(
       sv_dims = NT_DIM_NUMBERS
 
     o_curr_flat = sv_matmul(
-        s_curr_flat, v, sv_dims, has_partial_mask=has_partial_mask, diag=diag
+        s_curr_flat,
+        v,
+        sv_dims,
+        has_partial_mask=has_partial_mask and band is None,
+        diag=diag,
     )
     o_curr = o_curr_flat.reshape((num_stacked_q_heads, nq, head_dim_v))
 
@@ -1075,6 +1100,16 @@ def flash_attention_kernel(
       and num_stacked_q_heads == 1
       and bq == bkv
   )
+  gq, gk = _diag_grid_pair(config.qk_diag_grid)
+  use_diag_band = (
+      use_diag
+      and config.diag_band_skip
+      and not dropout_rate
+      and bq == bkv_compute
+      and gq == gk
+      and bq % gq == 0
+      and (bq // gq) % NUM_LANES == 0
+  )
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
@@ -1082,7 +1117,16 @@ def flash_attention_kernel(
 
   @pl.when(jnp.logical_and(jnp.logical_not(should_not_mask), should_run))
   def _():
-    if use_diag:
+    if use_diag_band:
+      sq = bq // gq
+      for qi in range(gq):
+        body(
+            0,
+            None,
+            has_partial_mask=True,
+            band=(qi * sq, (qi + 1) * sq, (qi + 1) * sq),
+        )
+    elif use_diag:
       for c in range(num_iters):  # Static c: the diagonal path slices by it.
         body(c, None, has_partial_mask=True, diag=True)
     else:
@@ -2176,7 +2220,11 @@ def _flash_attention_dkv_kernel(
         and gq == gk
         and has_partial_mask
         and not dropout_rate
-        and (dq_scratch_ref is not None or dq_ref is None)
+        and (
+            dq_scratch_ref is not None
+            or dq_ref is None
+            or (bq == bkv == bkv_compute and block_mask_ref is not None)
+        )
         and bkv_compute % gk == 0
         and bq % gq == 0
         and sk % NUM_LANES == 0
@@ -2192,6 +2240,7 @@ def _flash_attention_dkv_kernel(
           else NT_DIM_NUMBERS
       )
       q_view = lambda ref, s: None if ref is None else ref.at[:, s]
+      dq_acc: dict[int, jax.Array] = {}
       for ki in range(gk):
         q0, k0 = ki * sq, ki * sk
         qs = pl.ds(q0, bq - q0)
@@ -2243,7 +2292,7 @@ def _flash_attention_dkv_kernel(
         ):
           dk_b = dk_b / LOG2E
         dk_scratch_ref[kv_rows, :] += dk_b.astype(dk_scratch_ref.dtype)
-        if dq_scratch_ref is not None:
+        if dq_scratch_ref is not None or dq_ref is not None:
           dq_b = lax.dot_general(
               ds_b.T if _is_fp8(k) else ds_b.T.astype(k.dtype),
               k_b,
@@ -2252,7 +2301,24 @@ def _flash_attention_dkv_kernel(
           )
           if config.q_prescaled_log2e:
             dq_b = dq_b / LOG2E
-          dq_scratch_ref[q0:, :] += dq_b
+          if dq_scratch_ref is not None:
+            dq_scratch_ref[q0:, :] += dq_b
+          elif dq_ref is not None:
+            # Square dkv tiles imply num_iters == 1 (i == 0), and query band ki
+            # only attends to kv bands 0..ki, so dq_acc.pop(ki) is this block's
+            # complete dq contribution for q_band once iteration ki finishes.
+            for qb in range(ki, gk):
+              part = dq_b[(qb - ki) * sq : (qb - ki + 1) * sq]
+              prev = dq_acc.get(qb)
+              dq_acc[qb] = part if prev is None else prev + part
+            dq_band = dq_acc.pop(ki)
+            q_band = pl.ds(q0, sq)
+            if dq_alias is not None:
+              dq_ref[q_band, :] = (
+                  dq_alias[q_band, :].astype(jnp.float32) + dq_band
+              ).astype(dq_ref.dtype)
+            else:
+              dq_ref[q_band, :] = dq_band.astype(dq_ref.dtype)
       return
 
     if (

@@ -127,6 +127,14 @@ class Config:
           f"{self.block_kv_dkv_compute=} must be a multiple of"
           f" {self.qk_diag_grid=}."
       )
+    if (
+        self.diag_band_skip
+        and (self.block_kv_dkv_compute // self.qk_diag_grid) % NUM_LANES != 0
+    ):
+      raise ValueError(
+          f"{self.block_kv_dkv_compute=} // {self.qk_diag_grid=} must be a "
+          f"multiple of {NUM_LANES=} when diag_band_skip=True."
+      )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -429,14 +437,14 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         continue
       q_steps = q_seq_len // bq
       kv_steps = kv_seq_len // bkv
-      can_use_diag_skip_2048 = (
+      can_use_diag_band_skip = (
           is_causal and bq == bkv == bkv_c and dropout_rate == 0.0
       )
-      try_diag_band_skip = can_use_diag_skip_2048 and (
+      try_vmem_dq_band_skip = can_use_diag_band_skip and (
           q_steps <= 2 or kv_steps == 1 or bkv_c >= 2048
       )
       # TODO: Make these conditions more configurable
-      if bkv_c > 1024 and not can_use_diag_skip_2048:
+      if bkv_c > 1024 and not can_use_diag_band_skip:
         continue
 
       if bq >= 4096 or bkv >= 4096:
@@ -463,7 +471,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         else:
           qk_diag_grid_sizes = [2]
         for qk_grid_size in qk_diag_grid_sizes:
-          if bkv_c <= 1024 or can_use_diag_skip_2048:
+          if bkv_c <= 1024 or can_use_diag_band_skip:
             configs.add(
                 Config(
                     block_q_dkv=bq,
@@ -476,7 +484,27 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     qk_diag_grid=qk_grid_size,
                 )
             )
-          if try_diag_band_skip and (bkv_c // qk_grid_size) % NUM_LANES == 0:
+          if (
+              can_use_diag_band_skip
+              and (bkv_c // qk_grid_size) % NUM_LANES == 0
+          ):
+            configs.add(
+                Config(
+                    block_q_dkv=bq,
+                    block_kv_dkv=bkv,
+                    block_kv_dkv_compute=bkv_c,
+                    dropout_block_q=dbq,
+                    dropout_block_kv=dbkv,
+                    dq_reduction_steps=dq_reduction_steps,
+                    qk_diag_skip=True,
+                    qk_diag_grid=qk_grid_size,
+                    diag_band_skip=True,
+                )
+            )
+          if (
+              try_vmem_dq_band_skip
+              and (bkv_c // qk_grid_size) % NUM_LANES == 0
+          ):
             configs.add(
                 Config(
                     block_q_dkv=bq,
