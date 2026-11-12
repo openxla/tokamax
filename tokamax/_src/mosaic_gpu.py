@@ -112,6 +112,21 @@ def fence_async_shared_cta(_):
   nvvm.fence_proxy(nvvm.ProxyKind.async_shared, space=space)
 
 
+@plgpu.inline_mgpu()
+def _fence_acquire_shared_cluster(_):
+  mgpu.utils.inline_ptx(
+      "fence.proxy.async::generic.acquire"
+      ".sync_restrict::shared::cluster.cluster;"
+  )
+
+
+@plgpu.inline_mgpu()
+def _fence_release_shared_cta(_):
+  mgpu.utils.inline_ptx(
+      "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;"
+  )
+
+
 def _bar_operation(
     operation: str,
     barrier_id: int | jax.Array,
@@ -377,7 +392,7 @@ def _batched_persistent_body(body, in_batched, out_batched):
 
 def _persistent_kernel(
     recurse_fn: Callable[..., Any],
-    loop_fn: Callable[..., Any],
+    with_loop_fn: Callable[[Callable[..., Any]], Any],
     body: Callable[..., None],
     out_type: Any = (),
     *,
@@ -393,12 +408,17 @@ def _persistent_kernel(
 
     def wrapped_body(*refs, **scratch_ref_kwargs):
 
-      def grid_loop[T](init_carry: T = None) -> Callable[[Callable[..., T]], T]:
-        return lambda body: loop_fn(init_carry=init_carry)(
-            functools.partial(body, refs)
-        )
+      def run(loop_fn):
+        def grid_loop[T](
+            init_carry: T = None,
+        ) -> Callable[[Callable[..., T]], T]:
+          return lambda loop_body: loop_fn(init_carry=init_carry)(
+              functools.partial(loop_body, refs)
+          )
 
-      return body(grid_loop, **scratch_ref_kwargs)
+        return body(grid_loop, **scratch_ref_kwargs)
+
+      return with_loop_fn(run)
 
     return plgpu.kernel(
         wrapped_body,
@@ -436,10 +456,13 @@ def static_scheduling_persistent_kernel(
   """Entry point for defining a static scheduling persistent Mosaic GPU kernel."""
   cluster_size = math.prod(cluster)
   launch_grid_name = "$$__sm__$$" if cluster_size == 1 else "$$__cluster__$$"
+  loop_fn = functools.partial(
+      plgpu.nd_loop, grid, collective_axes=launch_grid_name
+  )
 
   return _persistent_kernel(
       static_scheduling_persistent_kernel,
-      functools.partial(plgpu.nd_loop, grid, collective_axes=launch_grid_name),
+      lambda run: run(loop_fn),
       body,
       out_type,
       grid=grid,
@@ -447,6 +470,97 @@ def static_scheduling_persistent_kernel(
       launch_grid_names=(launch_grid_name,),
       cluster=cluster,
       **kwargs,
+  )
+
+
+def _with_dynamic_scheduling_loop(
+    run: Callable[..., Any],
+    *,
+    grid_names: tuple[str, ...],
+    thread_axis: str | None,
+    cluster_axes: tuple[str, ...],
+):
+  """Allocates shared CLC state once so `grid_loop` can run per warpgroup."""
+  num_slots = 2
+  num_threads = 1 if thread_axis is None else jax.lax.axis_size(thread_axis)
+
+  def scoped(try_cancel_buffer, try_cancel_barrier, cancel_used_barrier):
+
+    def loop_fn(*, init_carry=None):
+
+      def decorator(body):
+
+        def cond(carry):
+          _, success, _, _ = carry
+          return success
+
+        def step(carry):
+          grid_idx, _, wave_step, user_carry = carry
+          loop_info = plgpu.NDLoopInfo(
+              index=grid_idx, local_index=wave_step, num_local_steps=None
+          )
+          slot = jax.lax.rem(wave_step, jnp.int32(num_slots))
+
+          @pl.when(wave_step >= num_slots)
+          def _():
+            plgpu.barrier_wait(cancel_used_barrier.at[slot])
+            _fence_acquire_shared_cluster()
+
+          plgpu.try_cluster_cancel(
+              try_cancel_buffer.at[slot],
+              try_cancel_barrier.at[slot],
+              collective_axes=(
+                  *cluster_axes,
+                  *(() if thread_axis is None else (thread_axis,)),
+              ),
+          )
+
+          if user_carry is None:
+            body(loop_info)
+          else:
+            user_carry = body(loop_info, carry=user_carry)
+
+          plgpu.barrier_wait(try_cancel_barrier.at[slot])
+          grid_idx, success = plgpu.query_cluster_cancel(
+              try_cancel_buffer.at[slot], grid_names=grid_names
+          )
+          _fence_release_shared_cta()
+          plgpu.barrier_arrive(cancel_used_barrier.at[slot])
+          return (grid_idx, success, wave_step + jnp.int32(1), user_carry)
+
+        grid_idx = tuple(map(jax.lax.axis_index, grid_names))
+        init = (grid_idx, True, jnp.int32(0), init_carry)
+        _, _, num_steps, final_carry = jax.lax.while_loop(cond, step, init)
+
+        @pl.loop(jnp.int32(0), jax.lax.min(num_steps, jnp.int32(num_slots)))
+        def _(slot):
+          plgpu.barrier_wait(cancel_used_barrier.at[slot])
+
+        return None if init_carry is None else final_carry
+
+      return decorator
+
+    return run(loop_fn)
+
+  if cluster_axes:
+    cancel_used_barrier = plgpu.ClusterBarrier(
+        collective_axes=cluster_axes,
+        num_arrivals=num_threads,
+        num_barriers=num_slots,
+    )
+  else:
+    cancel_used_barrier = plgpu.Barrier(
+        num_arrivals=num_threads,
+        num_barriers=num_slots,
+    )
+  return pl.run_scoped(
+      scoped,
+      try_cancel_buffer=plgpu.TryClusterCancelResult(num_slots),
+      try_cancel_barrier=plgpu.Barrier(
+          num_arrivals=num_threads, num_barriers=num_slots
+      ),
+      cancel_used_barrier=cancel_used_barrier,
+      collective_axes=thread_axis,
   )
 
 
@@ -465,7 +579,7 @@ def dynamic_scheduling_persistent_kernel(
   return _persistent_kernel(
       dynamic_scheduling_persistent_kernel,
       functools.partial(
-          plgpu.dynamic_scheduling_loop,
+          _with_dynamic_scheduling_loop,
           grid_names=grid_names,
           thread_axis=thread_name,
           cluster_axes=cluster_names,

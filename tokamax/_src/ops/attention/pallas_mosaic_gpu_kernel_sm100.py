@@ -429,8 +429,9 @@ def flash_attention_kernel(
     wg = lax.axis_index("wg")
     cluster_idx = lax.axis_index("cluster")
 
-    @grid_loop(init_carry=0)
-    def grid_loop_body(gmems, loop_info: plgpu.NDLoopInfo, carry):
+    def grid_loop_body(
+        gmems, loop_info: plgpu.NDLoopInfo, carry, *, wg_id: int
+    ):
       is_first_grid_iter = jnp.asarray(loop_info.local_index == 0)
       prev_iters = carry
       (
@@ -479,9 +480,7 @@ def flash_attention_kernel(
         k_end_min, k_end_max = map(load_k_bound, k_end_minmax_gmems)
         ub = lax.min(ub, pl.cdiv(k_end_max, block_kv))
 
-      @pl.when(wg == _MMA_TMA_WG)
       def mma_tma_wg():
-        plgpu.set_max_registers(80, action="decrease")
 
         qs_cluster = pl.ds(q_base_cluster, block_q)
         q_leader_tracked = (
@@ -645,9 +644,7 @@ def flash_attention_kernel(
               plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
             pv_mma(ub - 1)
 
-      @pl.when(wg == _SOFTMAX_WG)
       def softmax_wg():
-        plgpu.set_max_registers(256, action="increase")
         plgpu.barrier_arrive(s_consumed, predicate=is_first_grid_iter)
         if bias_consumed is not None:
           plgpu.barrier_arrive(bias_consumed, predicate=is_first_grid_iter)
@@ -832,9 +829,7 @@ def flash_attention_kernel(
                   optimized=False,
               )
 
-      @pl.when(wg == _SCALE_WG)
       def scale_wg():
-        plgpu.set_max_registers(160, action="decrease")
 
         @pl.when(loop_info.local_index == 0)
         def prologue():
@@ -966,7 +961,26 @@ def flash_attention_kernel(
 
           lax.cond(ub > lb, write_acc, write_zeros)
 
+      if wg_id == _MMA_TMA_WG:
+        mma_tma_wg()
+      elif wg_id == _SOFTMAX_WG:
+        softmax_wg()
+      elif wg_id == _SCALE_WG:
+        scale_wg()
+
       return prev_iters + lax.max(0, ub - lb)
+
+    def run_wg(
+        wg_id: int, max_regs: int, action: Literal["decrease", "increase"]
+    ):
+      @pl.when(wg == wg_id)
+      def _():
+        plgpu.set_max_registers(max_regs, action=action)
+        grid_loop(init_carry=0)(functools.partial(grid_loop_body, wg_id=wg_id))
+
+    run_wg(_MMA_TMA_WG, 80, "decrease")
+    run_wg(_SOFTMAX_WG, 256, "increase")
+    run_wg(_SCALE_WG, 160, "decrease")
 
     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 

@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import lax
+import jax.experimental.pallas as pl
 import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 import numpy as np
@@ -148,6 +149,42 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
     x = jnp.arange(8, dtype=jnp.int32)
     actual = kernel(x)
     expected = jnp.array([10, 11, 12, 13, 24, 25, 26, 27], dtype=jnp.int32)
+    np.testing.assert_array_equal(actual, expected)
+
+  @parameterized.parameters("static", "dynamic")
+  def test_persistent_kernel_per_warpgroup_loop(self, mode):
+    if mode == "dynamic" and not gpu_utils.is_sm100():
+      self.skipTest("CLC dynamic scheduling requires SM100+.")
+
+    def body(grid_loop):
+      wg = lax.axis_index("wg")
+      for wg_id, offset in ((0, 10), (1, 100)):
+
+        @pl.when(wg == wg_id)
+        def _(wg_id=wg_id, offset=offset):
+          @grid_loop(init_carry=jnp.int32(0))
+          def _(refs, loop_info, carry):
+            x_ref, out_ref = refs
+            (idx,) = loop_info.index
+            out_ref[idx, wg_id] = x_ref[idx, wg_id] + offset
+            return carry + 1
+
+    if mode == "static":
+      kernel_fn = common.static_scheduling_persistent_kernel
+    else:
+      kernel_fn = functools.partial(
+          common.dynamic_scheduling_persistent_kernel, grid_names=("tiles",)
+      )
+    fn = kernel_fn(
+        body,
+        out_type=jax.ShapeDtypeStruct((6, 2, 128), jnp.int32),
+        grid=(6,),
+        num_threads=2,
+        thread_name="wg",
+    )
+    x = jnp.arange(2 * 6 * 2 * 128, dtype=jnp.int32).reshape(2, 6, 2, 128)
+    actual = jax.vmap(fn)(x)
+    expected = x + jnp.array([[[10], [100]]], dtype=jnp.int32)
     np.testing.assert_array_equal(actual, expected)
 
 
