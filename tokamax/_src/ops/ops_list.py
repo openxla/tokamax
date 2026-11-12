@@ -784,4 +784,29 @@ OPS: tuple[Op, ...] = (
             ),
         ),
     ),
+    Op(
+        name="ssd_scan",
+        apis=(),
+        impls=(
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/ssd_scan/ssd_scan.py",
+            ),
+        ),
+    ),
+    Op(
+        name="ragged_causal_conv1d",
+        apis=(),
+        impls=(
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module=(
+                    "_src/ops/experimental/ragged_causal_conv1d/"
+                    "causal_conv1d.py"
+                ),
+            ),
+        ),
+    ),
 )
