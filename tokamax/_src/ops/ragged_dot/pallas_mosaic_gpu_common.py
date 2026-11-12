@@ -122,11 +122,15 @@ class GroupInfo:
     group_sizes = lax.max(jnp.zeros_like(group_sizes), group_sizes)
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts = jnp.cumulative_sum(group_sizes, include_initial=True)
-    group_starts_aligned = lax.div(group_starts[:-1], align_tile) * align_tile
+    group_starts_aligned = (
+        mgpu_lib.udiv(group_starts[:-1], align_tile) * align_tile
+    )
     # We could use `group_starts[1:]`, but XLA fuses this better.
     group_ends = group_starts[:-1] + group_sizes
     group_num_blocks = jnp.where(
-        group_sizes == 0, 0, pl.cdiv(group_ends - group_starts_aligned, tile)
+        group_sizes == 0,
+        0,
+        mgpu_lib.ucdiv(group_ends - group_starts_aligned, tile),
     )
     group_start_tasks = jnp.cumulative_sum(
         group_num_blocks, include_initial=True
