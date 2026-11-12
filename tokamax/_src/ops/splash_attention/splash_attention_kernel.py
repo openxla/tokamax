@@ -327,6 +327,12 @@ class SplashConfig:
   # non-contiguous revisits into a single pl.Buffered(1) q.shape buffer in HBM,
   # trading unpipelined dq DMAs for 3x lower dq HBM usage than 3.
   dq_reduction_steps: int | None = None
+  # [experimental] With dq_reduction_steps=1 on a dynamic grid whose dkv q
+  # blocks are not visited in one contiguous run, keep each q head's whole dq
+  # resident in VMEM (written back to HBM once per head) instead of the
+  # per-run read-modify-write of the pl.Buffered(1) HBM buffer. Only used when
+  # one head's dq fits in 8 MiB; bit-identical to False.
+  vmem_resident_dq: bool = False
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
   # Skip the wasted causal-diagonal work. Bit-exact: the output, dQ, dK and dV
@@ -2109,6 +2115,7 @@ def _flash_attention_dkv_kernel(
     config: SplashConfig,
     use_vmem_dq_reduction: bool = False,
     group_dkv_by_kv_head: bool = False,
+    dq_head_resident: bool = False,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -2477,6 +2484,11 @@ def _flash_attention_dkv_kernel(
           dq_ref[...] = dq.astype(dq_ref.dtype)
 
   if dq_scratch_ref is not None:
+    if dq_head_resident:
+
+      @pl.when(pl.program_id(1) == 0)
+      def _init_dq():
+        dq_ref[...] = jnp.zeros_like(dq_ref)
 
     @pl.when(should_initialize_dq)
     def _init_dq_scratch():
@@ -2505,7 +2517,13 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(should_write_dq)
     def _write_dq_scratch():
-      if dq_alias is not None:
+      if dq_head_resident:
+        q_start = active_cols_ref[pl.program_id(1)].astype(jnp.int32) * bq
+        rows = pl.ds(pl.multiple_of(q_start, bq), bq)
+        dq_ref[rows, :] = (
+            dq_ref[rows, :].astype(jnp.float32) + dq_scratch_ref[...]
+        ).astype(dq_ref.dtype)
+      elif dq_alias is not None:
         dq_ref[...] = (
             dq_alias[...].astype(jnp.float32) + dq_scratch_ref[...]
         ).astype(dq_ref.dtype)
@@ -2806,6 +2824,18 @@ def _splash_attention_bwd_dkv(
   dq_in_vmem_only = use_vmem_dq_reduction and (
       not dynamic_grid or q_blocks_are_contiguous
   )
+  # Keep each q head's dq resident in VMEM, written back once per head, instead
+  # of accumulating non-contiguous q block revisits in HBM. Double-buffer it
+  # only if both buffers fit in the same 8 MiB budget.
+  dq_head_bytes = (
+      q_seq_len * head_dim_qk * jnp.dtype(_unquantized_dtype(q)).itemsize
+  )
+  dq_head_resident = (
+      config.vmem_resident_dq
+      and use_vmem_dq_reduction
+      and not dq_in_vmem_only
+      and dq_head_bytes <= 8 * 1024 * 1024
+  )
   dq_reduction_steps = config.dq_reduction_steps
   if dq_reduction_steps is None and dynamic_grid:
     dq_reduction_steps = 3
@@ -2815,6 +2845,15 @@ def _splash_attention_bwd_dkv(
   dq = dq_alias_spec = None
   if dq_in_vmem_only:
     dq_spec = pl.BlockSpec((None, bq, head_dim_qk), o_index_map)
+    dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
+  elif dq_head_resident:
+    dq_spec = pl.BlockSpec(
+        (None, q_seq_len, head_dim_qk),
+        lambda h, *_: (h, 0, 0),
+        pipeline_mode=(
+            None if 2 * dq_head_bytes <= 8 * 1024 * 1024 else pl.Buffered(1)
+        ),
+    )
     dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
   elif dq_reduction_steps == 1:
     dq_spec = pl.BlockSpec(
@@ -2901,6 +2940,7 @@ def _splash_attention_bwd_dkv(
       q_heads_per_kv_head=q_heads_per_kv_head,
       use_vmem_dq_reduction=use_vmem_dq_reduction,
       group_dkv_by_kv_head=group_dkv_by_kv_head,
+      dq_head_resident=dq_head_resident,
   )
 
   kernel_name = get_kernel_name(

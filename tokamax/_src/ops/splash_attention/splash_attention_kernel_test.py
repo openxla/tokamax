@@ -2169,6 +2169,98 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     for r, g in zip(ref_vals, opt_vals):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
+  @parameterized.product(
+      mask_kind=("local", "segmented_causal"),
+      bkv_compute_div=(1, 2),
+      dtype=("bfloat16", "float32"),
+  )
+  def test_vmem_resident_dq(self, mask_kind, bkv_compute_div, dtype):
+    """vmem_resident_dq is bit-identical on a non-contiguous dq1 dkv grid."""
+    seq_len, num_q_heads, num_kv_heads, head_dim, block = 1024, 4, 2, 128, 256
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (random.normal(k1, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+    k = (random.normal(k2, (num_kv_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+    v = (random.normal(k3, (num_kv_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+    do = (random.normal(k4, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        dtype
+    )
+    segment_ids = None
+    if mask_kind == "local":
+      # Each kv block is visited by 3 q blocks, so the q-major dkv schedule
+      # revisits q blocks non-contiguously.
+      mask = mask_lib.LocalMask(
+          shape=(seq_len, seq_len), window_size=(2 * block, 0), offset=0
+      )
+    else:
+      # Segment ids make the q blocks count as non-contiguous.
+      mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+      seg = jnp.repeat(jnp.arange(4, dtype=jnp.int32), seq_len // 4)
+      seg = jnp.roll(seg, block // 2)
+      segment_ids = base.SegmentIds(q=seg, kv=seg)
+
+    def run(vmem_resident_dq):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block // bkv_compute_div,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block // bkv_compute_div,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=1,
+          vmem_resident_dq=vmem_resident_dq,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def fwd_bwd(q, k, v, do):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids),
+            q,
+            k,
+            v,
+        )
+        return (out, *vjp(do))
+
+      return fwd_bwd
+
+    def dkv_call(fn):
+      jaxpr = jax.make_jaxpr(fn)(q, k, v, do)
+      eqns = [
+          sub_e
+          for e in jaxpr.jaxpr.eqns
+          if e.primitive.name == "jit"
+          for sub_e in e.params["jaxpr"].eqns
+          if sub_e.primitive.name == "pallas_call"
+      ]
+      self.assertLen(eqns, 2)
+      return eqns[-1]
+
+    off, on = run(False), run(True)
+    # Off: dq accumulates through the aliased (bq, head_dim) HBM block. On: dq
+    # is one unaliased (seq_len, head_dim) block per q head.
+    for fn, aliased, dq_block in (
+        (off, True, (block, head_dim)),
+        (on, False, (seq_len, head_dim)),
+    ):
+      eqn = dkv_call(fn)
+      aliases = dict(eqn.params["input_output_aliases"])
+      self.assertEqual(0 in aliases.values(), aliased)
+      dq_mapping = list(eqn.params["grid_mapping"].block_mappings_output)[0]
+      self.assertEqual(tuple(dq_mapping.block_aval.shape), dq_block)
+
+    res_off = jax.jit(off)(q, k, v, do)
+    res_on = jax.jit(on)(q, k, v, do)
+    for name, a, b in zip(("out", "dq", "dk", "dv"), res_off, res_on):
+      with self.subTest(name):
+        np.testing.assert_array_equal(np.asarray(b), np.asarray(a))
+
 
 if __name__ == "__main__":
   absltest.main()
