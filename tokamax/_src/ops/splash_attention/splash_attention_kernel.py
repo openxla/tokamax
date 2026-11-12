@@ -394,10 +394,26 @@ class SplashConfig:
   # The kernel skips its own q scaling and returns dq, dk w.r.t. the
   # pre-scaled input (both divided by LOG2E). Subsumes dkv_reuse_scaled_q.
   q_prescaled_log2e: bool = False
+  # [experimental] With segment ids, keep the static (constant-foldable) mask
+  # schedule instead of pruning tiles whose q and kv segments are disjoint,
+  # when every active fwd and dkv block is on or next to the diagonal of square
+  # blocks (e.g. a sliding window no wider than a block). There pruning only
+  # removes a tile when a document boundary falls on a block edge, and the
+  # kernel's per-element segment mask handles such tiles. The output and
+  # gradients are unchanged as long as every q row sees at least one kv of its
+  # own segment (true for self-attention with packed segment ids). Also lets
+  # dq_reduction_steps=1 keep dq in VMEM with segment ids when the dkv schedule
+  # visits each q block in one contiguous run. Other schedules are unaffected.
+  near_diagonal_static_segments: bool = False
   # Set by _make_splash_attention when the static dkv schedule visits every q
   # block in a single contiguous run, allowing dq_reduction_steps=1 to write dq
   # directly from VMEM without HBM read-modify-write aliasing.
   dkv_q_blocks_are_contiguous: bool = False
+  # Set by _make_splash_attention when near_diagonal_static_segments is set and
+  # every active fwd and dkv block is on or next to the diagonal of square
+  # blocks. The wrappers then skip the segment pruning and keep the static
+  # schedule.
+  static_segment_schedule: bool = False
 
   @property
   def active_dropout_block_q(self) -> int:
@@ -1445,6 +1461,7 @@ def _splash_attention_forward(
           "Invalid shape for kv segment_ids: "
           f"{segment_ids.kv.shape}. Expected: {(kv_seq_len,)}"
       )
+  if segment_ids is not None and not config.static_segment_schedule:
     mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
         mask_info,
         segment_ids,
@@ -2563,7 +2580,7 @@ def _splash_attention_bwd_dkv(
   q_steps = q_seq_len // bq
   q_heads_per_kv_head = num_q_heads // num_kv_heads
 
-  if segment_ids is not None:
+  if segment_ids is not None and not config.static_segment_schedule:
     mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
         mask_info,
         segment_ids,
@@ -2794,7 +2811,9 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
-  q_blocks_are_contiguous = segment_ids is None and (
+  q_blocks_are_contiguous = (
+      segment_ids is None or config.static_segment_schedule
+  ) and (
       config.dkv_q_blocks_are_contiguous
       or (
           dynamic_grid
@@ -3335,6 +3354,12 @@ def _make_splash_attention(
       (config.block_q, config.block_kv),
   )
   fwd_mask_sparsity = float(np.mean(fwd_mask_info.block_mask != 0))
+  static_segment_schedule = (
+      config.near_diagonal_static_segments
+      and q_seq_shards == 1
+      and config.block_q == config.block_kv
+      and mask_info_lib.active_blocks_near_diagonal(fwd_mask_info)
+  )
   fwd_mask_info = tree_util.tree_map(jnp.array, fwd_mask_info)
 
   dkv_mask_info = None
@@ -3357,9 +3382,17 @@ def _make_splash_attention(
     assert (mask_function_fwd is None) == (mask_function_dkv is None)
 
     dkv_mask_sparsity = float(np.mean(dkv_mask_info.block_mask != 0))
+    static_segment_schedule = (
+        static_segment_schedule
+        and bq_dkv == bkv_dkv
+        and mask_info_lib.active_blocks_near_diagonal(dkv_mask_info)
+    )
     dkv_mask_info = tree_util.tree_map(jnp.array, dkv_mask_info)
   else:
     dkv_mask_sparsity = 1.0
+  config = dataclasses.replace(
+      config, static_segment_schedule=static_segment_schedule
+  )
 
   return SplashAttentionKernel(
       fwd_mask_info,

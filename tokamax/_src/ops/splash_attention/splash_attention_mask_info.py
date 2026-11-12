@@ -71,6 +71,20 @@ def dkv_q_blocks_are_contiguous(
   return True
 
 
+def active_blocks_near_diagonal(mask_info: 'MaskInfo') -> bool:
+  """Returns whether every active block of a dynamic grid has |row - col| <= 1.
+
+  Args:
+    mask_info: `MaskInfo` of a single sequence shard, with concrete arrays.
+  """
+  if mask_info.active_rows is None or mask_info.active_cols is None:
+    return False
+  n = int(np.asarray(mask_info.num_active_blocks).reshape(-1)[0])
+  rows = np.asarray(mask_info.active_rows)[:n].astype(np.int32)
+  cols = np.asarray(mask_info.active_cols)[:n].astype(np.int32)
+  return bool(np.all(np.abs(rows - cols) <= 1))
+
+
 # Logic for processing NumPy masks for kernels
 class MaskInfo(NamedTuple):
   """Contains runtime masking information for the Splash attention kernel.
