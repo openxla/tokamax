@@ -530,6 +530,75 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
         jnp.allclose(actual_out, expected_out, atol=1e-3, rtol=1e-3)
     )
 
+  @parameterized.parameters(
+      ('xla', 4),
+      ('xla_chunked', 2048),
+  )
+  def test_all_masked_query_row(
+      self, implementation: api.Implementation, seq_k: int
+  ):
+    query = jax.random.normal(
+        jax.random.key(0), (1, 4, 1, 32), dtype=jnp.float32
+    )
+    key_arr = jax.random.normal(
+        jax.random.key(1), (1, seq_k, 1, 32), dtype=jnp.float32
+    )
+    val_arr = jax.random.normal(
+        jax.random.key(2), (1, seq_k, 1, 32), dtype=jnp.float32
+    )
+    # Mask out row 1 entirely.
+    mask = (
+        jnp.ones((1, 1, 4, seq_k), dtype=jnp.bool_).at[:, :, 1, :].set(False)
+    )
+
+    sdpa_fn = functools.partial(
+        api.dot_product_attention,
+        mask=mask,
+        implementation=implementation,
+    )
+    out, vjp_fn = jax.vjp(sdpa_fn, query, key_arr, val_arr)
+    chex.assert_tree_all_finite(out)
+    chex.assert_trees_all_close(
+        out[:, 1, :, :], jnp.zeros_like(out[:, 1, :, :])
+    )
+    dquery, dkey, dvalue = vjp_fn(jnp.ones_like(out))
+    chex.assert_tree_all_finite((dquery, dkey, dvalue))
+    chex.assert_trees_all_close(
+        dquery[:, 1, :, :], jnp.zeros_like(dquery[:, 1, :, :])
+    )
+
+  def test_combine_partial_results_all_masked(self):
+    num_chunks = 2
+    batch, seq_len, num_heads, head_dim = 1, 4, 1, 32
+    out_partial = jnp.zeros(
+        (num_chunks, batch, seq_len, num_heads, head_dim), dtype=jnp.float32
+    )
+    m_arr = jnp.zeros(
+        (num_chunks, batch, num_heads, seq_len), dtype=jnp.float32
+    ).at[:, :, :, 1].set(-float('inf'))
+    l_arr = jnp.ones(
+        (num_chunks, batch, num_heads, seq_len), dtype=jnp.float32
+    ).at[:, :, :, 1].set(0.0)
+    for normalize in (True, False):
+      combined_out, (_, l_sum) = api.base.combine_partial_results(
+          out_partial, (m_arr, l_arr), normalize_output=normalize
+      )
+      chex.assert_tree_all_finite(combined_out)
+      chex.assert_trees_all_close(
+          combined_out[:, 1, :, :], jnp.zeros_like(combined_out[:, 1, :, :])
+      )
+      chex.assert_tree_all_finite(l_sum)
+
+  def test_softmax_unnormalized_all_masked(self):
+    x_arr = jnp.array([[-float('inf'), -float('inf')]], dtype=jnp.float32)
+    out, _ = api.base._softmax(x_arr, normalize=False)
+    chex.assert_tree_all_finite(out)
+    chex.assert_trees_all_close(out, jnp.zeros_like(out))
+    (_, _), (x_dot, _) = api.base._softmax_jvp(
+        False, (x_arr,), (jnp.ones_like(x_arr),)
+    )
+    chex.assert_tree_all_finite(x_dot)
+
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):
   IMPL = 'xla_chunked'

@@ -730,10 +730,7 @@ class DotProductAttention[C, K: Hashable](
     mask: jax.Array | None = mask.as_array(q_len_or_indices, k_len_or_indices)
 
     if mask is not None:
-      # This is not `-inf` as this can lead to `NaN`s when a full softmax row is
-      # masked (with stable softmax). This is because the maximum value for the
-      # row will be `-inf`, leading to `(-inf) - (-inf)` in the softmax.
-      logits = jnp.where(mask, logits, float(jnp.finfo(logits.dtype).min))
+      logits = jnp.where(mask, logits, -float("inf"))
 
     weights, softmax_residuals = _softmax(logits, normalize_output)
 
@@ -774,9 +771,11 @@ def _softmax(x: jax.Array, normalize: bool) -> tuple[jax.Array, Residuals]:
   # Always perform reductions in at least f32 precision.
   dtype = jnp.promote_types(x.dtype, jnp.float32)
   x_max = jnp.max(x.astype(dtype), axis=-1, keepdims=True)
-  unnormalized = jnp.exp(x - x_max)
+  safe_x_max = jnp.where(jnp.isneginf(x_max), 0.0, x_max)
+  unnormalized = jnp.exp(x - safe_x_max)
   denom = jnp.sum(unnormalized, axis=-1, keepdims=True)
-  out = (unnormalized / denom) if normalize else unnormalized
+  safe_denom = jnp.where(denom == 0.0, 1.0, denom)
+  out = (unnormalized / safe_denom) if normalize else unnormalized
   return out, (jnp.squeeze(x_max, -1), jnp.squeeze(denom, -1))
 
 
@@ -786,11 +785,17 @@ def _softmax_jvp(normalize, primals, tangents):
   (x_dot,) = tangents
   y, residual = _softmax(x, normalize)
   if normalize:
-    y_dot = y * (x_dot - (y * x_dot).sum(axis=-1, keepdims=True))
+    y_dot = jnp.where(
+        y == 0.0, 0.0, y * (x_dot - (y * x_dot).sum(axis=-1, keepdims=True))
+    )
   else:
     x_max = residual[0][..., None]
-    x_dot_max_mean = jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max))
-    y_dot = y * (x_dot - x_dot_max_mean)
+    x_dot_max_mean = jnp.where(
+        jnp.isneginf(x_max),
+        0.0,
+        jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max)),
+    )
+    y_dot = jnp.where(y == 0.0, 0.0, y * (x_dot - x_dot_max_mean))
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
 
 
@@ -945,14 +950,15 @@ def combine_partial_results(
   """Combine partial attention results (reducing over leading axes)."""
   m, l = residuals
   m_max = jnp.max(m, axis=0)
-  alpha = jnp.exp(m - m_max)
+  safe_m_max = jnp.where(jnp.isneginf(m_max), 0.0, m_max)
+  alpha = jnp.where(jnp.isneginf(m), 0.0, jnp.exp(m - safe_m_max))
   l_sum = jnp.sum(l * alpha, axis=0)
   alpha = alpha.mT[..., None]
   # Avoid NaNs where `out` is infinity.
   out = jnp.where(alpha == 0.0, 0.0, out * alpha)
   out = jnp.sum(out, axis=0)
   if normalize_output:
-    out = out / l_sum.mT[..., None]
+    out = out / jnp.where(l_sum == 0.0, 1.0, l_sum).mT[..., None]
   return out, (m_max, l_sum)
 
 
