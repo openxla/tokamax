@@ -368,6 +368,16 @@ class ShapeDtype:
           if hasattr(ml_dtypes, 'float8_e5m3fnu')
           else {}
       ),
+      **(
+          dict(c32=ml_dtypes.complex32)
+          if hasattr(ml_dtypes, 'complex32')
+          else {}
+      ),
+      **(
+          dict(bc32=ml_dtypes.bcomplex32)
+          if hasattr(ml_dtypes, 'bcomplex32')
+          else {}
+      ),
       c64=np.complex64,
       c128=np.complex128,
   )
