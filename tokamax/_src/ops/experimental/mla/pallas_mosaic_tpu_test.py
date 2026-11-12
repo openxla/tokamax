@@ -306,8 +306,8 @@ class AutotuningTest(parameterized.TestCase):
 
   def test_production_specs_hit_the_cache(self):
     device_kind = jax.devices()[0].device_kind.lower().replace(" ", "_")
-    if device_kind != "tpu7x":
-      self.skipTest("The cache is only populated for tpu7x.")
+    if device_kind not in ("tpu7x", "tpu8i"):
+      self.skipTest("The cache is only populated for tpu7x and tpu8i.")
     for spec in arg_specs.ARG_SPECS:
       with self.subTest(spec.name):
         self.assertIsNotNone(Mla().bind(**spec.args).cached_autotuning_data)
