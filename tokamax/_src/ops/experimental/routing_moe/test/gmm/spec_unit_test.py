@@ -17,7 +17,9 @@
 import dataclasses
 
 from absl.testing import absltest
+import jax
 import jax.numpy as jnp
+from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import spec
 from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 
@@ -96,6 +98,95 @@ class RoutingGmmSpecTest(absltest.TestCase):
     bad_scatter = spec.RoutingSpec(num_indices=79, remote_axis=None)
     with self.assertRaisesRegex(ValueError, "scatter must map every computed"):
       dataclasses.replace(base, scatter=bad_scatter)
+
+  def test_subchannel_weight_spec_scale_dtype(self):
+    subchannel = _make_spec(8, with_down=False).w
+    self.assertEqual(subchannel.scale_dtype, jnp.dtype(jnp.float32))
+
+
+def _block_scaled_weight_spec(
+    *,
+    in_size: int = 512,
+    scale_rows: int = 32,
+    dtype: jax.typing.DTypeLike = jnp.float8_e4m3fn,
+) -> spec.WeightSpec:
+  return spec.WeightSpec(
+      group_size=4,
+      in_size=in_size,
+      out_size=64,
+      dtype=jnp.dtype(dtype),
+      quant=spec.BlockScaledQuantSpec(scale_rows=scale_rows),
+      has_bias=False,
+      fused_gate_up=False,
+  )
+
+
+def _e8m0(shape: tuple[int, ...]) -> jax.Array:
+  return jax.lax.bitcast_convert_type(
+      jnp.full(shape, 127, jnp.uint8), jnp.float8_e8m0fnu
+  )
+
+
+class BlockScaledWeightSpecTest(absltest.TestCase):
+
+  def test_scale_shape_and_dtype(self):
+    w = _block_scaled_weight_spec(scale_rows=64, dtype=jnp.float8_e5m2)
+    self.assertEqual(w.scale_dtype, jnp.dtype(jnp.float8_e8m0fnu))
+    self.assertEqual(w.scale_shape, (4, 64, 64))
+
+  def test_rejects_non_positive_scale_rows(self):
+    for bad_rows in (0, -4):
+      with self.assertRaisesRegex(ValueError, "scale_rows must be positive"):
+        spec.BlockScaledQuantSpec(scale_rows=bad_rows)
+
+  def test_rejects_non_fp8_dtype(self):
+    with self.assertRaisesRegex(ValueError, "requires dtype in"):
+      _block_scaled_weight_spec(dtype=jnp.bfloat16)
+
+  def test_wrapper_infers_spec_from_3d_scales(self):
+    weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
+    for rows in (32, 64):
+      scale = _e8m0((4, rows, 64))
+      wrapped = arg.SingleWeightWrapper.create(weight, scale)
+      self.assertEqual(
+          wrapped.spec.quant, spec.BlockScaledQuantSpec(scale_rows=rows)
+      )
+      self.assertEqual(wrapped.spec.scale_shape, (4, rows, 64))
+
+  def test_wrapper_create_with_explicit_quant_validates_shape(self):
+    weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
+    explicit_quant = spec.BlockScaledQuantSpec(scale_rows=32)
+    wrapped = arg.SingleWeightWrapper.create(
+        weight, _e8m0((4, 32, 64)), quant=explicit_quant
+    )
+    self.assertEqual(wrapped.spec.quant, explicit_quant)
+    with self.assertRaisesRegex(ValueError, "Weight scale must have shape"):
+      arg.SingleWeightWrapper.create(
+          weight, _e8m0((4, 64, 64)), quant=explicit_quant
+      )
+
+  def test_wrapper_rejects_non_e8m0_3d_scale(self):
+    weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
+    with self.assertRaisesRegex(ValueError, "must have dtype float8_e8m0fnu"):
+      arg.SingleWeightWrapper.create(
+          weight, jnp.ones((4, 32, 64), dtype=jnp.float32)
+      )
+
+  def test_wrapper_rejects_invalid_scale_rank(self):
+    weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
+    with self.assertRaisesRegex(ValueError, "must be 3D .* or 4D"):
+      arg.SingleWeightWrapper.create(weight, _e8m0((4, 64)))
+
+
+class SubchannelWeightWrapperTest(absltest.TestCase):
+
+  def test_allows_4d_e8m0_scale(self):
+    weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
+    wrapped = arg.SingleWeightWrapper.create(weight, _e8m0((4, 16, 1, 64)))
+    self.assertEqual(
+        wrapped.spec.quant, spec.SubchannelQuantSpec(block_size=32)
+    )
+    self.assertEqual(wrapped.spec.scale_shape, (4, 16, 1, 64))
 
 
 if __name__ == "__main__":

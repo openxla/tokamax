@@ -972,7 +972,7 @@ class PipelineBlockSpecs:
       self, w_spec: spec_lib.WeightSpec, tile_k: int, tile_n: int
   ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
-    assert w_spec.quant is not None
+    assert isinstance(w_spec.quant, spec_lib.SubchannelQuantSpec)
     num_blocks = tile_k // w_spec.quant.block_size
     block_shape = (None, num_blocks, 1, tile_n)
     return pl.BlockSpec(

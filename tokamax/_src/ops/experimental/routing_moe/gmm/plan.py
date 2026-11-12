@@ -492,6 +492,7 @@ def _vmem_estimate(
     scale_vmem = 0
     bytes_per_fp32 = 4
     if weight.quant is not None:
+      assert isinstance(weight.quant, tensor_spec.SubchannelQuantSpec)
       num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
       scale_vmem = (
           num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
