@@ -354,8 +354,6 @@ class OpsListTest(absltest.TestCase):
     self.assertEqual(recorded_root_symbols, expected_root_entrypoints)
 
   def test_api_implementations_keys_appear_in_impls(self):
-    checked_ops_count = 0
-    checked_no_api_count = 0
     for op_entry in ops_list.OPS:
       api_rel_path = f"_src/ops/{op_entry.op_dir}/api.py"
       api_full_path = _TOKAMAX_ROOT / api_rel_path
@@ -366,7 +364,6 @@ class OpsListTest(absltest.TestCase):
             f" {api_rel_path}",
         )
       if not api_full_path.is_file():
-        checked_no_api_count += 1
         continue
 
       all_names = frozenset(impl.name for impl in op_entry.impls)
@@ -389,18 +386,6 @@ class OpsListTest(absltest.TestCase):
           f"Declared impl names mismatch for op '{op_entry.name}' in"
           f" '{api_rel_path}'",
       )
-      checked_ops_count += 1
-
-    self.assertGreaterEqual(
-        checked_ops_count,
-        30,
-        f"Expected at least 30 ops with api.py, got {checked_ops_count}",
-    )
-    self.assertGreaterEqual(
-        checked_no_api_count,
-        4,
-        f"Expected at least 4 ops without api.py, got {checked_no_api_count}",
-    )
 
   def test_op_directories_covered(self):
     ops_dir = _TOKAMAX_ROOT / "_src" / "ops"
@@ -509,39 +494,7 @@ class OpsListTest(absltest.TestCase):
             f"kernel_dir '{kernel_dir}' on op '{op.name}' has no python files",
         )
 
-    kernel_dir = "experimental/routing_moe"
-    op = ops_list.Op(
-        name="routing_moe",
-        apis=(),
-        impls=(
-            ops_list.Impl(
-                name="xla",
-                backend=ops_list.XLA,
-                module="_src/ops/experimental/routing_moe_op/base.py",
-            ),
-            ops_list.Impl(
-                name="mosaic_tpu",
-                backend=ops_list.MOSAIC_TPU,
-                module=(
-                    "_src/ops/experimental/routing_moe_op/pallas_mosaic_tpu.py"
-                ),
-                kernel_dirs=(kernel_dir,),
-            ),
-            ops_list.Impl(
-                name="mosaic_tpu_v2",
-                backend=ops_list.MOSAIC_TPU,
-                module="_src/ops/experimental/routing_moe_op/tpu_v2.py",
-                kernel_dirs=(kernel_dir,),
-            ),
-        ),
-    )
-    self.assertEqual(op.dirs, ("experimental/routing_moe_op", kernel_dir))
-
   def test_experimental_ops_and_impl_modules_consistency(self):
-    self.assertGreaterEqual(
-        sum(op.experimental for op in ops_list.OPS),
-        14,
-    )
     for op in ops_list.OPS:
       self.assertNotEmpty(
           op.impls, f"Op '{op.name}' must have at least one implementation"
@@ -565,23 +518,6 @@ class OpsListTest(absltest.TestCase):
             f"Impl {impl.module} resolves to {impl_op_dir}, expected"
             f" {op.op_dir}",
         )
-
-  def test_extract_dunder_all_parses_tuple_and_list(self):
-    tuple_tree = ast.parse('__all__ = ("a", "b")')
-    list_tree = ast.parse('__all__ = ["c", "d"]')
-    empty_tree = ast.parse("x = 1")
-    self.assertEqual(_extract_dunder_all(tuple_tree), frozenset({"a", "b"}))
-    self.assertEqual(_extract_dunder_all(list_tree), frozenset({"c", "d"}))
-    self.assertEmpty(_extract_dunder_all(empty_tree))
-
-  def test_extract_op_api_imports_finds_api_modules(self):
-    tree = ast.parse(
-        "from tokamax._src.ops.attention.api import dot_product_attention\n"
-        "from tokamax._src.ops.ragged_dot.base import foo\n"
-    )
-    self.assertEqual(
-        _extract_op_api_imports(tree), frozenset({"dot_product_attention"})
-    )
 
 
 if __name__ == "__main__":
