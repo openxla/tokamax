@@ -153,10 +153,11 @@ def gated_linear_unit(
     raise NotImplementedError(f"{k=} must be divisible by {tile_k=}")
 
   grid = (m // tile_m, n // tile_n)
+  out_smem_ty = mgpu_lib.tiled_swizzled_smem((tile_m, tile_n), dtype)
 
   @plgpu.kernel(
       out_type=jax.ShapeDtypeStruct((m, n), dtype),
-      scratch_types=(mgpu_lib.tiled_swizzled_smem((tile_m, tile_n), dtype),),
+      scratch_types=(out_smem_ty,),
       grid=(4 * backend.get_default_device().core_count,),
       grid_names=("block",),
   )
@@ -198,15 +199,14 @@ def gated_linear_unit(
         # layout emits scattered 4B stores). Ampere lacks TMA, so this is a
         # manual STS/LDS/STG path; the swizzle avoids STS bank conflicts.
         copy_layout = plgpu.Layout.SMEM_GMEM_COPY(
-            out_smem.shape, dtype, swizzle=out_smem.transforms[0].swizzle
+            out_smem.shape,
+            dtype,
+            swizzle=out_smem_ty.transforms[-1].swizzle,  # pyrefly: ignore[missing-attribute]
         )
         ms = pl.ds(mi * tile_m, tile_m)
         ns = pl.ds(ni * tile_n, tile_n)
         out_smem[...] = (proj * activation(gates)).astype(dtype)
         out = plgpu.layout_cast(out_smem[...], copy_layout)
-        if jax.__version_info__ >= (0, 11, 3):
-          plgpu.store(out_gmem.at[ms, ns], out, optimized=False)
-        else:
-          out_gmem[ms, ns] = out
+        mgpu_lib.store(out_gmem.at[ms, ns], out, optimized=False)
 
   return kernel(x, weights.reshape(k, 2 * n)).reshape(*orig_x_shape[:-1], n)

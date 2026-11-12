@@ -113,35 +113,34 @@ def fence_async_shared_cta(_):
 
 
 def _bar_operation(
-    operation: str, barrier_id: int | jax.Array, num_threads: int
+    operation: str,
+    barrier_id: int | jax.Array,
+    num_threads: int,
+    predicate: bool | jax.Array | None = None,
 ):
   """Performs a PTX CTA barrier operation."""
+  if isinstance(predicate, (bool, np.bool_)):
+    if not predicate:
+      return
+    predicate = None
+
   if isinstance(barrier_id, int):
-
-    @plgpu.inline_mgpu()
-    def bar_op(_):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [],
-          f"bar.{operation} {barrier_id}, {num_threads};",
-          "",
-          has_side_effects=True,
-      )
-
-    bar_op()
+    args, bar_id = [], barrier_id
   else:
+    args, bar_id = [barrier_id], "$0"
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,))
-    def bar_op(_, barrier_id):
-      llvm.inline_asm(
-          ir.Type.parse("!llvm.void"),
-          [barrier_id.registers[()]],
-          f"bar.{operation} $0, {num_threads};",
-          "r",
-          has_side_effects=True,
-      )
+  if predicate is not None:
+    args.append(predicate)
 
-    bar_op(barrier_id)
+  @plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT,) * len(args))
+  def bar_op(_, *args):
+    args = [a.registers[()] for a in args]
+    pred = None if predicate is None else args.pop()
+    mgpu.utils.inline_ptx(
+        f"bar.{operation} {bar_id}, {num_threads};", *args, predicate=pred
+    )
+
+  bar_op(*args)
 
 
 bar_arrive = functools.partial(_bar_operation, "arrive")
@@ -496,3 +495,16 @@ def not_persistent_grid_loop_kernel(
     return body(grid_loop, **kwargs)
 
   return plgpu.kernel(wrapped_body, grid_names=grid_names, **kwargs)
+
+
+def store(ref, value, *, optimized: bool = True) -> None:
+  """Stores `value` to `ref`, like `plgpu.store`.
+
+  Only the OSS export calls this; internal code calls `plgpu.store` directly.
+  JAX 0.11.2 has no `plgpu.store`, and there assigning through the ref already
+  does an unoptimized store.
+  """
+  if jax.__version_info__ >= (0, 12, 0):
+    plgpu.store(ref, value, optimized=optimized)
+  else:
+    ref[...] = value

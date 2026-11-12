@@ -14,7 +14,7 @@
 # ==============================================================================
 """Kimi Delta Attention argument specifications."""
 
-from typing import Final
+from typing import Any, Final
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -61,13 +61,13 @@ def _kimi_linear_48b_a3b_spec(
   dtype = jnp.bfloat16
   qkv_shape = (num_heads, batch_size, seq_len, head_dim)
 
-  args = {
+  args: dict[str, Any] = {
       "query": ShapeDtype(qkv_shape, dtype),
       "key": ShapeDtype(qkv_shape, dtype),
       "value": ShapeDtype(qkv_shape, dtype),
       "gate": ShapeDtype(qkv_shape, dtype),
-      "beta": numerics.RangedArrayInitializer(
-          shape=(num_heads, batch_size, seq_len), dtype=dtype, min=0.0, max=1.0
+      "beta": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len), dtype, minval=0.0, maxval=1.0
       ),
       "a_log": ShapeDtype((num_heads,), jnp.float32),
       "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
@@ -92,6 +92,104 @@ def _kimi_linear_48b_a3b_spec(
   )
 
 
+# Per-chip Gated DeltaNet shapes for Qwen3.5-397B-A17B training: 32 value
+# heads with 128-dimensional key and value states.
+def _qwen3_5_397b_a17b_spec(*, name: str, seq_len: int) -> arg_spec.ArgSpec:
+  """Builds a scalar-gate (Gated DeltaNet) training workload."""
+  batch_size = 1
+  num_heads = 32
+  head_dim = 128
+  dtype = jnp.bfloat16
+  qkv_shape = (num_heads, batch_size, seq_len, head_dim)
+
+  args: dict[str, Any] = {
+      "query": ShapeDtype(qkv_shape, dtype),
+      "key": ShapeDtype(qkv_shape, dtype),
+      "value": ShapeDtype(qkv_shape, dtype),
+      # One pre-activated log-space decay per head and token.
+      "gate": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len, 1), dtype, minval=-5.0, maxval=0.0
+      ),
+      "beta": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len), dtype, minval=0.0, maxval=1.0
+      ),
+      "output_final_state": False,
+      "use_qk_l2norm": True,
+      "use_gate_in_kernel": False,
+      "per_channel_gate": False,
+  }
+  return arg_spec.ArgSpec(
+      args=args,
+      project="qwen3_5_397b_a17b",
+      name=name,
+      tags=("primary",),
+  )
+
+
+# Per-device KDA inference shapes for Kimi K3 (moonshotai/Kimi-K3, 2.8T total /
+# 104B active, 69 KDA layers, 96 global heads, head_dim=128, causal conv1d W=4):
+# - TP=32 (InferenceX megakernel on gf=2x2x4, 32 TensorCores): 3 heads/core
+# - TP=16 (per 2-core chip on gf=2x2x4): 6 heads/chip
+# - TP=8 (serving on gf=4x4x4 / gf=4x4x8): 12 heads/device
+def _kimi_k3_2p8t_inference_spec(
+    *,
+    name: str,
+    num_heads: int,
+    seq_len: int,
+    batch_size: int = 1,
+    num_segments: int | None = None,
+) -> arg_spec.ArgSpec:
+  """Builds a Kimi K3 (2.8T) KDA inference workload."""
+  head_dim = 128
+  conv_width = 4
+  dtype = jnp.bfloat16
+  qkv_shape = (num_heads, batch_size, seq_len, head_dim)
+  num_states = num_segments if num_segments is not None else 1
+
+  args: dict[str, Any] = {
+      "query": ShapeDtype(qkv_shape, dtype),
+      "key": ShapeDtype(qkv_shape, dtype),
+      "value": ShapeDtype(qkv_shape, dtype),
+      "gate": ShapeDtype(qkv_shape, dtype),
+      "beta": numerics.FloatRangedArrayInitializer(
+          (num_heads, batch_size, seq_len), dtype, minval=0.0, maxval=1.0
+      ),
+      "a_log": ShapeDtype((num_heads,), jnp.float32),
+      "delta_time_bias": ShapeDtype((num_heads * head_dim,), jnp.float32),
+      "initial_state": ShapeDtype(
+          (batch_size, num_states, num_heads, head_dim, head_dim), jnp.float32
+      ),
+      "output_final_state": True,
+      "use_qk_l2norm": True,
+      "use_gate_in_kernel": True,
+      "lower_bound": -5.0,
+      "conv_weight_q": ShapeDtype(
+          (num_heads, conv_width, head_dim), jnp.float32
+      ),
+      "conv_weight_k": ShapeDtype(
+          (num_heads, conv_width, head_dim), jnp.float32
+      ),
+      "conv_weight_v": ShapeDtype(
+          (num_heads, conv_width, head_dim), jnp.float32
+      ),
+      "use_conv1d_in_kernel": True,
+  }
+  if num_segments is not None:
+    args["segment_ids"] = _make_segment_ids(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_segments=num_segments,
+    )
+    args["max_num_segments"] = num_segments
+
+  return arg_spec.ArgSpec(
+      args=args,
+      project="kimi_k3_2p8t",
+      name=name,
+      tags=("primary", "forward_only"),
+  )
+
+
 # Kimi Linear uses 32 KDA heads with 128-dimensional key and value states.
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
     _kimi_linear_48b_a3b_spec(
@@ -102,5 +200,40 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         name="packed_training_b1_t8192_n25_bf16",
         seq_len=8192,
         num_segments=25,
+    ),
+    _qwen3_5_397b_a17b_spec(
+        name="gdn_fixed_training_b1_t8192_bf16",
+        seq_len=8192,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_prefill_b1_t128_bf16",
+        num_heads=3,
+        seq_len=128,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_prefill_b1_t512_bf16",
+        num_heads=3,
+        seq_len=512,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_prefill_b1_t1024_bf16",
+        num_heads=3,
+        seq_len=1024,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_verify_b1_t64_n8_bf16",
+        num_heads=3,
+        seq_len=64,
+        num_segments=8,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp16_prefill_b1_t1024_bf16",
+        num_heads=6,
+        seq_len=1024,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp8_prefill_b1_t2048_bf16",
+        num_heads=12,
+        seq_len=2048,
     ),
 )

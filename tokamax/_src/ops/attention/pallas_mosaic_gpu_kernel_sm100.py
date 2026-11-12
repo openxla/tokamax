@@ -248,7 +248,7 @@ def get_heuristics_config(
   ):
     split_k = num_clusters // grid_size
     split_k = min(kv_seq_len // block_kv, split_k)
-    while kv_seq_len % split_k != 0:
+    while (kv_seq_len // block_kv) % split_k != 0:
       split_k -= 1
 
   q, k, v, bias, mask = eval_in_shapes(split_k=split_k)
@@ -373,6 +373,9 @@ def flash_attention_kernel(
   q, k, v = _pad_to_swizzle(q, k, v, collective=config.collective)
   head_dim = q.shape[-1]
   head_dim_out = v.shape[-1]
+
+  if bias is not None and bias.shape[-2] != 1:
+    bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
 
   if mask is not None:
     if mask.shape[-2] == 1 or mask.shape[-1] == 1:
@@ -769,7 +772,12 @@ def flash_attention_kernel(
                   lambda: s,
               )
               scale *= math.log2(math.e)
-              m_i = jnp.maximum(m_i, s.max(axis=1) * scale)
+              if jax.__version_info__ >= (0, 12, 0):
+                max_ilp = (tile_q // 64) * (4 if bias_gmem is None else 2)
+                s_max = plgpu.max(s, axis=1, accumulator_ilp=max_ilp)
+              else:
+                s_max = s.max(axis=1)
+              m_i = jnp.maximum(m_i, s_max * scale)
               cannot_be_inf = mask_gmem is None and not has_k_range
               m_valid = cannot_be_inf | (m_i != -jnp.inf)
               alpha = jnp.where(m_valid, jnp.exp2(m_scale - m_i), 1.0)
@@ -787,7 +795,14 @@ def flash_attention_kernel(
               m_scale = jnp.where(needs_rescale, m_i, m_scale)
               bcast = lambda x: lax.broadcast_in_dim(x, s.shape, [0])
               p = jnp.exp2(s * scale - bcast(jnp.where(m_valid, m_scale, 0.0)))
-              l_i = jnp.where(needs_rescale, l_i * alpha, l_i) + p.sum(axis=1)
+              l_i = jnp.where(needs_rescale, l_i * alpha, l_i)
+              if jax.__version_info__ >= (0, 12, 0):
+                sum_ilp = (tile_q // 64) * 4
+                if bias_gmem is None and block_kv > 64:
+                  sum_ilp *= 2
+                l_i += plgpu.sum(p, axis=1, accumulator_ilp=sum_ilp)
+              else:
+                l_i += p.sum(axis=1)
 
               with jax.named_scope("write qk_tmem"):
                 plgpu.async_store_tmem(p_tmem.at[si], p.astype(p_tmem.dtype))
@@ -801,13 +816,16 @@ def flash_attention_kernel(
           # in 2CTA we have non square blocks hence we may need to process
           # M//N steps with a mask, for M=256, N=128 this means 2 steps
           causal_blocks = int(is_causal) * (block_q // block_kv)
-          carry = lax.fori_loop(
-              lb, ub - causal_blocks, kv_loop, (m_i, m_i, l_i)
-          )
+          # Never start the causal loop before `lb`: with fewer than
+          # `causal_blocks` KV blocks (e.g. 2CTA with a single KV block), we
+          # would otherwise run more iterations than the MMA warp, and wait on
+          # `s_produced` forever.
+          ub_no_causal = lax.max(lb, ub - causal_blocks)
+          carry = lax.fori_loop(lb, ub_no_causal, kv_loop, (m_i, m_i, l_i))
 
           if is_causal:
             causal_kv_loop = functools.partial(kv_loop, do_causal=True)
-            carry = lax.fori_loop(ub - causal_blocks, ub, causal_kv_loop, carry)
+            carry = lax.fori_loop(ub_no_causal, ub, causal_kv_loop, carry)
 
           m_scale, m_i, l_i = carry
 
@@ -825,14 +843,11 @@ def flash_attention_kernel(
               l_i *= alpha
             m_i *= 1 / math.log2(math.e)
             for residual, gmem_ref in zip((m_i, l_i), residual_gmems):
-              if jax.__version_info__ >= (0, 11, 3):
-                plgpu.store(
-                    gmem_ref.at[hi, qs],
-                    residual.astype(gmem_ref.dtype),
-                    optimized=False,
-                )
-              else:
-                gmem_ref.at[hi, qs].set(residual.astype(gmem_ref.dtype))
+              mgpu_lib.store(
+                  gmem_ref.at[hi, qs],
+                  residual.astype(gmem_ref.dtype),
+                  optimized=False,
+              )
 
       @pl.when(wg == _SCALE_WG)
       def scale_wg():

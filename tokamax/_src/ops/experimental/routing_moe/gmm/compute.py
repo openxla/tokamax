@@ -18,6 +18,7 @@
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
@@ -45,6 +46,15 @@ def _silu_and_mul_with_clamp(
   return jax.nn.silu(gate) * up
 
 
+def _situ_and_mul(
+    gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
+) -> jax.Array:
+  gate = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+  if linear_beta is not None:
+    up = linear_beta * jnp.tanh(up / linear_beta)
+  return gate * up
+
+
 def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
   """Optionally applies a fused activation function to the accumulator."""
 
@@ -63,104 +73,206 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
       return _swigluoai(acc_gate, acc_up)
     case "silu_and_mul_with_clamp":
       return _silu_and_mul_with_clamp(acc_gate, acc_up)
+    case str() if fuse_act.startswith("situ:"):
+      _, beta, linear_beta = fuse_act.split(":")
+      linear_beta = None if linear_beta == "none" else float(linear_beta)
+      return _situ_and_mul(acc_gate, acc_up, float(beta), linear_beta)
     case _:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
 
+def _quantized_block_matmul(
+    cfg: config.ComputeConfig,
+    block_x: jax.Array,
+    block_w: jax.Array,
+    w_scale: jax.Array,
+    *,
+    start_k: int,
+    start_n: int,
+    end_n: int,
+    w_q_block_size: int,
+    preferred_element_type: jnp.dtype,
+) -> jax.Array:
+  """Computes one dynamically quantized K-block matmul over weight blocks."""
+  assert cfg.dynamic_quant is not None
+  x_q_dtype = cfg.matmul_dtype
+  block_k = block_x.shape[1]
+
+  # Perform lhs quantization. Note that for every block_lhs,
+  # same computation will be performed tiles_n//mxu_size times.
+  # But we can let compiler perform CSE and avoid recomputation.
+  block_scale, block_scale_inv = quant_util.compute_scale(
+      block_x, x_q_dtype, cfg.dynamic_quant
+  )
+  block_x_q = quant_util.quantize(block_x, block_scale_inv, x_q_dtype)
+
+  # Unlike unquantized path, compiler may not perform implicit type
+  # conversion due to numeric concerns. As this can cause unsupported
+  # matmul error, explicit type conversion is performed.
+  if not cfg.tpu_info.is_matmul_supported(x_q_dtype, block_w.dtype):
+    block_w = block_w.astype(x_q_dtype)
+
+  # If w_q_block_size < q_block_size, this loops
+  # q_block_size // w_q_block_size times. Otherwise it runs once over the
+  # whole x block (end_w is clipped to block_k), and consecutive
+  # x blocks share one weight scale.
+  # Don't initialize block_acc to jnp.zero because jnp.zeros causes zero
+  # initialization values to materialize.
+  block_acc = None
+  for start_w in range(0, block_k, w_q_block_size):
+    end_w = min(block_k, start_w + w_q_block_size)
+    sub_acc = jnp.matmul(
+        # block_x_q: [tile_m, block_k]
+        block_x_q[:, start_w:end_w],
+        # block_w: [block_k, col_size]
+        block_w[start_w:end_w],
+        preferred_element_type=preferred_element_type,
+    ).astype(cfg.acc_dtype)
+
+    # w_scale: [tile_k // w_q_block_size, 1, tile_n]
+    scale_idx = (start_k + start_w) // w_q_block_size
+    sub_acc *= w_scale[scale_idx, :, start_n:end_n].astype(cfg.acc_dtype)
+    block_acc = sub_acc if block_acc is None else block_acc + sub_acc
+
+  assert block_acc is not None
+  return block_acc * block_scale.astype(cfg.acc_dtype)
+
+
+def _quantized_matmul(
+    cfg: config.ComputeConfig,
+    x: jax.Array,
+    w: jax.Array,
+    w_scale: jax.Array,
+) -> jax.Array:
+  """Computes dynamically quantized matrix multiplication for a single tile."""
+  assert cfg.dynamic_quant is not None
+  mxu_size = cfg.tpu_info.mxu_column_size
+  tile_k, tile_n = w.shape
+  num_w_blocks = w_scale.shape[0]
+  x_q_dtype = cfg.matmul_dtype
+  x_q_block_size = cfg.dynamic_quant.block_size
+  assert x_q_block_size is not None
+  assert tile_k % num_w_blocks == 0, f"{num_w_blocks=} must divide {tile_k=}."
+  w_q_block_size = tile_k // num_w_blocks
+  # TODO: I think current code assumes x_q_block_size is always
+  # smaller than w_q_block_size? Revist this later.
+  if num_w_blocks > 1:
+    # With a single weight block (per-channel), every x block lies within it,
+    # so the block sizes need not divide one another.
+    block_sizes = (x_q_block_size, w_q_block_size)
+    assert (
+        max(block_sizes) % min(block_sizes) == 0
+    ), f"{x_q_block_size=} and {w_q_block_size=} must divide one another."
+
+  if jnp.issubdtype(x_q_dtype, jnp.floating):
+    preferred_element_type = jnp.float32.dtype
+  else:
+    preferred_element_type = jnp.int32.dtype
+
+  # Without n outer loop, result of quantized matmul becomes available only
+  # at the last iteration of the loop. This means [tile_m, tile_n] value
+  # needs to be stored until the last iteration. By adding n outer loop,
+  # result of [tile_m, mxu_size] becomes available at the end of every k
+  # inner loop which can be used to pipeline subsequent VPU or VST ops with
+  # MXU ops for the next [tile_m, mxu_size].
+  list_acc = []
+  for start_n in range(0, tile_n, mxu_size):
+    end_n = min(tile_n, start_n + mxu_size)
+    tile_acc = None
+    for start_k in range(0, tile_k, x_q_block_size):
+      end_k = min(tile_k, start_k + x_q_block_size)
+      block_acc = _quantized_block_matmul(
+          cfg,
+          x[:, start_k:end_k],
+          w[start_k:end_k, start_n:end_n],
+          w_scale,
+          start_k=start_k,
+          start_n=start_n,
+          end_n=end_n,
+          w_q_block_size=w_q_block_size,
+          preferred_element_type=preferred_element_type,
+      )
+      tile_acc = block_acc if tile_acc is None else tile_acc + block_acc
+    list_acc.append(tile_acc)
+  return jnp.concat(list_acc, axis=1)
+
+
+def _scale_after_matmul(
+    cfg: config.ComputeConfig,
+    x: jax.Array,
+    w: jax.Array,
+    w_scale: jax.Array,
+) -> jax.Array:
+  """Computes unquantized x @ quantized_w for a single tile.
+
+  Args:
+    cfg: Compute config. `cfg.dynamic_quant` must be None.
+    x: Activation tile of shape (tile_m, tile_k), not quantized.
+    w: Quantized weight tile of shape (tile_k, tile_n).
+    w_scale: Weight scale of shape (num_q_blocks, 1, tile_n), where
+      `num_w_blocks` is 1 for per-channel quantization.
+
+  Returns:
+    The product of shape (tile_m, tile_n) in `cfg.acc_dtype`.
+  """
+  assert cfg.dynamic_quant is None
+  mxu_size = cfg.tpu_info.mxu_column_size
+  tile_k, tile_n = w.shape
+  w_num_q_blocks = w_scale.shape[0]
+  assert (
+      tile_k % w_num_q_blocks == 0
+  ), f"{w_num_q_blocks=} must divide {tile_k=}."
+  w_q_block_size = tile_k // w_num_q_blocks
+
+  # w is not cast to x's dtype. Mosaic converts dtype combinations the MXU
+  # does not support natively.
+  list_acc = []
+  for start_n in range(0, tile_n, mxu_size):
+    end_n = min(tile_n, start_n + mxu_size)
+    tile_acc = None
+    for start_k in range(0, tile_k, w_q_block_size):
+      end_k = start_k + w_q_block_size
+      block_acc = jnp.matmul(
+          x[:, start_k:end_k],
+          w[start_k:end_k, start_n:end_n],
+          preferred_element_type=jnp.float32,
+      ).astype(cfg.acc_dtype)
+      scale_idx = start_k // w_q_block_size
+      block_acc *= w_scale[scale_idx, :, start_n:end_n].astype(cfg.acc_dtype)
+      tile_acc = block_acc if tile_acc is None else tile_acc + block_acc
+    list_acc.append(tile_acc)
+  return jnp.concat(list_acc, axis=1)
+
+
 def matmul(
-    cfg: config.RoutingGmmConfig,
+    cfg: config.ComputeConfig,
     x: jax.Array,
     w: jax.Array,
     w_scale: jax.Array | None,
     w_bias: jax.Array | None,
-    is_last_k_step=True,
-    is_first_k_step=True,
+    *,
+    is_last_k_step: bool = True,
+    is_first_k_step: bool = True,
 ) -> jax.Array:
-  """Perform stateless matrix multiplication for a given arguments."""
-
+  """Performs stateless matrix multiplication for a single tile."""
   # TODO: Support multiple N/K tiles.
-  assert is_last_k_step == is_first_k_step == True
+  assert is_last_k_step and is_first_k_step
 
-  tpu_info = cfg.tpu_info
-  mxu_size = tpu_info.mxu_column_size
-
-  # Step 1: Input pre-processing.
-  tile_m, tile_k = x.shape
-  tile_n = w.shape[-1]
-
-  # Step 2: Matmul.
-  acc_list = []
-
-  if cfg.x.dynamic_quant is None:
-    block_acc = jnp.matmul(x, w, preferred_element_type=jnp.float32)
-    acc_list.append(block_acc.astype(cfg.plan.acc_dtype))
-  else:
-    # Quantized matmul path.
-    x_q_dtype = cfg.x.dynamic_quant.dtype
-    q_block_size = cfg.x.dynamic_quant.block_size
-
-    if jnp.issubdtype(x_q_dtype, jnp.floating):
-      dtype_max = float(jnp.finfo(x_q_dtype).max)
-      preferred_element_type = jnp.float32
-    else:
-      dtype_max = float(jnp.iinfo(x_q_dtype).max)
-      preferred_element_type = jnp.int32
-
-    # Without n outer loop, result of quantized matmul becomes available only
-    # at the last iteration of the loop. This means [tile_m, tile_n] value
-    # needs to be stored until the last iteration. By adding n outer loop,
-    # result of [tile_m, mxu_size] becomes available at the end of every k
-    # inner loop which can be used to pipeline subsequent VPU or VST ops with
-    # MXU ops for the next [tile_m, mxu_size].
-    for start_n in range(0, tile_n, mxu_size):
-      end_n = min(tile_n, start_n + mxu_size)
-      col_size = end_n - start_n
-
-      acc_n = jnp.zeros((tile_m, col_size), dtype=cfg.plan.acc_dtype)
-      for start_k in range(0, tile_k, q_block_size):
-        end_k = min(tile_k, start_k + q_block_size)
-
-        block_x = x[:, start_k:end_k]
-        block_w = w[start_k:end_k, start_n:end_n]
-
-        # Perform lhs quantization. Note that for every block_lhs,
-        # same computation will be performed tiles_n//mxu_size times.
-        # But we can let compiler perform CSE and avoid recomputation.
-        block_abs_max = jnp.max(jnp.abs(block_x), axis=1, keepdims=True)
-        block_scale = block_abs_max / dtype_max
-
-        # If block_scale=0, it will cause division by zero and return either
-        # NaN or Inf. Since this can cause numeric issue when downcasting to
-        # quantized value, we convert them into 0.
-        block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-        # Convert lhs into quantized dtype.
-        block_x_q = (block_x * block_scale_inv).astype(x_q_dtype)
-
-        # Unlike unquantized path, compiler may not perform implicit type
-        # conversion due to numeric concerns. As this can cause unsupported
-        # matmul error, explicit type conversion is performed.
-        if not tpu_info.is_matmul_supported(x_q_dtype, block_w.dtype):
-          block_w = block_w.astype(x_q_dtype)
-
-        block_acc = jnp.matmul(
-            block_x_q,
-            block_w,
-            preferred_element_type=preferred_element_type,
-        ).astype(cfg.plan.acc_dtype)
-
-        if w_scale is not None:
-          # TODO: Support subchannel quantization.
-          block_acc *= w_scale[0, :, start_n:end_n].astype(
-              cfg.plan.acc_dtype
-          )
-
-        block_acc *= block_scale.astype(cfg.plan.acc_dtype)
-
-        acc_n += block_acc
-      acc_list.append(acc_n)
-  acc = jnp.concatenate(acc_list, axis=1)
+  match cfg.matmul_mode:
+    case config.MatmulMode.UNQUANTIZED:
+      acc = jnp.matmul(x, w, preferred_element_type=jnp.float32).astype(
+          cfg.acc_dtype
+      )
+    case config.MatmulMode.QUANTIZED:
+      assert w_scale is not None
+      acc = _quantized_matmul(cfg, x, w, w_scale)
+    case config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER:
+      assert w_scale is not None
+      acc = _scale_after_matmul(cfg, x, w, w_scale)
+    case _:
+      raise NotImplementedError(f"Unsupported matmul mode: {cfg.matmul_mode}")
 
   if w_bias is not None:
-    acc += w_bias
+    acc += w_bias.astype(acc.dtype)
 
   return acc

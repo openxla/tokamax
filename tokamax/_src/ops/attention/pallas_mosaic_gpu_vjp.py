@@ -18,6 +18,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Any, ClassVar, cast, override
 
 import jax
@@ -31,6 +32,7 @@ from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_common as vjp_common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm100 as sm100
+from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm80 as sm80
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp_kernel_sm90 as sm90
 
 
@@ -49,7 +51,7 @@ def _broadcast_to_rank(x, rank):
 class PallasMosaicGpuFlashAttentionVjp(
     base.DotProductAttentionVjp[Config, None]
 ):
-  """Pallas-Triton FlashAttention VJP implementation."""
+  """Pallas-Mosaic-GPU FlashAttention VJP implementation."""
 
   config_cls: ClassVar[Any] = Config | sm100.Config
   supports_symbolic_shapes: ClassVar[bool] = False
@@ -86,9 +88,11 @@ class PallasMosaicGpuFlashAttentionVjp(
     if not gpu_utils.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")
 
-    if not (gpu_utils.is_sm90() or gpu_utils.is_sm100()):
+    if not (
+        gpu_utils.is_sm80() or gpu_utils.is_sm90() or gpu_utils.is_sm100()
+    ):
       raise NotImplementedError(
-          "Mosaic GPU backend only supported for sm90 and sm100 GPUs."
+          "Mosaic GPU backend only supported for sm80, sm90 and sm100 GPUs."
       )
 
     if gpu_utils.is_sm100() and not isinstance(config, sm100.Config):
@@ -96,6 +100,9 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     if gpu_utils.is_sm90() and not isinstance(config, sm90.Config):
       raise NotImplementedError("SM90 config required for sm90 GPUs.")
+
+    if gpu_utils.is_sm80() and not isinstance(config, sm80.Config):
+      raise NotImplementedError("SM80 config required for sm80 GPUs.")
 
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
@@ -112,9 +119,23 @@ class PallasMosaicGpuFlashAttentionVjp(
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
+    orig_seq_len_k = k.shape[-3]
+    q_start = q_end = None
+    if gpu_utils.is_sm80():
+      mask, q_start, q_end = common.extract_q_range(
+          mask, q.ndim, q_indices, k_indices
+      )
     mask, is_causal, k_start, k_end = common.decompose_mask(
         mask, q, k, q_indices, k_indices
     )
+    block_kv_dkv = config.block_kv_dkv
+    if not isinstance(config, sm100.Config):
+      block_kv_dkv *= config.compute_wgs
+    if orig_seq_len_k % math.lcm(config.block_kv_dq, block_kv_dkv) != 0:
+      if k_end is None:
+        k_end = jnp.full([1] * (q.ndim - 1), orig_seq_len_k, jnp.int32)
+      else:
+        k_end = jnp.minimum(k_end, orig_seq_len_k)
 
     def cast(x, precision):
       msg = lambda dt: f"Only {dt} supported for {precision=}, got {x.dtype=}"
@@ -138,6 +159,7 @@ class PallasMosaicGpuFlashAttentionVjp(
         v.dtype, v.dtype, weights_v_dot_precision
     )
     # TODO: Avoid silently downcasting types.
+    orig_q_dtype, orig_k_dtype, orig_v_dtype = q.dtype, k.dtype, v.dtype
     q = cast(q, q_k_dot_precision)
     k = cast(k, q_k_dot_precision)
     v = cast(v, weights_v_dot_precision)
@@ -148,6 +170,8 @@ class PallasMosaicGpuFlashAttentionVjp(
     mask = _broadcast_to_rank(mask, q.ndim)
     k_start = _broadcast_to_rank(k_start, q.ndim - 1)
     k_end = _broadcast_to_rank(k_end, q.ndim - 1)
+    q_start = _broadcast_to_rank(q_start, q.ndim - 1)
+    q_end = _broadcast_to_rank(q_end, q.ndim - 1)
 
     dbias_intermediate_dtype = self.dbias_intermediate_dtype
     kwargs = dict(
@@ -160,13 +184,20 @@ class PallasMosaicGpuFlashAttentionVjp(
 
     if isinstance(config, sm100.Config):
       kernel_fn = sm100.flash_attention_vjp_kernel
+    elif gpu_utils.is_sm80():
+      kernel_fn = sm80.flash_attention_vjp_kernel
     else:
       kernel_fn = sm90.flash_attention_vjp_kernel
 
     f = base.vmap_batch_dims(functools.partial(kernel_fn, **kwargs))
-    dq, dk, dv, ds = f(
-        q, k, v, residuals, out, dout, bias, mask, k_start, k_end
-    )
+    if gpu_utils.is_sm80():
+      dq, dk, dv, ds = f(
+          q, k, v, residuals, out, dout, bias, mask, k_start, k_end, q_start, q_end  # pyrefly: ignore[bad-argument-type]
+      )
+    else:
+      dq, dk, dv, ds = f(
+          q, k, v, residuals, out, dout, bias, mask, k_start, k_end
+      )
 
     dbias = None
     if bias is not None:
@@ -175,22 +206,29 @@ class PallasMosaicGpuFlashAttentionVjp(
       dbias = jnp.sum(ds, axis=broadcast_bias_axes).astype(bias.dtype)
       dbias = dbias.reshape(orig_bias_shape)
 
+    dq = dq.astype(orig_q_dtype)
+    dk = dk.astype(orig_k_dtype)
+    dv = dv.astype(orig_v_dtype)
     return base.DotProductAttentionGrads(q=dq, k=dk, v=dv, bias=dbias), None
 
   @override
   def _get_heuristics_config(
       self, ba: op.BoundArguments
-  ) -> sm90.Config | sm100.Config:
+  ) -> Config | sm100.Config:
     if gpu_utils.is_sm100():
       return sm100.get_heuristics_config(ba)
+    if gpu_utils.is_sm80():
+      return sm80.get_heuristics_config(ba)
     return sm90.get_heuristics_config(ba)
 
   @override
   def _get_autotuning_configs(
       self, ba: op.BoundArguments
-  ) -> set[sm90.Config | sm100.Config]:
+  ) -> set[Config | sm100.Config]:
     if gpu_utils.is_sm100():
       return sm100.get_autotuning_configs(ba)  # pyrefly: ignore[bad-return]
+    if gpu_utils.is_sm80():
+      return sm80.get_autotuning_configs(ba)
     return sm90.get_autotuning_configs(ba)
 
   @override

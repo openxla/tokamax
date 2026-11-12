@@ -1,89 +1,60 @@
 name: CI-Build
 
-#  Shards are declared in `.github/ci/shards.py`, which also builds the job
-#  matrix and checks that every test file is claimed by some shard.
-#
-#  Which shards a pull request's changed files can reach is computed from the
-#  import graph in `.github/ci/deps.py` and reported in the run summary.
-#  Whether that decides anything is `SHARD_SELECTION` below: while it is
-#  `report` the selection is logged and every shard runs anyway. Anything
-#  that cannot be analysed runs everything, as does a `workflow_dispatch`.
-#
-#  `collect-tests` is the one job that ignores all of that and imports the
-#  whole suite in a single process, because some failures are properties of
-#  the collection rather than of any test.
-#
-#  Require `shard-all-tests-passed` in branch protection, not the shard jobs,
-#  whose names and number change whenever the SHARDS table is rebalanced.
+# Shards and matrices are defined in .github/ci/shards.py; dependency selection
+# is computed from .github/ci/deps.py.
 on:
-  # Trigger the workflow on pull request for the main branch.
   pull_request:
     branches:
       - main
-  # Event manually triggered (in the Github UI). This also forces all shards to run, so can be helpful for debugging.
+  # Manual trigger; runs all shards since there is no base ref to diff.
   workflow_dispatch:
 
-# Constants for the workflow that are shared across jobs.
 env:
   JAX_ENABLE_X64: 0
   JAX_TRACEBACK_FILTERING: off
   UV_HTTP_TIMEOUT: 300
-  # Change-based test selection. `report` computes which shards a change
-  # reaches and logs it, but runs every shard regardless; `enforce` lets it
-  # decide the matrix. This is the only line to change to turn it on, and the
-  # only one to change back if it drops something it should not have.
+  # Change-based test selection: `enforce` narrows the matrix; any other value
+  # (e.g. `report`) logs the selection via --dry-run but runs every shard.
   SHARD_SELECTION: enforce
 
 permissions:
   contents: read
   # For the jobs API, which `shard-all-tests-passed` reads to write a summary.
   actions: read
-# We should cancel the previous run if it's still running and there is a new commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-# These jobs should build Tokamax and run the tests on Google Cloud resources.
 jobs:
   shard-matrix:
     runs-on: ubuntu-latest
     outputs:
       include: ${{ steps.compute.outputs.include }}
-      # The pytest flags that decide which tests are selected, as opposed to
-      # how they are reported. Emitted by the same module that builds the
-      # shard paths so the two cannot disagree about what the suite is.
+      compat_include: ${{ steps.compute.outputs.compat_include }}
+      # Test selection flags (e.g. -m "not long") emitted by shards.py.
       pytest_flags: ${{ steps.compute.outputs.pytest_flags }}
     steps:
       - name: Checkout Tokamax
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-          # Full history, so that `origin/<base>` and the merge base with it
-          # both exist. 
+          # Full history, so the merge base with origin/<base> exists.
           fetch-depth: 0
 
       - name: Test the CI scripts
-        # `shards.py` decides what every other job runs
         run: python3 -m unittest discover -s .github/ci -p '*_test.py'
 
       - name: Decide which files changed
-        # Writes /tmp/changed, which narrows the matrix below. Every path that
-        # cannot produce a trustworthy list leaves the file absent, and an
-        # absent file means every shard runs: too many jobs costs runner
-        # minutes, too few reports a change green that was never tested.
+        # Writes /tmp/changed; if absent, every shard runs.
         env:
-          # The branch the pull request targets. Empty on `workflow_dispatch`,
-          # which has no base to diff against, and so has to mean everything.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           if [[ -z "${BASE_REF}" ]]; then
             echo "No base ref on ${GITHUB_EVENT_NAME}: every shard runs."
             exit 0
           fi
-          # Diff against the base branch merge base to isolate PR changes.
-          # Use `--no-renames` so old paths in renamed files are reported
-          # directly, allowing dependency tracking of the previous module name.
-          # On any git failure, fall back to running all shards.
+          # Diff against merge base. --no-renames reports old paths so deps.py
+          # can track dependents of renamed or deleted modules.
           if ! git diff --no-renames --name-only -z \
               "origin/${BASE_REF}...HEAD" > /tmp/changed.tmp; then
             echo "::warning::Could not diff against origin/${BASE_REF};" \
@@ -96,30 +67,21 @@ jobs:
           tr '\0' '\n' < /tmp/changed | sed 's/^/  /'
 
       - name: Skip a push that repeats a passing one
-        # Copybara re-exports a change as a new commit whose only difference
-        # is the committer timestamp: same files, same parent, new SHA.
-        #
-        # We compare tree SHA's of this PR's most recent passing run, not
-        # the push just before to determine whether or not to skip the run.
-        #
-        # After submit, Copybara also pushes the commit it landed on the base
-        # branch to the PR branch. That head is already on the base branch, so
-        # its diff is empty, which would otherwise run every shard.
-        #
+        # Copybara re-exports a change as a new commit with the same tree, and
+        # after submit pushes the landed commit to the PR branch. Skip if HEAD
+        # is already on the base branch, or if its tree matches this PR's most
+        # recent passing run.
         id: repeat
         env:
           GH_TOKEN: ${{ github.token }}
-          # A run only counts if it came from this repository.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # `GITHUB_HEAD_REF` is the PR's branch; empty outside `pull_request`.
           if [[ -z "${GITHUB_HEAD_REF}" || -z "${HEAD_REPO}" ]]; then
             echo "Not a pull request: nothing to compare against."
             exit 0
           fi
-          # Exit 1 (not an ancestor) and any git error both fall through.
           if git merge-base --is-ancestor "${HEAD_SHA}" "origin/${BASE_REF}"; then
             echo "${HEAD_SHA} is already on origin/${BASE_REF}: skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -160,15 +122,9 @@ jobs:
           SKIP_WHY: ${{ steps.repeat.outputs.skip_why }}
         run: |
           set -o pipefail
-          # `--changed-from` narrows the matrix to the shards those files can
-          # reach, via the import graph in `.github/ci/deps.py`. The step
-          # above writes the file only when there is something to diff
-          # against; with no file the flag is omitted and every shard runs.
           narrow=()
           if [[ -f /tmp/changed ]]; then
             narrow=(--changed-from /tmp/changed)
-            # Anything but `enforce` reports the selection and runs every
-            # shard, so a typo here fails towards running too much.
             if [[ "${SHARD_SELECTION}" != "enforce" ]]; then
               narrow+=(--dry-run)
             fi
@@ -178,18 +134,15 @@ jobs:
             cat /tmp/summary.txt
             exit 1
           fi
-          # Empty the *output* so that no shards run.
           if [[ "${SKIP}" == "true" ]]; then
-            sed -i 's/^include=.*/include=[]/' /tmp/outputs.txt
-            # Rewrite the one `selection:` line rather than adding a second,
-            # so the summary does not say both "every shard" and "none". `|`
-            # rather than `/` as the delimiter: the reason can name a ref.
+            sed -i -e 's/^include=.*/include=[]/' \
+              -e 's/^compat_include=.*/compat_include=[]/' /tmp/outputs.txt
+            # | delimiter avoids collision with slashes in SKIP_WHY.
             sed -i "s|^selection: \(.*\)|selection: ${SKIP_WHY} -- no shard runs (selection would have been: \1)|" \
               /tmp/summary.txt
           fi
           cat /tmp/outputs.txt >> "$GITHUB_OUTPUT"
           cat /tmp/summary.txt
-          # Add to run summary.
           {
             echo '## Shard selection'
             echo
@@ -197,9 +150,7 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Warn about unsharded test files
-        # Fails the run if a shard's targets have been renamed away, if a file
-        # split by node ID grows a class no shard names, or if a shard's paths
-        # are not test files. Stdlib only, so no install needed.
+        # Warn when unassigned test files fall into the catch-all shard.
         if: steps.compute.outputs.catch_all != '[]'
         env:
           CATCH_ALL: ${{ steps.compute.outputs.catch_all }}
@@ -210,16 +161,10 @@ jobs:
                "which shard has room."
 
       - name: List the shards
-        # Log only, so that one can still see it, but not as an authoritative
-        # run summary including timing data - that is done after the job ends.
         run: python3 .github/ci/shards.py list
 
       - name: Explain the selection
-        # Each shard the change reaches, and which of that shard's test files
-        # it reached. Log only: the decision was made in `Build test matrix`
-        # above, and this is the detail behind it for anyone asking why a
-        # shard did or did not run. Gated on the same `-f` test that step
-        # uses, rather than on a step output saying the same thing twice.
+        # Logs which changed files reached each selected shard.
         continue-on-error: true
         run: |
           if [[ -f /tmp/changed ]]; then
@@ -227,7 +172,8 @@ jobs:
           fi
 
   collect-tests:
-    # Whole-tree collection, deliberately unsharded and never narrowed.
+    # Imports the whole suite in one process, unsharded and never narrowed, to
+    # catch collection errors.
     needs: shard-matrix
     runs-on: ubuntu-latest
     steps:
@@ -242,13 +188,10 @@ jobs:
           python-version: 3.12
 
       - name: Install dependencies
-        # No device extra: nothing here executes a kernel.  JAX is pinned to
-        # the latest version that was installed in CI.
+        # No device extra: collection executes no kernels.
         run: |
           JAX_PIN=$(python -c 'import sys; sys.path.insert(0, ".github/ci"); import shards; print(shards.latest_jax())')
           echo "Installing dependencies on cpu, jax ${JAX_PIN}"
-          # No need to put `jaxlib` in the constraint file: jax's own metadata
-          # pins it from there.
           printf 'jax==%s\n' "${JAX_PIN}" > /tmp/jax-pin.txt
           python -m pip install --upgrade pip
           python -m pip install --constraint /tmp/jax-pin.txt -e ".[test]"
@@ -261,20 +204,13 @@ jobs:
         env:
           PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
         run: |
-          # `--collect-only` imports every test module and reports what it
-          # found without running any of it.
           printf '%s tokamax' "${PYTEST_FLAGS}" \
             | xargs pytest --collect-only -q
 
   shard-tests:
-    # This is an if statement: if `matrix.shard_name` doesn't exist, the `name` is changed to be the 
-    # readable `shard-tests (no shard selected)`, rather than the raw template.
     name: ${{ matrix.shard_name && format('shard-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'shard-tests (no shard selected)' }}
     needs: shard-matrix
-    # A change that reaches no test -- documentation, a benchmark script --
-    # selects no shard, and a matrix with an empty `include` is not a job with
-    # nothing to do, it is a configuration error. `Check results` knows this
-    # skip is legitimate and passes the run.
+    # An empty matrix is an error, so skip when no shard is selected.
     if: needs.shard-matrix.outputs.include != '[]'
     strategy:
       fail-fast: true
@@ -285,7 +221,6 @@ jobs:
       run:
         shell: bash
     container:
-    # Docker image will include CUDA and cuDNN for Tokamax.
       image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
     timeout-minutes: 360
     steps:
@@ -299,28 +234,64 @@ jobs:
           DEVICE: ${{ matrix.device }}
           JAX_PIN: ${{ matrix.jax_pin }}
         run: |
-          # See the script for why it upgrades uv and retries downloads.
           bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
 
       - name: Run shard
         env:
-          # Read through `env:` rather than as interpolated text.
           PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
           TEST_PATHS: ${{ matrix.test_paths }}
         run: |
-          # Which tests run is decided by `pytest_flags` plus this shard's
-          # paths, both from .github/ci/shards.py. `-s` and `--durations` are
-          # reporting only: --durations lists the slowest tests in each shard,
-          # which is what to rebalance the SHARDS table against.
-          # Use xargs to split the flags and paths into separate arguments.
+          printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
+            | xargs -r pytest -s --durations=25
+
+  compat-tests:
+    # Reruns the selected shards on older JAX versions in smoke mode, packed
+    # into bins (see COMPAT_BIN_MINUTES in shards.py). Separate job so fail-fast
+    # cancels other compat bins without aborting primary shard-tests.
+    name: ${{ matrix.shard_name && format('compat-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'compat-tests (no shard selected)' }}
+    needs: shard-matrix
+    if: needs.shard-matrix.outputs.compat_include != '[]'
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJson(needs.shard-matrix.outputs.compat_include) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: 'us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build-cuda13.2-cudnn9.15' # zizmor: ignore[unpinned-images]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        env:
+          DEVICE: ${{ matrix.device }}
+          JAX_PIN: ${{ matrix.jax_pin }}
+        run: |
+          bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
+
+      - name: Run compat bin
+        env:
+          PYTEST_FLAGS: ${{ needs.shard-matrix.outputs.pytest_flags }}
+          TEST_PATHS: ${{ matrix.test_paths }}
+          SHARDS: ${{ matrix.shards }}
+          # One case per test function; see tokamax/conftest.py.
+          TOKAMAX_COMPAT_SMOKE: '1'
+        run: |
+          echo "Shards in this bin: ${SHARDS}"
           printf '%s %s' "${PYTEST_FLAGS}" "${TEST_PATHS}" \
             | xargs -r pytest -s --durations=25
 
   shard-all-tests-passed:
-    # The idea here is that rather than checking for specific shard names to pass, we centralize
-    # the bookkeeping here, and then Copybara checks that this "result-aggregating" job passed.
+    # Aggregates results across matrix jobs into a single status check for
+    # branch protection and Copybara.
     name: shard-all-tests-passed
-    needs: [shard-matrix, collect-tests, shard-tests]
+    needs: [shard-matrix, collect-tests, shard-tests, compat-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -328,17 +299,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Summarise results and timings
-        # Every shard's result and wall clock, in the run summary.
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           JOBS: repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs
         run: |
-          # `gh` holds the token and this stays testable without one. `--jq`
-          # emits one job per line. `filter=latest` is the jobs endpoint's
-          # default, named here because it is load-bearing: `all` would return
-          # a re-run's earlier attempts too, and a shard would be reported
-          # twice, once with whatever it did the first time.
+          # filter=latest ensures re-run jobs are not reported multiple times.
           gh api --paginate "${JOBS}?per_page=100&filter=latest" \
             --jq '.jobs[]' > /tmp/jobs.jsonl
           python3 .github/ci/summary.py < /tmp/jobs.jsonl >> "${GITHUB_STEP_SUMMARY}"
@@ -349,10 +315,10 @@ jobs:
           COLLECT: ${{ needs.collect-tests.result }}
           TESTS: ${{ needs.shard-tests.result }}
           INCLUDE: ${{ needs.shard-matrix.outputs.include }}
+          COMPAT: ${{ needs.compat-tests.result }}
+          COMPAT_INCLUDE: ${{ needs.shard-matrix.outputs.compat_include }}
         run: |
-          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS}"
-          # Only `success` counts. `cancelled` in particular is not a result,
-          # and treating it as one is how a cancelled run reports green.
+          echo "shard-matrix=${MATRIX} collect=${COLLECT} tests=${TESTS} compat=${COMPAT}"
           if [[ "${MATRIX}" != "success" ]]; then
             echo "::error::shard-matrix did not succeed"
             exit 1
@@ -361,8 +327,14 @@ jobs:
             echo "::error::collect-tests reported ${COLLECT}"
             exit 1
           fi
-          # `skipped` is expected when the change only touches non-test files
-          # (e.g. documentation or non-code files) and no shards are selected.
+          # Only `success` passes (a cancelled job is not a pass); `skipped` is
+          # allowed only when no compat bins were scheduled.
+          if [[ "${COMPAT}" != "success" ]] &&
+             ! [[ "${COMPAT}" == "skipped" && "${COMPAT_INCLUDE}" == "[]" ]]; then
+            echo "::error::compat-tests reported ${COMPAT}"
+            exit 1
+          fi
+          # `skipped` is allowed only when no shard was selected.
           if [[ "${TESTS}" == "skipped" && "${INCLUDE}" == "[]" ]]; then
             echo "This change reaches no test; no shard was selected."
             exit 0

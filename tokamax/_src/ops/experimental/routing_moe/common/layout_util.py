@@ -15,6 +15,7 @@
 
 """Functions relevant to layouts. See https://openxla.org/xla/tiled_layout."""
 
+from collections.abc import Sequence
 import jax
 from jax.experimental import hijax
 from jax.experimental.pallas import tpu as pltpu
@@ -33,17 +34,26 @@ def get_uint_dtype(itemsize: int) -> jnp.dtype:
       raise NotImplementedError()
 
 
+def get_packing(dtype: jnp.dtype) -> int:
+  """Returns the number of `dtype` elements packed in one 32-bit word."""
+  return 4 // jnp.dtype(dtype).itemsize
+
+
 def to_compact_shape(
-    large_shape: tuple[int, int], dtype: jnp.dtype, lanes: int = 128
+    large_shape: Sequence[int], dtype: jax.typing.DTypeLike, lanes: int = 128
 ) -> tuple[int, int, int, int]:
   """Returns compact layout shape of a given large layout shape."""
   assert len(large_shape) == 2
   rows, cols = large_shape
   packing = 4 // jnp.dtype(dtype).itemsize
+  assert cols % (packing * lanes) == 0, (
+      f"cols ({cols}) must be a positive multiple of packing * lanes"
+      f" ({packing * lanes})."
+  )
   return (rows, cols // (packing * lanes), packing, lanes)
 
 
-def to_large_shape(compact_shape: tuple[int, int, int, int]) -> tuple[int, int]:
+def to_large_shape(compact_shape: Sequence[int]) -> tuple[int, int]:
   """Returns large layout shape of a given compact layout shape."""
   assert len(compact_shape) == 4
   rows, chunks, packing, lanes = compact_shape
@@ -104,7 +114,7 @@ def load_compact_to_large(
   return jnp.concat(chunks, axis=-1)
 
 
-def store_large_to_compact(vmem: hijax.TransformedRef, vreg: jax.Array):
+def store_large_to_compact(vmem: hijax.TransformedRef, vreg: jax.Array) -> None:
   """Strided store a large layout VREG into compact layout VMEM."""
 
   dtype = vmem.dtype
@@ -163,3 +173,23 @@ def large_deinterleave_lane(
   lhs = jnp.concat(chunks[0::2], axis=-1)
   rhs = jnp.concat(chunks[1::2], axis=-1)
   return lhs, rhs
+
+
+def store_compact_chunk(
+    vmem: hijax.TransformedRef, first_row: int, chunk: int, words: jax.Array
+) -> None:
+  """Stores `[rows, lanes]` u32 words into `chunk` starting at `first_row`.
+
+  Chunk `c` of compact row `r` is u32 word `r * vmem.shape[1] + c`, so one
+  strided store fills a chunk across consecutive compact rows.
+
+  Args:
+    vmem: Destination compact `[rows, chunks, packing, lanes]` VMEM reference.
+    first_row: Index of the first compact row to write.
+    chunk: Index of the chunk within each row to write.
+    words: Packed `u32[rows, lanes]` words, one row per compact output row.
+  """
+  lanes, stride = vmem.shape[-1], vmem.shape[1]
+  flat = vmem.bitcast(jnp.uint32).reshape(-1, lanes)
+  start = first_row * stride + chunk
+  flat[start : start + words.shape[0] * stride : stride] = words

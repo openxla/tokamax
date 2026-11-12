@@ -61,6 +61,7 @@ class GmmPerfTest(parameterized.TestCase):
         ),
         rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = benchmarking.standardize_function(

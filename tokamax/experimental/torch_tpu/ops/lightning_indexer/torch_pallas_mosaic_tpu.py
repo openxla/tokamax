@@ -116,6 +116,7 @@ class _PallasMosaicTpuLightningIndexer(
       cp_rank: torch.Tensor | int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: Config | None = None,
       configs: tuple[Config | None, Any] | None = None,
@@ -142,6 +143,7 @@ class _PallasMosaicTpuLightningIndexer(
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
         config=self.deconstruct_config(fwd_config),
     )
@@ -164,6 +166,7 @@ class _PallasMosaicTpuLightningIndexer(
       cp_rank: int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
@@ -188,6 +191,7 @@ class _PallasMosaicTpuLightningIndexer(
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
         config=kernel_cfg,
     )

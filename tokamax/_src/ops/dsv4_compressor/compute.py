@@ -450,3 +450,253 @@ def gather_from_page_buffer(
           score_window_u8[n, w, d_idx, :, :] = page_buffer[
               n, p, score_src_row, :, :
           ]
+
+
+def stage_sal_columns(
+    records_t_ref,  # VMEM (33, 4, padded_tokens) u8
+    records: jax.Array,  # (tile_n, 256) u8
+    first_token,  # scalar int: tile's starting token index (multiple of tile_n)
+) -> None:
+  """Transposes `records[:, :129]` into columns `[first_token, first_token + tile_n)`.
+
+  The 132-byte SAL record of token `k` is `[128 fp8 | 1 scale | 3 zero bytes]`,
+  stored down column `first_token + k` of `records_t_ref` reshaped as
+  `(132, padded_tokens)`. Because `tile_n` is smaller than the 8-row sublane
+  tile, `jnp.swapaxes` is not supported on `(tile_n, 256)`; instead, two
+  one-hot bf16 matmuls transpose the `(tile_n, 256)` bytes into `(132, 128)`
+  and place them at lanes `[col, col + tile_n)` of the 128-lane tile containing
+  `first_token`. Byte values `0..255` are exact in bf16 (7-bit significand),
+  and each one-hot dot has a single non-zero term, so the matmul is bit-exact.
+
+  Args:
+    records_t_ref: VMEM scratch buffer of shape `(33, 4, padded_tokens)`.
+    records: Quantized records of shape `(tile_n, 256)`.
+    first_token: Starting token index of the tile.
+  """
+  n, width = records.shape
+  sublane_tile = 8
+  lanes = 128
+  rec_bytes = 129  # 128 fp8 key bytes + 1 e8m0 scale byte
+  out_rows = records_t_ref.shape[0] * records_t_ref.shape[1]  # 33 * 4 = 132
+  rows_pad = max(sublane_tile, pl.cdiv(n, sublane_tile) * sublane_tile)
+
+  records_bf16 = jnp.pad(records, ((0, rows_pad - n), (0, 0))).astype(
+      jnp.bfloat16
+  )
+  b = jax.lax.broadcasted_iota(jnp.int32, (width, out_rows), 0)
+  d = jax.lax.broadcasted_iota(jnp.int32, (width, out_rows), 1)
+  byte_pick = ((b == d) & (d < rec_bytes)).astype(jnp.bfloat16)
+  # (rows_pad, width) @ (width, 132) -> (rows_pad, 132)
+  picked = jnp.dot(
+      records_bf16, byte_pick, preferred_element_type=jnp.float32
+  ).astype(jnp.bfloat16)
+
+  col = first_token % lanes
+  r = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 0)
+  l = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 1)
+  lane_place = ((r < n) & (l == col + r)).astype(jnp.bfloat16)
+  # (132, rows_pad) @ (rows_pad, 128) -> (132, 128)
+  placed = (
+      jnp.dot(picked.T, lane_place, preferred_element_type=jnp.float32)
+      .astype(jnp.uint8)
+      .reshape(records_t_ref.shape[0], records_t_ref.shape[1], lanes)
+  )
+
+  tile_off = pl.multiple_of((first_token // lanes) * lanes, lanes)
+  cur = records_t_ref[:, :, pl.ds(tile_off, lanes)]
+  lane = jax.lax.broadcasted_iota(jnp.int32, placed.shape, 2)
+  records_t_ref[:, :, pl.ds(tile_off, lanes)] = jnp.where(
+      (lane >= col) & (lane < col + n), placed, cur
+  )
+
+
+_SAL_KV_PACKING = 4
+_SAL_LANES = 128
+
+
+class SalTiles:
+  """`SEQ_ALONG_LANE` granule ops: a granule is one 128-lane tile.
+
+  The staged source (`k_ref`, `[sublane_groups, 4, padded_tokens]`) is already
+  transposed to the cache layout, so token `t` is lane `t` of the source and
+  cache row `page * page_size + slot` is lane `slot` of page `page`.
+  """
+
+  granule = _SAL_LANES
+
+  def __init__(self, k_ref, cache_ref, rmw_ref, page_size: int):
+    _, self.sublane_groups, _, _ = cache_ref.shape
+    self.cache = cache_ref
+    self.k = k_ref
+    self.rmw = rmw_ref
+    self.page_size = page_size
+    self.padded_tokens = k_ref.shape[2]
+    self.rec_dim = self.sublane_groups * _SAL_KV_PACKING
+
+  def _cache_lanes(self, row, n):
+    """Lanes `[row, row + n)` of the cache; `row` is 128-aligned."""
+    slot = pl.multiple_of(row % self.page_size, _SAL_LANES)
+    return self.cache.at[row // self.page_size, :, :, pl.ds(slot, n)]
+
+  def _src_tile(self, src_ref, tok_aligned):
+    off = pl.multiple_of(
+        jnp.clip(tok_aligned, 0, self.padded_tokens - _SAL_LANES), _SAL_LANES
+    )
+    return pltpu.bitcast(
+        src_ref[:, :, pl.ds(off, _SAL_LANES)].reshape(self.rec_dim, _SAL_LANES),
+        jnp.uint32,
+    )
+
+  def granule_copy(self, row, rmw_slot, sem, *, to_hbm: bool):
+    hbm = self._cache_lanes((row >> 7) << 7, _SAL_LANES)
+    vmem = self.rmw.at[rmw_slot]
+    src, dst = (vmem, hbm) if to_hbm else (hbm, vmem)
+    return pltpu.make_async_copy(src, dst, sem)
+
+  def blend(self, rmw_slot, row, src_tok, n):
+    """Overwrites lanes `[row, row + n) & 127` of RMW tile `rmw_slot`."""
+    dst_start = row & 127
+    src_start = src_tok & 127
+    tok_aligned = (src_tok >> 7) << 7
+    delta = (dst_start - src_start) & 127
+    # The `n <= 128` source lanes span at most two source tiles.
+    a = pltpu.roll(self._src_tile(self.k, tok_aligned), shift=delta, axis=1)
+    b = pltpu.roll(
+        self._src_tile(self.k, tok_aligned + _SAL_LANES), shift=delta, axis=1
+    )
+    lane = jax.lax.broadcasted_iota(
+        jnp.int32, (self.sublane_groups, _SAL_LANES), 1
+    )
+    src = jnp.where(lane < dst_start + (_SAL_LANES - src_start), a, b)
+    dst = pltpu.bitcast(
+        self.rmw[rmw_slot].reshape(self.rec_dim, _SAL_LANES), jnp.uint32
+    )
+    blended = jnp.where((lane >= dst_start) & (lane < dst_start + n), src, dst)
+    self.rmw[rmw_slot] = pltpu.bitcast(blended, jnp.uint8).reshape(
+        self.sublane_groups, _SAL_KV_PACKING, _SAL_LANES
+    )
+
+  def move_token(self, tok, dst_tok):
+    """Copies staged token (lane) `tok` to lane `dst_tok` (`<= tok`)."""
+    src = pltpu.roll(
+        self._src_tile(self.k, (tok >> 7) << 7),
+        shift=(dst_tok - tok) & 127,
+        axis=1,
+    )
+    dst_off = pl.multiple_of((dst_tok >> 7) << 7, _SAL_LANES)
+    lane = jax.lax.broadcasted_iota(
+        jnp.int32, (self.sublane_groups, _SAL_LANES), 1
+    )
+    out = jnp.where(
+        lane == (dst_tok & 127), src, self._src_tile(self.k, dst_off)
+    )
+    self.k[:, :, pl.ds(dst_off, _SAL_LANES)] = pltpu.bitcast(
+        out, jnp.uint8
+    ).reshape(self.sublane_groups, _SAL_KV_PACKING, _SAL_LANES)
+
+
+def find_runs(
+    ops: SalTiles,
+    dst_ref,
+    run_src_ref,
+    run_dst_ref,
+    *,
+    num_rows: int,
+    num_tokens: jax.Array | None = None,
+) -> jax.Array:
+  """Walks `dst_rows` once, compacting writable tokens and recording runs."""
+  max_tokens = dst_ref.shape[0]
+
+  def _step(tok, carry):
+    num_runs, num_valid, next_row = carry
+    if num_tokens is None:
+      row = dst_ref[tok]
+    else:
+      row = jnp.where(
+          tok < num_tokens, dst_ref[jnp.minimum(tok, max_tokens - 1)], -1
+      )
+    valid = (row >= 0) & (row < num_rows)
+    starts = valid & ((row != next_row) | (row % ops.granule == 0))
+    run_src_ref[num_runs] = num_valid
+    run_dst_ref[num_runs] = row
+
+    @pl.when(valid & (num_valid != tok))
+    def _():
+      ops.move_token(tok, num_valid)
+
+    return (
+        num_runs + starts.astype(jnp.int32),
+        num_valid + valid.astype(jnp.int32),
+        jnp.where(valid, row + 1, next_row),
+    )
+
+  zero = jnp.int32(0)
+  init = (zero, zero, jnp.int32(-1))
+  if num_tokens is None:
+    num_runs, num_valid, _ = jax.lax.fori_loop(
+        0, max_tokens, _step, init, unroll=8
+    )
+  else:
+
+    def _chunk(c, carry):
+      for j in range(8):
+        carry = _step(c * 8 + j, carry)
+      return carry
+
+    num_runs, num_valid, _ = jax.lax.fori_loop(
+        0, (num_tokens + 7) // 8, _chunk, init
+    )
+  run_src_ref[num_runs] = num_valid
+  return num_runs
+
+
+def write_runs(
+    ops: SalTiles,
+    num_runs: jax.Array,
+    run_src_ref,
+    run_dst_ref,
+    rd_sem,
+    wr_sem,
+    *,
+    wave: int,
+) -> None:
+  """Writes every run (each inside one granule), `wave` runs at a time."""
+  g = ops.granule
+
+  def _wave(w, _):
+    first = w * wave
+    count = jnp.minimum(wave, num_runs - first)
+
+    def _for_each(fn):
+      def _body(i, _):
+        src = run_src_ref[first + i]
+        fn(i, src, run_dst_ref[first + i], run_src_ref[first + i + 1] - src)
+        return None
+
+      jax.lax.fori_loop(0, count, _body, None)
+
+    def _reads(action):
+      def _fn(i, src, row, n):
+        del src
+
+        @pl.when(n < g)
+        def _():
+          action(ops.granule_copy(row, i, rd_sem, to_hbm=False))
+
+      return _fn
+
+    def _blend_and_start_write(i, src, row, n):
+      ops.blend(i, row, src, n)
+      ops.granule_copy(row, i, wr_sem, to_hbm=True).start()
+
+    def _wait_write(i, src, row, n):
+      del src, n
+      ops.granule_copy(row, i, wr_sem, to_hbm=True).wait()
+
+    _for_each(_reads(lambda c: c.start()))
+    _for_each(_reads(lambda c: c.wait()))
+    _for_each(_blend_and_start_write)
+    _for_each(_wait_write)
+    return None
+
+  jax.lax.fori_loop(0, (num_runs + wave - 1) // wave, _wave, None)

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Renders the per-shard result and timing table for the run summary.
-"""
+"""Renders the per-shard result and timing table for the run summary."""
 
 from __future__ import annotations
 
@@ -26,6 +25,11 @@ import sys
 import shards
 
 JOB_NAME = re.compile(r'shard-tests \((?P<runner>[^,]+), (?P<shard>.+)\)')
+# The compat bins, which hold several shards each and so get a table of their
+# own rather than a row in the per-shard one.
+COMPAT_JOB_NAME = re.compile(
+    r'compat-tests \((?P<runner>[^,]+), (?P<shard>.+)\)'
+)
 
 # Worst-first, so a shard's row reports its worst runner. `success` last means
 # a shard is only green when every runner it ran on was.
@@ -70,11 +74,15 @@ def duration_minutes(started: object, completed: object) -> float | None:
   return delta.total_seconds() / 60
 
 
-def parse_jobs(lines: Sequence[str]) -> dict[str, dict[str, dict[str, object]]]:
+def parse_jobs(
+    lines: Sequence[str], name_re: re.Pattern[str] = JOB_NAME
+) -> dict[str, dict[str, dict[str, object]]]:
   """Groups shard jobs by shard and runner.
 
   Args:
     lines: JSON objects, one job per line, as `gh api --jq '.jobs[]'` emits.
+    name_re: Which jobs to read, by title. `COMPAT_JOB_NAME` reads the compat
+      bins instead, keyed by bin name.
 
   Returns:
     Shard name to runner short name to `{'conclusion', 'minutes'}`. `minutes`
@@ -92,7 +100,7 @@ def parse_jobs(lines: Sequence[str]) -> dict[str, dict[str, dict[str, object]]]:
       # its shard read as "not run", which is visible; raising would replace
       # the table with a stack trace.
       continue
-    match = JOB_NAME.fullmatch(job.get('name', ''))
+    match = name_re.fullmatch(job.get('name', ''))
     if not match:
       continue
     jobs.setdefault(match['shard'], {})[match['runner']] = {
@@ -239,6 +247,61 @@ def render(jobs: dict[str, dict[str, dict[str, object]]]) -> list[str]:
   return out
 
 
+def _bin_order(name: str) -> tuple[int, str]:
+  """Sort key for compat bin names, numeric rather than lexical.
+
+  Args:
+    name: A compat bin name, `compat-<N>`.
+
+  Returns:
+    The bin's number (0 if it has none), then the name: `compat-10` sorts after
+    `compat-9`, not between `compat-1` and `compat-2`.
+  """
+  number = name.rpartition('-')[2]
+  return (int(number) if number.isdigit() else 0, name)
+
+
+def render_compat(jobs: dict[str, dict[str, dict[str, object]]]) -> list[str]:
+  """Builds the compat bins' table, one row per (bin, JAX version).
+
+  Args:
+    jobs: As `parse_jobs` returns with `COMPAT_JOB_NAME`.
+
+  Returns:
+    Lines of markdown, or none if no compat bin ran. Which shards a bin held
+    is in its job log: the jobs API only has the title.
+  """
+  rows = [
+      (name, runner, record)
+      for name in sorted(jobs, key=_bin_order)
+      for runner, record in sorted(jobs[name].items())
+      if record['conclusion'] != 'skipped'
+  ]
+  if not rows:
+    return []
+  out = [
+      '',
+      '## Backward compatibility (smoke)',
+      '',
+      '| bin | runner | result | minutes |',
+      '| --- | --- | --- | --- |',
+  ]
+  for name, runner, record in rows:
+    minutes = record['minutes']
+    # Same rule as the shard table: only a green job's duration is a cost.
+    shown = (
+        f'{minutes:.0f}m'
+        if minutes is not None and record['conclusion'] == 'success'
+        else '-'
+    )
+    out.append(
+        f'| `{name}` | {runner}'
+        f' | {RESULT_TEXT.get(record["conclusion"], record["conclusion"])}'
+        f' | {shown} |'
+    )
+  return out
+
+
 def main(argv: Sequence[str] | None = None) -> int:
   """Entry point.
 
@@ -251,7 +314,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     would turn a green run red over a table.
   """
   del argv
-  print('\n'.join(render(parse_jobs(sys.stdin.readlines()))))
+  lines = sys.stdin.readlines()
+  out = render(parse_jobs(lines))
+  out += render_compat(parse_jobs(lines, COMPAT_JOB_NAME))
+  print('\n'.join(out))
   return 0
 
 

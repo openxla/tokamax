@@ -30,7 +30,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
 
 
 QArray = base.QArray
@@ -175,12 +175,15 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     return out, residuals
 
   @override
-  def _get_heuristics_config(self, ba: op.BoundArguments):
-    # TODO: Select better parameters based on a heuristic.
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    q, k, v, mask = (ba.arguments[x] for x in ("q", "k", "v", "mask"))
+    max_tile = common.max_vmem_tile(q, v, mask)
+    block_q = common.largest_divisor_tile(q.shape[-3], max_tile)
+    block_kv = common.largest_divisor_tile(k.shape[-3], max_tile)
     return Config(
-        block_q=128,
-        block_kv=128,
-        block_kv_compute=128,
+        block_q=block_q,
+        block_kv=block_kv,
+        block_kv_compute=min(block_kv, 512),
         q_layout=splash.QKVLayout.HEAD_DIM_MINOR,
         k_layout=splash.QKVLayout.HEAD_DIM_MINOR,
         v_layout=splash.QKVLayout.HEAD_DIM_MINOR,

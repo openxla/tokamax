@@ -82,9 +82,9 @@ def main_kernel(
           jnp.bitwise_and(odd, jnp.int32(-65536)),  # 0xFFFF0000
       )
 
-  def outer_pipeline(idx_ref, valid_ref):
+  def outer_pipeline(outer_step, idx_ref, valid_ref):
     valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
-    b = pl.program_id(0)
+    b = outer_step.index[0]
     out_row_base = (b * num_cores + core_index) * num_row_subchunks
 
     # Subchunk handled by stream `s` at inner step `r`. `num_streams`
@@ -103,8 +103,8 @@ def main_kernel(
     # int32 rows produced per stream in the rope output (2 tokens per row).
     rope_rows_per_stream = row_subchunk_size // 2
 
-    def _body(*refs):
-      r = pl.program_id(0)
+    def _body(inner_step, *refs):
+      r = inner_step.index[0]
       nope_g = refs[0 * num_streams : 1 * num_streams]
       rope_g = refs[1 * num_streams : 2 * num_streams]
       rope_o = refs[2 * num_streams]
@@ -182,6 +182,7 @@ def main_kernel(
           grid=(num_row_subchunks // num_streams,),
           in_specs=nope_in_specs + rope_in_specs,
           out_specs=(rope_out_spec,),
+          _explicit_indices=True,
       )(
           *([nope_in_hbm_ref] * num_streams),
           *([rope_in_hbm_ref] * num_streams),
@@ -201,6 +202,7 @@ def main_kernel(
               lambda b: (0,),
           ),
       ),
+      _explicit_indices=True,
   )(indices_hbm_ref, valid_indices_ref)
 
 

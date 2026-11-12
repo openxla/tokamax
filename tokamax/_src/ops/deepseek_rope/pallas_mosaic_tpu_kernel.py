@@ -33,12 +33,12 @@ LANE = 128
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
-def largest_divisor(x: int, cap: int) -> int:
-  """Largest divisor of ``x`` that is <= ``cap``."""
+def largest_divisor(x: int, cap: int, *, multiple_of: int = 1) -> int:
+  """Largest divisor of ``x`` <= ``cap`` divisible by ``multiple_of``, or ``x``."""
   for candidate in range(min(x, cap), 0, -1):
-    if x % candidate == 0:
+    if x % candidate == 0 and candidate % multiple_of == 0:
       return candidate
-  return 1
+  return x
 
 
 def dtype_max(dtype: jax.typing.DTypeLike) -> float:
@@ -190,6 +190,7 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
 
 
 def _rope_body(
+    unused_step: pltpu.PipelineStep,
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     *out_refs: jax.Ref,
@@ -309,6 +310,7 @@ def _kernel(
       grid=(num_tiles,),
       in_specs=[x_spec, cos_sin_spec],
       out_specs=out_specs,
+      _explicit_indices=True,
   )
 
   @pl.with_scoped(allocations=(x_alloc, cos_sin_alloc, *out_allocs))
@@ -324,6 +326,7 @@ def _kernel(
 
 
 def _qnorm_rope_body(
+    unused_step: pltpu.PipelineStep,
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
@@ -401,6 +404,7 @@ def _qnorm_rope_kernel(
       grid=(num_tiles,),
       in_specs=[x_spec, cos_sin_spec],
       out_specs=[x_spec],
+      _explicit_indices=True,
   )
   allocations = (
       pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
@@ -452,7 +456,12 @@ def _rope_call(
     )
 
   if tile_n is None:
-    tile_n = largest_divisor(num_tokens, cap=128)
+    multiple_of = (
+        8 * max(1, 4 // jnp.dtype(x.dtype).itemsize)
+        if x.ndim == 2 and quant_dtype is None
+        else 1
+    )
+    tile_n = largest_divisor(num_tokens, cap=128, multiple_of=multiple_of)
   assert num_tokens % tile_n == 0
 
   x_block_shape = (

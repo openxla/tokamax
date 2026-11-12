@@ -170,6 +170,13 @@ class PydanticTest(parameterized.TestCase):
               vmap_axes=((0, 5), (B_SYMBOLIC, 7)),  # pyrefly: ignore[bad-argument-type]
           ),
       ),
+      (
+          batching.BatchedShapeDtype(
+              (1, 2, 3),
+              jnp.int8,
+              vmap_axes=((0, B_SYMBOLIC), (0, 5)),  # pyrefly: ignore[bad-argument-type]
+          ),
+      ),
   )
   def test_symbolic_shape_serialization(self, shape):
     ty = Annotated[jax.Array, pydantic_lib.ShapeDtype]
@@ -177,6 +184,8 @@ class PydanticTest(parameterized.TestCase):
     adapter.dump_python(shape)
     json_bytes = adapter.dump_json(shape)
     json.loads(json_bytes)
+    with self.assertRaises(pydantic.ValidationError):
+      adapter.validate_json(json_bytes)
 
   @parameterized.parameters(jax._src.dtypes._jax_types)
   def test_shape_dtype_short_names(self, dtype):
@@ -255,6 +264,37 @@ class PydanticTest(parameterized.TestCase):
     self.assertEqual(b'"bfloat16"', adapter.dump_json(ml_dtypes.bfloat16))
     self.assertEqual("bfloat16", adapter.dump_python(ml_dtypes.bfloat16))
     self.assertEqual(ml_dtypes.bfloat16, adapter.validate_json('"bfloat16"'))
+
+  def test_mesh_serialization(self):
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]),
+        ("d",),
+        axis_types=(jax.sharding.AxisType.Explicit,),
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.Mesh | None)
+    )
+    self.assertIs(mesh, adapter.validate_python(adapter.dump_python(mesh)))
+    expected = dict(axis_names=["d"], axis_sizes=[1], axis_types=["Explicit"])
+    self.assertEqual(expected, json.loads(adapter.dump_json(mesh)))
+    mesh_roundtrip = adapter.validate_json(adapter.dump_json(mesh))
+    self.assertIsInstance(mesh_roundtrip, jax.sharding.AbstractMesh)
+    self.assertEqual(
+        jax.sharding.AbstractMesh(
+            (1,), ("d",), axis_types=(jax.sharding.AxisType.Explicit,)
+        ),
+        mesh_roundtrip,
+    )
+    self.assertIsNone(adapter.validate_json(adapter.dump_json(None)))
+
+  def test_abstract_mesh_roundtrip(self):
+    mesh = jax.sharding.AbstractMesh(
+        (2, 4), ("x", "y"), axis_types=(jax.sharding.AxisType.Auto,) * 2
+    )
+    adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.AbstractMesh)
+    )
+    self.assertEqual(mesh, adapter.validate_json(adapter.dump_json(mesh)))
 
 
 if __name__ == "__main__":

@@ -226,6 +226,91 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
             vjp_config=config,
         )
 
+  @parameterized.named_parameters(
+      ('seq_64', 64, 128, jnp.bfloat16, False, (128, 128, 128), 128),
+      ('seq_256', 256, 128, jnp.bfloat16, False, (256, 256, 256), 256),
+      ('non_pow2', 768, 128, jnp.bfloat16, False, (256, 256, 256), 256),
+      ('bf16_2k', 2048, 128, jnp.bfloat16, False, (1024, 1024, 512), 512),
+      ('fp32_2k', 2048, 128, jnp.float32, False, (512, 512, 512), 256),
+      ('masked_2k', 2048, 128, jnp.bfloat16, True, (512, 512, 512), 256),
+      ('hd256_2k', 2048, 256, jnp.bfloat16, False, (512, 512, 512), 256),
+      ('hd64_bf16', 2048, 64, jnp.bfloat16, False, (1024, 1024, 512), 512),
+      ('hd64_fp32', 2048, 64, jnp.float32, False, (512, 512, 512), 256),
+      (
+          'q_fp32_v_bf16',
+          2048,
+          128,
+          jnp.float32,
+          False,
+          (512, 512, 512),
+          256,
+          jnp.bfloat16,
+      ),
+      (
+          'q_bf16_v_fp32',
+          2048,
+          128,
+          jnp.bfloat16,
+          False,
+          (512, 512, 512),
+          256,
+          jnp.float32,
+      ),
+  )
+  def test_heuristics_config(
+      self,
+      seq_len,
+      head_dim,
+      dtype,
+      has_mask,
+      fwd_tiles,
+      vjp_bkv_compute,
+      v_dtype=None,
+  ):
+    q = jax.ShapeDtypeStruct((2, seq_len, 8, head_dim), dtype)
+    v = jax.ShapeDtypeStruct(
+        (2, seq_len, 8, head_dim), dtype if v_dtype is None else v_dtype
+    )
+    res = jax.ShapeDtypeStruct((2, 8, seq_len), jnp.float32)
+    mask = (
+        jax.ShapeDtypeStruct((1, 1, seq_len, seq_len), jnp.bool_)
+        if has_mask
+        else None
+    )
+    ba = fa.PallasMosaicTpuFlashAttention().bind(
+        q, q, v, mask=mask, is_causal=not has_mask
+    )
+    cfg = ba.heuristics_config
+    self.assertEqual(
+        (cfg.block_q, cfg.block_kv, cfg.block_kv_compute), fwd_tiles
+    )
+    vjp_cfg = (
+        fa_vjp.PallasMosaicTpuFlashAttentionVjp()
+        .bind((res, res), v, v, *ba.args, **ba.kwargs)
+        .heuristics_config
+    )
+    self.assertEqual(
+        (
+            vjp_cfg.block_q_dkv,
+            vjp_cfg.block_kv_dkv,
+            vjp_cfg.block_kv_dkv_compute,
+        ),
+        (*fwd_tiles[:2], vjp_bkv_compute),
+    )
+
+  @parameterized.named_parameters(
+      ('bf16_gqa_1024', 1024, 2, jnp.bfloat16, True),
+      ('bf16_non_pow2_768', 768, 8, jnp.bfloat16, True),
+      ('fp32_mha_1024', 1024, 8, jnp.float32, False),
+  )
+  def test_long_seq_numerics(self, seq_len, num_kv_heads, dtype, is_causal):
+    q = jax.ShapeDtypeStruct((2, seq_len, 8, 128), dtype)
+    kv = jax.ShapeDtypeStruct((2, seq_len, num_kv_heads, 128), dtype)
+    q, k, v, do = numerics.random_initialize((q, kv, kv, q))
+    self._test_attention(
+        q, k, v, do, mask=None, is_causal=is_causal, logits_soft_cap=None
+    )
+
 
 if __name__ == '__main__':
   absltest.main()

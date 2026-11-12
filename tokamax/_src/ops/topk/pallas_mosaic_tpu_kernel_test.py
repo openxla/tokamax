@@ -153,12 +153,11 @@ class SparseCoreTopKTest(parameterized.TestCase):
     assert _topk_n(1048576, page_size=256) == N_1M
 
   @parameterized.parameters((64, 2048), (128, 2048))
-  def test_exact_topk_when_stage_two_needs_its_own_partition(self, b, k):
-    """Verifies recursive stage-2 partitioning when p * k_p > MAX_SLICE_WORDS."""
+  def test_exact_topk_1m_single_stage_partition(self, b, k):
+    """Verifies single-stage P=16 VMEM_SHARED execution at N=1M (64K slices)."""
     p = _pick_partition(b, N_1M, k)
-    assert (
-        p * min(k, N_1M // p) > MAX_SLICE_WORDS
-    ), f"{b=} {k=} no longer reaches the recursive stage-2 path (p={p})"
+    assert p == 16, f"Expected p=16 for {b=} {k=} at N_1M, got {p=}"
+    assert N_1M // p <= MAX_SLICE_WORDS
     rng = np.random.default_rng(SEED)
     scores = _scores("random", b, N_1M, rng)
     row_lengths = np.full(b, N_1M, np.int32)
@@ -304,12 +303,20 @@ def _stage_group_ids(b, n, k, **kwargs) -> list[int | None]:
   seen: list[int | None] = []
 
   def _stub(
-      scores, k_, row_lengths, *, write_empty=True, scheduling_group_id=None
+      scores,
+      k_,
+      row_lengths,
+      *,
+      local_idxs=None,
+      p=1,
+      write_empty=True,
+      return_scores=True,
+      scheduling_group_id=None,
   ):
-    del row_lengths, write_empty
+    del row_lengths, local_idxs, p, write_empty
     seen.append(scheduling_group_id)
     out = jnp.zeros((scores.shape[0], k_), jnp.int32)
-    return out, out
+    return (out, out) if return_scores else out
 
   with mock.patch.object(sc_module, "_sc_topk_direct", _stub):
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)  # pyrefly: ignore[missing-attribute]
@@ -329,14 +336,14 @@ class SparseCoreTopKSchedulingGroupTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       (
-          "both",
+          "p8_both",
           TWO_STAGE,
           dict(scheduling_group_id=3, stage2_scheduling_group_id=4),
-          [3, 4],
+          [3],
       ),
-      ("stage1_only", TWO_STAGE, dict(scheduling_group_id=3), [3, None]),
-      ("stage2_only", TWO_STAGE, dict(stage2_scheduling_group_id=4), [None, 4]),
-      ("neither", TWO_STAGE, {}, [None, None]),
+      ("p8_stage1_only", TWO_STAGE, dict(scheduling_group_id=3), [3]),
+      ("p8_stage2_only", TWO_STAGE, dict(stage2_scheduling_group_id=4), [None]),
+      ("p8_neither", TWO_STAGE, {}, [None]),
       (
           "p1_both",
           SINGLE_STAGE,
@@ -354,7 +361,7 @@ class SparseCoreTopKSchedulingGroupTest(parameterized.TestCase):
       self, shape, kwargs, expected
   ):
     b, n, k = shape
-    assert _pick_partition(b, n, k) == (8 if len(expected) == 2 else 1)
+    assert _pick_partition(b, n, k) == (8 if shape == TWO_STAGE else 1)
     assert _stage_group_ids(b, n, k, **kwargs) == expected
 
   def test_scheduling_group_ids_reach_the_lowered_hlo(self):
@@ -369,12 +376,10 @@ class SparseCoreTopKSchedulingGroupTest(parameterized.TestCase):
 
     both = _text(scheduling_group_id=3, stage2_scheduling_group_id=4)
     assert '_scheduling_group_id = "3"' in both
-    assert '_scheduling_group_id = "4"' in both
 
     # Nothing is annotated unless it was asked for.
     stage1_only = _text(scheduling_group_id=3)
     assert '_scheduling_group_id = "3"' in stage1_only
-    assert '_scheduling_group_id = "4"' not in stage1_only
     assert "_scheduling_group_id" not in _text()
 
   @parameterized.parameters("random", "heavy_ties")

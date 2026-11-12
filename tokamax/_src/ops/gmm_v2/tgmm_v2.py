@@ -42,18 +42,25 @@ class OperandRef:
   scale: Any | None = None
 
 
-TileTgmmFn = Callable[
-    [
-        gmm_v2.Dimensions,
-        gmm_v2.InputConfigs,
-        gmm_v2.InputConfigs,
-        int,
-        jnp.dtype,
-        jnp.dtype,
-        int,
-    ],
-    gmm_v2.TileSizes,
-]
+@dataclasses.dataclass(frozen=True)
+class TgmmTilingRequest:
+  """Inputs passed to a TGMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: gmm_v2.Dimensions
+  lhs_cfgs: gmm_v2.InputConfigs
+  rhs_cfgs: gmm_v2.InputConfigs
+  vmem_limit_bytes: int
+  out_dtype: jnp.dtype
+  acc_dtype: jnp.dtype
+  target_zero_ref_bytes: int
+  has_partial_sum: bool = False
+
+
+TileTgmmFn = Callable[[TgmmTilingRequest], gmm_v2.TileSizes]
 
 
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
@@ -80,6 +87,22 @@ def get_cost_estimate(cfgs: gmm_v2.GmmConfigs) -> pl.CostEstimate:
   )
 
 
+def calculate_tgmm_tiling_from_request(
+    req: TgmmTilingRequest,
+) -> gmm_v2.TileSizes:
+  """Default `TileTgmmFn` for `tgmm_v2`: calls `calculate_tgmm_tiling`."""
+  return calculate_tgmm_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.out_dtype,
+      req.acc_dtype,
+      req.target_zero_ref_bytes,
+      req.has_partial_sum,
+  )
+
+
 def calculate_tgmm_tiling(
     dims: gmm_v2.Dimensions,
     lhs_cfgs: gmm_v2.InputConfigs,
@@ -88,6 +111,7 @@ def calculate_tgmm_tiling(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype,
     target_zero_ref_bytes: int,
+    has_partial_sum: bool = False,
 ) -> gmm_v2.TileSizes:
   """Calculate optimal tile sizes for TGMM kernel."""
   # In tgmm, we calculate lhs.T @ dout which doesn't require quantization.
@@ -119,8 +143,12 @@ def calculate_tgmm_tiling(
     # lhs_masked/rhs_masked scratch arrays in tgmm_inner_kernel.
     # For lhs: num_buffers (HBM load) + 1 (transposed cache) + 1 (lhs_masked).
     # For rhs: num_buffers (HBM load) + 1 (rhs_masked).
+    # The partial sum tile is double-buffered like the output tile.
+    partial_sum_bytes = num_buffers * out_bytes if has_partial_sum else 0
     budget = (
-        tile_k * tile_n * (acc_bytes + num_buffers * out_bytes)
+        tile_k
+        * tile_n
+        * (acc_bytes + num_buffers * out_bytes + partial_sum_bytes)
         + (num_buffers + 2) * (tile_m * tile_k * lhs_bytes)
         + (num_buffers + 1) * (tile_m * tile_n * rhs_bytes)
         # Reserve VMEM for zero_ref. Use the upper bound target_zero_ref_bytes
@@ -176,11 +204,38 @@ def calculate_tgmm_tiling(
         f" tiles=({tile_m},{tile_k},{tile_n}), vmem={vmem_limit_bytes}"
     )
 
-  max_num_buckets = 4
+  # In MegaCore mode both the n and k grid dimensions are parallel (see
+  # `tgmm_kernel_main`), and the grid is split across TensorCores along the
+  # first of them whose tile count is a multiple of `num_cores`. If neither is,
+  # split the larger of k and n, so that each core re-reads only the operand of
+  # the smaller one. Splitting only shrinks tiles, so VMEM usage stays in limit.
+  num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
+  if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
+    tile_k_lower_bound = min(
+        pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
+    )
+    split_k = gmm_v2.split_for_cores(
+        dims.size_k, num_k_tiles, num_cores, num_lanes, tile_k_lower_bound
+    )
+    split_n = gmm_v2.split_for_cores(
+        dims.size_n, num_n_tiles, num_cores, num_lanes, tile_n_lower_bound
+    )
+    if split_k is not None and (dims.size_k >= dims.size_n or split_n is None):
+      num_k_tiles, tile_k = split_k
+    elif split_n is not None:
+      num_n_tiles, tile_n = split_n
+
+  # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
+  # full-tile int32 masks alongside the accumulator in VREGs, causing severe
+  # register spills. Also cap tile_m at the average group size so small-group
+  # shapes do not pad past typical group boundaries.
+  max_num_buckets = 2
   bucket_base = tile_m
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if not within_vmem_limit(new_tile_m, tile_k, tile_n):
       break
@@ -195,6 +250,7 @@ def make_tgmm_configs(
     lhs: jax.Array,  # [m, k]
     rhs: jax.Array,  # [m, n]
     rhs_scale: jax.Array,  # [1, 1, n] (per-N scale)
+    partial_sum: jax.Array | None,  # [num_actual_groups, k, n]
     group_sizes: jax.Array,
     num_actual_groups: int,
     *,
@@ -228,6 +284,16 @@ def make_tgmm_configs(
         "expecting rhs_scale.shape to be (1, 1, size_n) but got"
         f" {rhs_scale.shape}"
     )
+  if partial_sum is not None:
+    assert partial_sum.shape == (num_actual_groups, size_k, size_n), (
+        f"partial_sum shape {partial_sum.shape}. Expecting"
+        f" ({num_actual_groups}, {size_k}, {size_n})"
+    )
+    if partial_sum.dtype != jnp.dtype(out_dtype):
+      raise ValueError(
+          f"partial_sum dtype ({partial_sum.dtype}) must match output dtype"
+          f" ({jnp.dtype(out_dtype)})."
+      )
   # size_lhs_sublane is used in tgmm_inner_kernel to set the
   # (m/size_lhs_sublane, size_lhs_sublane, ...) reshape tile used on the m-axis
   # for both 'tiled_lhs_ref' and 'tiled_rhs_ref'.
@@ -268,14 +334,17 @@ def make_tgmm_configs(
     tiles = tile_info
   else:
     tiles = tile_info(
-        dims,
-        lhs_cfgs,
-        rhs_cfgs,
-        # pyrefly: ignore[bad-argument-type]
-        vmem_limit_bytes,
-        out_dtype,
-        acc_dtype,
-        target_zero_ref_bytes,
+        TgmmTilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            out_dtype=out_dtype,
+            acc_dtype=acc_dtype,
+            target_zero_ref_bytes=target_zero_ref_bytes,
+            has_partial_sum=partial_sum is not None,
+        )
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
       f"tile_m ({tiles.tile_m}) must be divisible by bucket_base"
@@ -294,19 +363,24 @@ def make_tgmm_configs(
       # tgmm accumulation happens at the 'pallas_call' level.
       zero_init=False,
       fuse_act=fuse_act,
+      has_partial_sum=partial_sum is not None,
   )
 
 
 def tgmm_inner_kernel(
+    step: pltpu.PipelineStep,
     tiled_lhs_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: OperandRef,
     # .value: [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     # .scale: [1, 1, tile_n] or None
+    tiled_partial_sum_ref: jax.Array | None,
+    # [None, tile_k, tile_n]
     tiled_out_ref: jax.Array,
     acc_ref: jax.Array,
     metadata_ref: gmm_v2.MetadataRef,
     *,
+    num_gm: jax.Array,
     cfgs: gmm_v2.GmmConfigs,
 ):
   """Inner kernel for TGMM computation.
@@ -316,12 +390,16 @@ def tgmm_inner_kernel(
   and accumulation across different group-major tiles.
 
   Args:
+    step: Current pipeline step.
     tiled_lhs_ref: Reference to the tiled LHS data.
     tiled_rhs_ref: OperandRef bundling the tiled RHS data ('.value') and its
       optional per-N scale ('.scale', None when there is no scale).
+    tiled_partial_sum_ref: Reference to the tiled partial sum
+      [None, tile_k, tile_n], or None if there is no partial sum.
     tiled_out_ref: Reference to the tiled output buffer [None, tile_k, tile_n].
     acc_ref: Scratch memory for accumulation [tile_k, tile_n].
     metadata_ref: Contains metadata like group offsets and group IDs.
+    num_gm: Total number of group-major tiles.
     cfgs: GmmConfigs object containing kernel configurations.
   """
   # NB: grid=(num_n, num_k, num_gm)
@@ -329,7 +407,7 @@ def tgmm_inner_kernel(
 
   tiled_lhs_ref = tiled_lhs_ref.reshape(-1, tiled_lhs_ref.shape[-1])
   tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
-  gm_id = pl.program_id(2)
+  gm_id = step.index[2]
 
   # Mask out invalid rows in the LHS/RHS tiles.
   # The DMA loads tiles aligned to sublane boundaries, but the actual group
@@ -374,6 +452,11 @@ def tgmm_inner_kernel(
         # pyrefly: ignore[unsupported-operation]
         scale_slice = tiled_rhs_scale_ref[0]
         acc *= scale_slice
+      if cfgs.has_partial_sum:
+        assert tiled_partial_sum_ref is not None, (
+            "cfgs.has_partial_sum is True but no partial-sum ref was passed"
+        )
+        acc += tiled_partial_sum_ref[...].astype(acc.dtype)
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
     else:
       acc_ref[...] = acc
@@ -386,7 +469,7 @@ def tgmm_inner_kernel(
   )
   new_group = jnp.logical_or(is_first_gm, group_id_changed)
 
-  is_last_gm = gm_id == (pl.num_programs(2) - 1)
+  is_last_gm = gm_id == (num_gm - 1)
   next_gm_id = jnp.where(is_last_gm, gm_id, gm_id + 1)
   next_group_id = metadata_ref.gm_id_to_group_id[next_gm_id]
   cur_group_id = metadata_ref.gm_id_to_group_id[gm_id]
@@ -481,7 +564,7 @@ class TgmmIndexMaps:
 
 def generate_tgmm_block_specs(
     metadata_ref: gmm_v2.MetadataRef, cfgs: gmm_v2.GmmConfigs
-) -> Tuple[Tuple[pl.BlockSpec, OperandRef], pl.BlockSpec]:
+) -> Tuple[Tuple[pl.BlockSpec, OperandRef, pl.BlockSpec | None], pl.BlockSpec]:
   """Generates block specs for the given lhs, rhs, and out refs."""
   index_map = TgmmIndexMaps(metadata_ref, cfgs)
   # NB: in tgmm, LHS is reshaped from (M, K) to (-1, size_lhs_sublane, K) so
@@ -510,8 +593,14 @@ def generate_tgmm_block_specs(
       (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
       index_map.out_index_map,
   )
+  partial_sum_block_spec = None
+  if cfgs.has_partial_sum:
+    partial_sum_block_spec = pl.BlockSpec(
+        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        index_map.out_index_map,
+    )
 
-  return (lhs_block_spec, rhs_spec), out_block_spec
+  return (lhs_block_spec, rhs_spec, partial_sum_block_spec), out_block_spec
 
 
 def zero_out_start(
@@ -603,13 +692,17 @@ def tgmm_kernel_main(
     semaphore_ref: DMA semaphore for the zeroing copies.
     cfgs: GmmConfigs object containing kernel configurations.
   """
-  num_groups_to_zero = zero_out_start(
-      lhs_group_sizes_ref,
-      group_offset_ref,
-      out_ref,
-      zero_ref,
-      semaphore_ref,
-  )
+  # With a partial sum, `out_ref` is initialized with it and accumulated into in
+  # place, so empty groups already hold their result and must not be zeroed.
+  num_groups_to_zero = None
+  if not cfgs.has_partial_sum:
+    num_groups_to_zero = zero_out_start(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        out_ref,
+        zero_ref,
+        semaphore_ref,
+    )
 
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.dims.size_n, cfgs.tiles.tile_n)
@@ -633,12 +726,13 @@ def tgmm_kernel_main(
       else (pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY)
   )
   pipeline_fn = pltpu.emit_pipeline(
-      functools.partial(tgmm_inner_kernel, cfgs=cfgs),
+      functools.partial(tgmm_inner_kernel, num_gm=num_gm, cfgs=cfgs),
       grid=(num_n, num_k, num_gm),
       in_specs=in_specs,
       out_specs=out_specs,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
+      _explicit_indices=True,
   )
   lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
   rhs_value = rhs_ref.value
@@ -646,14 +740,18 @@ def tgmm_kernel_main(
       -1, cfgs.dims.size_lhs_sublane, rhs_value.shape[-1]
   )
   rhs_operand = OperandRef(value=rhs_in, scale=rhs_ref.scale)
+  partial_sum_in = out_ref if cfgs.has_partial_sum else None
   scratches = [acc_ref, metadata_ref]
 
-  pipeline_fn(lhs_in, rhs_operand, out_ref, scratches=scratches)
-  zero_out_end(
-      num_groups_to_zero,
-      out_ref,
-      semaphore_ref,
+  pipeline_fn(
+      lhs_in, rhs_operand, partial_sum_in, out_ref, scratches=scratches
   )
+  if not cfgs.has_partial_sum:
+    zero_out_end(
+        num_groups_to_zero,
+        out_ref,
+        semaphore_ref,
+    )
 
 
 def validate_tgmm_inputs(
@@ -701,8 +799,11 @@ def tgmm_v2(
     num_actual_groups: int,
     rhs_scale: jax.Array | None = None,  # [1, 1, size_n] (per-N scale)
     group_offset: jax.Array | None = None,
+    partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
-    tile_info: gmm_v2.TileSizes | TileTgmmFn = calculate_tgmm_tiling,
+    tile_info: gmm_v2.TileSizes | TileTgmmFn = (
+        calculate_tgmm_tiling_from_request
+    ),
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -721,8 +822,14 @@ def tgmm_v2(
     num_actual_groups: The actual number of groups: weight.shape[0].
     rhs_scale: The per-N scale of the rhs.
     group_offset: An optional offset for the group indices.
+    partial_sum: Optional. Partial sums of shape [num_actual_groups, size_k,
+      size_n], added to the result inside the kernel (after rhs_scale). This
+      avoids a separate HBM round-trip when a TGMM is accumulated in chunks,
+      e.g. along m. Groups with no rows return their partial sum unchanged.
+      Must have the output dtype; the output is written in place over this
+      buffer.
     tile_info: Specifies the tiling strategy. Can be a `TileSizes` object or a
-      function to calculate it.
+      function that takes a `TgmmTilingRequest` and returns one.
     vmem_limit_bytes: The VMEM limit in bytes for the kernel.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
@@ -752,6 +859,7 @@ def tgmm_v2(
       rhs,
       # pyrefly: ignore[bad-argument-type]
       rhs_scale,
+      partial_sum,
       group_sizes,
       num_actual_groups,
       tile_info=tile_info,
@@ -803,6 +911,12 @@ def tgmm_v2(
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
   # pyrefly: ignore[bad-assignment]
   rhs = OperandRef(value=rhs, scale=rhs_scale)
+
+  if partial_sum is not None and config.disable_multi_core_mode.value:
+    raise NotImplementedError(
+        "partial_sum is not supported with disable_multi_core_mode."
+    )
+
   # TODO: Revert temporary fallback to unblock vmap on older JAX.
   # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
   # until Tokamax updates its JAX version.
@@ -840,9 +954,9 @@ def tgmm_v2(
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
-  return pl.kernel(
+  tgmm_kernel = functools.partial(
+      pl.kernel,
       functools.partial(tgmm_kernel_main, cfgs=cfgs),
-      out_type=out_init,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
@@ -856,4 +970,18 @@ def tgmm_v2(
       # It does not affect the kernel's computation.
       # pyrefly: ignore[bad-argument-type]
       metadata=gmm_v2.get_metadata(cfgs),
-  )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]
+  )
+
+  if partial_sum is None:
+    out = tgmm_kernel(out_type=out_init)(group_sizes, group_offset, lhs, rhs)
+  else:
+    # Match the tile-aligned output shape so the partial sum and output blocks
+    # line up exactly. The kernel accumulates into this buffer in place.
+    pad_k = aligned_k - dims.size_k
+    pad_n = aligned_n - dims.size_n
+    if pad_k or pad_n:
+      partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_k), (0, pad_n)))
+    out_ref = jax.new_ref(partial_sum)
+    tgmm_kernel(out_type=())(group_sizes, group_offset, lhs, rhs, out_ref)
+    out = jax.freeze(out_ref)
+  return out[:, : dims.size_k, : dims.size_n]

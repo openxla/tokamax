@@ -25,6 +25,7 @@ import os
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src import config
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
@@ -45,7 +46,24 @@ def exp2(x):
 
 def get_interpret() -> bool:
   env = os.environ.get("PALLAS_INTERPRET", "")
-  return env.strip().lower() in ("1", "true")
+  return env.strip().lower() in ("1", "true") or jax.default_backend() == "cpu"
+
+
+def get_chain_precision() -> jax.lax.Precision:
+  """Precision for the two matmuls on the forward's serial recurrent chain.
+
+  Set by the `tokamax_kda_chain_precision` config option: `highest` (default),
+  `high` or `default`. The two matmuls are `w @ h` and `kg^T @ v_new` in
+  `pallas_mosaic_tpu_fwd_kernel`. Their operands are read from bf16 buffers,
+  so lower precision uses fewer MXU passes. `v_new` feeds the recurrent state,
+  so errors compound across chunks; validate accuracy on TPU (CPU interpret
+  mode does not model TPU matmul precision).
+  """
+  return {
+      "highest": jax.lax.Precision.HIGHEST,
+      "high": jax.lax.Precision.HIGH,
+      "default": jax.lax.Precision.DEFAULT,
+  }[config.kda_chain_precision.value]
 
 
 def cdiv(x, y: int):
@@ -199,14 +217,16 @@ def _align_seqs(
       for idx, a in enumerate(aligned_3d):
         per_batch_3d[idx].append(a)
       padded_cus.append(padded_cu_b)
-      t_aligned_sizes.append(aligned_4d[0].shape[2])
+      _, _, aligned_t, _ = aligned_4d[0].shape
+      t_aligned_sizes.append(aligned_t)
 
     T_max = max(t_aligned_sizes)
     # Pad each batch element to T_max and concatenate along B.
     def _pad_and_cat_4d(tensors_per_batch):
       padded = []
       for t in tensors_per_batch:
-        pad_len = T_max - t.shape[2]
+        _, _, cur_t, _ = t.shape
+        pad_len = T_max - cur_t
         if pad_len > 0:
           t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
         padded.append(t)
@@ -215,7 +235,8 @@ def _align_seqs(
     def _pad_and_cat_3d(tensors_per_batch):
       padded = []
       for t in tensors_per_batch:
-        pad_len = T_max - t.shape[2]
+        _, _, cur_t = t.shape
+        pad_len = T_max - cur_t
         if pad_len > 0:
           t = jnp.pad(t, ((0, 0), (0, 0), (0, pad_len)))
         padded.append(t)
@@ -228,7 +249,7 @@ def _align_seqs(
 
   # --- Single-batch path (original) ---
   N = cu_seqlens.shape[0] - 1
-  T_old = tensors_4d[0].shape[2]
+  _, _, T_old, _ = tensors_4d[0].shape
 
   seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
   if aligned_cu_seqlens is None:
@@ -266,7 +287,6 @@ def _align_seqs(
     padded_cu,
     cu_seqlens,
   )
-
 
 
 def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
@@ -310,7 +330,6 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   gather_idx = jnp.full(T_out, safe_default, dtype=jnp.int32)
   gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
   return o[:, :, gather_idx]
-
 
 
 def align_segment_ids(
@@ -525,4 +544,3 @@ def kda_gate_chunk_cumsum(
       scale=scale,
       output_dtype=output_dtype or jnp.float32,
   )
-

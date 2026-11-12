@@ -49,10 +49,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
       layout = plgpu.Layout.WGMMA_UPCAST_4X
       x = plgpu.load(x_ref, layout=layout, optimized=False)
       x = common.int4_as_biased_f8e4m3fn(x, layout)
-      if jax.__version_info__ >= (0, 11, 3):
-        plgpu.store(o_ref, x, optimized=False)
-      else:
-        o_ref[...] = x
+      common.store(o_ref, x, optimized=False)
 
     x = jnp.arange(-8, 8, dtype=jnp.int8)
     x = jnp.tile(x, shape[0] * shape[1] // 16).astype(jnp.int4)
@@ -106,7 +103,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
         plgpu.tcgen05_mma(
             acc_tmem,
             a_smem,
-            plgpu.transpose_ref(b_up_smem, (1, 0)),
+            b_up_smem.T,
             accumulate=False,
             barrier=barrier_ref,
         )
@@ -117,10 +114,7 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
         # `S * D - Z * row_sum(A)` where S is scale=512 and Z is bias=8
         acc = 512 * plgpu.async_load_tmem(acc_tmem, layout=plgpu.Layout.TCGEN05)
         acc -= 8 * lax.broadcast_in_dim(a_row_sum, acc.shape, [0])
-        if jax.__version_info__ >= (0, 11, 3):
-          plgpu.store(out_gmem, acc, optimized=False)
-        else:
-          out_gmem[...] = acc
+        common.store(out_gmem, acc, optimized=False)
 
       pipeline(a_gmem, b_gmem)
 

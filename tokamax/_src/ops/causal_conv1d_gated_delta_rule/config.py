@@ -84,6 +84,25 @@ class GDNConfig:
   # shapes and loops can be sized off it unconditionally and the extra axis
   # / iterations fold away in the non-speculative paths.
   window_size: int = 1
+  # Indicate the use of unified pool.
+  is_shared: bool = False
+
+  @property
+  def conv_hbm_offset(self) -> int:
+    if self.is_shared:
+      # In Unified pool. Conv state is stored after recurrent state.
+      # Offset is calculated via recurrent state size.
+      lane_bytes = pltpu.get_tpu_info().num_lanes * 4
+      lane_elements = (
+          lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+      )
+      num_elements = self.v_dim_size * self.kq_head_dim
+      return num_elements // lane_elements
+    return 0
+
+  @property
+  def recurrent_hbm_offset(self) -> int:
+    return 0
 
   @property
   def chunk_size(self) -> int:
@@ -163,7 +182,10 @@ class GDNConfig:
           return b
       return 2
     # GDN
-    return max(2, min(16, 16 // head_groups))
+    for b in (16, 8, 4):
+      if head_groups * b <= 16:
+        return b
+    return 2
 
   def get_kernel_name(self) -> str:
     # Windows of different sizes compile to different kernels; keep them
@@ -202,16 +224,27 @@ class GDNConfig:
   # descriptors and register spills without reducing per-slot compute.
   DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
   MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
+  # Cap each batched recurrent contraction at 128 (seq, v_head) slices so
+  # intra-step f32 state_updated and state_new live ranges fit tiling.py's
+  # single-state working budget when seq_tile_size * num_v_heads reaches 256.
+  MAX_BATCHED_RECURRENT_HEADS: ClassVar[int] = 128
+
 
   @classmethod
-  def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+  def get_vmem_limit_bytes(
+      cls,
+      window_size: int = 1,
+      vmem_capacity_bytes: int | None = None,
+  ) -> int:
     """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+    if vmem_capacity_bytes is None:
+      vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     fraction = (
         cls.WINDOWED_VMEM_FRACTION
         if window_size > 1
         else cls.DEFAULT_VMEM_FRACTION
     )
-    return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
+    return int(fraction * vmem_capacity_bytes)
 
   def get_scratch_shape_dict(self) -> dict[str, Any]:
     conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

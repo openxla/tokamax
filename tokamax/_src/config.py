@@ -114,6 +114,19 @@ ignore_autotuning_cache = _ConfigOption(
     )
 )
 
+autotuning_auto_input_layouts = _ConfigOption(
+    flags.DEFINE_bool(
+        "tokamax_autotuning_auto_input_layouts",
+        True,
+        "If true, autotuning on GPU lets XLA choose the layouts of the"
+        " benchmark inputs, as it does for the parameters of a compiled"
+        " program, and lays out the inputs to match before timing. If false,"
+        " inputs use the default layouts, so an op that reads an input"
+        " transposed (e.g. a kernel reading `rhs.mT`) is timed with a"
+        " transpose that compiled programs avoid.",
+    )
+)
+
 disable_multi_core_mode = _ConfigOption(
     flags.DEFINE_bool(
         "tokamax_disable_multi_core_mode",
@@ -122,5 +135,17 @@ disable_multi_core_mode = _ConfigOption(
         " and fall back to the legacy pl.pallas_call path to unblock jax.vmap."
         " TODO: Revert this flag once Tokamax updates its JAX"
         " version.",
+    )
+)
+
+kda_chain_precision = _ConfigOption(
+    flags.DEFINE_enum(
+        "tokamax_kda_chain_precision",
+        "highest",
+        ("highest", "high", "default"),
+        "Matmul precision for the two matmuls on the serial recurrent chain of"
+        " the KDA Pallas Mosaic TPU forward kernel (`w @ h` and"
+        " `kg^T @ v_new`). Lower precision uses fewer MXU passes, but errors"
+        " compound across chunks, so validate accuracy on TPU.",
     )
 )

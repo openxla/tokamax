@@ -229,3 +229,4 @@ def check_bf16xbf16_or_f16xf16(lhs: jax.Array, rhs: jax.Array):
     raise NotImplementedError(
         f"Only bfloat16/float16 inputs are supported (got {lhs.dtype=})."
     )
+

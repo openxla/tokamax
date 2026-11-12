@@ -96,8 +96,12 @@ def _register_benchmarks():
 
       # The MGPU implementation is optimized for transposed RHS.
       if 'mosaic' in impl_name:
-        spec = spec | dict(rhs=jax.tree.map(_transpose_rhs, spec['rhs']))
-        _register_benchmark(name + '_transposed_rhs', impl_name, spec)
+        transposed_spec = spec | dict(
+            rhs=jax.tree.map(_transpose_rhs, spec['rhs'])
+        )
+        _register_benchmark(
+            name + '_transposed_rhs', impl_name, transposed_spec
+        )
 
 
 if __name__ == '__main__':

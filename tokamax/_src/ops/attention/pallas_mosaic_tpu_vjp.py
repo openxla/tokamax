@@ -28,7 +28,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
 
 
 QArray = base.QArray
@@ -203,10 +203,14 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    q, k, v, mask = (ba.arguments[x] for x in ("q", "k", "v", "mask"))
+    max_tile = common.max_vmem_tile(q, v, mask)
+    block_q_dkv = common.largest_divisor_tile(q.shape[-3], max_tile)
+    block_kv_dkv = common.largest_divisor_tile(k.shape[-3], max_tile)
     return Config(
-        block_q_dkv=128,
-        block_kv_dkv=128,
-        block_kv_dkv_compute=128,
+        block_q_dkv=block_q_dkv,
+        block_kv_dkv=block_kv_dkv,
+        block_kv_dkv_compute=min(block_kv_dkv, max_tile // 2),
         use_base2_exp=True,
     )
 

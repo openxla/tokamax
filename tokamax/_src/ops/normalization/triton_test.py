@@ -63,8 +63,10 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
 
     # We expect to see a shape for non-vmapped and each layer of vmap.
     seen_vmap_axis_sizes = seen_vmap_axis_sizes[-1 :: -(len(vmap_in_axes) + 1)]
-    # We expect three calls from fwd, fwd res, and VJP.
-    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * 3)
+    # We expect three calls from fwd, fwd res, and VJP (or four under
+    # custom_vjp3, which also traces and batches the primal function).
+    expected_calls = 4 if jax.config.jax_custom_vjp3 else 3
+    self.assertEqual(seen_vmap_axis_sizes, [vmap_axis_sizes] * expected_calls)
 
   def _assert_one_call_per_kernel(self, lowered):
     hlo = str(lowered.compiler_ir('stablehlo'))
@@ -97,7 +99,11 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
     self._assert_one_call_per_kernel(g_remat_lowered)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+    # `g_ref` runs eagerly and `g_remat` under jit, so the final sum can
+    # reduce in a different order.
+    chex.assert_trees_all_close(
+        g_out, g_ref(x, scale, offset), rtol=1e-6, atol=1e-6
+    )
 
   def test_remat_with_vmap(self):
     rngs = list(jax.random.split(jax.random.PRNGKey(0), 4))
@@ -119,7 +125,11 @@ class TritonNormalizationTest(test_base.NormalizationTestBase):
     self._assert_one_call_per_kernel(g_remat_lowered)
 
     g_out = g_remat_lowered.compile()(x, scale, offset)
-    chex.assert_trees_all_equal(g_out, g_ref(x, scale, offset))
+    # `g_ref` runs eagerly and `g_remat` under jit, so the final sum can
+    # reduce in a different order.
+    chex.assert_trees_all_close(
+        g_out, g_ref(x, scale, offset), rtol=1e-6, atol=1e-6
+    )
 
   def test_vmap_large_batch(self):
     # More blocks than CUDA allows along grid axes 1 and 2.

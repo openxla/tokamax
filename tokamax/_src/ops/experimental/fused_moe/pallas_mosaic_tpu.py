@@ -60,8 +60,10 @@ class PallasMosaicTpuFusedMoe(base.FusedMoe):
       renormalize: bool = True,
       act_fn: str = "silu",
       mesh: jax.sharding.Mesh,
+      return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[jax.Array, None]:
+    del return_residuals  # Unused.
     if config is None:
       config = Config()
 

@@ -42,6 +42,7 @@ def get_ds_dtype(
     return None
   if dbias_intermediate_dtype is None:
     return bias.dtype
-  if bias.shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
+  bias_shape = (1,) * (q.ndim - bias.ndim) + bias.shape
+  if bias_shape == (*q.shape[:-3], q.shape[-2], q.shape[-3], k.shape[-3]):
     return bias.dtype
   return dbias_intermediate_dtype

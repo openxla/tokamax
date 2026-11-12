@@ -65,10 +65,10 @@ def _make_inputs(
 
 class KimiDeltaAttentionTest(parameterized.TestCase):
 
-  def test_chunk_size_is_not_public(self):
-    self.assertNotIn(
-        "chunk_size", inspect.signature(api.kimi_delta_attention).parameters
-    )
+  def test_public_gdn_parameters(self):
+    parameters = inspect.signature(api.kimi_delta_attention).parameters
+    self.assertIn("chunk_size", parameters)
+    self.assertIn("use_conv1d_in_kernel", parameters)
 
   def test_public_api_uses_descriptive_names(self):
     parameters = inspect.signature(api.kimi_delta_attention).parameters
@@ -322,6 +322,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           initial_state=initial_state[:, :, :, :-1],
       )
 
+    _, batch, seq_len, _ = q.shape
     with self.subTest(name="segment_ids"), self.assertRaises(
         jt.TypeCheckError
     ):
@@ -331,7 +332,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           v,
           g,
           beta,
-          segment_ids=jnp.ones((q.shape[1], q.shape[2] + 1), jnp.int32),
+          segment_ids=jnp.ones((batch, seq_len + 1), jnp.int32),
           max_num_segments=1,
       )
 

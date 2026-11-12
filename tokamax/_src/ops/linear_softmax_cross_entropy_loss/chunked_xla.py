@@ -42,6 +42,249 @@ class Config:
   v_block_size: Annotated[int, pydantic.Field(ge=128, multiple_of=128)] = 2048
 
 
+def _forward_v_step(
+    j,
+    v_carry,
+    *,
+    labels_b,
+    x_b,
+    w_padded,
+    h_dim,
+    v_block_sz,
+    dtype,
+    preferred_element_type,
+    pad_mask=None,
+):
+  """Computes forward step for a single vocab block."""
+  lse_b_, b_loss_sum_neg_logits_ = v_carry
+  v_start = j * v_block_sz
+  w_j = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
+  logits_bv = jnp.dot(
+      x_b, w_j, preferred_element_type=preferred_element_type
+  )
+  logits_f32 = logits_bv.astype(jnp.float32)
+  if pad_mask is not None:
+    logits_f32 = jnp.where(pad_mask[None, :], -jnp.inf, logits_f32)
+
+  lse_b__ = jnp.logaddexp(
+      lse_b_, jax.nn.logsumexp(logits_f32, axis=-1)
+  )
+  labels_one_hot = jax.nn.one_hot(
+      labels_b - v_start, v_block_sz, dtype=dtype
+  )
+  b_loss_sum_neg_logits__ = b_loss_sum_neg_logits_ - jnp.sum(
+      logits_bv.astype(dtype) * labels_one_hot, axis=-1
+  )
+  return lse_b__, b_loss_sum_neg_logits__
+
+
+def _forward_b_step(
+    i,
+    carry,
+    *,
+    x_padded,
+    labels_padded,
+    w_padded,
+    b_block_sz,
+    v_block_sz,
+    b_dim,
+    v_dim,
+    h_dim,
+    b_dim_padded,
+    num_v_blocks,
+    v_pad,
+    unroll_factor,
+    reduction,
+    dtype,
+    preferred_element_type,
+):
+  """Computes forward step for a batch block across all vocab blocks."""
+  lse_all, loss_acc = carry
+  b_start = i * b_block_sz
+  labels_b = jax.lax.dynamic_slice(labels_padded, (b_start,), (b_block_sz,))
+  x_b = jax.lax.dynamic_slice(x_padded, (b_start, 0), (b_block_sz, h_dim))
+
+  v_step = functools.partial(
+      _forward_v_step,
+      labels_b=labels_b,
+      x_b=x_b,
+      w_padded=w_padded,
+      h_dim=h_dim,
+      v_block_sz=v_block_sz,
+      dtype=dtype,
+      preferred_element_type=preferred_element_type,
+  )
+
+  init_v_carry = (
+      jnp.full((b_block_sz,), -jnp.inf, dtype=jnp.float32),
+      jnp.zeros((b_block_sz,), dtype=dtype),
+  )
+
+  if v_pad == 0:
+    lse_b, b_loss_sum_neg_logits = jax.lax.fori_loop(
+        0,
+        num_v_blocks,
+        v_step,
+        init_v_carry,
+        unroll=unroll_factor,
+    )
+  else:
+    num_full_v_blocks = num_v_blocks - 1
+    if num_full_v_blocks > 0:
+      v_carry = jax.lax.fori_loop(
+          0,
+          num_full_v_blocks,
+          v_step,
+          init_v_carry,
+          unroll=unroll_factor,
+      )
+    else:
+      v_carry = init_v_carry
+    rem_v = v_dim - num_full_v_blocks * v_block_sz
+    last_mask = jnp.arange(v_block_sz) >= rem_v
+    lse_b, b_loss_sum_neg_logits = v_step(
+        num_full_v_blocks, v_carry, pad_mask=last_mask
+    )
+
+  mask_b = jnp.arange(b_dim_padded) < b_dim
+  mask_b = jax.lax.dynamic_slice(mask_b, (b_start,), (b_block_sz,))
+  mask_b = mask_b.astype(dtype)
+  b_loss_sum_neg_logits = b_loss_sum_neg_logits * mask_b
+  lse_b_masked = lse_b * mask_b
+
+  lse_all = jax.lax.dynamic_update_slice(lse_all, lse_b, (b_start,))
+  if reduction == "none":
+    loss_b = b_loss_sum_neg_logits + lse_b_masked.astype(dtype)
+    loss_acc = jax.lax.dynamic_update_slice(loss_acc, loss_b, (b_start,))
+  else:
+    loss_acc += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(
+        lse_b_masked.astype(dtype)
+    )
+  return lse_all, loss_acc
+
+
+def _backward_v_step(
+    j,
+    v_carry,
+    *,
+    labels_b,
+    x_b,
+    w_padded,
+    lse_b,
+    dout_b,
+    h_dim,
+    v_block_sz,
+    num_v_blocks,
+    last_mask,
+    dtype,
+    reduction,
+    preferred_element_type,
+):
+  """Computes backward step for a single vocab block."""
+  dx_b, dw_acc = v_carry
+  v_start = j * v_block_sz
+
+  w_v = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
+  logits_bv = jnp.dot(
+      x_b, w_v, preferred_element_type=preferred_element_type
+  )
+
+  labels_one_hot_bv = jax.nn.one_hot(
+      labels_b - v_start, v_block_sz, dtype=dtype
+  )
+  s_bv = (jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv).astype(
+      logits_bv.dtype
+  )
+  if reduction == "none":
+    s_bv = (s_bv * dout_b[:, None]).astype(logits_bv.dtype)
+
+  if last_mask is not None:
+    is_last = j == num_v_blocks - 1
+    pad_mask = jnp.where(is_last, last_mask, False)
+    s_bv = jnp.where(
+        pad_mask[None, :],
+        jnp.array(0.0, dtype=logits_bv.dtype),
+        s_bv,
+    )
+
+  dx_b += jnp.dot(
+      s_bv, w_v.T, preferred_element_type=preferred_element_type
+  )
+
+  dw_v = jax.lax.dynamic_slice(
+      dw_acc, (0, v_start), (h_dim, v_block_sz)
+  ) + jnp.dot(x_b.T, s_bv, preferred_element_type=preferred_element_type)
+  dw_acc = jax.lax.dynamic_update_slice(dw_acc, dw_v, (0, v_start))
+  return dx_b, dw_acc
+
+
+def _backward_b_step(
+    i,
+    b_carry,
+    *,
+    x_padded,
+    labels_padded,
+    w_padded,
+    lse_padded,
+    dout_padded,
+    b_block_sz,
+    v_block_sz,
+    v_dim,
+    h_dim,
+    num_v_blocks,
+    v_pad,
+    reduction,
+    dtype,
+    preferred_element_type,
+):
+  """Computes backward step for a batch block across all vocab blocks."""
+  dx, dw = b_carry
+  b_start = i * b_block_sz
+  lse_b = jax.lax.dynamic_slice(lse_padded, (b_start,), (b_block_sz,))
+  labels_b = jax.lax.dynamic_slice(labels_padded, (b_start,), (b_block_sz,))
+  x_b = jax.lax.dynamic_slice(x_padded, (b_start, 0), (b_block_sz, h_dim))
+
+  if reduction == "none":
+    dout_b = jax.lax.dynamic_slice(dout_padded, (b_start,), (b_block_sz,))
+  else:
+    dout_b = jnp.zeros((b_block_sz,), dtype=dtype)
+
+  if v_pad == 0:
+    last_mask = None
+  else:
+    rem_v = v_dim - (num_v_blocks - 1) * v_block_sz
+    last_mask = jnp.arange(v_block_sz) >= rem_v
+
+  v_step = functools.partial(
+      _backward_v_step,
+      labels_b=labels_b,
+      x_b=x_b,
+      w_padded=w_padded,
+      lse_b=lse_b,
+      dout_b=dout_b,
+      h_dim=h_dim,
+      v_block_sz=v_block_sz,
+      num_v_blocks=num_v_blocks,
+      last_mask=last_mask,
+      dtype=dtype,
+      reduction=reduction,
+      preferred_element_type=preferred_element_type,
+  )
+
+  dx_b_init = jnp.zeros((b_block_sz, h_dim), dtype=preferred_element_type)
+  init_v_carry = (dx_b_init, dw)
+
+  dx_b, dw = jax.lax.fori_loop(
+      0,
+      num_v_blocks,
+      v_step,
+      init_v_carry,
+  )
+
+  dx = jax.lax.dynamic_update_slice(dx, dx_b, (b_start, 0))
+  return dx, dw
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -101,59 +344,24 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
   num_b_blocks = b_dim_padded // b_block_sz
   num_v_blocks = v_dim_padded // v_block_sz
 
-  def b_loop_body(i, carry):
-    lse_all, loss_acc = carry
-    b_start = i * b_block_sz
-
-    def v_loop_body(j, v_carry):
-      lse_b_, b_loss_sum_neg_logits_ = v_carry
-      v_start = j * v_block_sz
-      labels_b = jax.lax.dynamic_slice(labels_padded, (b_start,), (b_block_sz,))
-      x_b = jax.lax.dynamic_slice(x_padded, (b_start, 0), (b_block_sz, h_dim))
-      w_j = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
-      logits_bv = jnp.dot(
-          x_b, w_j, preferred_element_type=preferred_element_type
-      )
-
-      lse_b__ = jnp.logaddexp(
-          lse_b_, jax.nn.logsumexp(logits_bv.astype(jnp.float32), axis=-1)
-      )
-      # If labels_b - v_start < 0 or labels_b - v_start >= v_block_sz, then
-      # one_hot will be all zeros.
-      labels_one_hot = jax.nn.one_hot(
-          labels_b - v_start, v_block_sz, dtype=dtype
-      )
-      b_loss_sum_neg_logits__ = b_loss_sum_neg_logits_ - jnp.sum(
-          logits_bv.astype(dtype) * labels_one_hot, axis=-1
-      )
-      return lse_b__, b_loss_sum_neg_logits__
-
-    lse_b, b_loss_sum_neg_logits = jax.lax.fori_loop(
-        0,
-        num_v_blocks,
-        v_loop_body,
-        (
-            jnp.full((b_block_sz,), -jnp.inf, dtype=jnp.float32),
-            jnp.zeros((b_block_sz,), dtype=dtype),
-        ),
-        unroll=unroll_factor,
-    )
-
-    mask_b = jnp.arange(b_dim_padded) < b_dim
-    mask_b = jax.lax.dynamic_slice(mask_b, (b_start,), (b_block_sz,))
-    mask_b = mask_b.astype(dtype)
-    b_loss_sum_neg_logits = b_loss_sum_neg_logits * mask_b
-    lse_b_masked = lse_b * mask_b
-
-    lse_all = jax.lax.dynamic_update_slice(lse_all, lse_b, (b_start,))
-    if reduction == "none":
-      loss_b = b_loss_sum_neg_logits + lse_b_masked.astype(dtype)
-      loss_acc = jax.lax.dynamic_update_slice(loss_acc, loss_b, (b_start,))
-    else:
-      loss_acc += jnp.sum(b_loss_sum_neg_logits) + jnp.sum(
-          lse_b_masked.astype(dtype)
-      )
-    return lse_all, loss_acc
+  b_step = functools.partial(
+      _forward_b_step,
+      x_padded=x_padded,
+      labels_padded=labels_padded,
+      w_padded=w_padded,
+      b_block_sz=b_block_sz,
+      v_block_sz=v_block_sz,
+      b_dim=b_dim,
+      v_dim=v_dim,
+      h_dim=h_dim,
+      b_dim_padded=b_dim_padded,
+      num_v_blocks=num_v_blocks,
+      v_pad=v_pad,
+      unroll_factor=unroll_factor,
+      reduction=reduction,
+      dtype=dtype,
+      preferred_element_type=preferred_element_type,
+  )
 
   if reduction == "none":
     init_loss = jnp.zeros(b_dim_padded, dtype=dtype)
@@ -163,7 +371,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
   lse_all, loss_acc = jax.lax.fori_loop(
       0,
       num_b_blocks,
-      b_loop_body,
+      b_step,
       (jnp.zeros(b_dim_padded, dtype=jnp.float32), init_loss),
   )
 
@@ -243,55 +451,27 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
   else:
     dout_padded = jnp.zeros((b_dim_padded,), dtype=x.dtype)
 
-  def b_loop_body(i, b_carry):
-    dx, dw = b_carry
-    b_start = i * b_block_sz
-    lse_b = jax.lax.dynamic_slice(lse_padded, (b_start,), (b_block_sz,))
-    labels_b = jax.lax.dynamic_slice(labels_padded, (b_start,), (b_block_sz,))
-
-    x_b = jax.lax.dynamic_slice(x_padded, (b_start, 0), (b_block_sz, h_dim))
-    if reduction == "none":
-      dout_b = jax.lax.dynamic_slice(dout_padded, (b_start,), (b_block_sz,))
-    else:
-      dout_b = jnp.zeros((b_block_sz,), dtype=dtype)
-
-    def v_loop_body(j, v_carry):
-      dx_b, dw_acc = v_carry
-      v_start = j * v_block_sz
-
-      w_v = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
-      logits_bv = jnp.dot(
-          x_b, w_v, preferred_element_type=preferred_element_type
-      )
-
-      labels_one_hot_bv = jax.nn.one_hot(
-          labels_b - v_start, v_block_sz, dtype=dtype
-      )
-      s_bv = (jnp.exp(logits_bv - lse_b[:, None]) - labels_one_hot_bv).astype(
-          logits_bv.dtype
-      )
-      if reduction == "none":
-        s_bv = (s_bv * dout_b[:, None]).astype(logits_bv.dtype)
-
-      dx_b += jnp.dot(
-          s_bv, w_v.T, preferred_element_type=preferred_element_type
-      )
-
-      dw_v = jax.lax.dynamic_slice(
-          dw_acc, (0, v_start), (h_dim, v_block_sz)
-      ) + jnp.dot(x_b.T, s_bv, preferred_element_type=preferred_element_type)
-      dw_acc = jax.lax.dynamic_update_slice(dw_acc, dw_v, (0, v_start))
-      return dx_b, dw_acc
-
-    dx_b_init = jnp.zeros((b_block_sz, h_dim), dtype=preferred_element_type)
-    dx_b, dw = jax.lax.fori_loop(0, num_v_blocks, v_loop_body, (dx_b_init, dw))
-
-    dx = jax.lax.dynamic_update_slice(dx, dx_b, (b_start, 0))
-    return dx, dw
+  b_step = functools.partial(
+      _backward_b_step,
+      x_padded=x_padded,
+      labels_padded=labels_padded,
+      w_padded=w_padded,
+      lse_padded=lse_padded,
+      dout_padded=dout_padded,
+      b_block_sz=b_block_sz,
+      v_block_sz=v_block_sz,
+      v_dim=v_dim,
+      h_dim=h_dim,
+      num_v_blocks=num_v_blocks,
+      v_pad=v_pad,
+      reduction=reduction,
+      dtype=dtype,
+      preferred_element_type=preferred_element_type,
+  )
 
   dx_init = jnp.zeros((b_dim_padded, h_dim), dtype=preferred_element_type)
   dw_init = jnp.zeros((h_dim, v_dim_padded), dtype=preferred_element_type)
-  dx, dw = jax.lax.fori_loop(0, num_b_blocks, b_loop_body, (dx_init, dw_init))
+  dx, dw = jax.lax.fori_loop(0, num_b_blocks, b_step, (dx_init, dw_init))
 
   dx = dx[:b_dim, :]
   dw = dw[:, :v_dim]

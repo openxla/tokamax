@@ -134,6 +134,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
         lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
         rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
+        zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
     )
     fn, args = tokamax.standardize_function(

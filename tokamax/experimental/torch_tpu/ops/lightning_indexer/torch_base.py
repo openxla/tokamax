@@ -52,13 +52,14 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       cp_rank: int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: Sequence[int] | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Meta/fake implementation for symbolic shape tracing in torch.compile."""
     del indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens
     del distribution, compression_ratio, kv_layout, cp_size, cp_rank
-    del interleave_size, return_scores, return_residuals, config
+    del interleave_size, return_scores, uniform_q_len, return_residuals, config
     out_shape = (q.shape[0], k)
     return (
         q.new_empty(out_shape, dtype=torch.int32),
@@ -82,6 +83,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       cp_rank: torch.Tensor | int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: _Config | None = None,
       configs: tuple[Any, Any] | None = None,
@@ -108,6 +110,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
         config=None,
     )
@@ -130,6 +133,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       cp_rank: int = 0,
       interleave_size: int = 1,
       return_scores: bool = False,
+      uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
@@ -153,6 +157,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
         cp_rank=cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
+        uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
         config=None,
     )

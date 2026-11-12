@@ -20,6 +20,8 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.ragged_gather_reduce import arg_specs
+from tokamax._src.ops.ragged_gather_reduce import base
 from tokamax._src.ops.ragged_gather_reduce import reference
 
 # bf16 outputs of a float32 sum whose order differs between implementations.
@@ -160,3 +162,13 @@ class RaggedGatherReduceTestBase(parameterized.TestCase):
         atol=ATOL,
         rtol=RTOL,
     )
+
+  def test_arg_specs(self):
+    """Checks that all arg specs bind and qwen3_5_397b shapes match."""
+    ragged_gather_reduce_op = base.RaggedGatherReduce()
+    for spec in arg_specs.ARG_SPECS:
+      ragged_gather_reduce_op.bind(**spec.args)
+      if spec.project == "qwen3_5_397b":
+        num_tokens = int(spec.name.rsplit("_", 1)[-1])
+        self.assertEqual(spec.args["indices"].shape, (num_tokens * 10,))
+        self.assertEqual(spec.args["reduce_group_size"], 10)

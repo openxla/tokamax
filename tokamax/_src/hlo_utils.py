@@ -124,7 +124,7 @@ def get_bound_args[**P](
   elif args or kwargs:
     raise ValueError('`args` / `kwargs` are only supported if `f` is callable.')
 
-  bound_args = get_opspecs(f)
+  bound_args = get_opspecs(f)  # pyrefly: ignore[bad-argument-type]
 
   # Filter out bound args so that only unique ones remain.
   seen_keys = set()

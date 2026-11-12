@@ -507,7 +507,7 @@ def _mla_ragged_paged_attention_kernel(
       out = (
           lax.div(acc, denom)
           if q_dtype == jnp.float32
-          else (acc * pl.reciprocal(denom, approx=True)).astype(q_dtype)
+          else (acc * pltpu.reciprocal(denom, approx=True)).astype(q_dtype)
       )
 
       # Wait for previous bo to be fully sent before storing new bo.

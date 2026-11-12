@@ -1930,7 +1930,21 @@
       "peak_memory_mb": 18169.856
     }
   },
-  "{\"x\":\"bf16[4864,4864,128]\",\"weights\":\"bf16[128,2,512]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
+  "{\"x\":\"bf16[4864,4864,128]\",\"weights\":\"bf16[128,2,512]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{\"tile_m\":128,\"tile_n\":64,\"tile_k\":128,\"num_stages\":2,\"epi_tile_n\":32,\"epi_tile_m\":64,\"grid_minor_dim\":1,\"grid_tile_width\":2,\"wg_dimension\":1,\"cluster_size_m\":1,\"cluster_size_n\":1}": {
+      "compile_time_ms": 914.5205960000027,
+      "lower_time_ms": 2432.8146919999936,
+      "evaluation_times_ms": [
+        20.454395,
+        21.15386,
+        22.015319,
+        21.928318,
+        21.932673
+      ],
+      "metadata": {},
+      "peak_memory_mb": 30283.137024
+    }
+  },
   "{\"x\":\"f32[4864,4864,128]\",\"weights\":\"f32[128,2,256]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {},
   "{\"x\":\"bf16[4864,4864,64]\",\"weights\":\"bf16[64,2,128]\",\"activation\":\"jax._src.nn.functions.sigmoid\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
     "{\"tile_m\":128,\"tile_n\":64,\"tile_k\":64,\"num_stages\":4,\"epi_tile_n\":32,\"epi_tile_m\":64,\"grid_minor_dim\":1,\"grid_tile_width\":4,\"wg_dimension\":1,\"cluster_size_m\":2,\"cluster_size_n\":1}": {
@@ -2507,6 +2521,21 @@
       ],
       "metadata": {},
       "peak_memory_mb": 7272.955904
+    }
+  },
+  "{\"x\":\"bf16[5120,384]\",\"weights\":\"bf16[384,2,1536]\",\"activation\":\"jax._src.nn.functions.silu\",\"precision\":\"BF16_BF16_F32\",\"return_residuals\":false}": {
+    "{\"tile_m\":128,\"tile_n\":64,\"tile_k\":128,\"num_stages\":2,\"epi_tile_n\":32,\"epi_tile_m\":64,\"grid_minor_dim\":1,\"grid_tile_width\":4,\"wg_dimension\":0,\"cluster_size_m\":1,\"cluster_size_n\":1}": {
+      "compile_time_ms": 6825.086440891027,
+      "lower_time_ms": 14568.363013677299,
+      "evaluation_times_ms": [
+        0.02768,
+        0.02768,
+        0.027584,
+        0.027712,
+        0.027552
+      ],
+      "metadata": {},
+      "peak_memory_mb": 22.020096
     }
   }
 }

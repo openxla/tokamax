@@ -20,7 +20,7 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tokamax._src.ops.experimental.tpu.splash_attention import base as jax_base
+from tokamax._src.ops.splash_attention import base as jax_base
 from tokamax.experimental.torch_tpu.ops.splash_attention import torch_base
 import torch
 from torch._subclasses import fake_tensor

@@ -58,66 +58,50 @@ def _attend_chunk(
 ]:
   """Computes a chunk of attention."""
   q_k_dot_precision, weights_v_dot_precision = precision
-  bias = jnp.array([]) if bias is None else bias
 
-  @functools.partial(jax.remat, prevent_cse=False)
-  def chunk(q, k, v, bias, mask, accum, x_max, denom):
-    bias = bias if len(bias) else None
+  # TODO: Can we be more efficient for multi-query attention?
+  logits = jnp.einsum(
+      "...qhd,...khd->...hqk",
+      q,
+      k,
+      precision=q_k_dot_precision,
+      preferred_element_type=q_k_dot_precision.accumulation_type,
+  ).astype(logits_dtype)
 
-    # TODO: Can we be more efficient for multi-query attention?
-    logits = jnp.einsum(
-        "...qhd,...khd->...hqk",
-        q,
-        k,
-        precision=q_k_dot_precision,
-        preferred_element_type=q_k_dot_precision.accumulation_type,
-    ).astype(logits_dtype)
+  logits *= logits_scale
 
-    logits *= logits_scale
+  if bias is not None:
+    logits = (logits + bias).astype(logits.dtype)
 
-    if bias is not None:
-      logits = (logits + bias).astype(logits.dtype)
+  if logits_soft_cap is not None:
+    logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-    if logits_soft_cap is not None:
-      logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
+  if mask is not None:
+    mask_value = float(jnp.finfo(logits.dtype).min)
+    logits = jnp.where(jnp.asarray(mask), logits, mask_value)
 
-    if mask is not None:
-      mask_value = float(jnp.finfo(logits.dtype).min)
-      logits = jnp.where(jnp.asarray(mask), logits, mask_value)
+  logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
+  loc_x_max = jnp.max(logits, axis=-1)
+  new_x_max = jnp.maximum(x_max, loc_x_max)
+  weights = jnp.exp(logits - new_x_max[..., None])
+  alpha = jnp.exp(x_max - new_x_max)
 
-    logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
-    loc_x_max = jnp.max(logits, axis=-1)
-    new_x_max = jnp.maximum(x_max, loc_x_max)
-    weights = jnp.exp(logits - new_x_max[..., None])
-    alpha = jnp.exp(x_max - new_x_max)
+  x_max = new_x_max
+  accum *= alpha.mT[..., None]
+  denom = (denom * alpha) + weights.sum(axis=-1)
 
-    x_max = new_x_max
-    accum *= alpha.mT[..., None]
-    denom = (denom * alpha) + weights.sum(axis=-1)
+  if dropout_mask is not None:
+    weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
 
-    if dropout_mask is not None:
-      weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
+  accum += jnp.einsum(
+      "...hqk,...khd->...qhd",
+      weights,
+      v,
+      precision=weights_v_dot_precision,
+      preferred_element_type=weights_v_dot_precision.accumulation_type,
+  ).astype(accum.dtype)
 
-    accum += jnp.einsum(
-        "...hqk,...khd->...qhd",
-        weights,
-        v,
-        precision=weights_v_dot_precision,
-        preferred_element_type=weights_v_dot_precision.accumulation_type,
-    ).astype(accum.dtype)
-
-    return accum, x_max, denom
-
-  return chunk(
-      q=q,
-      k=k,
-      v=v,
-      bias=bias,
-      mask=mask,
-      accum=accum,
-      x_max=x_max,
-      denom=denom,
-  )
+  return accum, x_max, denom
 
 
 @jaxtyping.jaxtyped
@@ -149,14 +133,18 @@ def _attend_chunked(
 
   q_chunk_size, kv_chunk_size = chunk_size
 
-  q_len_or_indices = seq_q if q_indices is None else q_indices
-  k_len_or_indices = seq_k if k_indices is None else k_indices
-  mask_ = mask.as_array(q_len_or_indices, k_len_or_indices)
+  if mask:
+    _ = jax.eval_shape(
+        lambda m, qi, ki: m.as_array(
+            seq_q if qi is None else qi, seq_k if ki is None else ki
+        ),
+        mask,
+        q_indices,
+        k_indices,
+    )
 
   def get_chunk(x, idx, size, axis):
-    if x is None:
-      return None
-    if x.shape[axis] == 1:
+    if x is None or x.ndim < -axis or x.shape[axis] == 1:
       return x
     return jax.lax.dynamic_slice_in_dim(x, idx, size, axis)
 
@@ -166,8 +154,14 @@ def _attend_chunked(
 
     q_chunk = get_q_chunk(q, -3)
     bias_chunk = get_q_chunk(bias, -2)
-    mask_chunk = get_q_chunk(mask_, -2)
     dropout_mask_chunk = get_q_chunk(dropout_mask, -2)
+    q_indices_chunk = get_q_chunk(q_indices, -1)
+    q_mask = dataclasses.replace(
+        mask,
+        bool_mask=get_q_chunk(mask.bool_mask, -2),
+        k_start=get_q_chunk(mask.k_start, -1),
+        k_end=get_q_chunk(mask.k_end, -1),
+    )
 
     intermediates_shape = (*b, h, q_chunk.shape[-3])
     acc = jnp.zeros(q_chunk.shape[:-1] + (d_out,), jnp.float32)
@@ -180,6 +174,28 @@ def _attend_chunked(
       def get_kv_chunk(x, axis):
         return get_chunk(x, kv_chunk_idx, kv_chunk_size, axis)
 
+      if q_mask:
+        kv_mask = dataclasses.replace(
+            q_mask,
+            bool_mask=get_kv_chunk(q_mask.bool_mask, -1),
+            q_start=get_kv_chunk(q_mask.q_start, -1),
+            q_end=get_kv_chunk(q_mask.q_end, -1),
+        )
+        q_idx = (
+            jnp.arange(q_chunk_size) + q_chunk_idx
+            if q_indices_chunk is None
+            else q_indices_chunk
+        )
+        k_indices_chunk = get_kv_chunk(k_indices, -1)
+        k_idx = (
+            jnp.arange(kv_chunk_size) + kv_chunk_idx
+            if k_indices_chunk is None
+            else k_indices_chunk
+        )
+        mask_chunk = kv_mask.as_array(q_idx, k_idx)
+      else:
+        mask_chunk = None
+
       out = _attend_chunk(
           q_chunk,
           get_kv_chunk(k, -3),
@@ -188,7 +204,7 @@ def _attend_chunked(
           x_max,
           denom,
           bias=get_kv_chunk(bias_chunk, -1),
-          mask=get_kv_chunk(mask_chunk, -1),
+          mask=mask_chunk,
           dropout_mask=get_kv_chunk(dropout_mask_chunk, -1),
           precision=precision,
           logits_dtype=logits_dtype,
@@ -198,28 +214,40 @@ def _attend_chunked(
       )
       return kv_chunk_idx + kv_chunk_size, *out
 
+    def remat_kv_loop_fn(size):
+      return jax.remat(
+          functools.partial(kv_loop_fn, kv_chunk_size=size), prevent_cse=False
+      )
+
     even_chunks = seq_k // kv_chunk_size
     carry = (0, acc, x_max, denom)
 
     # Main kv loop
     if seq_k >= kv_chunk_size:
-      loop_fn = functools.partial(kv_loop_fn, kv_chunk_size=kv_chunk_size)
-      carry = jax.lax.fori_loop(0, even_chunks, loop_fn, carry)
+      carry = jax.lax.fori_loop(
+          0, even_chunks, remat_kv_loop_fn(kv_chunk_size), carry
+      )
 
     # Remainder kv loop
     if (k_remainder := (seq_k % kv_chunk_size)) != 0:
-      carry = kv_loop_fn(even_chunks + 1, carry, kv_chunk_size=k_remainder)
+      carry = remat_kv_loop_fn(k_remainder)(even_chunks, carry)
 
     # Final normalization by the denominator.
     _, acc, _, denom = carry
     out = acc / denom.mT[..., None] if normalize_output else acc
     return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
 
+  def remat_q_loop_fn(size):
+    return jax.remat(
+        functools.partial(q_loop_fn, q_chunk_size=size), prevent_cse=False
+    )
+
   # Main q loop
   if seq_q >= q_chunk_size:
-    loop_fn = functools.partial(q_loop_fn, q_chunk_size=q_chunk_size)
     length = seq_q // q_chunk_size
-    q_chunk_idx, out = jax.lax.scan(loop_fn, init=0, length=length)
+    q_chunk_idx, out = jax.lax.scan(
+        remat_q_loop_fn(q_chunk_size), init=0, length=length
+    )
     out = shape_lib.einshape("q...thd->...(qt)hd")(out)
   else:
     q_chunk_idx = 0
@@ -227,7 +255,7 @@ def _attend_chunked(
 
   # Remainder q loop
   if (q_remainder := (seq_q % q_chunk_size)) != 0:
-    _, rem_out = q_loop_fn(q_chunk_idx, None, q_chunk_size=q_remainder)
+    _, rem_out = remat_q_loop_fn(q_remainder)(q_chunk_idx, None)
     out = rem_out if out is None else jnp.concatenate([out, rem_out], axis=-3)
 
   assert out is not None

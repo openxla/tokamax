@@ -15,6 +15,7 @@
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
 import dataclasses
+import itertools
 from typing import ClassVar, override
 
 import jax
@@ -46,6 +47,7 @@ class Config:
   tile_k: pydantic.PositiveInt | None = None
   tile_n: pydantic.PositiveInt | None = None
   bucket_base: pydantic.PositiveInt | None = None
+  lhs_buffer_count: pydantic.PositiveInt | None = None
 
 DEFAULT_RAGGED_DOT_DIM_NUMS = base.DEFAULT_RAGGED_DOT_DIM_NUMS
 DLHS_RAGGED_DOT_DIM_NUMS = base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
@@ -110,17 +112,13 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             config=config,
         )(*args, **kw)
 
-      if self.dlhs_config is not None:
-        dlhs_config = self.dlhs_config
-      elif self.config is not None:
-        dlhs_config = Config(
-            tile_m=self.config.tile_m,
-            tile_k=self.config.tile_n,
-            tile_n=self.config.tile_k,
-            bucket_base=self.config.bucket_base,
-        )
-      else:
-        dlhs_config = None
+      # The dlhs pass is a transposed-rhs gmm whose output dimension is the
+      # forward `k`, so the forward tiling does not carry over to it. For
+      # example, swapping a forward `tile_n` that splits `n` across MegaCore
+      # TensorCores into the dlhs `tile_k` leaves a single dlhs output tile
+      # that runs on one core. Without an explicit `dlhs_config`, the dlhs
+      # sub-op picks its own tiling (autotuning cache or heuristic).
+      dlhs_config = self.dlhs_config
 
       if self.drhs_config is not None:
         drhs_config = self.drhs_config
@@ -201,6 +199,9 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
             bucket_base=config.bucket_base
             if config.bucket_base is not None
             else config.tile_m,
+            lhs_buffer_count=config.lhs_buffer_count
+            if config.lhs_buffer_count is not None
+            else gmm_backend.TileSizes.lhs_buffer_count,
         )
     )
     if ragged_dot_dimension_numbers == DEFAULT_RAGGED_DOT_DIM_NUMS:  # gmm fwd
@@ -325,7 +326,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else gmm_backend.calculate_tiling,
+          else gmm_backend.calculate_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type,
@@ -367,7 +368,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           lhs_scale,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else gmm_backend.calculate_tiling,
+          else gmm_backend.calculate_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type
@@ -414,7 +415,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
           group_offset=group_offset,
           tile_info=explicit_tiles
           if explicit_tiles is not None
-          else tgmm_backend.calculate_tgmm_tiling,
+          else tgmm_backend.calculate_tgmm_tiling_from_request,
           vmem_limit_bytes=vmem_limit_bytes,
           precision=precision,
           preferred_element_type=preferred_element_type
@@ -447,6 +448,78 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     # caller that wants fixed tiles can pass an explicit `Config` to the op.
     del ba
     return Config()
+
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    lhs, rhs = ba.args[:2]
+    dims = ba.arguments.get(
+        "ragged_dot_dimension_numbers", DEFAULT_RAGGED_DOT_DIM_NUMS
+    )
+    if dims == DEFAULT_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, _, n) = lhs.shape, rhs.shape
+      if ba.arguments.get("fuse_gateup_activation") is not None:
+        n //= 2
+    elif dims == DLHS_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, n, _) = lhs.shape, rhs.shape
+    elif dims == DRHS_RAGGED_DOT_DIM_NUMS:
+      (m, k), (_, n) = lhs.shape, rhs.shape
+    else:
+      raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
+
+    k_ = ((k + 128 - 1) // 128) * 128
+    n_ = ((n + 128 - 1) // 128) * 128
+
+    try:
+      tpu_gen = getattr(pltpu.get_tpu_info(), "generation", 0)
+    except ValueError:
+      tpu_gen = 0
+    max_tile_m = 2048 if tpu_gen >= 8 else 1024
+    tile_m_range = [
+        128 * (2**i)
+        for i in range(8)
+        if 128 * (2**i) <= m and 128 * (2**i) <= max_tile_m
+    ]
+    tile_k_range = (
+        {128 * (2**i) for i in range(8) if 128 * (2**i) <= k_}
+        | {
+            k_ // (2**i)
+            for i in range(6)
+            if k_ // (2**i) >= 128 and (k_ // (2**i)) % 128 == 0
+        }
+        | {k_}
+    )
+    tile_n_range = (
+        {128 * (2**i) for i in range(8) if 128 * (2**i) <= n_}
+        | {
+            n_ // (2**i)
+            for i in range(6)
+            if n_ // (2**i) >= 128 and (n_ // (2**i)) % 128 == 0
+        }
+        | {n_}
+    )
+    lhs_buffer_count_range = (
+        [None]
+        if dims == DRHS_RAGGED_DOT_DIM_NUMS
+        else ([2, 3, 4] if tpu_gen >= 8 else [2, 3])
+    )
+    buckets_range = (1, 2, 4, 8) if tpu_gen >= 8 else (1, 2, 4)
+    return {
+        Config(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            bucket_base=tile_m // num_buckets,
+            lhs_buffer_count=lhs_buffer_count,
+        )
+        for tile_m, tile_k, tile_n, num_buckets, lhs_buffer_count in itertools.product(
+            tile_m_range,
+            tile_k_range,
+            tile_n_range,
+            buckets_range,
+            lhs_buffer_count_range,
+        )
+        if tile_m // num_buckets >= 64
+    }
 
   @override
   def supported_on(self, device: jax.Device) -> bool:

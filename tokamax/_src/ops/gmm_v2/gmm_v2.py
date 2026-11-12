@@ -127,6 +127,50 @@ def align_to(x, a):
   return pl.cdiv(x, a) * a
 
 
+def get_num_cores(tpu_info: Any) -> int:
+  """Returns the number of TensorCores that the kernel grid is split across.
+
+  In MegaCore mode (e.g. TPU v4 and v5p), the parallel grid dimensions are
+  partitioned across `tpu_info.num_cores` TensorCores. When multi-core mode is
+  disabled, the whole grid runs on a single core.
+
+  Args:
+    tpu_info: The `pltpu.TpuInfo` of the current device.
+  """
+  if config.disable_multi_core_mode.value:
+    return 1
+  num_cores = getattr(tpu_info, "num_cores", 1)
+  return num_cores if type(num_cores) is int and num_cores > 1 else 1
+
+
+def split_for_cores(
+    size: int, num_tiles: int, num_cores: int, num_lanes: int, min_tile: int
+) -> tuple[int, int] | None:
+  """Splits `size` into a multiple of `num_cores` equal, lane-aligned tiles.
+
+  Args:
+    size: The size of the dimension to split.
+    num_tiles: The current number of tiles. The result has at least as many.
+    num_cores: The number of TensorCores the tiles are partitioned across.
+    num_lanes: The number of lanes that each tile must be aligned to.
+    min_tile: The smallest allowed tile size.
+
+  Returns:
+    `(num_tiles, tile)` for the fewest tiles that are a multiple of `num_cores`,
+    are at least `min_tile` and exactly cover `size` (rounded up to
+    `num_lanes`), or `None` if no such split exists.
+  """
+  aligned_size = align_to(size, num_lanes)
+  start = align_to(max(num_tiles, 1), num_cores)
+  for cand in range(start, aligned_size // num_lanes + 1, num_cores):
+    tile = align_to(size, cand * num_lanes) // cand
+    if tile < min_tile:
+      break
+    if tile * cand == aligned_size:
+      return cand, tile
+  return None
+
+
 def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
   """Sublane block size the kernel processes lhs rows in."""
   size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(dtype)
@@ -332,6 +376,7 @@ class GmmConfigs:
   zero_init: bool
   fuse_act: str | None
   transpose_rhs: bool = False
+  has_partial_sum: bool = False
 
   @property
   def num_quant_blocks_per_tile_k(self) -> int:
@@ -345,17 +390,38 @@ class GmmConfigs:
       return self.dims.size_n // 2
 
 
-TileFn = Callable[
-    [Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes
-]
+@dataclasses.dataclass(frozen=True)
+class TilingRequest:
+  """Inputs passed to a GMM `tile_info` callback.
+
+  New tiling inputs are added as fields with defaults, so existing callbacks
+  keep working when the kernel gains new features.
+  """
+
+  dims: Dimensions
+  lhs_cfgs: InputConfigs
+  rhs_cfgs: InputConfigs
+  vmem_limit_bytes: int
+  fuse_act: str | None = None
+  has_partial_sum: bool = False
+
+
+TileFn = Callable[[TilingRequest], TileSizes]
 
 
 class IndexMaps:
   """Index maps for GMM kernel."""
 
-  def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
+  def __init__(
+      self,
+      metadata_ref: MetadataRef,
+      cfgs: GmmConfigs,
+      *,
+      num_gm: jax.Array,
+  ):
     self.metadata_ref = metadata_ref
     self.cfgs = cfgs
+    self.num_gm = num_gm
 
   def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
     m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -401,7 +467,7 @@ class IndexMaps:
     return (group_id, b_tile_id, 0, n_id)
 
   def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
-    is_last_gm = gm_id == (pl.num_programs(1) - 1)
+    is_last_gm = gm_id == (self.num_gm - 1)
     m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
     m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
 
@@ -413,13 +479,28 @@ class IndexMaps:
 
     return (pl.ds(row_start, row_size), 0, n_id)
 
+  def partial_sum_index_map(
+      self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array
+  ):
+    m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+
+    row_start = m_start // self.cfgs.dims.size_lhs_sublane
+    row_end = pl.cdiv(m_end, self.cfgs.dims.size_lhs_sublane)
+    row_size = row_end - row_start
+
+    return (pl.ds(row_start, row_size), 0, n_id)
+
 
 def generate_block_specs(
-    metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> Tuple[Tuple[LhsRef, WeightsRef], pl.BlockSpec]:
+    metadata_ref: MetadataRef,
+    cfgs: GmmConfigs,
+    *,
+    num_gm: jax.Array,
+) -> Tuple[Tuple[LhsRef, WeightsRef, pl.BlockSpec | None], pl.BlockSpec]:
   """Generates block specs for the given lhs, rhs, and out refs."""
 
-  index_map = IndexMaps(metadata_ref, cfgs)
+  index_map = IndexMaps(metadata_ref, cfgs, num_gm=num_gm)
   bounded_slice_gm = pl.BoundedSlice(
       cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane
   )
@@ -449,7 +530,7 @@ def generate_block_specs(
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
-  rhs_scale_block_spec = rhs_bias_block_spec = None
+  rhs_scale_block_spec = rhs_bias_block_spec = partial_sum_block_spec = None
   if cfgs.rhs_cfgs.has_bias:
     rhs_bias_block_spec = pl.BlockSpec(
         (None, 1, cfgs.tiles.tile_n),
@@ -459,6 +540,12 @@ def generate_block_specs(
     rhs_scale_block_spec = pl.BlockSpec(
         (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
         index_map.rhs_scale_index_map,
+    )
+
+  if cfgs.has_partial_sum:
+    partial_sum_block_spec = pl.BlockSpec(
+        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+        index_map.partial_sum_index_map,
     )
 
   rhs_block_spec = WeightsRef(
@@ -472,17 +559,24 @@ def generate_block_specs(
       index_map.out_index_map,
   )
 
-  return (lhs_block_spec, rhs_block_spec), out_block_spec
+  return (
+      (lhs_block_spec, rhs_block_spec, partial_sum_block_spec),
+      out_block_spec,
+  )
 
 
 # Define kernels.
 
 
 def inner_kernel(
+    step: pltpu.PipelineStep,
     # In
     tiled_lhs_ref: LhsRef,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
+    # Partial Sum
+    tiled_partial_sum_ref: jax.Array | None,
+    # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     # Out
     tiled_out_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
@@ -502,9 +596,12 @@ def inner_kernel(
   invalid data and needs to be masked out.
 
   Args:
+    step: Current pipeline step.
     tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
     tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
       g_id is the group associated with lhs[m_start:m_end, :]
+    tiled_partial_sum_ref: Contains value partial_sum[m_start:m_end,
+      n_start:n_end], or None if there is no partial sum.
     tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
     partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
       Will be initialized to zero if this is first tile for grid[n_id, :, :].
@@ -513,7 +610,7 @@ def inner_kernel(
     cfgs: GmmConfigs.
   """
 
-  gm_id = pl.program_id(1)
+  gm_id = step.index[1]
   m_start = metadata_ref.gm_id_to_m_offset[gm_id]
   m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
   m_offset = m_start - m_start % cfgs.dims.size_lhs_sublane
@@ -722,6 +819,17 @@ def inner_kernel(
       if cfgs.rhs_cfgs.has_bias:
         tiled_rhs_bias = tiled_rhs_ref.get_bias()
         acc += tiled_rhs_bias.astype(acc.dtype)
+      if cfgs.has_partial_sum:
+        assert tiled_partial_sum_ref is not None, (
+            "cfgs.has_partial_sum is True but no partial-sum ref was passed"
+        )
+        # `acc` covers only `acc_m` rows (the current bucket), while the
+        # partial sum block spans the full `tile_m`. Slice it the same way the
+        # output ref is written below.
+        partial_sum_tile = tiled_partial_sum_ref.reshape(
+            -1, cfgs.tiles.tile_n
+        )[:acc_m]
+        acc += partial_sum_tile.astype(acc.dtype)
 
       acc = apply_act_fn(acc, cfgs.fuse_act)
 
@@ -782,8 +890,8 @@ def inner_kernel(
     def matmul_last():
       _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
 
-    num_k = pl.num_programs(2)
-    k_id = pl.program_id(2)
+    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+    k_id = step.index[2]
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
@@ -796,8 +904,26 @@ def inner_kernel(
   branches = []
   for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
     branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-  bucket_idx = m_end_local // cfgs.tiles.bucket_base
+  bucket_idx = select_bucket_idx(m_end_local, cfgs.tiles.bucket_base)
   lax.switch(bucket_idx, branches)
+
+
+def select_bucket_idx(m_end_local: jax.Array, bucket_base: int) -> jax.Array:
+  """Returns the index of the smallest bucket that covers rows [0, m_end_local).
+
+  Bucket `i` computes `bucket_base * (i + 1)` rows, so the result is
+  `ceil(m_end_local / bucket_base) - 1`.
+
+  Args:
+    m_end_local: One past the last row of the current group, relative to the
+      start of the tile.
+    bucket_base: Number of rows in the smallest bucket.
+  """
+  # m_end_local is one past the last row, so the last row is m_end_local - 1.
+  # Using m_end_local directly picks one bucket too many whenever the row count
+  # is a multiple of bucket_base. lax.switch clamps the index, so -1 (no rows)
+  # selects the smallest bucket.
+  return (m_end_local - 1) // bucket_base
 
 
 def fill_metadata(
@@ -1035,7 +1161,9 @@ def kernel_main(
         dims=cfgs.dims,
     )
 
-  (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
+  (lhs_spec, rhs_spec, partial_sum_spec), out_spec = generate_block_specs(
+      metadata_ref, cfgs, num_gm=num_gm
+  )
 
   if cfgs.fuse_act is not None:
     rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
@@ -1060,10 +1188,11 @@ def kernel_main(
   pipeline_fn = pltpu.emit_pipeline(
       functools.partial(inner_kernel, cfgs=cfgs),
       grid=(num_n, num_gm, num_k),
-      in_specs=(lhs_spec, rhs_spec),
+      in_specs=(lhs_spec, rhs_spec, partial_sum_spec),
       out_specs=out_spec,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
+      _explicit_indices=True,
   )
 
   # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1074,11 +1203,26 @@ def kernel_main(
   )
   lhs_in = LhsRef(value=lhs_value_in, scale=lhs_ref.scale)
   out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+  # With a partial sum, `out_ref` is initialized with it and accumulated into in
+  # place.
+  partial_sum_in = out_in if cfgs.has_partial_sum else None
   scratches = [partial_out_ref, acc_ref, metadata_ref]
-  pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+  pipeline_fn(lhs_in, rhs_ref, partial_sum_in, out_in, scratches=scratches)
 
   if cfgs.zero_init:
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
+
+
+def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
+  """Default `TileFn` for `gmm_v2`: calls `calculate_tiling` with `req`."""
+  return calculate_tiling(
+      req.dims,
+      req.lhs_cfgs,
+      req.rhs_cfgs,
+      req.vmem_limit_bytes,
+      req.fuse_act,
+      req.has_partial_sum,
+  )
 
 
 def calculate_tiling(
@@ -1087,6 +1231,7 @@ def calculate_tiling(
     rhs_cfgs: InputConfigs,
     vmem_limit_bytes: int,
     fuse_act: str | None = None,
+    has_partial_sum: bool = False,
 ) -> TileSizes:
   """Calculate optimal tile sizes for GMM kernel."""
 
@@ -1096,11 +1241,17 @@ def calculate_tiling(
   lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
   rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
+  tpu_info = pltpu.get_tpu_info()
+
   # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
   # safe to use for most scenarios. But if lower bitwidth is used, we need
   # to tweak tile_m to account for using faster hardware unit.
-  # TODO: Account for different TPU hardware specs.
-  bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
+  gen = getattr(tpu_info, "generation", None)
+  tpu_generation = gen if type(gen) is int else 0
+  if tpu_generation >= 8:
+    bf16_bf16_tile_m = 256
+  else:
+    bf16_bf16_tile_m = 256 if rhs_cfgs.is_transposed else 128
   rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
   tile_m = bf16_bf16_tile_m // rhs_mod
   if lhs_cfgs.should_quantize:
@@ -1109,7 +1260,7 @@ def calculate_tiling(
 
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_limit = tpu_info.mxu_column_size * 2
   tile_n_limit = min(tile_n_limit, dims.size_n)
 
   size_n_per_rhs = dims.size_n
@@ -1168,11 +1319,12 @@ def calculate_tiling(
     acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
     acc_vmem = tm * acc_cols * acc_dtype_bytes
 
-    # 4. Output tile (double-buffered)
+    # 4. Output tile (double-buffered) and partial sum tile (double-buffered)
     out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
     out_vmem = 2 * tm * tn * out_dtype_bytes
+    partial_sum_vmem = 2 * tm * tn * out_dtype_bytes if has_partial_sum else 0
 
-    return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
+    return lhs_vmem + rhs_vmem + acc_vmem + out_vmem + partial_sum_vmem
 
   # Multiple k tiles will introduce accumulation overhead. Thus, we first try
   # to fit the tensors into vmem by only adjusting tile_n.
@@ -1189,6 +1341,18 @@ def calculate_tiling(
   if tile_n < tile_n_limit:
     num_n_tiles -= 1
     tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
+
+  # In MegaCore mode only the n grid dimension is split across TensorCores (see
+  # `kernel_main`), so use a multiple of `num_cores` n tiles to keep every core
+  # busy. Keep the current tiling if `size_n_per_rhs` cannot be split evenly
+  # into tiles of at least `tile_n_limit`.
+  num_cores = get_num_cores(tpu_info)
+  if num_cores > 1 and num_n_tiles % num_cores:
+    split = split_for_cores(
+        size_n_per_rhs, num_n_tiles, num_cores, num_lanes, tile_n_limit
+    )
+    if split is not None:
+      num_n_tiles, tile_n = split
 
   # If memory is STILL exceeded after tile_n adjustment, we must decrease
   # tile_k.
@@ -1217,22 +1381,41 @@ def calculate_tiling(
 
   # TODO: max number of bucket was choosen empiirically.
   # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 4
+  # Each bucket adds a fully unrolled copy of the matmul body. On TPU8, the
+  # larger VMEM allows tiles big enough that 3+ buckets can exceed instruction
+  # memory, which can make the kernel >2x slower, so use fewer buckets there.
+  max_num_buckets = 2 if tpu_generation >= 8 else 4
   bucket_base = tile_m
+  # For transposed RHS (dlhs), cap tile_m at the average group size so tiles do
+  # not pad and XLU-transpose rows past typical group boundaries. Keep full
+  # bucket growth for non-transposed forward calls, where larger tile_m avoids
+  # re-streaming hot expert weights under skewed routing.
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  max_tile_m = (
+      min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
+      if rhs_cfgs.is_transposed
+      else dims.size_m
+  )
   for _ in range(1, max_num_buckets):
     new_tile_m = tile_m + bucket_base
-    if new_tile_m > dims.size_m:
+    if new_tile_m > max_tile_m:
       break
     if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
       break
     tile_m = new_tile_m
 
-  lhs_buffer_count = (
-      3
-      if _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=3)
-      <= vmem_limit_bytes
-      else 2
-  )
+  # Up to this point, we have found tile_m, tile_n, tile_k for
+  # lhs_buffer_count == 2. So it's guaranteed the for loop below can find an
+  # available lhs_buffer_count.
+  max_lhs_buffers = 4 if tpu_generation >= 8 else 3
+  lhs_buffer_count = 2
+  for count in range(max_lhs_buffers, 2, -1):
+    if (
+        _gmm_vmem_estimate(tile_m, tile_n, tile_k, lhs_buffer_count=count)
+        <= vmem_limit_bytes
+    ):
+      lhs_buffer_count = count
+      break
 
   return TileSizes(
       tile_m=tile_m,
@@ -1264,6 +1447,7 @@ def validate_inputs(
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
     rhs_bias: jax.Array | None,
+    partial_sum: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
@@ -1272,6 +1456,7 @@ def validate_inputs(
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
     packing_factor: int = 1,
+    out_dtype: jnp.dtype | None = None,
 ) -> Dimensions:
   """Validates the inputs for the GMM kernel."""
 
@@ -1302,6 +1487,19 @@ def validate_inputs(
     assert rhs.shape == (size_group, size_k // packing_factor, size_n)
   if rhs_bias is not None:
     assert rhs_bias.shape == (size_group, 1, size_n)
+  if partial_sum is not None:
+    if fuse_act is not None:
+      raise NotImplementedError("partial_sum does not support fuse_act.")
+    assert partial_sum.shape == (size_m, size_n), (
+        f"partial_sum shape {partial_sum.shape}. Expecting ({size_m},"
+        f" {size_n})"
+    )
+    expected_dtype = lhs.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    if partial_sum.dtype != expected_dtype:
+      raise ValueError(
+          f"partial_sum dtype ({partial_sum.dtype}) must match output dtype"
+          f" ({expected_dtype})."
+      )
   if rhs_scale is not None:
     num_quant_blocks = rhs_scale.shape[1]
     assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n), (
@@ -1405,6 +1603,7 @@ def make_gmm_configs(
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
     rhs_bias: jax.Array | None,
+    partial_sum: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     *,
@@ -1428,6 +1627,7 @@ def make_gmm_configs(
       rhs,
       rhs_scale,
       rhs_bias,
+      partial_sum,
       group_sizes,
       group_offset,
       fuse_act,
@@ -1436,6 +1636,7 @@ def make_gmm_configs(
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
       packing_factor=packing_factor,
+      out_dtype=out_dtype,
   )
 
   if rhs_scale is not None:
@@ -1513,7 +1714,17 @@ def make_gmm_configs(
   if isinstance(tile_info, TileSizes):
     tiles = tile_info
   else:
-    tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)  # pyrefly: ignore[bad-argument-type]
+    tiles = tile_info(
+        TilingRequest(
+            dims=dims,
+            lhs_cfgs=lhs_cfgs,
+            rhs_cfgs=rhs_cfgs,
+            # pyrefly: ignore[bad-argument-type]
+            vmem_limit_bytes=vmem_limit_bytes,
+            fuse_act=fuse_act,
+            has_partial_sum=partial_sum is not None,
+        )
+    )
 
   return GmmConfigs(
       dims=dims,
@@ -1525,6 +1736,7 @@ def make_gmm_configs(
       zero_init=zero_initialize,
       fuse_act=fuse_act,
       transpose_rhs=transpose_rhs,
+      has_partial_sum=partial_sum is not None,
   )
 
 
@@ -1562,8 +1774,9 @@ def gmm_v2(
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
+    partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
-    tile_info: TileSizes | TileFn = calculate_tiling,
+    tile_info: TileSizes | TileFn = calculate_tiling_from_request,
     vmem_limit_bytes: int | None = None,
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
@@ -1595,9 +1808,15 @@ def gmm_v2(
       granularity; currently only per-tensor `[1, 1]` is supported. When None, a
       quantized lhs uses the default dynamic per-block absmax calibration. Only
       takes effect when maybe_quantize_lhs is True and rhs is quantized.
+    partial_sum: Optional. Partial sums of shape [size_m, size_n], added to the
+      matmul result inside the kernel (after rhs_bias). This avoids a separate
+      HBM round-trip when a GMM is accumulated in chunks, e.g. along k. Must
+      have the output dtype; the output is written in place over this buffer.
+      Not supported together with fuse_act.
     lhs_quant_dtype: Optional jnp.dtype to use for quantizing lhs
     rhs_quant_dtype: Optional jnp.dtype to use for quantizing rhs
-    tile_info: The tile sizes or tile function to use.
+    tile_info: The tile sizes, or a function that takes a `TilingRequest` and
+      returns them.
     vmem_limit_bytes: Optional vmem limit in bytes.
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
@@ -1621,6 +1840,10 @@ def gmm_v2(
   padded_size_m = align_to(size_m, size_lhs_sublane)
   if padded_size_m != size_m:
     lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    if partial_sum is not None:
+      partial_sum = jnp.pad(
+          partial_sum, ((0, padded_size_m - size_m), (0, 0))
+      )
 
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1636,6 +1859,7 @@ def gmm_v2(
       rhs,
       rhs_scale,
       rhs_bias,
+      partial_sum,
       group_sizes,
       group_offset,
       tile_info=tile_info,
@@ -1711,6 +1935,11 @@ def gmm_v2(
   lhs_in = LhsRef(value=lhs, scale=lhs_scale)
   rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+  if partial_sum is not None and config.disable_multi_core_mode.value:
+    raise NotImplementedError(
+        "partial_sum is not supported with disable_multi_core_mode."
+    )
+
   # TODO: Revert temporary fallback to unblock vmap on older JAX.
   # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
   # until Tokamax updates its JAX version.
@@ -1760,9 +1989,9 @@ def gmm_v2(
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
 
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
-  return pl.kernel(
+  gmm_kernel = functools.partial(
+      pl.kernel,
       functools.partial(kernel_main, cfgs=cfgs),
-      out_type=out_init,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       compiler_params=pltpu.CompilerParams(
@@ -1772,4 +2001,21 @@ def gmm_v2(
       name=get_scope_name(cfgs),
       cost_estimate=get_cost_estimate(cfgs),
       metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-  )(group_sizes, group_offset, lhs_in, rhs_weights)[:size_m, : cfgs.out_size_n]
+  )
+
+  if partial_sum is None:
+    out = gmm_kernel(out_type=out_init)(
+        group_sizes, group_offset, lhs_in, rhs_weights
+    )
+  else:
+    # Match the lane-aligned output width so the partial sum and output blocks
+    # line up exactly. The kernel accumulates into this buffer in place.
+    pad_n = aligned_n - partial_sum.shape[1]
+    if pad_n:
+      partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_n)))
+    out_ref = jax.new_ref(partial_sum)
+    gmm_kernel(out_type=())(
+        group_sizes, group_offset, lhs_in, rhs_weights, out_ref
+    )
+    out = jax.freeze(out_ref)
+  return out[:size_m, : cfgs.out_size_n]

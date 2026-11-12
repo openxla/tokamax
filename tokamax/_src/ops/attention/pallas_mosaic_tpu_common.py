@@ -16,15 +16,35 @@
 
 from collections.abc import Callable
 import functools
+import math
 from typing import Any, Final
 
 import jax
 import jax.numpy as jnp
 from tokamax._src.ops.attention import base
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as splash
-from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_kernel as splash
+from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
 NUM_LANES: Final[int] = 128
+
+
+def largest_divisor_tile(seq_len: int, max_tile: int) -> int:
+  """Returns the largest power-of-two tile <= `max_tile` dividing `seq_len`."""
+  for tile in (1024, 512, 256):
+    if tile <= max_tile and seq_len % tile == 0:
+      return tile
+  return NUM_LANES
+
+
+def _padded_row_bytes(x: Any) -> int:
+  padded_dim = math.ceil(x.shape[-1] / NUM_LANES) * NUM_LANES
+  return padded_dim * jnp.dtype(x.dtype).itemsize
+
+
+def max_vmem_tile(q: Any, v: Any, mask: base.Mask) -> int:
+  """Returns the max tile size fitting inputs within 16 MiB TPU VMEM."""
+  row_bytes = max(_padded_row_bytes(q), _padded_row_bytes(v))
+  return 1024 if mask.bool_mask is None and row_bytes <= 256 else 512
 
 
 def check_inputs_support(

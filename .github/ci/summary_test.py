@@ -220,6 +220,45 @@ class ParseTest(unittest.TestCase):
     self.assertIn('core-short', summary.parse_jobs(lines))
 
 
+class CompatTest(unittest.TestCase):
+  """The compat bins, which get their own table."""
+
+  def compat_job(self, name: str, runner: str, **kwargs: object) -> str:
+    record = json.loads(job(name, runner, **kwargs))
+    record['name'] = f'compat-tests ({runner}, {name})'
+    return json.dumps(record)
+
+  def compat(self, lines: list[str]) -> str:
+    return '\n'.join(
+        summary.render_compat(
+            summary.parse_jobs(lines, summary.COMPAT_JOB_NAME)
+        )
+    )
+
+  def test_compat_bins_stay_out_of_the_shard_table(self) -> None:
+    lines = [job('core-short'), self.compat_job('compat-1', 'tpu7x-jax0.11.1')]
+    self.assertEqual(list(summary.parse_jobs(lines)), ['core-short'])
+    self.assertNotIn('compat-1', render(lines))
+
+  def test_each_bin_and_version_gets_a_row(self) -> None:
+    out = self.compat([
+        self.compat_job('compat-1', 'tpu7x-jax0.11.1', minutes=12),
+        self.compat_job('compat-1', 'tpu7x-jax0.11.0', conclusion='failure'),
+    ])
+    self.assertIn('| `compat-1` | tpu7x-jax0.11.1 | pass | 12m |', out)
+    # A failed job's duration is how far it got, not what the bin costs.
+    self.assertIn('| `compat-1` | tpu7x-jax0.11.0 | FAIL | - |', out)
+
+  def test_bins_sort_numerically(self) -> None:
+    out = self.compat(
+        [self.compat_job(f'compat-{i}', 'tpu7x-jax0.11.1') for i in (10, 2, 1)]
+    )
+    self.assertLess(out.index('compat-2`'), out.index('compat-10`'))
+
+  def test_no_bins_no_section(self) -> None:
+    self.assertEqual(self.compat([job('core-short')]), '')
+
+
 class RealTableTest(unittest.TestCase):
   """Against the shard table as it actually is."""
 

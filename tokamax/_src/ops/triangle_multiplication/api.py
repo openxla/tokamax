@@ -20,6 +20,7 @@ from typing import Any, Final, Literal
 
 import immutabledict
 import jax
+from jax.extend import backend
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.triangle_multiplication import base
@@ -30,6 +31,35 @@ _IMPLEMENTATIONS: dict[str, Callable[..., Any]] = dict(
     xla=base.TriangleMultiplication()
 )
 _DEFAULT_IMPLEMENTATIONS: tuple[Implementation, ...] = ("xla",)  # pylint: disable=invalid-name
+
+try:
+  from tokamax._src.ops.triangle_multiplication import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["triton"] = triton.TritonTriangleMultiplication()
+  _DEFAULT_IMPLEMENTATIONS = ("triton",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.triangle_multiplication import pallas_mosaic_gpu as pl_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_gpu"] = (
+      pl_mgpu.PallasMosaicGpuTriangleMultiplication()
+  )
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
+
+try:
+  from tokamax._src.ops.triangle_multiplication import pallas_mosaic_tpu as pl_mtpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_tpu"] = (
+      pl_mtpu.PallasMosaicTpuTriangleMultiplication()
+  )
+  if "mosaic" not in _DEFAULT_IMPLEMENTATIONS:
+    _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS  # pylint: disable=invalid-name
+except ImportError:
+  pass
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(_IMPLEMENTATIONS)
@@ -92,7 +122,8 @@ def triangle_multiplication(
   Returns:
     The result of triangle multiplication of shape `[N, N, D]`.
   """
-  if implementation is None:
+  is_default = implementation is None
+  if is_default:
     implementation = _DEFAULT_IMPLEMENTATIONS
   elif isinstance(implementation, str):
     implementation = (implementation,)
@@ -105,7 +136,18 @@ def triangle_multiplication(
     if isinstance(impl, str):
       if impl not in supported_implementations:
         raise NotImplementedError(f"Implementation '{impl}' is not supported.")
+      if impl == "mosaic":
+        impl = (
+            "mosaic_gpu"
+            if "NVIDIA" in backend.get_default_device().device_kind
+            else "mosaic_tpu"
+        )
       if impl not in IMPLEMENTATIONS:
+        if is_default:
+          errors.append(
+              NotImplementedError(f"Implementation '{impl}' is not registered.")
+          )
+          continue
         raise ValueError(f"Unknown implementation: {impl}.")
       fn = IMPLEMENTATIONS[impl]
       sub_impl: base.Implementation | None = "xla" if impl == "xla" else None
@@ -131,6 +173,8 @@ def triangle_multiplication(
           implementation=sub_impl,
       )
     except NotImplementedError as e:
+      if len(implementation) == 1:
+        raise
       errors.append(e)
 
   raise ExceptionGroup("all implementations failed", errors)
