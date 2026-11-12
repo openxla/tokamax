@@ -720,6 +720,8 @@ def flash_attention_kernel(
     mask_function: MaskFunctionType | None,
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
+    q_block_offset: int = 0,
+    total_q_steps: int | None = None,
 ):
   del mask_next_ref
   float32 = jnp.float32
@@ -1015,7 +1017,9 @@ def flash_attention_kernel(
       global_kv_block_idx = j * (bkv // bkv_compute) + kv_compute_index
       canonical_q = config.active_dropout_block_q
       canonical_kv = config.active_dropout_block_kv
-      n_q_blocks = q_steps * (bq // canonical_q)
+      n_q_blocks = (q_steps if total_q_steps is None else total_q_steps) * (
+          bq // canonical_q
+      )
       n_kv_blocks = kv_steps * (bkv // canonical_kv)
       # One mask per stacked head, assembled into the (heads, bq, bkv) tile:
       # writing them in with `.at[head].set` would lower to a scatter, which
@@ -1027,7 +1031,7 @@ def flash_attention_kernel(
         head_mask = _dropout_mask_tile(
             prng_key_ref,
             head_idx=h * num_stacked_q_heads + head,
-            q_block_idx=i,
+            q_block_idx=q_block_offset + i,
             kv_block_idx=global_kv_block_idx,
             q_block_size=bq,
             kv_block_size=bkv_compute,
@@ -1135,10 +1139,37 @@ def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
   return math.ceil(math.prod(x.shape) * info(x.dtype).bits / 8)
 
 
+_SEGMENT_BITMASK_WORDS = 8
+_SEGMENT_BITMASK_BUCKETS = _SEGMENT_BITMASK_WORDS * 32
+# Leaves headroom below the 1 MiB TPU SMEM limit for bounds and compiler data.
+_MAX_SCALAR_PREFETCH_BYTES = 576 * 1024
+
+
+def _segment_block_bitmask(segs: jax.Array) -> jax.Array:
+  """Returns a `[num_blocks, 8]` uint32 modulo-256 bitmask per block."""
+  buckets = segs.astype(jnp.int32) & (_SEGMENT_BITMASK_BUCKETS - 1)
+  words = buckets >> 5
+  bits = jnp.left_shift(jnp.uint32(1), (buckets & 31).astype(jnp.uint32))
+  word_eq = words[..., None] == jnp.arange(
+      _SEGMENT_BITMASK_WORDS, dtype=jnp.int32
+  )
+  return jnp.bitwise_or.reduce(
+      jnp.where(word_eq, bits[..., None], jnp.uint32(0)), axis=-2
+  )
+
+
+def _onehot_lookup_words(table: jax.Array, idx: jax.Array) -> jax.Array:
+  """Indexes `table` along axis `-2` via bitwise-OR to avoid XLA gathers."""
+  onehot = idx[..., None] == jnp.arange(table.shape[-2], dtype=idx.dtype)
+  return jnp.bitwise_or.reduce(
+      jnp.where(onehot[..., None], table, jnp.uint32(0)), axis=-2
+  )
+
+
 def _segment_block_overlap(
     segment_ids: base.SegmentIds,
-    q_idx: jax.Array,
-    kv_idx: jax.Array,
+    q_idx: jax.Array | None = None,
+    kv_idx: jax.Array | None = None,
     *,
     q_blocks: int,
     kv_blocks: int,
@@ -1147,35 +1178,52 @@ def _segment_block_overlap(
 ) -> jax.Array:
   """Returns whether each `(q_idx, kv_idx)` tile can share any segment id.
 
-  Conservative: it tests whether the `[min, max]` id intervals of the two
-  blocks intersect. If the blocks really do share an id, that id lies in both
-  intervals, so the intervals must intersect. There are therefore no false
-  negatives and pruning on this result never drops a contributing tile. False
-  positives (e.g. q ids `{1, 5}` against kv id `{3}`) merely leave a fully
-  masked tile scheduled. This argument does not assume ids are sorted.
-
-  The result is reduced over any `vmap` batch dimension so the whole batch
-  shares one schedule, which is what keeps `pallas_call` batch fusion intact.
+  Conservative: intersects the `[min, max]` id intervals and modulo-256 id
+  bitmasks of the two blocks without assuming sorted ids. Reduction over any
+  `vmap` batch dimension keeps `MaskInfo` unbatched so `pallas_call` batch
+  fusion stays intact.
 
   Args:
     segment_ids: Unbatched q / kv segment ids.
-    q_idx: Integer array of q block indices.
-    kv_idx: Integer array of kv block indices, broadcastable against `q_idx`.
+    q_idx: Optional integer array of q block indices. When both `q_idx` and
+      `kv_idx` are None, returns the dense `[q_blocks, kv_blocks]` overlap grid.
+    kv_idx: Optional integer array of kv block indices, broadcastable against
+      `q_idx`.
     q_blocks: Number of q blocks, `q_seq_len // bq`.
     kv_blocks: Number of kv blocks, `kv_seq_len // bkv`.
     bq: q block size.
     bkv: kv block size.
 
   Returns:
-    A boolean array of the broadcast shape of `q_idx` and `kv_idx`.
+    A boolean array of shape `(q_blocks, kv_blocks)` when `q_idx` and `kv_idx`
+    are None, or the broadcast shape of `q_idx` and `kv_idx`.
   """
   q_segs = segment_ids.q.reshape(q_blocks, bq)  # pyrefly: ignore[missing-attribute]
   kv_segs = segment_ids.kv.reshape(kv_blocks, bkv)  # pyrefly: ignore[missing-attribute]
-  q_lo = _onehot_lookup(jnp.min(q_segs, axis=-1), q_idx)
-  q_hi = _onehot_lookup(jnp.max(q_segs, axis=-1), q_idx)
-  kv_lo = _onehot_lookup(jnp.min(kv_segs, axis=-1), kv_idx)
-  kv_hi = _onehot_lookup(jnp.max(kv_segs, axis=-1), kv_idx)
-  return _unvmap_any_p.bind((q_hi >= kv_lo) & (kv_hi >= q_lo))
+  q_lo = jnp.min(q_segs, axis=-1)
+  q_hi = jnp.max(q_segs, axis=-1)
+  kv_lo = jnp.min(kv_segs, axis=-1)
+  kv_hi = jnp.max(kv_segs, axis=-1)
+  q_masks = _segment_block_bitmask(q_segs)
+  kv_masks = _segment_block_bitmask(kv_segs)
+  if q_idx is None and kv_idx is None:
+    interval_overlap = (q_hi[:, None] >= kv_lo[None, :]) & (
+        kv_hi[None, :] >= q_lo[:, None]
+    )
+    bitmask_overlap = jnp.any(
+        (q_masks[:, None, :] & kv_masks[None, :, :]) != 0, axis=-1
+    )
+  else:
+    assert q_idx is not None and kv_idx is not None
+    q_lo = _onehot_lookup(q_lo, q_idx)
+    q_hi = _onehot_lookup(q_hi, q_idx)
+    kv_lo = _onehot_lookup(kv_lo, kv_idx)
+    kv_hi = _onehot_lookup(kv_hi, kv_idx)
+    q_masks = _onehot_lookup_words(q_masks, q_idx)
+    kv_masks = _onehot_lookup_words(kv_masks, kv_idx)
+    interval_overlap = (q_hi >= kv_lo) & (kv_hi >= q_lo)
+    bitmask_overlap = jnp.any((q_masks & kv_masks) != 0, axis=-1)
+  return _unvmap_any_p.bind(interval_overlap & bitmask_overlap)
 
 
 def _onehot_lookup(table: jax.Array, idx: jax.Array) -> jax.Array:
@@ -1206,60 +1254,85 @@ def _refine_mask_info_with_segments(
     bq: int,
     bkv: int,
     is_dkv: bool,
+    keep_empty_rows: bool = False,
 ) -> tuple[
     MaskInfo,
     jax.Array | np.ndarray | None,
     jax.Array | np.ndarray | None,
 ]:
-  """Prunes `mask_info` tiles whose q and kv `segment_ids` ranges are disjoint."""
+  """Prunes `mask_info` tiles whose q and kv `segment_ids` are disjoint."""
   num_rows, num_cols = (
       (kv_blocks, q_blocks) if is_dkv else (q_blocks, kv_blocks)
   )
   if mask_info.active_rows is None:
     m_size = num_rows * num_cols
-    rows, cols = jnp.unravel_index(
-        jnp.arange(m_size, dtype=jnp.int32), (num_rows, num_cols)
+    idx = jnp.arange(m_size, dtype=jnp.int32)
+    rows_c, cols_c = jnp.unravel_index(idx, (num_rows, num_cols))
+    block_mask = (
+        jnp.full((m_size,), 2, dtype=jnp.int8)
+        if mask_info.block_mask is None
+        else jnp.asarray(mask_info.block_mask).reshape(m_size)
     )
-    num_active = jnp.array([m_size], dtype=jnp.int32)
+    valid_static = block_mask > 0
+    seg_grid = _segment_block_overlap(
+        segment_ids,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+    )
+    seg_any = (seg_grid.T if is_dkv else seg_grid).reshape(m_size)
+    active = valid_static & seg_any
+    row_has_active = jnp.any(active.reshape(num_rows, num_cols), axis=1)
+    row_has_active_per_tile = jnp.broadcast_to(
+        row_has_active[:, None], (num_rows, num_cols)
+    ).reshape(m_size)
+    is_first_in_row = (idx % num_cols) == 0
+    keep_empty = jnp.asarray(keep_empty_rows)
   else:
     rows = jnp.asarray(mask_info.active_rows, dtype=jnp.int32)
     cols = jnp.asarray(mask_info.active_cols, dtype=jnp.int32)
     m_size = rows.size
     num_active = jnp.asarray(mask_info.num_active_blocks, dtype=jnp.int32)
+    block_mask = (
+        jnp.full((m_size,), 2, dtype=jnp.int8)
+        if mask_info.block_mask is None
+        else jnp.asarray(mask_info.block_mask).reshape(m_size)
+    )
+    idx = jnp.arange(m_size, dtype=jnp.int32)
+    in_schedule = idx < num_active[0]
+    valid_static = (block_mask > 0) & in_schedule
+    rows_c = jnp.clip(rows, 0, num_rows - 1)
+    cols_c = jnp.clip(cols, 0, num_cols - 1)
+    seg_any = _segment_block_overlap(
+        segment_ids,
+        cols_c if is_dkv else rows_c,
+        rows_c if is_dkv else cols_c,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+    )
+    active = valid_static & seg_any
+    # Per-tile row lookups use `row_eq` and compaction uses `lax.sort` so no XLA
+    # gather is emitted (see `_onehot_lookup`).
+    row_eq = in_schedule[:, None] & (
+        rows_c[:, None] == jnp.arange(num_rows, dtype=jnp.int32)[None, :]
+    )
+    row_has_active = jnp.any(row_eq & active[:, None], axis=0)
+    first_in_row = jnp.argmax(row_eq, axis=0).astype(jnp.int32)
+    row_has_active_per_tile = jnp.any(row_eq & row_has_active[None, :], axis=1)
+    is_first_in_row = in_schedule & (
+        idx == jnp.sum(jnp.where(row_eq, first_in_row[None, :], 0), axis=1)
+    )
+    keep_empty = jnp.asarray(keep_empty_rows) & jnp.all(jnp.any(row_eq, axis=0))
 
-  block_mask = (
-      jnp.full((m_size,), 2, dtype=jnp.int8)
-      if mask_info.block_mask is None
-      else jnp.asarray(mask_info.block_mask).reshape(m_size)
-  )
-  idx = jnp.arange(m_size, dtype=jnp.int32)
-  valid_static = (block_mask > 0) & (idx < num_active[0])
-
-  rows_c = jnp.clip(rows, 0, num_rows - 1)
-  cols_c = jnp.clip(cols, 0, num_cols - 1)
-  seg_any = _segment_block_overlap(
-      segment_ids,
-      cols_c if is_dkv else rows_c,
-      rows_c if is_dkv else cols_c,
-      q_blocks=q_blocks,
-      kv_blocks=kv_blocks,
-      bq=bq,
-      bkv=bkv,
-  )
-
-  active = valid_static & seg_any
   # Every output row needs >= 1 scheduled step (with block_mask=0 if inactive)
   # so `bounds_start`/`bounds_end` still zero-initialize and write that row.
-  # Per-tile row lookups go through the `row_eq` one-hot rather than
-  # `table[rows_c]`, and compaction below uses `lax.sort` rather than
-  # `x[argsort(...)]`: this function emits no XLA gather (see `_onehot_lookup`).
-  row_eq = rows_c[:, None] == jnp.arange(num_rows, dtype=jnp.int32)[None, :]
-  row_has_active = jnp.any(row_eq & active[:, None], axis=0)
-  first_in_row = jnp.argmax(row_eq, axis=0).astype(jnp.int32)
   keep = active | (
-      (is_dkv | jnp.any(active))
-      & ~jnp.any(row_eq & row_has_active[None, :], axis=1)
-      & (idx == jnp.sum(jnp.where(row_eq, first_in_row[None, :], 0), axis=1))
+      (is_dkv | keep_empty | jnp.any(active))
+      & ~row_has_active_per_tile
+      & is_first_in_row
   )
 
   block_mask = jnp.where(active, block_mask, 0).astype(block_mask.dtype)
@@ -1285,12 +1358,12 @@ def _refine_mask_info_with_segments(
       jnp.where(is_active_slot, payload[0], -1)
   )
   row_dtype = (
-      jnp.int32
+      (jnp.int16 if num_rows <= np.iinfo(np.int16).max else jnp.int32)
       if mask_info.active_rows is None
       else mask_info.active_rows.dtype
   )
   col_dtype = (
-      jnp.int32
+      (jnp.int16 if num_cols <= np.iinfo(np.int16).max else jnp.int32)
       if mask_info.active_cols is None
       else mask_info.active_cols.dtype
   )
@@ -1304,6 +1377,78 @@ def _refine_mask_info_with_segments(
       ),
       bounds_start,
       bounds_end,
+  )
+
+
+def _refined_entry_bytes(
+    mask_info: MaskInfo, num_rows: int, num_cols: int
+) -> int:
+  """Returns scalar-prefetch bytes per schedule entry after refinement."""
+  row_bytes = 2 if num_rows <= np.iinfo(np.int16).max else 4
+  col_bytes = 2 if num_cols <= np.iinfo(np.int16).max else 4
+  next_bytes = (
+      0 if mask_info.mask_next is None else mask_info.mask_next.dtype.itemsize
+  )
+  block_mask_bytes = (
+      1 if mask_info.block_mask is None else mask_info.block_mask.dtype.itemsize
+  )
+  bounds_bytes = 4 + 4  # bounds_start + bounds_end (int32)
+  return row_bytes + col_bytes + next_bytes + bounds_bytes + block_mask_bytes
+
+
+def _q_blocks_per_chunk(
+    mask_info: MaskInfo,
+    q_blocks: int,
+    kv_blocks: int,
+    *,
+    is_dkv: bool,
+    max_bytes: int | None = None,
+) -> int:
+  """Returns max q blocks per call whose refined schedule fits in SMEM."""
+  if max_bytes is None:
+    max_bytes = _MAX_SCALAR_PREFETCH_BYTES
+  if mask_info.active_rows is not None or q_blocks <= 1 or kv_blocks <= 0:
+    return q_blocks
+  num_rows, num_cols = (
+      (kv_blocks, q_blocks) if is_dkv else (q_blocks, kv_blocks)
+  )
+  entry_bytes = _refined_entry_bytes(mask_info, num_rows, num_cols)
+  if q_blocks * kv_blocks * entry_bytes <= max_bytes:
+    return q_blocks
+  return max(1, min(q_blocks, max_bytes // (kv_blocks * entry_bytes)))
+
+
+def _slice_dense_mask_info_q(
+    mask_info: MaskInfo,
+    qb0: int,
+    qb1: int,
+    q_blocks: int,
+    kv_blocks: int,
+    bq: int,
+    *,
+    is_dkv: bool,
+) -> MaskInfo:
+  """Slices dense `mask_info` arrays to q block range `[qb0, qb1)`."""
+  assert mask_info.active_rows is None
+
+  def _slice_grid(
+      arr: jax.Array | np.ndarray | None,
+  ) -> jax.Array | np.ndarray | None:
+    if arr is None:
+      return None
+    if is_dkv:
+      return arr.reshape(kv_blocks, q_blocks)[:, qb0:qb1].reshape(-1)
+    return arr.reshape(q_blocks, kv_blocks)[qb0:qb1, :].reshape(-1)
+
+  q_seq = (
+      None
+      if mask_info.q_sequence is None
+      else mask_info.q_sequence[qb0 * bq : qb1 * bq]
+  )
+  return mask_info._replace(
+      block_mask=_slice_grid(mask_info.block_mask),
+      mask_next=_slice_grid(mask_info.mask_next),
+      q_sequence=q_seq,
   )
 
 
@@ -1324,10 +1469,8 @@ def _splash_attention_forward(
     prng_key: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
-  head_dim_v = v.shape[-1]
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
-  fuse_reciprocal = config.fuse_reciprocal or not save_residuals
   num_stacked_q_heads = config.num_stacked_q_heads
   prng_key = _check_dropout_args(config, prng_key)
 
@@ -1401,18 +1544,6 @@ def _splash_attention_forward(
           "Invalid shape for kv segment_ids: "
           f"{segment_ids.kv.shape}. Expected: {(kv_seq_len,)}"
       )
-    mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
-        mask_info,
-        segment_ids,
-        q_blocks=q_seq_len // bq,
-        kv_blocks=kv_steps,
-        bq=bq,
-        bkv=bkv,
-        is_dkv=False,
-    )
-  else:
-    bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
-  dynamic_grid = mask_info.active_rows is not None
 
   if config.max_logit_const is not None and max_logit_value is not None:
     raise ValueError(
@@ -1428,6 +1559,128 @@ def _splash_attention_forward(
     max_logit_value = jnp.broadcast_to(
         jnp.atleast_1d(max_logit_value), (num_q_heads,)
     )
+
+  q_steps = q_seq_len // bq
+  if segment_ids is not None and q_seq_len % bq == 0:
+    chunk_q_steps = _q_blocks_per_chunk(
+        mask_info, q_steps, kv_steps, is_dkv=False
+    )
+    if chunk_q_steps < q_steps:
+      outs, lses, max_logits_list = [], [], []
+      for qb0 in range(0, q_steps, chunk_q_steps):
+        qb1 = min(qb0 + chunk_q_steps, q_steps)
+        q0, q1 = qb0 * bq, qb1 * bq
+        chunk_ret = _splash_attention_forward_single(
+            _slice_dense_mask_info_q(
+                mask_info, qb0, qb1, q_steps, kv_steps, bq, is_dkv=False
+            ),
+            q[:, q0:q1, :],
+            k,
+            v,
+            base.SegmentIds(segment_ids.q[q0:q1], segment_ids.kv),
+            sinks,
+            mask_value=mask_value,
+            is_mqa=is_mqa,
+            config=config,
+            save_residuals=save_residuals,
+            mask_function=mask_function,
+            fwd_mask_sparsity=fwd_mask_sparsity,
+            max_logit_value=max_logit_value,
+            pallas_prng_key=prng_key,
+            q_block_offset=qb0,
+            total_q_steps=q_steps,
+            apply_checkpoint=False,
+        )
+        if save_residuals:
+          chunk_out, chunk_stats = chunk_ret
+          outs.append(chunk_out)
+          lses.append(chunk_stats["logsumexp"])
+          max_logits_list.append(chunk_stats["max_logits"])
+        else:
+          outs.append(chunk_ret)
+      out = jnp.concatenate(outs, axis=1)
+      logsumexp = jnp.concatenate(lses, axis=1) if save_residuals else None
+      max_logits = (
+          jnp.concatenate(max_logits_list, axis=1) if save_residuals else None
+      )
+      if config.residual_checkpoint_name is not None:
+        out = ad_checkpoint.checkpoint_name(
+            out, name=config.residual_checkpoint_name
+        )
+        if logsumexp is not None:
+          logsumexp = ad_checkpoint.checkpoint_name(
+              logsumexp, name=config.residual_checkpoint_name
+          )
+      if save_residuals:
+        stats = {"logsumexp": logsumexp, "max_logits": max_logits}
+        return out, jax.tree.map(jax.lax.stop_gradient, stats)
+      return out
+
+  return _splash_attention_forward_single(
+      mask_info,
+      q,
+      k,
+      v,
+      segment_ids,
+      sinks,
+      mask_value=mask_value,
+      is_mqa=is_mqa,
+      config=config,
+      save_residuals=save_residuals,
+      mask_function=mask_function,
+      fwd_mask_sparsity=fwd_mask_sparsity,
+      max_logit_value=max_logit_value,
+      pallas_prng_key=prng_key,
+      apply_checkpoint=True,
+  )
+
+
+def _splash_attention_forward_single(
+    mask_info: MaskInfo,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    segment_ids: base.SegmentIds | None,
+    sinks: jax.Array | None,
+    *,
+    mask_value: float,
+    is_mqa: bool,
+    config: SplashConfig,
+    save_residuals: bool,
+    mask_function: MaskFunctionType | None,
+    fwd_mask_sparsity: float,
+    max_logit_value: jax.Array | None,
+    pallas_prng_key: jax.Array | None,
+    q_block_offset: int = 0,
+    total_q_steps: int | None = None,
+    apply_checkpoint: bool = True,
+) -> base.SplashCustomReturnType:
+  """Runs a single forward `pallas_call` for `q` (or one q chunk)."""
+  num_q_heads, q_seq_len, head_dim_qk = q.shape
+  head_dim_v = v.shape[-1]
+  bq, bkv = config.block_q, config.block_kv
+  bkv_compute = config.block_kv_compute
+  fuse_reciprocal = config.fuse_reciprocal or not save_residuals
+  num_stacked_q_heads = config.num_stacked_q_heads
+  num_kv_heads = 1 if is_mqa else k.shape[0]
+  q_heads_per_kv_head = num_q_heads // num_kv_heads
+  kv_seq_len = k.shape[-2]
+  kv_steps = kv_seq_len // bkv
+
+  if segment_ids is not None:
+    mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
+        mask_info,
+        segment_ids,
+        q_blocks=q_seq_len // bq,
+        kv_blocks=kv_steps,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=sinks is not None or save_residuals,
+    )
+  else:
+    bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
+  dynamic_grid = mask_info.active_rows is not None
 
   q_layout = config.q_layout
   k_layout = config.k_layout
@@ -1670,6 +1923,8 @@ def _splash_attention_forward(
             fuse_reciprocal=fuse_reciprocal,
             config=config,
             mask_function=mask_function,
+            q_block_offset=q_block_offset,
+            total_q_steps=total_q_steps,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=7,
@@ -1708,7 +1963,7 @@ def _splash_attention_forward(
         bounds_start,
         bounds_end,
         mask_info.block_mask,
-        prng_key,
+        pallas_prng_key,
         q if q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
         k if k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
         v if v_layout == QKVLayout.HEAD_DIM_MINOR else v.mT,
@@ -1751,7 +2006,7 @@ def _splash_attention_forward(
     # out of the kernel.
     assert fuse_reciprocal
 
-  if config.residual_checkpoint_name is not None:
+  if apply_checkpoint and config.residual_checkpoint_name is not None:
     out = ad_checkpoint.checkpoint_name(
         out, name=config.residual_checkpoint_name
     )
@@ -1761,7 +2016,8 @@ def _splash_attention_forward(
       )
   if save_residuals:
     stats = {"logsumexp": logsumexp, "max_logits": max_logits}
-    stats = jax.tree.map(jax.lax.stop_gradient, stats)
+    if apply_checkpoint:
+      stats = jax.tree.map(jax.lax.stop_gradient, stats)
     return out, stats
   return out
 
@@ -2064,6 +2320,8 @@ def _flash_attention_dkv_kernel(
     q_heads_per_kv_head: int,
     config: SplashConfig,
     use_vmem_dq_reduction: bool = False,
+    q_block_offset: int = 0,
+    total_q_steps: int | None = None,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -2321,12 +2579,14 @@ def _flash_attention_dkv_kernel(
       global_kv_block_idx = kv_index * (bkv // bkv_compute) + i
       canonical_q = config.active_dropout_block_q
       canonical_kv = config.active_dropout_block_kv
-      n_q_blocks = q_steps * (bq // canonical_q)
+      n_q_blocks = (q_steps if total_q_steps is None else total_q_steps) * (
+          bq // canonical_q
+      )
       n_kv_blocks = kv_steps * (bkv // canonical_kv)
       dropout_scale = _dropout_mask_tile(
           prng_key_ref,
           head_idx=q_head,
-          q_block_idx=q_index,
+          q_block_idx=q_block_offset + q_index,
           kv_block_idx=global_kv_block_idx,
           q_block_size=bq,
           kv_block_size=bkv_compute,
@@ -2478,27 +2738,12 @@ def _splash_attention_bwd_dkv(
     dkv_mask_sparsity: float,
     prng_key: jax.Array | None = None,
 ):
-  num_q_heads, q_seq_len, head_dim_qk = q.shape
-  kv_seq_len, head_dim_v = v.shape[-2:]
+  num_q_heads, q_seq_len, _ = q.shape
+  kv_seq_len = v.shape[-2]
   num_kv_heads = 1 if is_mqa else k.shape[0]
   prng_key = _check_dropout_args(config, prng_key)
   kv_steps = kv_seq_len // bkv
   q_steps = q_seq_len // bq
-  q_heads_per_kv_head = num_q_heads // num_kv_heads
-
-  if segment_ids is not None:
-    mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
-        mask_info,
-        segment_ids,
-        q_blocks=q_steps,
-        kv_blocks=kv_steps,
-        bq=bq,
-        bkv=bkv,
-        is_dkv=True,
-    )
-  else:
-    bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
-  dynamic_grid = mask_info.active_rows is not None
 
   if bq > q_seq_len:
     raise ValueError(f"{bq=} should not be greater than {q_seq_len=}")
@@ -2520,6 +2765,116 @@ def _splash_attention_bwd_dkv(
         f"Expected 'key' {k.shape} and 'value' {v.shape} to have the same "
         "leading dimensions."
     )
+
+  if segment_ids is not None and q_seq_len % bq == 0:
+    chunk_q_steps = _q_blocks_per_chunk(
+        mask_info, q_steps, kv_steps, is_dkv=True
+    )
+    if chunk_q_steps < q_steps:
+      dqs = []
+      dk_acc = dv_acc = None
+      for qb0 in range(0, q_steps, chunk_q_steps):
+        qb1 = min(qb0 + chunk_q_steps, q_steps)
+        q0, q1 = qb0 * bq, qb1 * bq
+        dq_chunk, dk_chunk, dv_chunk = _splash_attention_bwd_dkv_single(
+            q[:, q0:q1, :],
+            k,
+            v,
+            base.SegmentIds(segment_ids.q[q0:q1], segment_ids.kv),
+            logsumexp[:, q0:q1],
+            do[:, q0:q1, :],
+            di[:, q0:q1],
+            bq=bq,
+            bkv=bkv,
+            bkv_compute=bkv_compute,
+            is_mqa=is_mqa,
+            mask_info=_slice_dense_mask_info_q(
+                mask_info, qb0, qb1, q_steps, kv_steps, bq, is_dkv=True
+            ),
+            mask_value=mask_value,
+            mask_function=mask_function,
+            config=config,
+            dkv_mask_sparsity=dkv_mask_sparsity,
+            pallas_prng_key=prng_key,
+            q_block_offset=qb0,
+            total_q_steps=q_steps,
+            keep_dkv_fp32=True,
+        )
+        dqs.append(dq_chunk)
+        dk_acc = dk_chunk if dk_acc is None else dk_acc + dk_chunk
+        dv_acc = dv_chunk if dv_acc is None else dv_acc + dv_chunk
+      assert dk_acc is not None and dv_acc is not None
+      return (
+          jnp.concatenate(dqs, axis=1),
+          dk_acc.astype(_unquantized_dtype(k)),
+          dv_acc.astype(_unquantized_dtype(v)),
+      )
+
+  return _splash_attention_bwd_dkv_single(
+      q,
+      k,
+      v,
+      segment_ids,
+      logsumexp,
+      do,
+      di,
+      bq=bq,
+      bkv=bkv,
+      bkv_compute=bkv_compute,
+      is_mqa=is_mqa,
+      mask_info=mask_info,
+      mask_value=mask_value,
+      mask_function=mask_function,
+      config=config,
+      dkv_mask_sparsity=dkv_mask_sparsity,
+      pallas_prng_key=prng_key,
+  )
+
+
+def _splash_attention_bwd_dkv_single(
+    q,
+    k,
+    v,
+    segment_ids,
+    logsumexp,
+    do,
+    di,
+    *,
+    bq: int,
+    bkv: int,
+    bkv_compute: int,
+    is_mqa: bool,
+    mask_info: MaskInfo,
+    mask_value: float,
+    mask_function: MaskFunctionType | None,
+    config: SplashConfig,
+    dkv_mask_sparsity: float,
+    pallas_prng_key: jax.Array | None = None,
+    q_block_offset: int = 0,
+    total_q_steps: int | None = None,
+    keep_dkv_fp32: bool = False,
+):
+  """Runs a single backward dKV `pallas_call` for `q` (or one q chunk)."""
+  num_q_heads, q_seq_len, head_dim_qk = q.shape
+  kv_seq_len, head_dim_v = v.shape[-2:]
+  num_kv_heads = 1 if is_mqa else k.shape[0]
+  kv_steps = kv_seq_len // bkv
+  q_steps = q_seq_len // bq
+  q_heads_per_kv_head = num_q_heads // num_kv_heads
+
+  if segment_ids is not None:
+    mask_info, bounds_start, bounds_end = _refine_mask_info_with_segments(
+        mask_info,
+        segment_ids,
+        q_blocks=q_steps,
+        kv_blocks=kv_steps,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=True,
+    )
+  else:
+    bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
+  dynamic_grid = mask_info.active_rows is not None
 
   if dynamic_grid:
 
@@ -2756,8 +3111,16 @@ def _splash_attention_bwd_dkv(
   else:
     in_specs += [None, None]
     dk, dv = None, None
-    dk_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(k)
-    dv_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(v)
+    dk_type = (
+        jnp.float32
+        if (reduce_dkv_over_q_heads or keep_dkv_fp32)
+        else _unquantized_dtype(k)
+    )
+    dv_type = (
+        jnp.float32
+        if (reduce_dkv_over_q_heads or keep_dkv_fp32)
+        else _unquantized_dtype(v)
+    )
 
   dk_shape = (
       (num_q_heads, kv_seq_len, head_dim_qk)
@@ -2788,6 +3151,8 @@ def _splash_attention_bwd_dkv(
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
       use_vmem_dq_reduction=use_vmem_dq_reduction,
+      q_block_offset=q_block_offset,
+      total_q_steps=total_q_steps,
   )
 
   kernel_name = get_kernel_name(
@@ -2817,7 +3182,7 @@ def _splash_attention_bwd_dkv(
       bounds_start,
       bounds_end,
       mask_info.block_mask,
-      prng_key,
+      pallas_prng_key,
       # inputs
       q if config.q_layout == QKVLayout.HEAD_DIM_MINOR else q.mT,
       k if config.k_layout == QKVLayout.HEAD_DIM_MINOR else k.mT,
@@ -2962,8 +3327,9 @@ def _splash_attention_bwd_dkv(
       dk = jnp.squeeze(dk, axis=0)
       dv = jnp.squeeze(dv, axis=0)
   dq = dq.astype(_unquantized_dtype(q))
-  dk = dk.astype(_unquantized_dtype(k))
-  dv = dv.astype(_unquantized_dtype(v))
+  if not keep_dkv_fp32:
+    dk = dk.astype(_unquantized_dtype(k))
+    dv = dv.astype(_unquantized_dtype(v))
   return dq, dk, dv
 
 
