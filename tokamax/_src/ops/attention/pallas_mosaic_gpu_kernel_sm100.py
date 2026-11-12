@@ -580,6 +580,24 @@ def flash_attention_kernel(
                   leader_tracked=q_leader_tracked,
                   predicate=jnp.asarray(ub > lb),
               )
+            else:
+              # Issue the Q load for this tile as soon as the previous tile's
+              # last Q@K.T completes. Issuing it from the MMA warp would delay
+              # it until that warp has also issued the previous tile's last
+              # P@V.
+              assert q_consumed is not None
+              plgpu.barrier_arrive(q_consumed, predicate=is_first_grid_iter)
+
+              @pl.when(ub > lb)
+              def load_q():
+                plgpu.barrier_wait(q_consumed)
+                plgpu.copy_gmem_to_smem(
+                    q_gmem.at[qs_cluster, hi],
+                    q_smem,
+                    barrier=q_produced,
+                    collective_axes=collective_axis,
+                    leader_tracked=q_leader_tracked,
+                )
 
             tma_load_kv_warp(k_gmem, k_smem, k_produced, k_consumed, 0)
 
@@ -612,55 +630,20 @@ def flash_attention_kernel(
                       mask_gmem.at[hi_, qs, ks], mask_smem, mask_produced
                   )
 
-          if config.persistent:
+          @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0) & (ub > lb))
+          def mma_warp():
+            plgpu.barrier_wait(q_produced)
+            qk_mma(lb)
 
-            @pl.when(warp_id == _MMA_WARP)
-            def tma_load_q_mma_warp():
+            @pl.loop(lb, ub - 1)
+            def kv_loop(ki):
+              qk_mma(ki + 1)
+              pv_mma(ki)
+
+            if config.persistent:
               assert q_consumed is not None
-              plgpu.barrier_arrive(q_consumed, predicate=is_first_grid_iter)
-              plgpu.async_prefetch(
-                  q_gmem.at[qs_cluster, hi],
-                  collective_axes=collective_axis,
-                  leader_tracked=q_leader_tracked,
-              )
-
-              @pl.when(ub > lb)
-              def do_block():
-                plgpu.barrier_wait(q_consumed)
-                plgpu.copy_gmem_to_smem(
-                    q_gmem.at[qs_cluster, hi],
-                    q_smem,
-                    barrier=q_produced,
-                    collective_axes=collective_axis,
-                    leader_tracked=q_leader_tracked,
-                )
-
-                @pl.when(cluster_idx == 0)
-                def do_mma():
-                  plgpu.barrier_wait(q_produced)
-                  qk_mma(lb)
-
-                  @pl.loop(lb, ub - 1)
-                  def kv_loop(ki):
-                    qk_mma(ki + 1)
-                    pv_mma(ki)
-
-                  plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
-                  pv_mma(ub - 1)
-
-          else:
-
-            @pl.when((warp_id == _MMA_WARP) & (cluster_idx == 0) & (ub > lb))
-            def mma_warp():
-              plgpu.barrier_wait(q_produced)
-              qk_mma(lb)
-
-              @pl.loop(lb, ub - 1)
-              def kv_loop(ki):
-                qk_mma(ki + 1)
-                pv_mma(ki)
-
-              pv_mma(ub - 1)
+              plgpu.tcgen05_commit_arrive(q_consumed, collective_axis)
+            pv_mma(ub - 1)
 
       @pl.when(wg == _SOFTMAX_WG)
       def softmax_wg():
