@@ -55,12 +55,35 @@ _F32_DOT_PRECISION_MAP: Final[dict[str, dict[Precision, str]]] = dict(
         Precision.HIGH: "TF32_TF32_F32",
         Precision.HIGHEST: "F32_F32_F32",
     },
+    # XLA only picks TF32 for f32 GEMMs on CUDA; on ROCm every precision is F32.
+    rocm={
+        Precision.DEFAULT: "F32_F32_F32",
+        Precision.HIGH: "F32_F32_F32",
+        Precision.HIGHEST: "F32_F32_F32",
+    },
     cpu={
         Precision.DEFAULT: "F32_F32_F32",
         Precision.HIGH: "F32_F32_F32",
         Precision.HIGHEST: "F32_F32_F32",
     },
 )
+
+
+def _gpu_precision_backend(device: jax.Device) -> str:
+  """Returns the `_F32_DOT_PRECISION_MAP` key for a GPU device."""
+  compute_capability = getattr(device, "compute_capability", None)
+  if compute_capability is None:
+    logging.warning(
+        "Unknown GPU compute capability when determining dot precision"
+        " preset; assuming compute_capability >= 8.0"
+    )
+    return "gpu"
+  try:
+    return "gpu_old" if float(compute_capability) < 8.0 else "gpu"
+  except ValueError:
+    # ROCm devices report their GFX architecture (e.g. "gfx950") instead of a
+    # CUDA compute capability.
+    return "rocm"
 
 
 CanonicalPrecision = (
@@ -120,15 +143,7 @@ def to_dot_algorithm_preset(
   dtype = jnp.result_type(a_dtype, b_dtype)
   backend = jax.default_backend()
   if backend == "gpu":
-    device = jax.devices()[0]
-    compute_capability = getattr(device, "compute_capability", None)
-    if compute_capability is None:
-      logging.warning(
-          "Unknown GPU compute capability when determining dot precision"
-          " preset; assuming compute_capability >= 8.0"
-      )
-    elif float(compute_capability) < 8.0:
-      backend = "gpu_old"
+    backend = _gpu_precision_backend(jax.devices()[0])
 
   match dtype:
     case jnp.float16:
