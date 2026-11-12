@@ -1809,6 +1809,79 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     for r, g in zip(grads(False), grads(True)):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
+  def test_dkv_segment_kv_trim(self):
+    """Trimming segment-dead kv bands of full dkv tiles changes no output."""
+    seq_len, num_heads, head_dim, block = 4096, 2, 128, 1024
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    shape = (2, num_heads, seq_len, head_dim)
+    q, k, v, do = (
+        (random.normal(key, shape) * 0.5).astype(jnp.bfloat16)
+        for key in (k1, k2, k3, k4)
+    )
+    # Documents end mid-block. In batch 0, q block 2 sees kv block 1 with band
+    # 0 dead (one band trimmed), and q block 3 sees kv blocks 1 and 2 with
+    # bands 0 and 1 dead (two bands trimmed).
+    seg = jnp.stack([
+        jnp.searchsorted(jnp.array(ends), jnp.arange(seq_len), side="right")
+        for ends in ((1300, 2700, 3500), (700, 2600, 3900))
+    ]).astype(jnp.int32)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def make_bwd(trim: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=3,
+          interpret=self.INTERPRET,
+          dkv_segment_kv_trim=trim,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q, k, v, do, seg):
+        segment_ids = base.SegmentIds(q=seg, kv=seg)
+        out, vjp = jax.vjp(
+            lambda q, k, v: attn(q, k, v, segment_ids=segment_ids), q, k, v
+        )
+        return (out, *vjp(do))
+
+      return jax.vmap(bwd)
+
+    def dkv_inputs(trim: bool):
+      jaxpr = jax.make_jaxpr(make_bwd(trim))(q, k, v, do, seg)
+      calls = []
+
+      def walk(jaxpr):
+        for e in jaxpr.eqns:
+          if e.primitive.name == "pallas_call":
+            calls.append(e)
+            continue
+          for p in e.params.values():
+            for sub in p if isinstance(p, (tuple, list)) else (p,):
+              sub = getattr(sub, "jaxpr", sub)  # ClosedJaxpr -> Jaxpr.
+              if hasattr(sub, "eqns"):
+                walk(sub)
+
+      walk(jaxpr.jaxpr)
+      return [x.aval for x in calls[-1].invars]
+
+    # The [min, max] segment id table: 4 q blocks and 16 kv bands of 256 rows.
+    def is_table(aval):
+      return aval.dtype == jnp.int32 and aval.shape[-2:] == (8, 16)
+
+    self.assertFalse(any(map(is_table, dkv_inputs(False))))
+    self.assertTrue(any(map(is_table, dkv_inputs(True))))
+
+    expected = jax.jit(make_bwd(False))(q, k, v, do, seg)
+    actual = jax.jit(make_bwd(True))(q, k, v, do, seg)
+    for name, r, g in zip(("out", "dq", "dk", "dv"), expected, actual):
+      with self.subTest(name):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
+
   @parameterized.product(
       mask_kind=("causal", "local", "full"),
       is_mqa=(False, True),
