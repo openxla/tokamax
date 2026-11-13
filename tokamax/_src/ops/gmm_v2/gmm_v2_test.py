@@ -189,6 +189,24 @@ def assert_arrays_all_close(actual, desired, *, atol=None, rtol=None):
   chex.assert_trees_all_close(actual, desired, atol=atol, rtol=rtol)
 
 
+def _poison_vmem_all_cores(num_rows: int = 8192) -> None:
+  """Fills VMEM scratch across all cores with NaNs to expose stale reads."""
+  num_cores = pltpu.get_tpu_info().num_cores
+
+  def _kernel(out_ref, scratch_ref):
+    scratch_ref[...] = jnp.full(scratch_ref.shape, jnp.nan, jnp.float32)
+    core_id = jax.lax.axis_index("core")
+    pltpu.sync_copy(scratch_ref.at[:8, :], out_ref.at[core_id])
+
+  out = pl.kernel(
+      _kernel,
+      out_type=pltpu.HBM((num_cores, 8, 128), jnp.float32),
+      scratch_types=[pltpu.VMEM((num_rows, 128), jnp.float32)],
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+  )()
+  jax.block_until_ready(out)
+
+
 class GmmTest(parameterized.TestCase):
 
   def setUp(self):
@@ -2369,6 +2387,62 @@ class GmmTest(parameterized.TestCase):
 
     assert actual.shape == (batch_size, out_size)
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
+
+  @parameterized.product(
+      rhs_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      in_size_and_blocks=[(1536, 3), (1280, 5)],
+      maybe_quantize_lhs=[False, True],
+  )
+  def test_partial_k_tile_skips_stale_rhs_scale(
+      self, rhs_dtype, in_size_and_blocks, maybe_quantize_lhs
+  ):
+    """Partial K tail tiles skip uninitialized rhs_scale blocks (b/576348326)."""
+    if (
+        rhs_dtype == jnp.float8_e4m3fn
+        and pltpu.get_tpu_info().generation <= 5
+    ):
+      self.skipTest("FP8 is only supported after TPU generation 5")
+    in_size, num_scale_blocks = in_size_and_blocks
+    batch_size, out_size, num_groups = 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(42), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
+    rhs = (
+        jax.random.normal(k1, (num_groups, in_size, out_size), jnp.float32)
+        * 4.0
+    ).astype(rhs_dtype)
+    rhs_scale = (
+        jnp.abs(
+            jax.random.normal(
+                k2, (num_groups, num_scale_blocks, 1, out_size), jnp.float32
+            )
+        )
+        * 0.02
+    )
+    group_sizes = jnp.array([64, 64, 64, 64], dtype=jnp.int32)
+    # tile_k=1024 does not divide in_size (valid_k=512 or 256 on final K step),
+    # leaving trailing sub-blocks in rhs_scale VMEM uninitialized on step 1.
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=1024, tile_n=256, bucket_base=128
+    )
+
+    _poison_vmem_all_cores()
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertFalse(bool(jnp.any(jnp.isnan(actual))))
+    expected = reference_gmm(
+        lhs, rhs, group_sizes, rhs_scale=rhs_scale
+    ).astype(jnp.bfloat16)
+    if maybe_quantize_lhs:
+      chex.assert_trees_all_close(actual, expected, atol=6e-1, rtol=6e-1)
+    else:
+      assert_arrays_all_close(actual, expected)
 
 
 _VMEM_LIMIT_BYTES = int(64 * 1024 * 1024 * 0.9)

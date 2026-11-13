@@ -653,7 +653,12 @@ def inner_kernel(
       rhs_qbs = cfgs.tiles.tile_k
 
     valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+    tile_k_end = cfgs.tiles.tile_k
     if is_last_k_step and valid_k != 0:
+      # Bound the K matmul loops to valid_k on partial tail tiles: trailing
+      # rhs_scale rows in VMEM are leftover data and can be NaN, so even
+      # masking invalid lhs/rhs to 0 would still produce 0 * NaN = NaN.
+      tile_k_end = valid_k
       # `lhs` needs to be masked over k-axis iff `lhs` contains `jnp.nan`s
       # Otherwise, only masking `rhs` to zeros is sufficient.
       mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1) < valid_k
@@ -671,7 +676,7 @@ def inner_kernel(
         col_size = end_n - start_n
 
         acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-        for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
+        for start_k in range(0, tile_k_end, rhs_qbs):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)  # pyrefly: ignore[unsupported-operation]
 
           block_acc = jnp.matmul(
@@ -737,7 +742,7 @@ def inner_kernel(
         col_size = end_n - start_n
 
         acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-        for start_k in range(0, cfgs.tiles.tile_k, q_block_size):  # pyrefly: ignore[bad-argument-type]
+        for start_k in range(0, tile_k_end, q_block_size):  # pyrefly: ignore[bad-argument-type]
           end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)  # pyrefly: ignore[unsupported-operation]
 
           block_lhs = tiled_lhs[:, start_k:end_k]
@@ -771,10 +776,11 @@ def inner_kernel(
             block_rhs = block_rhs.astype(lhs_q_dtype)
 
           block_len = end_k - start_k
+          sub_limit = min(block_len, tile_k_end - start_k)
           # Initialize to None rather than jnp.zeros to avoid emitting an extra
           # VPU add instruction on the first sub-block in Pallas/Mosaic lowering
           block_acc = acc_n if ext_lhs_scale_const_k else None
-          for sub_k in range(0, block_len, step_k):  # pyrefly: ignore[bad-argument-type]
+          for sub_k in range(0, sub_limit, step_k):  # pyrefly: ignore[bad-argument-type]
             sub_end_k = min(block_len, sub_k + step_k)  # pyrefly: ignore[unsupported-operation]
             sub_acc = jnp.matmul(
                 block_lhs_q[:, sub_k:sub_end_k],
