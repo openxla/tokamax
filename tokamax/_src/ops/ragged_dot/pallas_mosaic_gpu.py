@@ -28,7 +28,6 @@ from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_x8 as sm100_quant_x8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
@@ -202,10 +201,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
         if isinstance(lhs, jax.Array):
-          if config.post_scale:
-            fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
-          else:
-            fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
+          fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
     elif gpu_utils.is_sm80():
