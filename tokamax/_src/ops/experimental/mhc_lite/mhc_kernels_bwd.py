@@ -16,7 +16,6 @@
 
 import functools
 import math
-from typing import Any
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -125,9 +124,7 @@ def _post_bwd_2d_mxu_core(
   with jax.named_scope("vpu_subtile_cotangents_and_fold"):
     for sub_idx in range(num_subtiles):
       with jax.named_scope(f"subtile_{sub_idx}"):
-        s_slice = slice(None)
-        if num_subtiles > 1:
-          s_slice = slice(sub_idx * sub_tokens, (sub_idx + 1) * sub_tokens)
+        s_slice = slice(sub_idx * sub_tokens, (sub_idx + 1) * sub_tokens)
         with jax.named_scope("load_subtile_inputs"):
           dy_sub = dy_sub_fn(s_slice)
           l_sub = layer_output_ref[s_slice, :].astype(jnp.float32)
@@ -179,21 +176,29 @@ def _post_bwd_2d_mxu_core(
                 jnp.concatenate(s_res_sub_by_j[j], axis=1)
             )
 
-  # Stage B (MXU num_lanes -> 1 systolic contraction):
+  # Stage B (MXU 128 -> 1 systolic contraction):
   # dh_post = S_tilde_post @ U_post
   # dH_res = sum_j (S_tilde_res^(j) @ U_res^(j))
   with jax.named_scope("mxu_systolic_gate_reductions"):
-
-    def _mxu_reduce(rows: list[jax.Array], u_mat: jax.Array) -> jax.Array:
-      stacked = rows[0] if num_subtiles == 1 else jnp.concatenate(rows, axis=0)
-      return jnp.dot(stacked, u_mat, preferred_element_type=jnp.float32)
-
     with jax.named_scope("mxu_d_h_post"):
-      d_h_post_ref[...] = _mxu_reduce(s_post_rows, u_post_bf16)
+      d_h_post_all = jnp.dot(
+          jnp.concatenate(s_post_rows, axis=0),
+          u_post_bf16,
+          preferred_element_type=jnp.float32,
+      )
+      d_h_post_ref[...] = d_h_post_all
     with jax.named_scope("mxu_d_residual"):
-      d_res_all = _mxu_reduce(s_res_rows_by_j[0], u_res_mats[0])
+      d_res_all = jnp.dot(
+          jnp.concatenate(s_res_rows_by_j[0], axis=0),
+          u_res_mats[0],
+          preferred_element_type=jnp.float32,
+      )
       for j in range(1, streams):
-        d_res_all = d_res_all + _mxu_reduce(s_res_rows_by_j[j], u_res_mats[j])
+        d_res_all = d_res_all + jnp.dot(
+            jnp.concatenate(s_res_rows_by_j[j], axis=0),
+            u_res_mats[j],
+            preferred_element_type=jnp.float32,
+        )
       d_residual_ref[...] = d_res_all.astype(d_residual_ref.dtype)
 
 
@@ -243,28 +248,31 @@ def _zero_pre_bwd_accumulators(d_phi_ref, d_ab_ref) -> None:
 def _pre_bwd_core(
     streams: int,
     embedding: int,
-    rms_epsilon: float,
+    config: common.MhcKernelConfig,
     block_tokens: int,
     step: jax.Array,
     x_ref,
     phi_ref,
     gate_ab_ref,
     permutations_ref,
+    h_pre_ref,
     d_layer_input_ref,
     d_h_post_ref,
     d_residual_ref,
     d_phi_ref,
     d_ab_ref,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-  """Shared pre-branch backward core accumulating parameter gradients."""
-  # Differentiates the pre-branch forward equations (with folded weight matrix
-  # Phi = diag(gamma) [W_pre, W_post, W_res] of shape (F, C) where F = S * D
-  # and C = 2S + P = 32):
-  #   mu_t = (1/F) sum_f X[t, f]^2, r_t = (mu_t + eps_rms)^(-1/2)
-  #   R_t = X_t @ Phi, Z_hat_t = r_t * R_t, Z_t = alpha * Z_hat_t + b
-  #   h_pre = sigmoid(Z[:, :S]) + eps_pre, h_post = 2 * sigmoid(Z[:, S:2S])
-  #   w_res = softmax(Z[:, 2S:]), H_res = w_res @ P
-  #   L_in[t, e] = sum_i h_pre[t, i] * X[t, i, e]
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Shared pre-branch backward core accumulating parameter gradients.
+
+  Differentiates the pre-branch forward equations (with folded weight matrix
+  `Phi = diag(gamma) [W_pre, W_post, W_res]` of shape `(F, C)` where `F = S * D`
+  and `C = 2S + P = 32`):
+    `mu_t = (1/F) sum_f X[t, f]^2`, `r_t = (mu_t + eps_rms)^(-1/2)`
+    `R_t = X_t @ Phi`, `Z_hat_t = r_t * R_t`, `Z_t = alpha * Z_hat_t + b`
+    `h_pre = sigmoid(Z[:, :S]) + eps_pre`, `h_post = 2 * sigmoid(Z[:, S:2S])`
+    `w_res = softmax(Z[:, 2S:])`, `H_res = w_res @ P`
+    `L_in[t, e] = sum_i h_pre[t, i] * X[t, i, e]`
+  """
   with jax.named_scope("init_chunk_accumulators"):
     pl.when(step == 0)(
         functools.partial(_zero_pre_bwd_accumulators, d_phi_ref, d_ab_ref)
@@ -277,6 +285,7 @@ def _pre_bwd_core(
     num_permutations = phi_cols - 2 * streams
     gate_ab_value = gate_ab_ref[...]
     permutations_value = permutations_ref[...]
+    h_pre_value = h_pre_ref[...]
     d_layer_input_f32 = d_layer_input_ref[...].astype(jnp.float32)
     alpha_row = gate_ab_value[0:1, :]
     bias_row = gate_ab_value[1:2, :]
@@ -309,7 +318,7 @@ def _pre_bwd_core(
   # and Z_t = alpha * Z_hat_t + b.
   with jax.named_scope("remat_rms_norm_and_logits"):
     mean_square = mean_square_sum * (1.0 / flattened_size)
-    inv_rms = jax.lax.rsqrt(mean_square + rms_epsilon)
+    inv_rms = jax.lax.rsqrt(mean_square + config.rms_epsilon)
     projected = raw_projected * inv_rms
     logits = projected * alpha_row + bias_row
 
@@ -358,10 +367,11 @@ def _pre_bwd_core(
         axis=0,
     )
 
-  # Step 5: Folded weight & RMSNorm scale gradients:
+  # Step 5: Folded weight & RMSNorm input gradients:
   # dZ_hat = alpha * dZ, dR = r_t * dZ_hat, dPhi += X^T @ dR,
-  # scale_x = -(r_t^2 / F) * sum_c dZ_hat[t, c] * Z_hat[t, c].
-  with jax.named_scope("accum_d_phi_and_scale_x"):
+  # scale_x = -(r_t^2 / F) * sum_c dZ_hat[t, c] * Z_hat[t, c],
+  # dX_proj = dR @ Phi^T.
+  with jax.named_scope("accum_d_phi_and_dx_proj"):
     d_projected = d_logits * alpha_row
     d_raw_projected = d_projected * inv_rms
     with jax.named_scope("mxu_accum_d_phi"):
@@ -376,48 +386,19 @@ def _pre_bwd_core(
           * (inv_rms * inv_rms)
           * (1.0 / flattened_size)
       )
-  return phi_value, d_raw_projected, scale_x
-
-
-def _pre_bwd_dx_streams(
-    streams: int,
-    embedding: int,
-    phi_value: jax.Array,
-    d_raw_projected: jax.Array,
-    scale_x: jax.Array,
-    x_ref,
-    h_pre_ref,
-    d_layer_input_ref,
-    d_x_acc_ref,
-    out_dtype: jax.typing.DTypeLike,
-) -> list[jax.Array]:
-  """Computes per-stream `dX` tiles of shape `(block_tokens, embedding)`."""
-  h_pre_value = h_pre_ref[...]
-  d_layer_input_f32 = d_layer_input_ref[...].astype(jnp.float32)
-  dx_streams = []
-  for i in range(streams):
-    f_slice = slice(i * embedding, (i + 1) * embedding)
-    with jax.named_scope("mxu_dx_projected_stream"):
-      dx_proj_i = jnp.dot(
+    with jax.named_scope("mxu_dx_projected"):
+      d_x_projected = jnp.dot(
           d_raw_projected,
-          phi_value[f_slice, :].T,
+          phi_value.T,
           preferred_element_type=jnp.float32,
       )
-    dx_streams.append(
-        (
-            dx_proj_i
-            + d_x_acc_ref[:, f_slice]
-            + h_pre_value[:, i : i + 1] * d_layer_input_f32
-            + x_ref[:, f_slice] * scale_x
-        ).astype(out_dtype)
-    )
-  return dx_streams
+  return x_value, h_pre_value, d_layer_input_f32, scale_x, d_x_projected
 
 
 def _pre_bwd_fused_body(
     streams: int,
     embedding: int,
-    rms_epsilon: float,
+    config: common.MhcKernelConfig,
     block_tokens: int,
     step: pltpu.PipelineStep,
     x_ref,
@@ -440,37 +421,39 @@ def _pre_bwd_fused_body(
     `            + h_pre[t, i] * dL_in[t, e] + scale_x[t] * X[t, i, e]`
   """
   with jax.named_scope("pre_bwd_core"):
-    phi_value, d_raw_projected, scale_x = _pre_bwd_core(
-        streams,
-        embedding,
-        rms_epsilon,
-        block_tokens,
-        step.index[1],
-        x_ref,
-        phi_ref,
-        gate_ab_ref,
-        permutations_ref,
-        d_layer_input_ref,
-        d_h_post_ref,
-        d_residual_ref,
-        d_phi_ref,
-        d_ab_ref,
+    x_value, h_pre_value, d_layer_input_f32, scale_x, d_x_projected = (
+        _pre_bwd_core(
+            streams,
+            embedding,
+            config,
+            block_tokens,
+            step.index[1],
+            x_ref,
+            phi_ref,
+            gate_ab_ref,
+            permutations_ref,
+            h_pre_ref,
+            d_layer_input_ref,
+            d_h_post_ref,
+            d_residual_ref,
+            d_phi_ref,
+            d_ab_ref,
+        )
     )
+  # 4-term input gradient sum per stream i:
+  # dX[t, i, e] = (
+  #     dX_proj[t, i, e] + dX_acc[t, i, e]
+  #     + h_pre[t, i] * dL_in[t, e] + scale_x[t] * X[t, i, e]
+  # )
   with jax.named_scope("combine_dx_streams"):
-    dx_streams = _pre_bwd_dx_streams(
-        streams,
-        embedding,
-        phi_value,
-        d_raw_projected,
-        scale_x,
-        x_ref,
-        h_pre_ref,
-        d_layer_input_ref,
-        d_x_acc_ref,
-        d_x_ref.dtype,
-    )
-    for i, dx_i in enumerate(dx_streams):
-      d_x_ref[:, i * embedding : (i + 1) * embedding] = dx_i
+    for i in range(streams):
+      feature_slice = slice(i * embedding, (i + 1) * embedding)
+      d_x_ref[:, feature_slice] = (
+          d_x_projected[:, feature_slice]
+          + d_x_acc_ref[:, feature_slice]
+          + h_pre_value[:, i : i + 1] * d_layer_input_f32
+          + x_value[:, feature_slice] * scale_x
+      ).astype(d_x_ref.dtype)
 
 
 def _chunk_token_index_map(
@@ -581,24 +564,19 @@ def _run_bwd_chunk_pipeline(
     body_fn,
     tokens: int,
     block_tokens: int,
-    bwd_num_chunks: int,
     phi: jax.Array,
     weights: common.MhcWeights,
     permutations: jax.Array,
     token_args: tuple[jax.Array, ...],
-    token_out_shapes_dtypes: tuple[
-        tuple[tuple[int, ...], jax.typing.DTypeLike], ...
-    ],
+    token_out_shapes_dtypes: tuple[tuple[tuple[int, ...], jnp.dtype], ...],
     cost_estimate: pl.CostEstimate,
-    *,
-    vmem_limit_bytes: int,
-    interpret: bool,
+    config: common.MhcKernelConfig,
 ) -> tuple[tuple[jax.Array, ...], common.MhcWeights]:
   """Emits and executes a 2D chunk-parallel Pallas backward kernel."""
   common.validate_token_block_size(tokens, block_tokens, name="bwd_block_size")
   num_sublanes = common.get_tpu_info().num_sublanes
   num_blocks = tokens // block_tokens
-  num_chunks = math.gcd(num_blocks, bwd_num_chunks)
+  num_chunks = math.gcd(num_blocks, 4)
   blocks_per_chunk = num_blocks // num_chunks
   gate_ab, permutations_padded = _prepare_bwd_params(weights, permutations)
   flattened_size, phi_cols = phi.shape
@@ -646,9 +624,9 @@ def _run_bwd_chunk_pipeline(
         out_specs=(common.HBM_SPEC,) * len(out_shape),
         cost_estimate=cost_estimate,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit_bytes,
+            vmem_limit_bytes=config.vmem_limit_bytes,
         ),
-        interpret=interpret,
+        interpret=config.interpret,
     )(*in_args)
   d_weights = _finalize_weight_grads(
       d_phi_chunks, d_ab_chunks, weights, streams
@@ -659,7 +637,7 @@ def _run_bwd_chunk_pipeline(
 def _post_and_pre_bwd_fused_body(
     streams: int,
     embedding: int,
-    rms_epsilon: float,
+    config: common.MhcKernelConfig,
     block_tokens: int,
     sub_tokens: int,
     num_subtiles: int,
@@ -688,43 +666,56 @@ def _post_and_pre_bwd_fused_body(
 
   Since Stage-2 input is Stage-1 output (`X^(2) = Y^(1)`), the upstream
   cotangent for Stage-1 post_bwd (`dY^(1)[t, j, e] = dX^(2)[t, j, e]`) is
-  materialized per stream in `bfloat16` before `_post_bwd_2d_mxu_core` so all
-  Stage-2 `float32` temporaries end their live ranges early and avoid a
-  full-tensor HBM round-trip.
+  materialized on the fly per `sub_tokens` subtile in VMEM from the 4
+  `_pre_bwd_core` terms and fed directly into `_post_bwd_2d_mxu_core`,
+  avoiding a full-tensor HBM round-trip.
   """
   with jax.named_scope("stage2_pre_bwd_core"):
-    phi_value, d_raw_projected, scale_x_next = _pre_bwd_core(
+    (
+        x_next_value,
+        next_h_pre_value,
+        _,
+        scale_x_next,
+        d_x_next_projected,
+    ) = _pre_bwd_core(
         streams,
         embedding,
-        rms_epsilon,
+        config,
         block_tokens,
         step.index[1],
         x_next_ref,
         phi_ref,
         gate_ab_ref,
         permutations_ref,
+        next_h_pre_ref,
         d_next_layer_input_ref,
         d_next_h_post_ref,
         d_next_residual_ref,
         d_phi_ref,
         d_ab_ref,
     )
-  with jax.named_scope("materialize_stage1_dy_streams"):
-    dy_streams = _pre_bwd_dx_streams(
-        streams,
-        embedding,
-        phi_value,
-        d_raw_projected,
-        scale_x_next,
-        x_next_ref,
-        next_h_pre_ref,
-        d_next_layer_input_ref,
-        d_x_next_acc_ref,
-        x_next_ref.dtype,
-    )
 
+  # Materialize dY^(1)[t, j, e] = dX^(2)[t, j, e] on the fly per subtile in
+  # VMEM from the 4 _pre_bwd_core terms. Quantizing through x_next_ref.dtype
+  # (bf16) via .astype(x_next_ref.dtype).astype(jnp.float32) matches non-fused
+  # HBM boundary semantics and halves VMEM spill traffic.
   def _dy_sub_from_pre_bwd(s_slice: slice) -> list[jax.Array]:
-    return [dy_j[s_slice, :].astype(jnp.float32) for dy_j in dy_streams]
+    with jax.named_scope("materialize_stage1_dy_subtile"):
+      scale_sub = scale_x_next[s_slice, :]
+      next_h_pre_sub = next_h_pre_value[s_slice, :]
+      d_next_li_sub = d_next_layer_input_ref[s_slice, :].astype(jnp.float32)
+      x_next_sub_2d = x_next_value[s_slice, :]
+      dy_sub = []
+      for j in range(streams):
+        f_slice = slice(j * embedding, (j + 1) * embedding)
+        dy_j = (
+            d_x_next_projected[s_slice, f_slice]
+            + d_x_next_acc_ref[s_slice, f_slice]
+            + next_h_pre_sub[:, j : j + 1] * d_next_li_sub
+            + x_next_sub_2d[:, f_slice] * scale_sub
+        ).astype(x_next_ref.dtype)
+        dy_sub.append(dy_j.astype(jnp.float32))
+      return dy_sub
 
   with jax.named_scope("stage1_post_bwd_core"):
     _post_bwd_2d_mxu_core(
@@ -745,37 +736,21 @@ def _post_and_pre_bwd_fused_body(
 
 
 def pre_bwd(
-    config: Any,
+    config: common.MhcKernelConfig,
     residuals: tuple[
         tuple[jax.Array, jax.Array],
         tuple[jax.Array, common.MhcWeights, jax.Array],
     ],
     cotangents: tuple[jax.Array, common.MHCContext],
-    *,
-    rms_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
 ) -> tuple[jax.Array, common.MhcWeights, None]:
   """Custom-VJP backward rule for `pre`."""
   with jax.named_scope("mhc_pre_bwd"):
+    config = common.resolve_config(config)
+    assert config.bwd_block_size is not None
     (phi, h_pre), (x, weights, permutations) = residuals
     d_layer_input, d_context = cotangents
     tokens, streams = h_pre.shape
     embedding = d_layer_input.shape[-1]
-    config, rms_eps, _, vmem_limit, interpret_flag = (
-        common.prepare_kernel_config(
-            config,
-            tokens,
-            streams,
-            embedding,
-            permutations.shape[0],
-            x.dtype,
-            is_bwd=True,
-            rms_epsilon=rms_epsilon,
-            vmem_limit_bytes=vmem_limit_bytes,
-            interpret=interpret,
-        )
-    )
     flattened_size = streams * embedding
     block_tokens = config.bwd_block_size
     x_in = x.reshape(tokens, flattened_size)
@@ -783,11 +758,10 @@ def pre_bwd(
     (d_x_out,), d_weights = _run_bwd_chunk_pipeline(
         "mhc_pre_bwd_fused",
         functools.partial(
-            _pre_bwd_fused_body, streams, embedding, rms_eps, block_tokens
+            _pre_bwd_fused_body, streams, embedding, config, block_tokens
         ),
         tokens,
         block_tokens,
-        config.bwd_num_chunks,
         phi,
         weights,
         permutations,
@@ -803,62 +777,64 @@ def pre_bwd(
         cost_estimate=common.pre_cost(
             tokens, streams, embedding, permutations.shape[0], is_bwd=True
         ),
-        vmem_limit_bytes=vmem_limit,
-        interpret=interpret_flag,
+        config=config,
     )
     return d_x_out.reshape(x.shape), d_weights, None
 
 
 def post_bwd(
-    config: Any,
+    config: common.MhcKernelConfig,
     saved: tuple[jax.Array, common.MHCContext],
     d_output: jax.Array,
-    *,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
 ) -> tuple[jax.Array, common.MHCContext]:
   """Custom-VJP backward rule for `post`."""
+  config = common.resolve_config(config)
+  assert config.bwd_block_size is not None
   layer_output, context = saved
   x, h_post, residual = context.x, context.h_post, context.residual
   embedding = layer_output.shape[-1]
   tokens = layer_output.size // embedding
   streams = h_post.shape[-1]
-  config, _, _, vmem_limit, interpret_flag = common.prepare_kernel_config(
-      config,
-      tokens,
-      streams,
-      embedding,
-      24,
-      x.dtype,
-      is_bwd=True,
-      vmem_limit_bytes=vmem_limit_bytes,
-      interpret=interpret,
-  )
+  flattened_size = streams * embedding
   block_tokens = config.bwd_block_size
   common.validate_token_block_size(tokens, block_tokens, name="bwd_block_size")
-  sub_tokens = math.gcd(block_tokens, config.bwd_sub_tokens)
-  in_args = (
-      x.reshape(tokens, streams * embedding),
-      layer_output.reshape(tokens, embedding),
-      h_post.reshape(tokens, streams),
-      residual.reshape(tokens, streams * streams),
-      d_output.reshape(tokens, streams * embedding),
+  sub_tokens = math.gcd(block_tokens, 4 * common.get_tpu_info().num_sublanes)
+  num_subtiles = block_tokens // sub_tokens
+
+  x_in = x.reshape(tokens, flattened_size)
+  layer_output_in = layer_output.reshape(tokens, embedding)
+  h_post_in = h_post.reshape(tokens, streams)
+  residual_in = residual.reshape(tokens, streams * streams)
+  d_output_in = d_output.reshape(tokens, flattened_size)
+
+  spec_x_2d = common.token_block_spec((tokens, flattened_size), block_tokens)
+  spec_layer_output = common.token_block_spec((tokens, embedding), block_tokens)
+  spec_h_post = common.token_block_spec((tokens, streams), block_tokens)
+  spec_residual_2d = common.token_block_spec(
+      (tokens, streams * streams), block_tokens
   )
-  in_specs = tuple(
-      common.token_block_spec(arg.shape, block_tokens) for arg in in_args
-  )
-  out_args = in_args[:4]
   kernel_main = pltpu.emit_pipeline(
       lambda unused_step, *refs: _post_apply_bwd_2d_mxu_body(
           streams,
           embedding,
           sub_tokens,
-          block_tokens // sub_tokens,
+          num_subtiles,
           *refs,
       ),
       grid=(tokens // block_tokens,),
-      in_specs=in_specs,
-      out_specs=in_specs[:4],
+      in_specs=(
+          spec_x_2d,
+          spec_layer_output,
+          spec_h_post,
+          spec_residual_2d,
+          spec_x_2d,
+      ),
+      out_specs=(
+          spec_x_2d,
+          spec_layer_output,
+          spec_h_post,
+          spec_residual_2d,
+      ),
       dimension_semantics=(pltpu.PARALLEL,),
       _explicit_indices=True,
   )
@@ -866,17 +842,20 @@ def post_bwd(
     d_x, d_layer_output, d_h_post, d_residual = pl.pallas_call(
         kernel_main,
         name="mhc_post_apply_bwd",
-        out_shape=tuple(
-            jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in out_args
+        out_shape=(
+            jax.ShapeDtypeStruct((tokens, flattened_size), x.dtype),
+            jax.ShapeDtypeStruct((tokens, embedding), layer_output.dtype),
+            jax.ShapeDtypeStruct((tokens, streams), h_post.dtype),
+            jax.ShapeDtypeStruct((tokens, streams * streams), residual.dtype),
         ),
-        in_specs=(common.HBM_SPEC,) * len(in_args),
-        out_specs=(common.HBM_SPEC,) * len(out_args),
+        in_specs=(common.HBM_SPEC,) * 5,
+        out_specs=(common.HBM_SPEC,) * 4,
         cost_estimate=common.post_cost(tokens, streams, embedding, is_bwd=True),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit,
+            vmem_limit_bytes=config.vmem_limit_bytes,
         ),
-        interpret=interpret_flag,
-    )(*in_args)
+        interpret=config.interpret,
+    )(x_in, layer_output_in, h_post_in, residual_in, d_output_in)
   return (
       d_layer_output.reshape(layer_output.shape),
       common.MHCContext(
@@ -889,17 +868,13 @@ def post_bwd(
 
 
 def post_and_pre_bwd(
-    config: Any,
+    config: common.MhcKernelConfig,
     residuals: tuple[
         tuple[jax.Array, jax.Array],
         tuple[jax.Array, common.MHCContext],
         tuple[jax.Array, common.MhcWeights, jax.Array],
     ],
     cotangents: tuple[jax.Array, common.MHCContext],
-    *,
-    rms_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
 ) -> tuple[
     jax.Array,
     common.MHCContext,
@@ -908,6 +883,8 @@ def post_and_pre_bwd(
 ]:
   """Custom-VJP backward rule for `post_and_pre`."""
   with jax.named_scope("mhc_post_and_pre_bwd"):
+    config = common.resolve_config(config)
+    assert config.bwd_block_size is not None
     (
         (phi, next_h_pre),
         (layer_output, context),
@@ -917,25 +894,11 @@ def post_and_pre_bwd(
     embedding = layer_output.shape[-1]
     tokens = layer_output.size // embedding
     streams = h_post.shape[-1]
-    config, rms_eps, _, vmem_limit, interpret_flag = (
-        common.prepare_kernel_config(
-            config,
-            tokens,
-            streams,
-            embedding,
-            permutations.shape[0],
-            x.dtype,
-            is_bwd=True,
-            rms_epsilon=rms_epsilon,
-            vmem_limit_bytes=vmem_limit_bytes,
-            interpret=interpret,
-        )
-    )
     flattened_size = streams * embedding
     d_next_layer_input, d_next_context = cotangents
 
     block_tokens = config.bwd_block_size
-    sub_tokens = math.gcd(block_tokens, config.bwd_sub_tokens)
+    sub_tokens = math.gcd(block_tokens, 4 * common.get_tpu_info().num_sublanes)
     num_subtiles = block_tokens // sub_tokens
     x_in = x.reshape(tokens, flattened_size)
     x_next_in = x_next.reshape(tokens, flattened_size)
@@ -951,14 +914,13 @@ def post_and_pre_bwd(
             _post_and_pre_bwd_fused_body,
             streams,
             embedding,
-            rms_eps,
+            config,
             block_tokens,
             sub_tokens,
             num_subtiles,
         ),
         tokens,
         block_tokens,
-        config.bwd_num_chunks,
         phi,
         next_weights,
         permutations,
@@ -983,8 +945,7 @@ def post_and_pre_bwd(
         cost_estimate=common.post_and_pre_cost(
             tokens, streams, embedding, permutations.shape[0], is_bwd=True
         ),
-        vmem_limit_bytes=vmem_limit,
-        interpret=interpret_flag,
+        config=config,
     )
     return (
         d_layer_output_flat.reshape(layer_output.shape),

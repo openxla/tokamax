@@ -775,12 +775,12 @@ OPS: tuple[Op, ...] = (
             Impl(
                 name="xla",
                 backend=XLA,
-                module="_src/ops/experimental/mhc_lite/base.py",
+                module="_src/ops/experimental/mhc_lite/mhc_xla.py",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
-                module="_src/ops/experimental/mhc_lite/pallas_mosaic_tpu.py",
+                module="_src/ops/experimental/mhc_lite/mhc_kernels_fwd.py",
             ),
         ),
     ),
