@@ -2108,6 +2108,7 @@ def _flash_attention_dkv_kernel(
     q_heads_per_kv_head: int,
     config: SplashConfig,
     use_vmem_dq_reduction: bool = False,
+    group_dkv_by_kv_head: bool = False,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -2124,6 +2125,12 @@ def _flash_attention_dkv_kernel(
     kv_index = active_rows_ref[grid_idx].astype(jnp.int32)
     should_initialize = bounds_start_ref[grid_idx].astype(jnp.bool_)
     should_write = bounds_end_ref[grid_idx].astype(jnp.bool_)
+    if group_dkv_by_kv_head:
+      qh_local = pl.program_id(2)
+      should_initialize = jnp.logical_and(should_initialize, qh_local == 0)
+      should_write = jnp.logical_and(
+          should_write, qh_local == q_heads_per_kv_head - 1
+      )
     if use_vmem_dq_reduction:
       # Coalesce consecutive steps for the same q block in VMEM; non-contiguous
       # revisits accumulate via dq_alias in HBM.
@@ -2138,7 +2145,11 @@ def _flash_attention_dkv_kernel(
       )
     if dropout_rate:
       # Mirrors the fwd indices: rows are kv blocks and cols are q blocks here.
-      q_head = pl.program_id(0)
+      q_head = (
+          pl.program_id(0) * q_heads_per_kv_head + pl.program_id(2)
+          if group_dkv_by_kv_head
+          else pl.program_id(0)
+      )
       q_index = active_cols_ref[grid_idx].astype(jnp.int32)
     else:
       q_head = 0
@@ -2587,7 +2598,39 @@ def _splash_attention_bwd_dkv(
         "leading dimensions."
     )
 
-  if dynamic_grid:
+  use_vmem_dq_reduction = (
+      dynamic_grid or (num_q_heads == 1 and q_steps == 1)
+  ) and config.dq_reduction_steps == 1
+  # Group query heads under each KV head so dK/dV accumulate in VMEM without
+  # HBM input/output aliasing. `use_vmem_dq_reduction` needs consecutive
+  # `grid_idx` steps to stay on the same query head, so it keeps the 2D grid.
+  # TODO: The 2D grid still aliases `dk`/`dv` in HBM for GQA.
+  group_dkv_by_kv_head = (
+      dynamic_grid and q_heads_per_kv_head != 1 and not use_vmem_dq_reduction
+  )
+
+  if group_dkv_by_kv_head:
+
+    def unravel(f):
+      def index_map(kv_h, grid_idx, qh_local, rows_ref, cols_ref, *_):
+        h = kv_h * q_heads_per_kv_head + qh_local
+        j = to_i32(rows_ref[grid_idx])
+        i = to_i32(cols_ref[grid_idx])
+        return f(h, i, j)
+
+      return index_map
+
+    grid_size = mask_info.num_active_blocks[0]  # pyrefly: ignore[unsupported-operation]
+    grid = (num_kv_heads, grid_size, q_heads_per_kv_head)
+
+    def mask_index_map(
+        kv_h, grid_idx, qh_local, rows_ref, cols_ref, mask_next_ref=None, *_
+    ):
+      del kv_h, qh_local, rows_ref, cols_ref  # Unused.
+      next_m = to_i32(mask_next_ref[grid_idx])  # pyrefly: ignore[unsupported-operation]
+      return next_m, 0, 0
+
+  elif dynamic_grid:
 
     def unravel(f):
       def index_map(h, grid_idx, rows_ref, cols_ref, *_):
@@ -2620,16 +2663,21 @@ def _splash_attention_bwd_dkv(
   )
   o_index_map = unravel(lambda h, i, j: (h, i, 0))
 
-  def create_kv_index_map(layout):
-    def index_map(h, i, j, *_):
-      del i  # Unused.
-      prefix = () if is_mqa else (_div(h, q_heads_per_kv_head),)
-      return from_head_minor((*prefix, j, 0), layout)
+  if group_dkv_by_kv_head:
+    unravel_kv = lambda f: lambda kv_h, grid_idx, qh_local, rows_ref, *_: f(
+        () if is_mqa else (kv_h,), to_i32(rows_ref[grid_idx])
+    )
+  else:
+    unravel_kv = lambda f: unravel(
+        lambda h, i, j: f(() if is_mqa else (_div(h, q_heads_per_kv_head),), j)
+    )
 
-    return index_map
-
-  k_index_map = unravel(create_kv_index_map(config.k_layout))
-  v_index_map = unravel(create_kv_index_map(config.v_layout))
+  k_index_map = unravel_kv(
+      lambda prefix, j: from_head_minor((*prefix, j, 0), config.k_layout)
+  )
+  v_index_map = unravel_kv(
+      lambda prefix, j: from_head_minor((*prefix, j, 0), config.v_layout)
+  )
 
   q_spec = pl.BlockSpec(
       from_head_minor((None, bq, head_dim_qk), config.q_layout), q_index_map
@@ -2652,33 +2700,28 @@ def _splash_attention_bwd_dkv(
       v_index_map,
   )
 
-  # On the dynamic grid (`grid = (num_q_heads, grid_size)`), GQA/MQA normally
-  # accumulates `dk`/`dv` across the `q_heads_per_kv_head` query heads in a KV
-  # group through an aliased HBM buffer (`dk_ref = dk_alias + dk_scratch`),
-  # cycling through `j = 0 .. kv_steps - 1` within each `q_head`. Pallas TPU's
-  # 2-deep input/output DMA pipeline requires at least 3 distinct blocks in that
-  # cycle (matching `dq_reduction_steps = 3`); when `kv_steps <= 2`, the next
-  # `q_head` prefetches `dk_alias` before the previous `q_head`'s store lands in
-  # HBM (or coalesces the load when `kv_steps == 1`). Write per-`q_head` outputs
-  # and reduce outside the kernel instead.
+  # On the 2D dynamic grid (`grid = (num_q_heads, grid_size)`), GQA/MQA
+  # accumulates `dk`/`dv` across query heads in a KV group via HBM aliasing,
+  # except when `kv_steps <= 2` where the 2-deep DMA pipeline would prefetch
+  # stale aliases across heads and must reduce per-`q_head` outputs afterward.
   reduce_dkv_over_q_heads = (
-      dynamic_grid and q_heads_per_kv_head != 1 and kv_steps <= 2
+      dynamic_grid
+      and not group_dkv_by_kv_head
+      and q_heads_per_kv_head != 1
+      and kv_steps <= 2
   )
   alias_dkv = (
-      dynamic_grid and q_heads_per_kv_head != 1 and not reduce_dkv_over_q_heads
+      dynamic_grid
+      and not group_dkv_by_kv_head
+      and q_heads_per_kv_head != 1
+      and not reduce_dkv_over_q_heads
   )
 
-  def create_dkv_index_map(h, i, j, *_):
-    del i  # Unused.
-    if reduce_dkv_over_q_heads:
-      prefix = (h,)
-    elif is_mqa:
-      prefix = ()
-    else:
-      prefix = (_div(h, q_heads_per_kv_head),)
-    return (*prefix, j, 0)
-
-  dkv_index_map = unravel(create_dkv_index_map)
+  dkv_index_map = (
+      unravel(lambda h, i, j: (h, j, 0))
+      if reduce_dkv_over_q_heads
+      else unravel_kv(lambda prefix, j: (*prefix, j, 0))
+  )
 
   dk_spec = pl.BlockSpec(
       (bkv, head_dim_qk)
@@ -2751,9 +2794,6 @@ def _splash_attention_bwd_dkv(
     q_sequence = None
     in_specs.append(None)
 
-  use_vmem_dq_reduction = (
-      dynamic_grid or (num_q_heads == 1 and q_steps == 1)
-  ) and config.dq_reduction_steps == 1
   q_blocks_are_contiguous = segment_ids is None and (
       config.dkv_q_blocks_are_contiguous
       or (
@@ -2784,11 +2824,17 @@ def _splash_attention_bwd_dkv(
     dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
     dq = jnp.zeros_like(dq_shape)
   elif dq_reduction_steps == 3:
-    dq_index_map = (
-        (lambda h, g, r, c, *_: (g % 3, h, to_i32(c[g]), 0))
-        if dynamic_grid
-        else unravel(lambda h, i, j: (j % 3, h, i, 0))
-    )
+    if group_dkv_by_kv_head:
+      dq_index_map = lambda kv_h, g, qh_local, r, c, *_: (
+          g % 3,
+          kv_h * q_heads_per_kv_head + qh_local,
+          to_i32(c[g]),
+          0,
+      )
+    elif dynamic_grid:
+      dq_index_map = lambda h, g, r, c, *_: (g % 3, h, to_i32(c[g]), 0)
+    else:
+      dq_index_map = unravel(lambda h, i, j: (j % 3, h, i, 0))
     dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
     dq_alias_spec = dq_spec
     dq_shape = jax.ShapeDtypeStruct((3, *q.shape), _unquantized_dtype(q))
@@ -2854,6 +2900,7 @@ def _splash_attention_bwd_dkv(
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
       use_vmem_dq_reduction=use_vmem_dq_reduction,
+      group_dkv_by_kv_head=group_dkv_by_kv_head,
   )
 
   kernel_name = get_kernel_name(
