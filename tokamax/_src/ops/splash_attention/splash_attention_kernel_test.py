@@ -1809,6 +1809,49 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     for r, g in zip(grads(False), grads(True)):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
+  @parameterized.parameters(False, True)
+  def test_sublane_residuals_bit_exact(self, fuse_reciprocal):
+    """Residual rows (block_q % 128 == 0) match lane-broadcast residuals.
+
+    block_q=64 keeps the forward residuals lane-broadcast; 128 stores them as
+    sublane rows. The output, stats, dq, dk and dv are bit-identical.
+    """
+    seq_len, num_heads = 1024, 2
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = random.normal(k1, (num_heads, seq_len, 128), jnp.bfloat16)
+    k = random.normal(k2, (num_heads, seq_len, 128), jnp.bfloat16)
+    v = random.normal(k3, (num_heads, seq_len, 128), jnp.bfloat16)
+    do = random.normal(k4, (num_heads, seq_len, 128), jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def run(bq):
+      config = splash.SplashConfig(
+          block_q=bq,
+          block_kv=256,
+          block_kv_compute=256,
+          block_q_dkv=256,
+          block_kv_dkv=256,
+          block_kv_dkv_compute=256,
+          use_fused_bwd_kernel=True,
+          residual_checkpoint_name="context",
+          fuse_reciprocal=fuse_reciprocal,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      attn_stats = splash.make_splash_mha_single_device(
+          mask, config=config, save_residuals=True
+      )
+
+      def fwd_bwd(q, k, v, do):
+        out, vjp = jax.vjp(attn, q, k, v)
+        _, stats = attn_stats(q, k, v)
+        return out, stats["logsumexp"], stats["max_logits"], *vjp(do)
+
+      return jax.jit(fwd_bwd)(q, k, v, do)
+
+    for r, o in zip(run(64), run(128)):
+      np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
   @parameterized.product(
       mask_kind=("causal", "local", "full"),
       is_mqa=(False, True),
