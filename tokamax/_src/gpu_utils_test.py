@@ -19,6 +19,10 @@ import jax
 from tokamax._src import gpu_utils
 
 
+# Pre-release VR200 drivers report "NVIDIA Graphics Device".
+_VR200_DEVICE_KINDS = ("VR200", "VR NVL72", "R200", "Graphics Device")
+
+
 class GpuUtilsTest(absltest.TestCase):
 
   def test_triton_support(self):
@@ -28,9 +32,13 @@ class GpuUtilsTest(absltest.TestCase):
   def test_mosaic_gpu_support(self):
     if jax.default_backend() != "gpu":
       self.assertFalse(gpu_utils.has_mosaic_gpu_support())
+      return
 
     device_kind = jax.devices()[0].device_kind
-    expected = any(k in device_kind for k in ("H100", "B200", "GB300"))
+    expected = any(
+        k in device_kind
+        for k in ("A100", "H100", "B200", "GB300", *_VR200_DEVICE_KINDS)
+    )
     self.assertEqual(gpu_utils.has_mosaic_gpu_support(), expected)
 
   def test_is_sm80(self):
@@ -47,7 +55,7 @@ class GpuUtilsTest(absltest.TestCase):
     device_kind = jax.devices()[0].device_kind
     self.assertEqual(
         gpu_utils.is_sm100(),
-        any(k in device_kind for k in ("B200", "GB300")),
+        any(k in device_kind for k in ("B200", "GB300", *_VR200_DEVICE_KINDS)),
     )
 
   def test_is_sm103(self):
@@ -61,6 +69,11 @@ class GpuUtilsTest(absltest.TestCase):
     self.assertTrue(gpu_utils.is_sm100(sm103_dev))
 
   def test_is_sm107(self):
+    device_kind = jax.devices()[0].device_kind
+    self.assertEqual(
+        gpu_utils.is_sm107(),
+        any(k in device_kind for k in _VR200_DEVICE_KINDS),
+    )
     sm100_dev = mock.Mock(platform="gpu", compute_capability="10.0")
     sm107_dev = mock.Mock(platform="gpu", compute_capability="10.7")
     self.assertFalse(gpu_utils.is_sm107(sm100_dev))
