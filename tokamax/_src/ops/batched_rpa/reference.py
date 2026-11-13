@@ -21,21 +21,25 @@ from jax import lax
 import jax.numpy as jnp
 
 
-def _cdiv(a: int | jax.Array, b: int | jax.Array) -> int | jax.Array:
-  return (a + b - 1) // b
+def _cdiv(
+    numerator: int | jax.Array, denominator: int | jax.Array
+) -> int | jax.Array:
+  return (numerator + denominator - 1) // denominator
 
 
 def _align_to(val: int, align: int) -> int:
   return (val + align - 1) // align * align
 
 
-def _merge_kv(k: jax.Array, v: jax.Array, kv_packing: int = 1) -> jax.Array:
+def _merge_kv(
+    k: jax.Array, val_tensor: jax.Array, kv_packing: int = 1
+) -> jax.Array:
   """Concatenate and format key and value tensors into 5D packed VREG slice."""
   max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
   actual_num_kv_heads_x2 = actual_num_kv_heads * 2
   head_dim_aligned = _align_to(actual_head_dim, 128)
   num_kv_heads_x2_aligned = _align_to(actual_num_kv_heads_x2, kv_packing)
-  kv_concat = jnp.concatenate([k, v], axis=-1).reshape(
+  kv_concat = jnp.concatenate([k, val_tensor], axis=-1).reshape(
       max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
   )
   kv_padded = jnp.pad(
@@ -55,6 +59,74 @@ def _merge_kv(k: jax.Array, v: jax.Array, kv_packing: int = 1) -> jax.Array:
   return kv_padded
 
 
+def _compute_single_token(
+    token_idx: jax.Array,
+    sequence_index: jax.Array,
+    query_token: jax.Array,
+    token_pos: jax.Array,
+    all_k: jax.Array,
+    all_v: jax.Array,
+    kv_lens: jax.Array,
+    sm_scale: float,
+    soft_cap: float | None,
+    use_causal_mask: bool,
+    sliding_window: int | None,
+    attention_sink: jax.Array | None,
+    quantize_p: bool,
+    kv_cache_dtype: Any,
+    out_dtype: Any,
+    max_kv_len: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes attention output and LSE for a single query token."""
+  del token_idx
+  query_f32 = query_token.astype(jnp.float32)
+  key_seq = all_k[sequence_index]
+  val_seq = all_v[sequence_index]
+
+  scores = (
+      jnp.einsum(
+          "hd,khd->hk", query_f32, key_seq, preferred_element_type=jnp.float32
+      )
+      * sm_scale
+  )
+
+  if soft_cap is not None:
+    scores = soft_cap * jnp.tanh(scores / soft_cap)
+
+  k_positions = jnp.arange(max_kv_len)
+  mask = k_positions < kv_lens[sequence_index]
+  if use_causal_mask:
+    mask = mask & (k_positions <= token_pos)
+  if sliding_window is not None:
+    mask = mask & (k_positions > token_pos - sliding_window)
+
+  scores = jnp.where(mask[None, :], scores, -1e30)
+  if attention_sink is not None:
+    sink = attention_sink.astype(scores.dtype)[:, None]
+    scores_with_sink = jnp.concatenate([sink, scores], axis=-1)
+    max_score = jnp.max(scores_with_sink, axis=-1, keepdims=True)
+    probs = jnp.exp(scores - max_score)
+    sum_probs = jnp.sum(probs, axis=-1, keepdims=True) + jnp.exp(
+        sink - max_score
+    )
+  else:
+    max_score = jnp.max(scores, axis=-1, keepdims=True)
+    probs = jnp.exp(scores - max_score)
+    sum_probs = jnp.sum(probs, axis=-1, keepdims=True)
+  lse = jnp.squeeze(max_score + jnp.log(sum_probs), axis=-1).astype(jnp.float32)
+
+  if quantize_p:
+    probs = probs.astype(kv_cache_dtype).astype(jnp.float32)
+
+  token_out = (
+      jnp.einsum(
+          "hk,khd->hd", probs, val_seq, preferred_element_type=jnp.float32
+      )
+      / sum_probs
+  ).astype(out_dtype)
+  return token_out, lse
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -63,6 +135,8 @@ def _merge_kv(k: jax.Array, v: jax.Array, kv_packing: int = 1) -> jax.Array:
         "soft_cap",
         "mask_value",
         "out_dtype",
+        "use_per_token_scale",
+        "per_token_scale_dtype",
         "q_scale",
         "k_scale",
         "v_scale",
@@ -72,6 +146,7 @@ def _merge_kv(k: jax.Array, v: jax.Array, kv_packing: int = 1) -> jax.Array:
         "cp_group_size",
         "attention_scope",
         "return_lse",
+        "quantize_p",
     ),
 )
 def batched_ragged_paged_attention_reference(
@@ -83,6 +158,7 @@ def batched_ragged_paged_attention_reference(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    attention_sink: jax.Array | None = None,
     *,
     use_causal_mask: bool = True,
     sm_scale: float = 1.0,
@@ -90,9 +166,13 @@ def batched_ragged_paged_attention_reference(
     soft_cap: float | None = None,
     mask_value: float | None = None,
     out_dtype: Any = None,
+    use_per_token_scale: bool = False,
+    per_token_scale_dtype: Any = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    dynamic_k_scale: jax.Array | None = None,
+    dynamic_v_scale: jax.Array | None = None,
     decode_query_size: int = 1,
     skip_kv_update: bool = False,
     kv_layout: Any = None,
@@ -100,6 +180,7 @@ def batched_ragged_paged_attention_reference(
     cp_rank: jax.Array | None = None,
     attention_scope: Any = None,
     return_lse: bool = False,
+    quantize_p: bool = False,
     **unused_kwargs: Any,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   """Reference multi-head / grouped-query ragged paged attention in pure JAX.
@@ -108,11 +189,14 @@ def batched_ragged_paged_attention_reference(
     queries: [total_q_tokens, num_q_heads, head_dim]
     keys: [total_q_tokens, num_kv_heads, head_dim]
     values: [total_q_tokens, num_kv_heads, head_dim]
-    kv_cache: [total_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim_aligned]
+    kv_cache: [total_pages, page_size, num_kv_heads_x2 // kv_packing,
+      kv_packing, head_dim_aligned]
     kv_lens: [max_num_seqs] sequence lengths for each request.
     page_indices: [max_num_seqs * pages_per_seq] page allocation mapping.
     cu_q_lens: [max_num_seqs + 1] cumulative query tokens per request.
     distribution: [3] active counts for [prefill, decode, mixed] batch splits.
+    attention_sink: Optional [num_q_heads] sink logits included in softmax
+      normalization.
     use_causal_mask: Whether to apply lower-triangular causal masking.
     sm_scale: Softmax scaling factor (typically 1 / sqrt(head_dim)).
     sliding_window: Optional local attention window size.
@@ -125,6 +209,16 @@ def batched_ragged_paged_attention_reference(
     outputs: [total_q_tokens, num_q_heads, head_dim] attention outputs.
     updated_kv_cache: Updated KV cache buffer.
   """
+  del per_token_scale_dtype
+  if (
+      use_per_token_scale
+      or dynamic_k_scale is not None
+      or dynamic_v_scale is not None
+  ):
+    raise NotImplementedError(
+        "Per-token scale is not supported in"
+        " batched_ragged_paged_attention_reference."
+    )
   if out_dtype is None:
     out_dtype = queries.dtype
 
@@ -135,10 +229,17 @@ def batched_ragged_paged_attention_reference(
 
   if kv_cache.ndim != 5:
     raise ValueError(
-        f"kv_cache must be 5D, matching get_kv_cache_shape. Got {kv_cache.ndim}D with shape {kv_cache.shape}"
+        "kv_cache must be 5D, matching get_kv_cache_shape. Got"
+        f" {kv_cache.ndim}D with shape {kv_cache.shape}"
     )
 
-  total_pages, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned = kv_cache.shape
+  (
+      total_pages,
+      page_size,
+      num_kv_heads_x2_per_kv_packing,
+      kv_packing,
+      head_dim_aligned,
+  ) = kv_cache.shape
   num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
   merged_kv = _merge_kv(keys, values, kv_packing=kv_packing)
   max_num_seqs = kv_lens.shape[0]
@@ -167,18 +268,34 @@ def batched_ragged_paged_attention_reference(
 
   # Mask out invalid / padding tokens beyond active sequence count.
   active_count = distribution[-1]
-  valid_token = (token_indices < cu_q_lens[active_count]) & (seq_idx < active_count)
+  valid_token = (token_indices < cu_q_lens[active_count]) & (
+      seq_idx < active_count
+  )
 
   if not skip_kv_update:
-    # Append a dummy page to absorb invalid token writes safely.
-    dummy_page = jnp.zeros(
-        (1, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_aligned), dtype=kv_cache.dtype
+    # Append dummy pages to absorb invalid token writes safely.
+    # Allocating total_q_tokens dummy pages guarantees each invalid token writes
+    # to a unique (page_idx, offset) slot, avoiding duplicate-index scatter
+    # collisions under deterministic GPU execution flags.
+    dummy_pages = jnp.zeros(
+        (
+            total_q_tokens,
+            page_size,
+            num_kv_heads_x2_per_kv_packing,
+            kv_packing,
+            head_dim_aligned,
+        ),
+        dtype=kv_cache.dtype,
     )
-    padded_cache = jnp.concatenate([kv_cache, dummy_page], axis=0)
+    padded_cache = jnp.concatenate([kv_cache, dummy_pages], axis=0)
 
-    safe_page_idx = jnp.where(valid_token, page_idx, total_pages)
+    safe_page_idx = jnp.where(
+        valid_token, page_idx, total_pages + token_indices
+    )
     safe_page_offset = jnp.where(valid_token, page_offset, 0)
-    padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(merged_kv)
+    padded_cache = padded_cache.at[safe_page_idx, safe_page_offset].set(
+        merged_kv
+    )
     updated_kv_cache = padded_cache[:total_pages]
   else:
     updated_kv_cache = kv_cache
@@ -188,10 +305,12 @@ def batched_ragged_paged_attention_reference(
   seq_kv_pages = updated_kv_cache[page_table]
   flat_kv = seq_kv_pages.reshape(
       max_num_seqs, max_kv_len, num_kv_heads_x2, head_dim_aligned
-  )[:, :, : actual_num_kv_heads * 2]  # Drop the kv_packing padding heads.
+  )[
+      :, :, : actual_num_kv_heads * 2
+  ]  # Drop the kv_packing padding heads.
 
-  all_k = flat_kv[:, :, 0::2, :actual_head_dim]
-  all_v = flat_kv[:, :, 1::2, :actual_head_dim]
+  all_k = flat_kv[:, :, 0::2, :actual_head_dim].astype(jnp.float32)
+  all_v = flat_kv[:, :, 1::2, :actual_head_dim].astype(jnp.float32)
 
   all_k = jnp.repeat(all_k, actual_num_q_heads_per_kv_head, axis=2)
   all_v = jnp.repeat(all_v, actual_num_q_heads_per_kv_head, axis=2)
@@ -203,40 +322,32 @@ def batched_ragged_paged_attention_reference(
     all_v = all_v / v_scale
 
   # Step 3: Compute attention per query token.
-  def compute_single_token(t: jax.Array) -> tuple[jax.Array, jax.Array]:
-    s = seq_idx[t]
-    q_t = scaled_queries[t]
-    k_s = all_k[s]
-    v_s = all_v[s]
-
-    scores = jnp.einsum(
-        "hd,khd->hk", q_t, k_s, preferred_element_type=jnp.float32
-    ) * sm_scale
-
-    if soft_cap is not None:
-      scores = soft_cap * jnp.tanh(scores / soft_cap)
-
-    k_positions = jnp.arange(max_kv_len)
-    mask = k_positions < kv_lens[s]
-    if use_causal_mask:
-      mask = mask & (k_positions <= token_kv_pos[t])
-    if sliding_window is not None:
-      mask = mask & (k_positions > token_kv_pos[t] - sliding_window)
-
-    scores = jnp.where(mask[None, :], scores, -1e30)
-    lse = jax.nn.logsumexp(scores, axis=-1).astype(jnp.float32)
-    weights = jax.nn.softmax(scores, axis=-1).astype(out_dtype)
-
-    token_out = jnp.einsum(
-        "hk,khd->hd", weights, v_s, preferred_element_type=jnp.float32
-    ).astype(out_dtype)
-    return token_out, lse
-
-  token_outputs, token_lses = jax.vmap(compute_single_token)(token_indices)
-  outputs = jnp.where(valid_token[:, None, None], token_outputs, jnp.zeros_like(token_outputs))
+  token_fn = functools.partial(
+      _compute_single_token,
+      all_k=all_k,
+      all_v=all_v,
+      kv_lens=kv_lens,
+      sm_scale=sm_scale,
+      soft_cap=soft_cap,
+      use_causal_mask=use_causal_mask,
+      sliding_window=sliding_window,
+      attention_sink=attention_sink,
+      quantize_p=quantize_p,
+      kv_cache_dtype=kv_cache.dtype,
+      out_dtype=out_dtype,
+      max_kv_len=max_kv_len,
+  )
+  token_outputs, token_lses = jax.vmap(token_fn)(
+      token_indices, seq_idx, scaled_queries, token_kv_pos
+  )
+  outputs = jnp.where(
+      valid_token[:, None, None], token_outputs, jnp.zeros_like(token_outputs)
+  )
 
   if return_lse:
-    lse = jnp.where(valid_token[:, None], token_lses, jnp.full_like(token_lses, -jnp.inf))
+    lse = jnp.where(
+        valid_token[:, None], token_lses, jnp.full_like(token_lses, -jnp.inf)
+    )
     return outputs, updated_kv_cache, lse
 
   return outputs, updated_kv_cache

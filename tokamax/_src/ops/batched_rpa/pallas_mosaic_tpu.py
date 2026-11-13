@@ -17,13 +17,50 @@
 from typing import Annotated, Any, ClassVar
 import jax
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 import pydantic
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.batched_rpa import base
 from tokamax._src.ops.batched_rpa.kernel import configs as rpa_configs
+from tokamax._src.ops.batched_rpa.kernel import scheduler as rpa_scheduler
+from tokamax._src.ops.batched_rpa.kernel import scheduler_cp as rpa_scheduler_cp
 from tokamax._src.ops.batched_rpa.kernel import wrapper as rpa_wrapper
 from typing_extensions import override
+
+
+def _build_scheduler_and_extra_scalars(
+    cp_group_size: int | None,
+    cp_rank: jax.Array | None,
+    attention_scope: base.AttentionScope,
+) -> tuple[Any, tuple[jax.Array, ...]]:
+  """Builds execution scheduler and extra scalars for RPA."""
+  if cp_group_size is not None:
+    if cp_rank is None:
+      raise ValueError("cp_rank must be provided when cp_group_size is set")
+    if attention_scope == base.AttentionScope.CACHE_ONLY:
+      scheduler = rpa_scheduler_cp.StripedCacheScheduler(
+          cp_group_size=cp_group_size
+      )
+    elif attention_scope == base.AttentionScope.NEW_TOKENS_ONLY:
+      scheduler = rpa_scheduler_cp.StripedNewTokensScheduler(
+          cp_group_size=cp_group_size
+      )
+    else:
+      raise ValueError(
+          "Context Parallel does not support AttentionScope.FULL where"
+          " cache is sharded but current tokens is sequential"
+      )
+    extra_scalars = (jnp.reshape(cp_rank, (1,)),)
+    return scheduler, extra_scalars
+
+  if cp_rank is not None:
+    raise ValueError("cp_group_size must be set when cp_rank is provided")
+  if attention_scope != base.AttentionScope.FULL:
+    raise ValueError(
+        f"attention_scope={attention_scope} requires cp_group_size to be set"
+    )
+  return rpa_scheduler.BaseScheduler(), ()
 
 
 @pydantic.dataclasses.dataclass(frozen=True)
@@ -35,7 +72,7 @@ class Config:
   prefill_bq_c_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=16)] = 64
   # Shared KV tile configuration
   bkv_sz: Annotated[int, pydantic.Field(gt=0, multiple_of=128)] = 512
-  # Batch sizes (decode fixed at bq_sz=1, bq_c_sz=1 for fast single-token path)
+  # Batch sizes (decode uses bq_sz=decode_query_size, bq_c_sz=decode_query_size)
   decode_batch_size: Annotated[int, pydantic.Field(gt=0)] = 8
   prefill_batch_size: Annotated[int, pydantic.Field(gt=0)] = 2
   # KV memory layout
@@ -66,14 +103,19 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       page_indices: jax.Array,
       cu_q_lens: jax.Array,
       distribution: jax.Array,
+      attention_sink: jax.Array | None = None,
       *,
       sm_scale: float = 1.0,
       sliding_window: int | None = None,
       soft_cap: float | None = None,
       mask_value: float | None = None,
+      use_per_token_scale: bool = False,
+      per_token_scale_dtype: Any = None,
       q_scale: float | None = None,
       k_scale: float | None = None,
       v_scale: float | None = None,
+      dynamic_k_scale: jax.Array | None = None,
+      dynamic_v_scale: jax.Array | None = None,
       chunk_prefill_size: int | None = None,
       decode_block_sizes: base.BlockSizes | None = None,
       prefill_block_sizes: base.BlockSizes | None = None,
@@ -88,9 +130,12 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       cp_rank: jax.Array | None = None,
       attention_scope: base.AttentionScope | str = base.AttentionScope.FULL,
       return_lse: bool = False,
+      quantize_p: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
+  ) -> tuple[
+      tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None
+  ]:
     del return_residuals
     assert config is not None, "Config must be supplied."
 
@@ -119,7 +164,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
     if decode_block_sizes is None:
       decode_block_sizes = rpa_configs.BlockSizes(
           bq_sz=decode_query_size,
-          bq_c_sz=1,
+          bq_c_sz=decode_query_size,
           bkv_sz=config.bkv_sz,
           batch_size=config.decode_batch_size,
       )
@@ -131,6 +176,12 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
           batch_size=config.prefill_batch_size,
       )
 
+    scheduler, extra_scalars = _build_scheduler_and_extra_scalars(
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=effective_attention_scope,
+    )
+
     result = rpa_wrapper.ragged_paged_attention(
         queries=queries,
         keys=keys,
@@ -140,15 +191,22 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         page_indices=page_indices,
         cu_q_lens=cu_q_lens,
         distribution=distribution,
+        attention_sink=attention_sink,
+        scheduler=scheduler,
+        extra_scalars=extra_scalars,
         use_causal_mask=use_causal_mask,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
         out_dtype=out_dtype,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        dynamic_k_scale=dynamic_k_scale,
+        dynamic_v_scale=dynamic_v_scale,
         chunk_prefill_size=chunk_prefill_size,
         decode_block_sizes=decode_block_sizes,
         prefill_block_sizes=prefill_block_sizes,
@@ -157,10 +215,8 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         skip_kv_update=skip_kv_update,
         kv_layout=effective_kv_layout,
         decode_query_size=decode_query_size,
-        cp_group_size=cp_group_size,
-        cp_rank=cp_rank,
-        attention_scope=effective_attention_scope,
         return_lse=return_lse,
+        quantize_p=quantize_p,
     )
 
     if return_lse:
