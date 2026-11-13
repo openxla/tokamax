@@ -53,6 +53,7 @@ from tokamax._src.ops.batched_rpa.kernel import utils
         "return_lse",
         "quantize_p",
         "return_raw_output",
+        "decode_only",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -98,6 +99,7 @@ def ragged_paged_attention(
     quantize_p: bool = False,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     return_raw_output: bool = False,
+    decode_only: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   """Perform batched ragged paged attention.
 
@@ -162,6 +164,7 @@ def ragged_paged_attention(
       If set, queries/keys/values are only used for their shapes and dtypes.
     return_raw_output: If True, return the kernel's output in its packed
       [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d] layout.
+    decode_only: If True, skip the RpaCase.MIXED kernel call.
 
   Returns:
     out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -361,9 +364,10 @@ def ragged_paged_attention(
   o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
       configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
   )
-  o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-      configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-  )
+  if not decode_only:
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+    )
 
   if return_raw_output:
     o_hbm = o_hbm_alias_q_hbm

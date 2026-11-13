@@ -122,6 +122,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       attention_scope: AttentionScope | str = AttentionScope.FULL,
       return_lse: bool = False,
       quantize_p: bool = False,
+      decode_only: bool = False,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Validates structural dimensions and binds input arguments."""
@@ -180,6 +181,7 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
         attention_scope=attention_scope,
         return_lse=return_lse,
         quantize_p=quantize_p,
+        decode_only=decode_only,
         return_residuals=return_residuals,
     )
 
@@ -223,13 +225,14 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
       attention_scope: AttentionScope | str = AttentionScope.FULL,
       return_lse: bool = False,
       quantize_p: bool = False,
+      decode_only: bool = False,
       return_residuals: bool = False,
       config: _Config | None = None,
   ) -> tuple[
       tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None
   ]:
     """Invokes standard reference implementation."""
-    del config, return_residuals
+    del config, return_residuals, decode_only
     ref_res = reference.batched_ragged_paged_attention_reference(
         queries=queries,
         keys=keys,

@@ -14,14 +14,19 @@
 # ==============================================================================
 """Tests for Batched RPA base operator."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.batched_rpa import api
 from tokamax._src.ops.batched_rpa import base
+from tokamax._src.ops.batched_rpa import pallas_mosaic_tpu
 from tokamax._src.ops.batched_rpa import reference
 from tokamax._src.ops.batched_rpa.kernel import configs
+from tokamax._src.ops.batched_rpa.kernel import wrapper
 
 jax.config.parse_flags_with_absl()
 
@@ -641,6 +646,156 @@ class BatchedRpaBaseTest(parameterized.TestCase):
         )
     )
     self.assertTrue(jnp.all(jnp.isfinite(out_skip)))
+
+  def test_decode_only_matches_standard_on_decode_batch(self):
+    total_q_tokens = 2
+    page_size = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    total_pages = 4
+    head_dim_aligned = 128
+
+    k1, k2, k3 = jax.random.split(jax.random.key(31), 3)
+    queries = jax.random.normal(
+        k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    kv_cache = jnp.zeros(
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.bfloat16,
+    )
+    kv_lens = jnp.array([6, 8], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 1, 2], dtype=jnp.int32)
+    distribution = jnp.array([2, 2, 2], dtype=jnp.int32)
+
+    ref_out, ref_cache = (  # pyrefly: ignore[bad-unpacking]
+        api.batched_ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            decode_only=False,
+            implementation="reference",
+        )
+    )
+    dec_out, dec_cache = (  # pyrefly: ignore[bad-unpacking]
+        api.batched_ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            decode_only=True,
+            implementation="reference",
+        )
+    )
+    self.assertTrue(jnp.array_equal(dec_out, ref_out))
+    self.assertTrue(jnp.array_equal(dec_cache, ref_cache))
+
+  @parameterized.named_parameters(
+      ("default", None, False, [configs.RpaCase.DECODE, configs.RpaCase.MIXED]),
+      (
+          "standard",
+          False,
+          False,
+          [configs.RpaCase.DECODE, configs.RpaCase.MIXED],
+      ),
+      ("decode_only", True, False, [configs.RpaCase.DECODE]),
+      ("decode_only_with_lse", True, True, [configs.RpaCase.DECODE]),
+  )
+  def test_decode_only_skips_mixed_kernel(
+      self, decode_only, return_lse, expected_modes
+  ):
+    self.assertIsInstance(
+        api.IMPLEMENTATIONS["mosaic_tpu"], pallas_mosaic_tpu.PallasTpuBatchedRpa
+    )
+    modes = []
+
+    def _fake_schedule(*args, **kwargs):
+      del args, kwargs
+      return jnp.zeros((1,), dtype=jnp.int32)
+
+    def _fake_kernel(*args, cfgs, **kwargs):
+      del kwargs
+      modes.append(cfgs.mode)
+      return args[1], args[3], args[4]
+
+    queries = jnp.zeros((2, 4, 64), dtype=jnp.bfloat16)
+    keys = jnp.zeros((2, 2, 64), dtype=jnp.bfloat16)
+    values = jnp.zeros((2, 2, 64), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((4, 8, 2, 2, 128), dtype=jnp.bfloat16)
+    kv_lens = jnp.array([4, 6], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 1, 2], dtype=jnp.int32)
+    distribution = jnp.array([2, 2, 2], dtype=jnp.int32)
+
+    kwargs = {} if decode_only is None else {"decode_only": decode_only}
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    jax.clear_caches()
+
+    with (
+        mock.patch.object(
+            pallas_mosaic_tpu.PallasTpuBatchedRpa,
+            "supported_on",
+            autospec=True,
+            return_value=True,
+        ),
+        mock.patch.object(
+            pltpu,
+            "get_tpu_info",
+            autospec=True,
+            return_value=tpu_info,
+        ),
+        mock.patch.object(
+            wrapper.scheduler_lib,
+            "generate_rpa_metadata",
+            side_effect=_fake_schedule,
+        ),
+        mock.patch.object(
+            wrapper.schedule,
+            "smem_prefetch_start",
+            return_value=None,
+        ),
+        mock.patch.object(
+            wrapper.kernel, "rpa_kernel", side_effect=_fake_kernel
+        ),
+    ):
+      result = api.batched_ragged_paged_attention(
+          queries=queries,
+          keys=keys,
+          values=values,
+          kv_cache=kv_cache,
+          kv_lens=kv_lens,
+          page_indices=page_indices,
+          cu_q_lens=cu_q_lens,
+          distribution=distribution,
+          return_lse=return_lse,
+          implementation="mosaic_tpu",
+          **kwargs,
+      )
+    out, new_cache, *extra = result
+    self.assertEqual(out.shape, queries.shape)
+    self.assertEqual(new_cache.shape, kv_cache.shape)
+    if return_lse:
+      self.assertLen(extra, 1)
+      self.assertEqual(extra[0].shape, (queries.shape[0], queries.shape[1]))
+    else:
+      self.assertEmpty(extra)
+    self.assertEqual(modes, expected_modes)
 
 
 if __name__ == "__main__":
