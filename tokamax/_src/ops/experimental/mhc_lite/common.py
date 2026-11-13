@@ -17,8 +17,6 @@
 import contextlib
 import dataclasses
 import functools
-import math
-from typing import Any
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -71,246 +69,40 @@ class MHCContext:
   implementation: str = dataclasses.field(metadata={"static": True})
 
 
-FWD_TILING_FIELDS = (
-    "block_size",
-    "fwd_pipeline_blocks",
-    "fwd_sub_tokens",
-    "fwd_strip_tokens",
-    "fwd_band_width",
-)
-BWD_TILING_FIELDS = ("bwd_block_size", "bwd_num_chunks", "bwd_sub_tokens")
-_POSITIVE_CONFIG_FIELDS = (
-    "block_size",
-    "fwd_pipeline_blocks",
-    "fwd_sub_tokens",
-    "fwd_strip_tokens",
-    "fwd_band_width",
-    "bwd_block_size",
-    "bwd_num_chunks",
-    "bwd_sub_tokens",
-    "vmem_limit_bytes",
-)
-
-
 @dataclasses.dataclass(frozen=True)
 class MhcKernelConfig:
   """Compiler and tiling configuration for mHC Pallas kernels."""
 
   block_size: int | None = None
-  fwd_pipeline_blocks: int | None = None
-  fwd_sub_tokens: int | None = None
-  fwd_strip_tokens: int | None = None
-  fwd_band_width: int | None = None
+  fwd_pipeline_blocks: int = 2
   bwd_block_size: int | None = None
-  bwd_num_chunks: int | None = None
-  bwd_sub_tokens: int | None = None
   vmem_limit_bytes: int | None = None
   rms_epsilon: float = 1e-5
   pre_mapping_epsilon: float = 1e-6
   interpret: bool = False
 
-  def has_fwd_tiling_overrides(self) -> bool:
-    """Returns True if any forward tiling field is explicitly set."""
-    return any(getattr(self, name) is not None for name in FWD_TILING_FIELDS)
 
-  def has_bwd_tiling_overrides(self) -> bool:
-    """Returns True if any backward tiling field is explicitly set."""
-    return any(getattr(self, name) is not None for name in BWD_TILING_FIELDS)
-
-  def has_tiling_overrides(self) -> bool:
-    """Returns True if any explicit tiling or VMEM override is set."""
-    return (
-        self.has_fwd_tiling_overrides()
-        or self.has_bwd_tiling_overrides()
-        or self.vmem_limit_bytes is not None
-    )
-
-
-def _default(val: int | None, fallback: int) -> int:
-  """Returns `fallback` when `val` is `None`, otherwise `val`."""
-  return fallback if val is None else val
-
-
-def chunk_tokens(tokens: int, block_size: int, fwd_pipeline_blocks: int) -> int:
-  """Returns `block_size * fwd_pipeline_blocks` when dividing `tokens`."""
-  chunk = block_size * fwd_pipeline_blocks
-  if fwd_pipeline_blocks > 1 and tokens % chunk == 0:
-    return chunk
-  return block_size
-
-
-def validate_config_fields(
-    config: object,
-    num_lanes: int,
-    num_sublanes: int,
-    *,
-    check_fwd: bool = True,
-    check_bwd: bool = True,
-) -> None:
-  """Validates positive and alignment constraints on config fields."""
-  for name in _POSITIVE_CONFIG_FIELDS:
-    if (val := getattr(config, name, None)) is not None and val < 1:
-      raise UnsupportedInputError(
-          f"Expected positive {name}; got {val}."
-      )
-  aligned_fields: list[tuple[str, int]] = []
-  if check_fwd:
-    aligned_fields.extend((
-        ("fwd_sub_tokens", num_sublanes),
-        ("fwd_strip_tokens", num_sublanes),
-        ("fwd_band_width", num_lanes),
-    ))
-  if check_bwd:
-    aligned_fields.append(("bwd_sub_tokens", num_sublanes))
-  for name, align in aligned_fields:
-    if (val := getattr(config, name, None)) is not None and val % align:
-      raise UnsupportedInputError(
-          f"Expected {name} to be a positive multiple of {align}; got {val}."
-      )
-
-
-def token_block_candidates(
-    tokens: int,
-    num_lanes: int,
-    num_sublanes: int,
-    multipliers: int | tuple[int, ...] = (1, 2, 3, 4, 6, 8),
-) -> list[int]:
-  """Returns lane-aligned or sublane-aligned block divisors of `tokens`."""
-  if tokens <= 0:
-    return [num_lanes]
-  mults = (
-      range(1, multipliers + 1)
-      if isinstance(multipliers, int)
-      else multipliers
-  )
-  lane_divs = [
-      mult * num_lanes for mult in mults if tokens % (mult * num_lanes) == 0
-  ]
-  if lane_divs:
-    return lane_divs
-  sublane_divs = [
-      mult * num_sublanes
-      for mult in range(2 * num_lanes // num_sublanes, 0, -1)
-      if tokens % (mult * num_sublanes) == 0
-  ]
-  return sublane_divs or [num_lanes]
-
-
-def resolve_config(
-    config: MhcKernelConfig,
-    *,
-    tokens: int | None = None,
-    streams: int = 4,
-    embedding: int = 512,
-    num_permutations: int = 24,
-    dtype: jax.typing.DTypeLike = jnp.bfloat16,
-    check_fwd: bool = True,
-    check_bwd: bool = True,
-) -> MhcKernelConfig:
-  """Resolves `None` tiling and VMEM fields with safe hardware defaults."""
-  del streams, num_permutations, dtype
+def resolve_config(config: MhcKernelConfig) -> MhcKernelConfig:
+  """Resolves `None` tiling and VMEM parameters using `get_tpu_info()`."""
   tpu_info = get_tpu_info()
-  num_lanes, num_sublanes = tpu_info.num_lanes, tpu_info.num_sublanes
-  validate_config_fields(
-      config, num_lanes, num_sublanes, check_fwd=check_fwd, check_bwd=check_bwd
+  block_size = (
+      tpu_info.num_lanes if config.block_size is None else config.block_size
   )
-  vmem_limit = _default(config.vmem_limit_bytes, tpu_info.vmem_capacity_bytes)
-  wide_or_interpret = config.interpret or embedding > 1024
-  if tokens is None or tokens <= 0:
-    block_size = _default(config.block_size, num_lanes)
-    fwd_pipe = _default(config.fwd_pipeline_blocks, 2)
-    chunk = block_size * fwd_pipe
-    bwd_block_size = _default(config.bwd_block_size, 2 * num_lanes)
-    num_bwd_blocks = 4
-  else:
-    cands = token_block_candidates(tokens, num_lanes, num_sublanes, (1, 2))
-    default_blk = min(cands) if wide_or_interpret else max(cands)
-    block_size = _default(config.block_size, default_blk)
-    default_pipe = (
-        2
-        if not wide_or_interpret and tokens % (2 * block_size) == 0
-        else 1
-    )
-    fwd_pipe = _default(config.fwd_pipeline_blocks, default_pipe)
-    chunk = chunk_tokens(tokens, block_size, fwd_pipe)
-    bwd_block_size = _default(config.bwd_block_size, default_blk)
-    num_bwd_blocks = max(1, tokens // max(1, bwd_block_size))
-
-  max_strip_elems = 12 * num_lanes * 512
-  if config.interpret or chunk * embedding > max_strip_elems:
-    default_strip = math.gcd(chunk, num_lanes // 2) or num_sublanes
-  else:
-    default_strip = chunk
-  default_fwd_sub = math.gcd(chunk, 2 * num_sublanes) or num_sublanes
-  default_band = math.gcd(embedding, 2 * num_lanes) or num_lanes
-  default_bwd_sub = math.gcd(bwd_block_size, 2 * num_sublanes) or num_sublanes
-  default_bwd_chunks = math.gcd(num_bwd_blocks, 4)
+  bwd_block_size = (
+      2 * tpu_info.num_lanes
+      if config.bwd_block_size is None
+      else config.bwd_block_size
+  )
+  vmem_limit_bytes = (
+      tpu_info.vmem_capacity_bytes
+      if config.vmem_limit_bytes is None
+      else config.vmem_limit_bytes
+  )
   return dataclasses.replace(
       config,
       block_size=block_size,
-      fwd_pipeline_blocks=fwd_pipe,
-      fwd_sub_tokens=_default(config.fwd_sub_tokens, default_fwd_sub),
-      fwd_strip_tokens=_default(config.fwd_strip_tokens, default_strip),
-      fwd_band_width=_default(config.fwd_band_width, default_band),
       bwd_block_size=bwd_block_size,
-      bwd_num_chunks=_default(config.bwd_num_chunks, default_bwd_chunks),
-      bwd_sub_tokens=_default(config.bwd_sub_tokens, default_bwd_sub),
-      vmem_limit_bytes=vmem_limit,
-  )
-
-
-def prepare_kernel_config(
-    config: Any,
-    tokens: int,
-    streams: int,
-    embedding: int,
-    num_permutations: int,
-    dtype: jax.typing.DTypeLike,
-    *,
-    is_bwd: bool = False,
-    rms_epsilon: float | None = None,
-    pre_mapping_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
-) -> tuple[Any, float, float, int, bool]:
-  """Validates `config` and resolves concrete kernel execution parameters."""
-  check_fwd, check_bwd = (False, True) if is_bwd else (True, False)
-  if isinstance(config, MhcKernelConfig):
-    config = resolve_config(
-        config,
-        tokens=tokens,
-        streams=streams,
-        embedding=embedding,
-        num_permutations=num_permutations,
-        dtype=dtype,
-        check_fwd=check_fwd,
-        check_bwd=check_bwd,
-    )
-  else:
-    tpu_info = get_tpu_info()
-    validate_config_fields(
-        config,
-        tpu_info.num_lanes,
-        tpu_info.num_sublanes,
-        check_fwd=check_fwd,
-        check_bwd=check_bwd,
-    )
-  if rms_epsilon is None:
-    rms_epsilon = getattr(config, "rms_epsilon", 1e-5)
-  if pre_mapping_epsilon is None:
-    pre_mapping_epsilon = getattr(config, "pre_mapping_epsilon", 1e-6)
-  if vmem_limit_bytes is None:
-    vmem_limit_bytes = (
-        getattr(config, "vmem_limit_bytes", None)
-        or get_tpu_info().vmem_capacity_bytes
-    )
-  resolved_interpret = interpret or getattr(config, "interpret", False)
-  return (
-      config,
-      rms_epsilon,
-      pre_mapping_epsilon,
-      vmem_limit_bytes,
-      resolved_interpret,
+      vmem_limit_bytes=vmem_limit_bytes,
   )
 
 
@@ -461,8 +253,6 @@ def validate_token_block_size(
     tokens: int, block_size: int, *, name: str = "block_size"
 ) -> None:
   """Validates a token-axis Pallas block size."""
-  if tokens <= 0:
-    raise UnsupportedInputError(f"Expected positive token count; got {tokens}.")
   num_sublanes = get_tpu_info().num_sublanes
   if block_size < num_sublanes or block_size % num_sublanes:
     raise UnsupportedInputError(

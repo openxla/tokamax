@@ -12,21 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Low-level Pallas forward kernels for mHC-lite."""
+"""Low-level Pallas forward kernels and custom VJP functions for mHC-lite."""
 
 import functools
 import math
-from typing import Any
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.mhc_lite import common
+from tokamax._src.ops.experimental.mhc_lite import mhc_kernels_bwd
+
+
+def _zero_index_map(ndim: int, *_):
+  """Index map returning all-zero block coordinates of length `ndim`."""
+  return (0,) * ndim
 
 
 def _full_param_block_spec(param: jax.Array) -> pl.BlockSpec:
   """Creates an unsharded BlockSpec covering the full parameter shape."""
-  return pl.BlockSpec(param.shape, lambda *_: (0,) * param.ndim)
+  return pl.BlockSpec(
+      param.shape, functools.partial(_zero_index_map, param.ndim)
+  )
+
+
+def _fwd_chunk_tokens(tokens: int, config: common.MhcKernelConfig) -> int:
+  """Returns the pipelined token chunk size for forward kernels."""
+  assert config.block_size is not None
+  pipelined = config.fwd_pipeline_blocks * config.block_size
+  if config.fwd_pipeline_blocks > 1 and tokens % pipelined == 0:
+    return pipelined
+  return config.block_size
 
 
 def _prepare_fwd_params(
@@ -72,13 +88,9 @@ def _run_fwd_pipeline(
     tokens: int,
     chunk_tokens: int,
     token_args: tuple[jax.Array, ...],
-    out_shapes_dtypes: tuple[
-        tuple[tuple[int, ...], jax.typing.DTypeLike], ...
-    ],
+    out_shapes_dtypes: tuple[tuple[tuple[int, ...], jnp.dtype], ...],
     cost_estimate: pl.CostEstimate,
-    *,
-    vmem_limit_bytes: int,
-    interpret: bool,
+    config: common.MhcKernelConfig,
     param_args: tuple[jax.Array, ...] = (),
 ):
   """Emits and executes a 1D token-pipelined Pallas forward kernel."""
@@ -110,19 +122,16 @@ def _run_fwd_pipeline(
         out_specs=(common.HBM_SPEC,) * len(out_shapes_dtypes),
         cost_estimate=cost_estimate,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit_bytes,
+            vmem_limit_bytes=config.vmem_limit_bytes,
         ),
-        interpret=interpret,
+        interpret=config.interpret,
     )(*in_args)
 
 
 def _pre_fwd_pipeline_body(
     streams: int,
     embedding: int,
-    rms_epsilon: float,
-    pre_mapping_epsilon: float,
-    fwd_strip_tokens: int,
-    fwd_band_width: int,
+    config: common.MhcKernelConfig,
     x_ref,
     phi_ref,
     gate_bias_ref,
@@ -147,13 +156,13 @@ def _pre_fwd_pipeline_body(
     with jax.named_scope("vpu_rms_norm"):
       flattened_f32 = x_full.astype(jnp.float32)
       mean_square = jnp.mean(jnp.square(flattened_f32), axis=-1, keepdims=True)
-      inv_rms = jax.lax.rsqrt(mean_square + rms_epsilon)
+      inv_rms = jax.lax.rsqrt(mean_square + config.rms_epsilon)
       logits = raw_proj * inv_rms + gate_bias
 
   # Fused pre/post sigmoid on lanes 0..2*S-1.
   with jax.named_scope("sigmoid_pre_post_gates"):
     gates = jax.nn.sigmoid(logits[:, : 2 * streams])
-    h_pre = gates[:, :streams] + pre_mapping_epsilon
+    h_pre = gates[:, :streams] + config.pre_mapping_epsilon
     h_post = 2.0 * gates[:, streams : 2 * streams]
 
   # Zero-shift 32-lane softmax + padded (32, S^2) permutation projection:
@@ -173,38 +182,30 @@ def _pre_fwd_pipeline_body(
     h_post_ref[...] = h_post
     residual_ref[...] = residual.astype(residual_ref.dtype)
 
-  # Strip-mined stream collapse over token strips and column bands to bound
-  # live float32 vector registers and prevent VMEM register spills.
+  # Strip-mined fori_loop stream collapse over (num_lanes // 2)-token strips
+  # and num_lanes-col bands to bound live float32 vector registers and prevent
+  # VMEM register spills.
   with jax.named_scope("strip_mined_stream_collapse"):
-    strip_tokens = math.gcd(x_full.shape[0], fwd_strip_tokens)
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    strip_tokens = math.gcd(x_full.shape[0], num_lanes // 2)
     num_strips = x_full.shape[0] // strip_tokens
-    band_width = math.gcd(embedding, fwd_band_width)
 
-    def _collapse_bands(t_slice, h_strip) -> None:
+    def _li_strip_body(strip_idx: jax.Array, _) -> None:
       with jax.named_scope("stream_collapse_strip"):
-        for band_col in range(0, embedding, band_width):
-          band_end = band_col + band_width
-          acc = h_strip[:, 0:1] * x_ref[t_slice, band_col:band_end]
-          for k in range(1, streams):
-            col = k * embedding + band_col
+        t_dslice = pl.dslice(strip_idx * strip_tokens, strip_tokens)
+        h_s = h_pre_ref[t_dslice, :]
+        for band_col in range(0, embedding, num_lanes):
+          acc = h_s[:, 0:1] * x_ref[t_dslice, band_col : band_col + num_lanes]
+          for s in range(1, streams):
+            col = s * embedding + band_col
             acc = (
-                acc
-                + h_strip[:, k : k + 1] * x_ref[t_slice, col : col + band_width]
+                acc + h_s[:, s : s + 1] * x_ref[t_dslice, col : col + num_lanes]
             )
-          layer_input_ref[t_slice, band_col:band_end] = acc.astype(jnp.bfloat16)
+          layer_input_ref[t_dslice, band_col : band_col + num_lanes] = (
+              acc.astype(jnp.bfloat16)
+          )
 
-    if num_strips == 1:
-      _collapse_bands(slice(None), h_pre)
-    else:
-      jax.lax.fori_loop(
-          0,
-          num_strips,
-          lambda strip_idx, _: _collapse_bands(
-              pl.dslice(strip_idx * strip_tokens, strip_tokens),
-              h_pre_ref[pl.dslice(strip_idx * strip_tokens, strip_tokens), :],
-          ),
-          None,
-      )
+    jax.lax.fori_loop(0, num_strips, _li_strip_body, None)
 
 
 def _post_apply_fwd_pipeline_body(
@@ -222,9 +223,7 @@ def _post_apply_fwd_pipeline_body(
   with jax.named_scope("post_stream_mix_subtiles"):
     for sub_idx in range(num_subtiles):
       with jax.named_scope(f"subtile_{sub_idx}"):
-        s_slice = slice(None)
-        if num_subtiles > 1:
-          s_slice = slice(sub_idx * sub_tokens, (sub_idx + 1) * sub_tokens)
+        s_slice = slice(sub_idx * sub_tokens, (sub_idx + 1) * sub_tokens)
         with jax.named_scope("load_subtile_inputs"):
           res_sub = residual_ref[s_slice, :].astype(jnp.float32)
           h_post_sub = h_post_ref[s_slice, :]
@@ -251,10 +250,7 @@ def _post_apply_fwd_pipeline_body(
 def _post_and_pre_fwd_pipeline_body(
     streams: int,
     embedding: int,
-    rms_epsilon: float,
-    pre_mapping_epsilon: float,
-    fwd_strip_tokens: int,
-    fwd_band_width: int,
+    config: common.MhcKernelConfig,
     sub_tokens: int,
     num_subtiles: int,
     x_ref,
@@ -285,10 +281,7 @@ def _post_and_pre_fwd_pipeline_body(
     _pre_fwd_pipeline_body(
         streams,
         embedding,
-        rms_epsilon,
-        pre_mapping_epsilon,
-        fwd_strip_tokens,
-        fwd_band_width,
+        config,
         x_next_out_ref,
         phi_ref,
         gate_bias_ref,
@@ -298,52 +291,24 @@ def _post_and_pre_fwd_pipeline_body(
     )
 
 
-def pre_fwd(
+def _pre_fwd(
     x: jax.Array,
     weights: common.MhcWeights,
     permutations: jax.Array,
-    config: Any,
-    *,
-    rms_epsilon: float | None = None,
-    pre_mapping_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
+    config: common.MhcKernelConfig,
 ):
-  """Forward execution for `pre`, returning outputs and backward residuals."""
+  """Custom-VJP forward rule for `pre`."""
+  config = common.resolve_config(config)
+  common.validate_inputs(x, config.block_size, permutations.shape)
   streams = permutations.shape[-1]
   embedding = weights.norm_scale.shape[0] // streams
   tokens = x.size // (streams * embedding)
-  config, rms_eps, pre_eps, vmem_limit, interpret_flag = (
-      common.prepare_kernel_config(
-          config,
-          tokens,
-          streams,
-          embedding,
-          permutations.shape[0],
-          x.dtype,
-          rms_epsilon=rms_epsilon,
-          pre_mapping_epsilon=pre_mapping_epsilon,
-          vmem_limit_bytes=vmem_limit_bytes,
-          interpret=interpret,
-      )
-  )
-  common.validate_inputs(x, config.block_size, permutations.shape)
   x_in = x.reshape(tokens, streams * embedding)
-  chunk_tokens = common.chunk_tokens(
-      tokens, config.block_size, config.fwd_pipeline_blocks
-  )
+  chunk_tokens = _fwd_chunk_tokens(tokens, config)
   phi, param_args = _prepare_fwd_params(weights, permutations)
   layer_input, h_pre, h_post, residual = _run_fwd_pipeline(
       "mhc_pre_fwd_fused",
-      functools.partial(
-          _pre_fwd_pipeline_body,
-          streams,
-          embedding,
-          rms_eps,
-          pre_eps,
-          config.fwd_strip_tokens,
-          config.fwd_band_width,
-      ),
+      functools.partial(_pre_fwd_pipeline_body, streams, embedding, config),
       tokens,
       chunk_tokens,
       token_args=(x_in,),
@@ -357,8 +322,7 @@ def pre_fwd(
       cost_estimate=common.pre_cost(
           tokens, streams, embedding, permutations.shape[0]
       ),
-      vmem_limit_bytes=vmem_limit,
-      interpret=interpret_flag,
+      config=config,
   )
   context = common.MHCContext(
       x=x_in,
@@ -377,95 +341,28 @@ def pre_fwd(
   )
 
 
-def _prepare_post_fwd(
+def _post_fwd(
     layer_output: jax.Array,
     context: common.MHCContext,
-    config: Any,
-    permutations_shape: tuple[int, ...] | None = None,
-    *,
-    rms_epsilon: float | None = None,
-    pre_mapping_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
+    config: common.MhcKernelConfig,
 ):
-  """Resolves config, validates shapes, and packs post-branch forward args."""
+  """Custom-VJP forward rule for `post`."""
+  config = common.resolve_config(config)
   x, h_post, residual = context.x, context.h_post, context.residual
   embedding = layer_output.shape[-1]
   tokens = layer_output.size // embedding
   streams = h_post.shape[-1]
-  num_perms = permutations_shape[0] if permutations_shape else 24
-  config, rms_eps, pre_eps, vmem_limit, interpret_flag = (
-      common.prepare_kernel_config(
-          config,
-          tokens,
-          streams,
-          embedding,
-          num_perms,
-          x.dtype,
-          rms_epsilon=rms_epsilon,
-          pre_mapping_epsilon=pre_mapping_epsilon,
-          vmem_limit_bytes=vmem_limit_bytes,
-          interpret=interpret,
-      )
+  flattened_size = streams * embedding
+  x_in = x.reshape(tokens, flattened_size)
+  x_check = (
+      x.reshape(*layer_output.shape[:2], streams, embedding)
+      if layer_output.ndim == 3
+      else x_in
   )
-  x_in = x.reshape(tokens, streams * embedding)
-  x_check = x_in
-  if layer_output.ndim == 3:
-    x_check = x.reshape(*layer_output.shape[:2], streams, embedding)
-  common.validate_inputs(x_check, config.block_size, permutations_shape)
-  chunk = common.chunk_tokens(
-      tokens, config.block_size, config.fwd_pipeline_blocks
-  )
-  sub_tokens = math.gcd(chunk, config.fwd_sub_tokens)
-  token_args = (
-      x_in,
-      layer_output.reshape(tokens, embedding),
-      h_post.reshape(tokens, streams),
-      residual.reshape(tokens, streams * streams),
-  )
-  return (
-      config,
-      rms_eps,
-      pre_eps,
-      vmem_limit,
-      interpret_flag,
-      tokens,
-      streams,
-      embedding,
-      chunk,
-      sub_tokens,
-      token_args,
-  )
+  common.validate_inputs(x_check, config.block_size)
 
-
-def post_fwd(
-    layer_output: jax.Array,
-    context: common.MHCContext,
-    config: Any,
-    *,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
-):
-  """Forward execution for `post`, returning output and backward residuals."""
-  (
-      _,
-      _,
-      _,
-      vmem_limit,
-      interpret_flag,
-      tokens,
-      streams,
-      embedding,
-      chunk,
-      sub_tokens,
-      token_args,
-  ) = _prepare_post_fwd(
-      layer_output,
-      context,
-      config,
-      vmem_limit_bytes=vmem_limit_bytes,
-      interpret=interpret,
-  )
+  block_tokens = _fwd_chunk_tokens(tokens, config)
+  sub_tokens = math.gcd(block_tokens, 2 * common.get_tpu_info().num_sublanes)
   (output,) = _run_fwd_pipeline(
       "mhc_post_apply_fwd",
       functools.partial(
@@ -473,57 +370,52 @@ def post_fwd(
           streams,
           embedding,
           sub_tokens,
-          chunk // sub_tokens,
+          block_tokens // sub_tokens,
       ),
       tokens,
-      chunk,
-      token_args=token_args,
-      out_shapes_dtypes=((token_args[0].shape, jnp.bfloat16),),
+      block_tokens,
+      token_args=(
+          x_in,
+          layer_output.reshape(tokens, embedding),
+          h_post.reshape(tokens, streams),
+          residual.reshape(tokens, streams * streams),
+      ),
+      out_shapes_dtypes=((x_in.shape, jnp.bfloat16),),
       cost_estimate=common.post_cost(tokens, streams, embedding),
-      vmem_limit_bytes=vmem_limit,
-      interpret=interpret_flag,
+      config=config,
   )
-  out_shape = token_args[0].shape
-  if layer_output.ndim == 3:
-    out_shape = (*layer_output.shape[:2], streams, embedding)
+  out_shape = (
+      (*layer_output.shape[:2], streams, embedding)
+      if layer_output.ndim == 3
+      else (tokens, flattened_size)
+  )
   return output.reshape(out_shape), (layer_output, context)
 
 
-def post_and_pre_fwd(
+def _post_and_pre_fwd(
     layer_output: jax.Array,
     context: common.MHCContext,
     next_weights: common.MhcWeights,
     permutations: jax.Array,
-    config: Any,
-    *,
-    rms_epsilon: float | None = None,
-    pre_mapping_epsilon: float | None = None,
-    vmem_limit_bytes: int | None = None,
-    interpret: bool = False,
+    config: common.MhcKernelConfig,
 ):
-  """Forward execution for `post_and_pre`, returning outputs and residuals."""
-  (
-      config,
-      rms_eps,
-      pre_eps,
-      vmem_limit,
-      interpret_flag,
-      tokens,
-      streams,
-      embedding,
-      chunk,
-      sub_tokens,
-      token_args,
-  ) = _prepare_post_fwd(
-      layer_output,
-      context,
-      config,
-      permutations.shape,
-      rms_epsilon=rms_epsilon,
-      pre_mapping_epsilon=pre_mapping_epsilon,
-      vmem_limit_bytes=vmem_limit_bytes,
-      interpret=interpret,
+  """Custom-VJP forward rule for `post_and_pre`."""
+  config = common.resolve_config(config)
+  x, h_post, residual = context.x, context.h_post, context.residual
+  embedding = layer_output.shape[-1]
+  tokens = layer_output.size // embedding
+  streams = h_post.shape[-1]
+  flattened_size = streams * embedding
+  x_in = x.reshape(tokens, flattened_size)
+  x_check = (
+      x.reshape(*layer_output.shape[:2], streams, embedding)
+      if layer_output.ndim == 3
+      else x_in
   )
+  common.validate_inputs(x_check, config.block_size, permutations.shape)
+
+  chunk_tokens = _fwd_chunk_tokens(tokens, config)
+  sub_tokens = math.gcd(chunk_tokens, 2 * common.get_tpu_info().num_sublanes)
   phi, param_args = _prepare_fwd_params(next_weights, permutations)
   next_layer_input, x_next, next_h_pre, next_h_post, next_residual = (
       _run_fwd_pipeline(
@@ -532,20 +424,22 @@ def post_and_pre_fwd(
               _post_and_pre_fwd_pipeline_body,
               streams,
               embedding,
-              rms_eps,
-              pre_eps,
-              config.fwd_strip_tokens,
-              config.fwd_band_width,
+              config,
               sub_tokens,
-              chunk // sub_tokens,
+              chunk_tokens // sub_tokens,
           ),
           tokens,
-          chunk,
-          token_args=token_args,
+          chunk_tokens,
+          token_args=(
+              x_in,
+              layer_output.reshape(tokens, embedding),
+              h_post.reshape(tokens, streams),
+              residual.reshape(tokens, streams * streams),
+          ),
           param_args=param_args,
           out_shapes_dtypes=(
               ((tokens, embedding), jnp.bfloat16),
-              (token_args[0].shape, jnp.bfloat16),
+              (x_in.shape, jnp.bfloat16),
               ((tokens, streams), jnp.float32),
               ((tokens, streams), jnp.float32),
               ((tokens, streams * streams), jnp.bfloat16),
@@ -553,8 +447,7 @@ def post_and_pre_fwd(
           cost_estimate=common.post_and_pre_cost(
               tokens, streams, embedding, permutations.shape[0]
           ),
-          vmem_limit_bytes=vmem_limit,
-          interpret=interpret_flag,
+          config=config,
       )
   )
   next_context = common.MHCContext(
@@ -570,7 +463,48 @@ def post_and_pre_fwd(
   )
 
 
-# Backwards-compatible aliases kept for lift_kernels/tokamax/converter.py.
-_pre_fwd = pre_fwd
-_post_fwd = post_fwd
-_post_and_pre_fwd = post_and_pre_fwd
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def pre(
+    x: jax.Array,
+    weights: common.MhcWeights,
+    permutations: jax.Array,
+    config: common.MhcKernelConfig = common.MhcKernelConfig(),
+) -> tuple[jax.Array, common.MHCContext]:
+  """Runs the coefficient and pre-application kernels."""
+  primals_out, _ = _pre_fwd(x, weights, permutations, config)
+  return primals_out
+
+
+pre.defvjp(_pre_fwd, mhc_kernels_bwd.pre_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def post(
+    layer_output: jax.Array,
+    context: common.MHCContext,
+    config: common.MhcKernelConfig = common.MhcKernelConfig(),
+) -> jax.Array:
+  """Runs the fused post-gate and residual-mixing kernel."""
+  output, _ = _post_fwd(layer_output, context, config)
+  return output
+
+
+post.defvjp(_post_fwd, mhc_kernels_bwd.post_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4,))
+def post_and_pre(
+    layer_output: jax.Array,
+    context: common.MHCContext,
+    next_weights: common.MhcWeights,
+    permutations: jax.Array,
+    config: common.MhcKernelConfig = common.MhcKernelConfig(),
+) -> tuple[jax.Array, common.MHCContext]:
+  """Runs the fused Stage-1 post and Stage-2 pre kernel."""
+  primals_out, _ = _post_and_pre_fwd(
+      layer_output, context, next_weights, permutations, config
+  )
+  return primals_out
+
+
+post_and_pre.defvjp(_post_and_pre_fwd, mhc_kernels_bwd.post_and_pre_bwd)
