@@ -82,7 +82,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       out_dtype: Any = None,
       use_causal_mask: bool = True,
       skip_kv_update: bool = False,
-      kv_layout: base.KVLayout | str = base.KVLayout.HEAD_ALONG_SUBLANE,
+      kv_layout: base.KVLayout | str | None = None,
       decode_query_size: int = 1,
       cp_group_size: int | None = None,
       cp_rank: jax.Array | None = None,
@@ -90,7 +90,9 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       return_lse: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
-  ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None]:
+  ) -> tuple[
+      tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], None
+  ]:
     del return_residuals
     assert config is not None, "Config must be supplied."
 
@@ -112,22 +114,39 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       except KeyError:
         effective_kv_layout = base.KVLayout(kv_layout)
     elif kv_layout is None:
-      effective_kv_layout = base.KVLayout[config.kv_layout]
+      if isinstance(config.kv_layout, base.KVLayout):
+        effective_kv_layout = config.kv_layout
+      elif isinstance(config.kv_layout, str):
+        try:
+          effective_kv_layout = base.KVLayout[config.kv_layout]
+        except KeyError:
+          effective_kv_layout = base.KVLayout(config.kv_layout)
+      else:
+        effective_kv_layout = base.KVLayout(config.kv_layout)
     else:
       effective_kv_layout = base.KVLayout(kv_layout)
+
+    bkv_sz = config.bkv_sz
+    if effective_kv_layout == base.KVLayout.SEQ_ALONG_LANE:
+      page_size = (
+          kv_cache.shape[4]
+          if (kv_cache.ndim == 5 and kv_cache.shape[4] > kv_cache.shape[1])
+          else kv_cache.shape[1]
+      )
+      bkv_sz = ((config.bkv_sz + page_size - 1) // page_size) * page_size
 
     if decode_block_sizes is None:
       decode_block_sizes = rpa_configs.BlockSizes(
           bq_sz=decode_query_size,
           bq_c_sz=1,
-          bkv_sz=config.bkv_sz,
+          bkv_sz=bkv_sz,
           batch_size=config.decode_batch_size,
       )
     if prefill_block_sizes is None:
       prefill_block_sizes = rpa_configs.BlockSizes(
           bq_sz=config.prefill_bq_sz,
           bq_c_sz=config.prefill_bq_c_sz,
-          bkv_sz=config.bkv_sz,
+          bkv_sz=bkv_sz,
           batch_size=config.prefill_batch_size,
       )
 

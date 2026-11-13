@@ -37,9 +37,15 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     pages_per_seq = 2
 
     k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
-    queries = jax.random.normal(k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16)
-    keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    queries = jax.random.normal(
+        k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
     kv_cache = jnp.zeros(
         (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
@@ -87,9 +93,15 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     head_dim_aligned = 128
 
     k1, k2, k3 = jax.random.split(jax.random.key(1), 3)
-    queries = jax.random.normal(k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16)
-    keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    queries = jax.random.normal(
+        k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
     kv_cache = jnp.zeros(
         (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
@@ -115,7 +127,16 @@ class BatchedRpaBaseTest(parameterized.TestCase):
           distribution=dist,
       )
 
-    out, new_cache = run_fn(queries, keys, values, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+    out, new_cache = run_fn(
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
     self.assertEqual(out.shape, queries.shape)
     self.assertEqual(new_cache.shape, kv_cache.shape)
 
@@ -130,9 +151,15 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     head_dim_aligned = 128
 
     k1, k2, k3 = jax.random.split(jax.random.key(2), 3)
-    queries = jax.random.normal(k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16)
-    keys = jax.random.normal(k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    values = jax.random.normal(k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    queries = jax.random.normal(
+        k1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        k2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        k3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
     kv_cache = jnp.zeros(
         (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
         dtype=jnp.bfloat16,
@@ -184,6 +211,212 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     )
     self.assertEqual(out_std.shape, queries.shape)
     self.assertEqual(new_cache_std.shape, kv_cache.shape)
+
+  def test_scale_dequantization(self):
+    total_q_tokens = 4
+    page_size = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    total_pages = 8
+    head_dim_aligned = 128
+
+    key1, key2, key3 = jax.random.split(jax.random.key(10), 3)
+    queries = jax.random.normal(
+        key1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.float32
+    )
+    keys = jax.random.normal(
+        key2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.float32
+    )
+    values = jax.random.normal(
+        key3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.float32
+    )
+    kv_cache = jnp.zeros(
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.float32,
+    )
+    kv_lens = jnp.array([8, 8], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 4], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    out_unscaled, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+    )
+
+    out_id_scales, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        q_scale=1.0,
+        k_scale=1.0,
+        v_scale=1.0,
+    )
+    self.assertTrue(jnp.allclose(out_id_scales, out_unscaled, atol=1e-5))
+
+    out_v_scale, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        v_scale=2.5,
+    )
+    self.assertTrue(jnp.allclose(out_v_scale, out_unscaled * 2.5, atol=1e-5))
+
+    out_k_scale, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        sm_scale=0.5,
+        k_scale=2.0,
+    )
+    out_double_sm, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        sm_scale=1.0,
+    )
+    self.assertTrue(jnp.allclose(out_k_scale, out_double_sm, atol=1e-5))
+
+  def test_custom_mask_value(self):
+    total_q_tokens = 4
+    page_size = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    total_pages = 8
+    head_dim_aligned = 128
+
+    key1, key2, key3 = jax.random.split(jax.random.key(20), 3)
+    queries = jax.random.normal(
+        key1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.float32
+    )
+    keys = jax.random.normal(
+        key2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.float32
+    )
+    values = jax.random.normal(
+        key3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.float32
+    )
+    kv_cache = jnp.zeros(
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.float32,
+    )
+    kv_lens = jnp.array([8, 8], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 4], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    out_default, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        mask_value=None,
+    )
+    out_custom, _ = reference.batched_ragged_paged_attention_reference(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        mask_value=-1e4,
+    )
+    self.assertEqual(out_custom.shape, out_default.shape)
+    self.assertTrue(jnp.allclose(out_custom, out_default, atol=1e-3))
+
+  def test_return_lse_dtype(self):
+    total_q_tokens = 4
+    page_size = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    total_pages = 8
+    head_dim_aligned = 128
+
+    key1, key2, key3 = jax.random.split(jax.random.key(30), 3)
+    queries_bf16 = jax.random.normal(
+        key1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys_bf16 = jax.random.normal(
+        key2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values_bf16 = jax.random.normal(
+        key3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    kv_cache_bf16 = jnp.zeros(
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.bfloat16,
+    )
+    kv_lens = jnp.array([8, 8], dtype=jnp.int32)
+    page_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 2, 4], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    _, _, lse_bf16 = reference.batched_ragged_paged_attention_reference(
+        queries=queries_bf16,
+        keys=keys_bf16,
+        values=values_bf16,
+        kv_cache=kv_cache_bf16,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        return_lse=True,
+    )
+    self.assertEqual(lse_bf16.dtype, jnp.bfloat16)
+    self.assertEqual(lse_bf16.shape, (total_q_tokens, num_q_heads))
+
+    queries_f32 = queries_bf16.astype(jnp.float32)
+    keys_f32 = keys_bf16.astype(jnp.float32)
+    values_f32 = values_bf16.astype(jnp.float32)
+    kv_cache_f32 = kv_cache_bf16.astype(jnp.float32)
+
+    _, _, lse_f32 = reference.batched_ragged_paged_attention_reference(
+        queries=queries_f32,
+        keys=keys_f32,
+        values=values_f32,
+        kv_cache=kv_cache_f32,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        return_lse=True,
+    )
+    self.assertEqual(lse_f32.dtype, jnp.float32)
+    self.assertEqual(lse_f32.shape, (total_q_tokens, num_q_heads))
 
 
 if __name__ == "__main__":

@@ -65,7 +65,7 @@ def batched_ragged_paged_attention(
     out_dtype: Any = None,
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
-    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
+    kv_layout: KVLayout | str | None = None,
     decode_query_size: int = 1,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
