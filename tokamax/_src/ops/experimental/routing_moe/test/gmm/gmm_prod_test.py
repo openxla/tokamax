@@ -57,9 +57,10 @@ class RoutingGmmProdTest(parameterized.TestCase):
     rtol = 5e-2
     atol = max(8e-2, rtol * float(np.abs(expected).max()))
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
-    logging.info("gmm_only: %.1f us", gmm_only.latency_us())
-    logging.info("unfused: %.1f us", unfused.latency_us())
-    logging.info("fused: %.1f us %s", fused.latency_us(), fused.trace())
+    if helper_util.ROUTING_MOE_PROFILE.value:
+      logging.info("gmm_only: %.1f us", gmm_only.latency_us())
+      logging.info("unfused: %.1f us", unfused.latency_us())
+      logging.info("fused: %.1f us %s", fused.latency_us(), fused.trace())
 
   @parameterized.product(case_spec=helper_cases.PROD_CASES)
   def test_gather_gmm(self, case_spec: helper_cases.Case):
@@ -197,37 +198,41 @@ class RoutingGmmProdTest(parameterized.TestCase):
             dict(scatter=routing.scatter),
         ),
     }
+    check_latency = (
+        case_spec.num_local_experts >= 512 and case_spec.num_tokens == 1
+    )
     for name, (x, written, kwargs) in calls.items():
-      outs = {}
-      report = {}
-      for live_group_walk in (False, True):
-        timed = helper_util.Timed.create(
-            kernel.routing_gmm,
-            x,
-            case.w1,
-            custom_plan=gmm_plan.RoutingGmmPlan(
-                live_group_walk=live_group_walk
-            ),
-            **kwargs,
-            **routing.kernel_kwargs,
-        )
-        outs[live_group_walk] = gmm_test_lib.to_large_layout(
-            timed.fn(timed.args)
-        )[written]
-        report[live_group_walk] = (timed.latency_us(), timed.trace())
+      timed = {
+          walk: helper_util.Timed.create(
+              kernel.routing_gmm,
+              x,
+              case.w1,
+              custom_plan=gmm_plan.RoutingGmmPlan(live_group_walk=walk),
+              **kwargs,
+              **routing.kernel_kwargs,
+          )
+          for walk in (False, True)
+      }
+      outs = {
+          walk: gmm_test_lib.to_large_layout(t.fn(t.args))[written]
+          for walk, t in timed.items()
+      }
       np.testing.assert_array_equal(outs[True], outs[False])
-      logging.info(
-          "%s %s: all groups %.1f us %s, live groups %.1f us %s",
-          case_spec.name,
-          name,
-          *report[False],
-          *report[True],
-      )
       # At one token the walk over 512 local groups is a large share of the
       # kernel (about 3 us of 20-25 us). With more tokens the matmul dominates,
       # and with 64 groups the gap is within noise, so those only log.
-      if case_spec.num_local_experts >= 512 and case_spec.num_tokens == 1:
-        self.assertLess(report[True][0], report[False][0])
+      if check_latency:
+        self.assertLess(timed[True].latency_us(), timed[False].latency_us())
+      if helper_util.ROUTING_MOE_PROFILE.value:
+        logging.info(
+            "%s %s: all groups %.1f us %s, live groups %.1f us %s",
+            case_spec.name,
+            name,
+            timed[False].latency_us(),
+            timed[False].trace(),
+            timed[True].latency_us(),
+            timed[True].trace(),
+        )
 
 
 class RemoteRoutingGmmProdTest(parameterized.TestCase):
@@ -293,24 +298,25 @@ class RemoteRoutingGmmProdTest(parameterized.TestCase):
         np.asarray(remote.fn(remote.args)).view(np.uint8),
         np.asarray(local.fn(local.args)).view(np.uint8),
     )
-    local_us = local.latency_us()
-    kernel_us = local_kernel.latency_us()
-    remote_us = remote.latency_us()
-    with helper_util.XprofTrace() as xprof:
-      for timed in (local, remote):
-        jax.block_until_ready(jax.jit(timed.fn)(timed.args))
-    logging.info(
-        "tokens=%d out=%s: local_total=%.0f us, local_kernel=%.0f us,"
-        " local_a2a=%.0f us, remote=%.0f us (%.2fx) %s",
-        num_tokens,
-        jnp.dtype(out_dtype or jnp.bfloat16).name,
-        local_us,
-        kernel_us,
-        local_us - kernel_us,
-        remote_us,
-        remote_us / local_us,
-        xprof.links,
-    )
+    if helper_util.ROUTING_MOE_PROFILE.value:
+      local_us = local.latency_us()
+      kernel_us = local_kernel.latency_us()
+      remote_us = remote.latency_us()
+      with helper_util.XprofTrace() as xprof:
+        for timed in (local, remote):
+          jax.block_until_ready(jax.jit(timed.fn)(timed.args))
+      logging.info(
+          "tokens=%d out=%s: local_total=%.0f us, local_kernel=%.0f us,"
+          " local_a2a=%.0f us, remote=%.0f us (%.2fx) %s",
+          num_tokens,
+          jnp.dtype(out_dtype or jnp.bfloat16).name,
+          local_us,
+          kernel_us,
+          local_us - kernel_us,
+          remote_us,
+          remote_us / local_us,
+          xprof.links,
+      )
 
 
 if __name__ == "__main__":

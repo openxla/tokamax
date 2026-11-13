@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 import dataclasses
 from typing import Any, Self
 
+from absl import flags
 from absl import logging
 from absl.testing import absltest
 import jax
@@ -25,6 +26,13 @@ from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
+
+ROUTING_MOE_PROFILE = flags.DEFINE_bool(
+    "routing_moe_profile",
+    False,
+    "If true, run XProf trace capture and latency benchmarks in routing_moe"
+    " prod tests.",
+)
 
 
 def skip_unless_supported(
