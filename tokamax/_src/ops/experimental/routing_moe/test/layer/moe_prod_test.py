@@ -23,6 +23,7 @@ from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_lib
 
@@ -48,7 +49,9 @@ class MoEProdTest(moe_test_base.MoETestCase):
       use_sp: bool,
   ):
     layout = moe_test_lib.WeightLayout(case.sharding, use_sp=use_sp)
-    self.check_case(case, layout, capture_xprof=True)
+    self.check_case(
+        case, layout, capture_xprof=helper_util.ROUTING_MOE_PROFILE.value
+    )
 
   @parameterized.product(
       case=_SHARED_EXPERT_CASES,
@@ -76,7 +79,7 @@ class MoEProdTest(moe_test_base.MoETestCase):
         case,
         layout,
         reduce_output=remote_scatter,
-        capture_xprof=True,
+        capture_xprof=helper_util.ROUTING_MOE_PROFILE.value,
         moe_plan=moe_plan_lib.RoutingMoEPlan(remote_scatter=remote_scatter),
     )
 
@@ -112,7 +115,7 @@ class MoEProdTest(moe_test_base.MoETestCase):
     self.check_case(
         case,
         layout,
-        capture_xprof=True,
+        capture_xprof=helper_util.ROUTING_MOE_PROFILE.value,
         moe_plan=moe_plan,
     )
 
@@ -131,7 +134,7 @@ class MoEProdTest(moe_test_base.MoETestCase):
     self.check_case(
         helper_cases.QWEN_38_FLASH_NEXT_8,
         reduce_output=False,
-        capture_xprof=True,
+        capture_xprof=helper_util.ROUTING_MOE_PROFILE.value,
         gmm_plan=gmm_plan,
     )
 
