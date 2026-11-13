@@ -124,7 +124,7 @@ class _Sm100QuantTestBase(test_base.RaggedDotTestBase):
     self.skipTest("Not supported.")
 
   @override
-  def _test_vjp(self, num_groups, m, k, n, activation=None):
+  def _test_vjp(self, num_groups, m, k, n, activation=None, group_sizes=None):
     self.skipTest("Not supported.")
 
   @override

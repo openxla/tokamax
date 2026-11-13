@@ -132,6 +132,17 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
 
+  def test_vjp_multi_block_groups(self):
+    # In `test_vjp` every group has 16 or 128 rows; these groups span more than
+    # one 128-row block of the contracting dimension of the `drhs` ragged dot.
+    for group_sizes in (
+        (256, 256, 256, 256),
+        (100, 156, 200, 56, 312, 72, 64, 64),
+    ):
+      with self.subTest(group_sizes=group_sizes):
+        num_groups, m, k, n = len(group_sizes), sum(group_sizes), 128, 256
+        self._test_vjp(num_groups, m, k, n, group_sizes=group_sizes)
+
 
 if __name__ == "__main__":
   absltest.main()
