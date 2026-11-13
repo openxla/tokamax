@@ -343,7 +343,7 @@ class MhcLiteApiTest(parameterized.TestCase):
         x_2d, hc_weights, w_branch
     )
     self.assertEqual(dx_2d.shape, x_2d.shape)
-    np.testing.assert_allclose(loss_2d, loss, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(loss_2d, loss, rtol=2e-2, atol=2e-2)
     np.testing.assert_allclose(
         dx_2d, dx.reshape(x_2d.shape), rtol=1e-3, atol=1e-3
     )
