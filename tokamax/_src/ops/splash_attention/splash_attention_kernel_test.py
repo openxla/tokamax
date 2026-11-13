@@ -2169,6 +2169,217 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     for r, g in zip(ref_vals, opt_vals):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
+  @parameterized.product(
+      dq_reduction_steps=(1, 3),
+      q_layout=(
+          splash.QKVLayout.HEAD_DIM_MINOR,
+          splash.QKVLayout.SEQ_MINOR,
+      ),
+      kv_layout=(
+          splash.QKVLayout.HEAD_DIM_MINOR,
+          splash.QKVLayout.SEQ_MINOR,
+      ),
+      qk_dtype=("bfloat16", "float8_e4m3fn"),
+      dkv_reuse_scaled_q=(False, True),
+  )
+  def test_bwd_diag_tip_subskip_equivalence(
+      self,
+      dq_reduction_steps,
+      q_layout,
+      kv_layout,
+      qk_dtype,
+      dkv_reuse_scaled_q,
+  ):
+    seq_len, num_heads, block = 2048, 2, 1024
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(3), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def grads(band_skip: bool, tip_subskip: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          q_layout=q_layout,
+          k_layout=kv_layout,
+          v_layout=kv_layout,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          dkv_reuse_scaled_q=dkv_reuse_scaled_q,
+          qk_diag_grid=2,
+          interpret=self.INTERPRET,
+          qk_diag_skip=band_skip,
+          diag_band_skip=band_skip,
+          bwd_diag_tip_subskip=tip_subskip,
+          dq_reduction_steps=dq_reduction_steps if band_skip else None,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q_, k_, v_, do_):
+        _, vjp = jax.vjp(attn, q_, k_, v_)
+        return vjp(do_)
+
+      return jax.jit(bwd)(q, k, v, do)
+
+    stock_grads = grads(False, False)
+    band_grads = grads(True, False)
+    tip_grads = grads(True, True)
+    for r, g in zip(stock_grads, tip_grads, strict=True):
+      self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+    for r, g in zip(band_grads, tip_grads, strict=True):
+      self._assert_allclose(g, r, atol=1e-2, rtol=1e-2)
+
+  @parameterized.product(
+      block_and_grid=((512, 2), (1024, 2), (2048, 2)),
+      dq_reduction_steps=(1, 3),
+      q_prescaled_log2e=(False, True),
+  )
+  def test_bwd_diag_tip_subskip_generalized_splits(
+      self,
+      block_and_grid,
+      dq_reduction_steps,
+      q_prescaled_log2e,
+  ):
+    block, qk_diag_grid = block_and_grid
+    if block == 2048 and not self.INTERPRET:
+      try:
+        if pltpu.get_tpu_info().generation < 6:
+          self.skipTest(
+              "2048 square tiles exceed 16 MiB default scoped VMEM on TPU <v6."
+          )
+      except (ValueError, RuntimeError):
+        pass
+    seq_len = 2 * block
+    num_heads, head_dim_qk, head_dim_v = 2, 128, 128
+    k1, k2, k3, k4 = random.split(random.key(5), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def grads(band_skip: bool, tip_subskip: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          q_prescaled_log2e=q_prescaled_log2e,
+          qk_diag_grid=qk_diag_grid,
+          interpret=self.INTERPRET,
+          qk_diag_skip=band_skip,
+          diag_band_skip=band_skip,
+          bwd_diag_tip_subskip=tip_subskip,
+          dq_reduction_steps=dq_reduction_steps if band_skip else None,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q_, k_, v_, do_):
+        _, vjp = jax.vjp(attn, q_, k_, v_)
+        return vjp(do_)
+
+      return jax.jit(bwd)(q, k, v, do)
+
+    stock_grads = grads(False, False)
+    band_grads = grads(True, False)
+    tip_grads = grads(True, True)
+    for r, g in zip(stock_grads, tip_grads, strict=True):
+      self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+    for r, g in zip(band_grads, tip_grads, strict=True):
+      self._assert_allclose(g, r, atol=1e-2, rtol=1e-2)
+
+  @parameterized.product(
+      bkv_compute=(256, 512),
+      extra=("none", "segments", "softcap"),
+  )
+  def test_diag_subblock_causal_mask_bit_exact(self, bkv_compute, extra):
+    seq_len, num_heads, block = 1024, 2, 512
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(4), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    segment_ids = None
+    if extra == "segments":
+      seg = jnp.concatenate([
+          jnp.zeros(300, dtype=jnp.int32),
+          jnp.ones(seq_len - 300, dtype=jnp.int32),
+      ])
+      segment_ids = splash.SegmentIds(q=seg, kv=seg)
+    soft_cap = 15.0 if extra == "softcap" else None
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def run(optimized: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=bkv_compute,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          attn_logits_soft_cap=soft_cap,
+          qk_diag_grid=2,
+          interpret=self.INTERPRET,
+          qk_diag_skip=optimized,
+          diag_band_skip=optimized and (bkv_compute == block),
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      if bkv_compute == block:
+        fwd_only = lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids)
+        return [jax.jit(fwd_only)(q, k, v)]
+
+      def fwd_and_bwd(q_, k_, v_, do_):
+        out, vjp = jax.vjp(
+            lambda qq, kk, vv: attn(qq, kk, vv, segment_ids=segment_ids),
+            q_,
+            k_,
+            v_,
+        )
+        return out, *vjp(do_)
+
+      return jax.jit(fwd_and_bwd)(q, k, v, do)
+
+    for r, o in zip(run(False), run(True), strict=True):
+      np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
 
 if __name__ == "__main__":
   absltest.main()
