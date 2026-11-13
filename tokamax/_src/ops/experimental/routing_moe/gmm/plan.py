@@ -266,6 +266,50 @@ def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
   )
 
 
+def w_has_small_quant_block(
+    w: tensor_spec.WeightSpec, tpu_info: pltpu.TpuInfo
+) -> bool:
+  """Returns whether w's quant blocks are narrower than the MXU."""
+  if w.quant is None:
+    return False
+  assert isinstance(w.quant, tensor_spec.SubchannelQuantSpec)
+  return w.quant.block_size < tpu_info.mxu_column_size
+
+
+def dequantizes_w_before_matmul(
+    *,
+    x_dtype: jnp.dtype,
+    matmul_dtype: jnp.dtype,
+    w: tensor_spec.WeightSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> bool:
+  """Returns whether w is dequantized in VMEM before the matmul."""
+  return matmul_dtype == x_dtype and w_has_small_quant_block(w, tpu_info)
+
+
+def _quantized_x_dtype(
+    w_dtype: jnp.dtype, tpu_info: pltpu.TpuInfo
+) -> jnp.dtype:
+  """Returns the narrowest x dtype the MXU can pair with quantized w."""
+  # matmul_dtype is the dtype x is converted to right before it goes
+  # into the MXU. See RoutingGmmConfig.create(). compute.py converts the
+  # weight dtype to matmul_dtype before the matmul if
+  # is_matmul_supported(matmul_dtype, w.dtype) is false.
+  # We pick the narrowest x dtype that satisfies is_matmul_supported.
+  if not jnp.issubdtype(w_dtype, jnp.floating):
+    return w_dtype
+  for dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz):
+    dtype = jnp.dtype(dtype)
+    if tpu_info.is_matmul_supported(dtype, w_dtype) or (
+        _fits_in(w_dtype, dtype) and tpu_info.is_matmul_supported(dtype, dtype)
+    ):
+      return dtype
+  raise NotImplementedError(
+      f"No supported fp8 activation dtype for {w_dtype} weights on"
+      f" {tpu_info.chip_version}"
+  )
+
+
 def _resolve_dtypes(
     plan: RoutingGmmPlan,
     *,
@@ -278,27 +322,13 @@ def _resolve_dtypes(
   # dtype is used so that both operands enter the MXU in the same dtype.
   if plan.matmul_dtype is not None:
     matmul_dtype = jnp.dtype(plan.matmul_dtype)
+  elif x.quant is None and w_has_small_quant_block(w, tpu_info):
+    # Small w blocks are dequantized in VMEM before the matmul, and the
+    # dequantized w is wider than w.dtype, so x stays unquantized.
+    # Otherwise, fp8 @ bf16 costs precision and buys no speed.
+    matmul_dtype = x.dtype
   elif x.quant is None and w.quant is not None:
-    matmul_dtype = w.dtype
-    # matmul_dtype is the dtype x is converted to right before it goes
-    # into the MXU. See RoutingGmmConfig.create(). compute.py converts the
-    # weight dtype to matmul_dtype before the matmul if
-    # is_matmul_supported(matmul_dtype, w.dtype) is false.
-    # We pick the narrowest x dtype that satisfies is_matmul_supported.
-    if jnp.issubdtype(w.dtype, jnp.floating):
-      for dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3b11fnuz):
-        dtype = jnp.dtype(dtype)
-        if tpu_info.is_matmul_supported(dtype, w.dtype) or (
-            _fits_in(w.dtype, dtype)
-            and tpu_info.is_matmul_supported(dtype, dtype)
-        ):
-          matmul_dtype = dtype
-          break
-      else:
-        raise NotImplementedError(
-            f"No supported fp8 activation dtype for {w.dtype} weights on"
-            f" {tpu_info.chip_version}"
-        )
+    matmul_dtype = _quantized_x_dtype(w.dtype, tpu_info)
   else:
     matmul_dtype = x.dtype
 
@@ -463,6 +493,9 @@ def _vmem_estimate(
 ) -> int:
   """Estimates VMEM usage in bytes for routing GMM."""
   is_dynamic_quantized = matmul_dtype != x.dtype
+  is_w_dequantized_before = dequantizes_w_before_matmul(
+      x_dtype=x.dtype, matmul_dtype=matmul_dtype, w=w, tpu_info=tpu_info
+  )
   matmul_bits = jax.dtypes.itemsize_bits(matmul_dtype)
   acc_bits = jax.dtypes.itemsize_bits(acc_dtype)
 
@@ -504,6 +537,9 @@ def _vmem_estimate(
     # Dynamic quantization materializes a quantized copy of the x tile.
     if is_dynamic_quantized:
       acc_vmem += tile_m * k_tile * matmul_bits // 8
+    # Dequantizing before the matmul materializes a dequantized copy of w.
+    elif is_w_dequantized_before:
+      acc_vmem += num_w_refs * k_tile * n_tile * matmul_bits // 8
     return w_vmem + scale_vmem + bias_vmem + acc_vmem
 
   num_w1_refs = 2 if is_fused_act else 1

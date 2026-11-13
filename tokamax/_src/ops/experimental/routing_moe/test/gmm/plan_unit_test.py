@@ -119,6 +119,7 @@ def _resolve(
     tpu_info: pltpu.TpuInfo | None = None,
     w_dtype: jnp.dtype | None = None,
     row_group: bool = True,
+    num_w_q_blocks: int = 1,
 ) -> gmm_plan.ResolvedGmmPlan:
   gmm_spec = _make_spec(
       num_tokens,
@@ -127,6 +128,7 @@ def _resolve(
       size_n=size_n,
       w_dtype=w_dtype,
       row_group=row_group,
+      num_w_q_blocks=num_w_q_blocks,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       out_format,
@@ -223,6 +225,20 @@ class MatmulDtypeTest(parameterized.TestCase):
         NotImplementedError, "No supported fp8 activation dtype"
     ):
       _resolve(8, tpu_info=tpu_info, w_dtype=jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_small_w_blocks_keep_x_unquantized(self):
+    # size_k=2560 in 20 blocks gives 128-wide blocks, below the MXU width so we
+    # dequant weight before the matmul for better mxu utilization.
+    # In this case, we don't quantize the activations. Otherwise, fp8 @ bf16
+    # costs precision and buys no speed.
+    resolved = _resolve(8, num_w_q_blocks=20)
+    self.assertEqual(resolved.matmul_dtype, jnp.bfloat16)
+    self.assertIsNone(resolved.x_quant_block_size)
+
+  def test_small_w_blocks_keep_explicit_matmul_dtype(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, num_w_q_blocks=20)
+    self.assertEqual(resolved.matmul_dtype, jnp.float8_e4m3fn)
 
 
 class NumWBuffersTest(parameterized.TestCase):
@@ -743,6 +759,36 @@ class VmemEstimateTest(parameterized.TestCase):
     self.assertEqual(
         estimate(2) - estimate(1),
         num_w_buffers * scale_cols * bytes_per_f32,
+    )
+
+  def test_vmem_estimate_dequantized_w(self):
+    num_w_buffers = 3
+
+    def estimate(num_w_q_blocks: int) -> int:
+      gmm_spec = _make_spec(8, num_w_q_blocks=num_w_q_blocks)
+      return gmm_plan._vmem_estimate(
+          x=gmm_spec.x,
+          w=gmm_spec.w,
+          matmul_dtype=gmm_spec.x.dtype,
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=gmm_spec.x.dtype,
+          tile_m=128,
+          tile_k=gmm_spec.size_k,
+          tile_n=gmm_spec.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    # 128-wide blocks are below the MXU width, so the estimate adds a bf16
+    # copy of the dequantized w tile on top of the extra scale rows.
+    gmm_spec = _make_spec(8)
+    size_k, size_n = gmm_spec.size_k, gmm_spec.size_out_n
+    bytes_per_f32, bytes_per_bf16 = 4, 2
+    self.assertEqual(
+        estimate(20) - estimate(1),
+        num_w_buffers * 19 * size_n * bytes_per_f32
+        + size_k * size_n * bytes_per_bf16,
     )
 
 

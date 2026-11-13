@@ -62,6 +62,9 @@ class MatmulMode(enum.StrEnum):
   # w is passed in quantized with scales. x is passed in unquantized and stays
   # unquantized. The output is scaled by w scales.
   WEIGHT_ONLY_SCALE_AFTER = enum.auto()
+  # Like WEIGHT_ONLY_SCALE_AFTER, but w is dequantized before the matmul. Used
+  # when w quant blocks are narrower than the MXU.
+  WEIGHT_ONLY_SCALE_BEFORE = enum.auto()
 
 
 @dataclass_util.require_no_default
@@ -160,6 +163,13 @@ class RoutingGmmConfig:
 
     if x_quant is not None and spec.w.quant is not None:
       matmul_mode = MatmulMode.QUANTIZED
+    elif plan_lib.dequantizes_w_before_matmul(
+        x_dtype=spec.x.dtype,
+        matmul_dtype=plan.matmul_dtype,
+        w=spec.w,
+        tpu_info=tpu_info,
+    ):
+      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
     elif x_quant is None and spec.w.quant is not None:
       matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
     elif x_quant is None and spec.w.quant is None:

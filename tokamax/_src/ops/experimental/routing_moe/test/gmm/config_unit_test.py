@@ -37,9 +37,15 @@ def _make_config(
     size_ep: int = 1,
     size_n: int = 1280,
     quantize_w: bool = True,
+    w_q_block_size: int | None = None,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a RoutingGmmConfig for a 512-expert, top-10 MoE layer."""
   num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
+  w_q_block_size = (
+      w_q_block_size
+      if w_q_block_size is not None
+      else size_k
+  )
   x = spec.ActivationSpec(
       row_size=num_tokens,
       col_size=size_k,
@@ -51,7 +57,9 @@ def _make_config(
       in_size=size_k,
       out_size=size_n,
       dtype=jnp.dtype(jnp.float8_e4m3fn if quantize_w else jnp.bfloat16),
-      quant=spec.SubchannelQuantSpec(block_size=size_k) if quantize_w else None,
+      quant=spec.SubchannelQuantSpec(block_size=w_q_block_size)
+      if quantize_w
+      else None,
       has_bias=False,
       fused_gate_up=False,
   )
@@ -115,14 +123,31 @@ class OutSpecAndValidationTest(parameterized.TestCase):
           custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.bfloat16),
           expected=gmm_config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER,
       ),
+      dict(
+          testcase_name="small_w_block",
+          quantize_w=True,
+          custom_plan=None,
+          w_q_block_size=128,
+          expected=gmm_config.MatmulMode.WEIGHT_ONLY_SCALE_BEFORE,
+      ),
+      dict(
+          testcase_name="small_w_block_quantized_x",
+          quantize_w=True,
+          custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn),
+          w_q_block_size=128,
+          expected=gmm_config.MatmulMode.QUANTIZED,
+      ),
   )
   def test_matmul_mode(
       self,
       quantize_w: bool,
       custom_plan: gmm_plan.RoutingGmmPlan | None,
       expected: gmm_config.MatmulMode,
+      w_q_block_size: int | None = None,
   ):
-    cfg = _make_config(8, custom_plan, quantize_w=quantize_w)
+    cfg = _make_config(
+        8, custom_plan, quantize_w=quantize_w, w_q_block_size=w_q_block_size
+    )
     self.assertEqual(cfg.compute.matmul_mode, expected)
 
   def test_default_out_format_uses_input_dtype_and_unquantized(self):
