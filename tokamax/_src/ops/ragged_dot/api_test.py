@@ -163,6 +163,61 @@ class RaggedDotTest(parameterized.TestCase):
                 or isinstance(opspecs[0].op, mosaic_impl)
             )
 
+  @parameterized.parameters(None, "xla", "mosaic", "triton", "mosaic_tpu_v2")
+  def test_vmap(self, implementation):
+    if implementation == "triton" and not gpu_utils.has_triton_support():
+      self.skipTest("Triton not supported on this platform.")
+
+    if implementation == "mosaic_tpu_v2" and (
+        jax.default_backend() != "tpu"
+        or "mosaic_tpu_v2" not in api.IMPLEMENTATIONS
+    ):
+      self.skipTest("mosaic_tpu_v2 is only supported on TPU.")
+
+    if implementation == "mosaic" or implementation is None:
+      if (
+          jax.default_backend() == "gpu"
+          and not gpu_utils.has_mosaic_gpu_support()
+      ):
+        self.skipTest("Mosaic not supported on this platform.")
+      if jax.default_backend() == "cpu":
+        self.skipTest("No Mosaic support on CPU.")
+
+    if jax.default_backend() == "tpu":
+      lhs, rhs, group_sizes = _get_input_data(
+          num_experts=8, m=256, k=128, n=128  # TPU needs shapes >= 128
+      )
+    else:
+      lhs, rhs, group_sizes = _get_input_data(num_experts=8, m=128, k=64, n=128)
+
+    ragged_dot_fn = (
+        functools.partial(api.ragged_dot, preferred_element_type=jnp.bfloat16)
+        if jax.default_backend() == "tpu"
+        else api.ragged_dot
+    )
+
+    @jax.jit
+    @jax.vmap
+    @functools.partial(jax.value_and_grad, argnums=(0, 1))
+    def f(lhs, rhs, group_sizes):
+      out = ragged_dot_fn(lhs, rhs, group_sizes, implementation=implementation)
+      return jnp.sum(out)
+
+    @jax.jit
+    @functools.partial(jax.value_and_grad, argnums=(0, 1))
+    def f_gt(lhs, rhs, group_sizes):
+      return jnp.sum(jax.lax.ragged_dot(lhs, rhs, group_sizes))
+
+    out, (lhs_grad, rhs_grad) = f(lhs[None], rhs[None], group_sizes[None])
+    out_gt, (lhs_grad_gt, rhs_grad_gt) = f_gt(lhs, rhs, group_sizes)
+
+    with self.subTest("value"):
+      chex.assert_trees_all_close(out, out_gt[None])
+    with self.subTest("lhs_grad"):
+      chex.assert_trees_all_close(lhs_grad, lhs_grad_gt[None])
+    with self.subTest("rhs_grad"):
+      chex.assert_trees_all_close(rhs_grad, rhs_grad_gt[None])
+
   def test_manual_axis_type(self):
     if jax.default_backend() == "tpu":
       lhs, rhs, group_sizes = _get_input_data(

@@ -153,16 +153,7 @@ class ResolvedGmmPlan:
         plan, out_quant=out_format.quant
     )
 
-    live_group_walk = plan.live_group_walk
-    if live_group_walk is None:
-      # The walk pays off while most of this shard's groups are empty.
-      # size_out_m counts the routed rows of all shards, i.e. (token, pick)
-      # pairs, num_tokens * top-k. A shard gets size_out_m * group_size /
-      # num_global_groups of them on average, which is fewer than its
-      # group_size groups exactly when size_out_m < num_global_groups, under TP
-      # or EP alike. This also keeps row_group, one int32 per routed row in
-      # SMEM, small.
-      live_group_walk = spec.size_out_m < spec.num_global_groups
+    live_group_walk = _resolve_live_group_walk(plan, spec=spec)
 
     if spec.w2 is None and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires w2 to be set.")
@@ -214,7 +205,7 @@ class ResolvedGmmPlan:
     if not fuse_up_and_down and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires fuse_up_and_down=True.")
 
-    return cls(
+    resolved = cls(
         tile_m=tile_m,
         tile_k=tile_k,
         tile_k2=tile_k2,
@@ -231,6 +222,36 @@ class ResolvedGmmPlan:
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
     )
+    if spec.w2 is None or fuse_up_and_down:
+      check_smem(smem_estimate(spec, resolved), tpu_info)
+    return resolved
+
+
+def smem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
+  """Bytes of SMEM that routing gmm may allocate without slowing down."""
+  # XLA gives a custom call this fraction of SMEM by default
+  # (xla_tpu_impure_smem_callee_ratio); the caller keeps the rest. Past this
+  # split, sreg spill slots go to HBM and routing gmm runs much slower. Under
+  # dynamic SMEM negotiation the kernel gets at least as much, so this static
+  # budget stays safe (only conservative).
+  callee_ratio = 0.6
+  # Left for sreg spill slots, the compiler's own SMEM, and Mosaic rounding
+  # each kernel SMEM buffer up to 512 B (a few KiB at most).
+  reserved_bytes = 32 * 1024
+  return int(callee_ratio * tpu_info.smem_capacity_bytes) - reserved_bytes
+
+
+def check_smem(allocations: dict[str, int], tpu_info: pltpu.TpuInfo) -> None:
+  """Raises if the kernel's SMEM `allocations` (bytes) exceed the budget."""
+  total = sum(allocations.values())
+  budget = smem_budget_bytes(tpu_info)
+  if total <= budget:
+    return
+  raise ValueError(
+      f"Routing gmm SMEM allocations {allocations} total {total} bytes, over"
+      f" the budget of {budget} bytes. Reduce the tokens, or set"
+      " live_group_walk=False if row_group is large."
+  )
 
 
 def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
@@ -291,6 +312,28 @@ def _resolve_dtypes(
   else:
     acc_dtype = jnp.dtype(plan.acc_dtype)
   return matmul_dtype, acc_dtype, x_quant_block_size
+
+
+def _resolve_live_group_walk(
+    plan: RoutingGmmPlan, *, spec: gmm_spec_lib.RoutingGmmSpec
+) -> bool:
+  """Resolves whether metadata walks only the groups with rows."""
+  live_group_walk = plan.live_group_walk
+  if live_group_walk is None:
+    # The walk pays off while most of this shard's groups are empty.
+    # size_out_m counts the routed rows of all shards, i.e. (token, pick)
+    # pairs, num_tokens * top-k. A shard gets size_out_m * group_size /
+    # num_global_groups of them on average, which is fewer than its
+    # group_size groups exactly when size_out_m < num_global_groups, under TP
+    # or EP alike. This also keeps row_group, one int32 per routed row in
+    # SMEM, small.
+    live_group_walk = spec.size_out_m < spec.num_global_groups
+  if live_group_walk and not spec.size_row_group:
+    if plan.live_group_walk:
+      raise ValueError("live_group_walk requires the row_group input.")
+    # The walk reads row_group; without it, use the sorted walk.
+    live_group_walk = False
+  return live_group_walk
 
 
 def _resolve_stash(
@@ -361,6 +404,43 @@ def _choose_tiling_and_fusion(
   return tiling, False
 
 
+def smem_estimate(
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    plan: ResolvedGmmPlan,
+    *,
+    smem_indices: bool = False,
+) -> dict[str, int]:
+  """Estimates SMEM allocation sizes in bytes for routing GMM."""
+  allocs = {}
+  allocs["group_cum_sum"] = 4 * (spec.num_global_groups + 1)
+  allocs["group_offset"] = 4
+  if plan.live_group_walk and spec.size_row_group:
+    allocs["row_group"] = 4 * spec.size_row_group
+
+  max_num_gm = spec.size_local_groups + pl.cdiv(spec.size_out_m, plan.tile_m)
+  allocs["gm_id_to_group_id"] = 4 * max_num_gm
+  allocs["gm_id_to_m_offset"] = 4 * max_num_gm
+  allocs["gm_id_to_num_rows"] = 4 * max_num_gm
+  allocs["num_gm"] = 4
+
+  # smem_indices covers indices passed as SMEM kernel inputs.
+  for name, routing in (
+      ("gather_idx", spec.gather),
+      ("scatter_idx", spec.scatter),
+  ):
+    if routing is not None:
+      if smem_indices:
+        allocs[name] = 4 * (routing.num_indices + plan.tile_m_idx)
+      else:
+        allocs[f"{name}_buffers"] = (
+            4 * plan.num_idx_buffers * plan.idx_buffer_size
+        )
+
+  return allocs
+
+
+# SMEM is estimated from the spec and plan by smem_estimate, and checked
+# against smem_budget_bytes in ResolvedGmmPlan.create.
 def _vmem_estimate(
     *,
     x: tensor_spec.ActivationSpec,
@@ -410,14 +490,21 @@ def _vmem_estimate(
     w_bits = jax.dtypes.itemsize_bits(weight.dtype)
     w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
     scale_vmem = 0
+    bytes_per_fp32 = 4
     if weight.quant is not None:
+      assert isinstance(weight.quant, tensor_spec.SubchannelQuantSpec)
       num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
-      scale_vmem = num_w_refs * num_w_buffers * num_blocks * n_tile * 4
+      scale_vmem = (
+          num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
+      )
+    bias_vmem = 0
+    if weight.has_bias:
+      bias_vmem = num_w_refs * num_w_buffers * n_tile * bytes_per_fp32
     acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
     # Dynamic quantization materializes a quantized copy of the x tile.
     if is_dynamic_quantized:
       acc_vmem += tile_m * k_tile * matmul_bits // 8
-    return w_vmem + scale_vmem + acc_vmem
+    return w_vmem + scale_vmem + bias_vmem + acc_vmem
 
   num_w1_refs = 2 if is_fused_act else 1
   if w2 is None:
@@ -571,12 +658,9 @@ def calculate_tiling(
   x, w = spec.x, spec.w
   # Step 1: Set default values.
   # A group gets at most one row per input token, so a tile never needs more
-  # rows than there are tokens (e.g. decode). Tiles stay a whole number of
-  # sublane tiles of x and, with dynamic quantization, of x in matmul_dtype.
-  min_tile_m = max(
-      tpu_info.get_sublane_tiling(x.dtype),
-      tpu_info.get_sublane_tiling(matmul_dtype),
-  )
+  # rows than there are tokens (e.g. decode). Compact VMEM loads and stores
+  # operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
+  min_tile_m = tpu_info.num_sublanes
   max_group_rows = min_tile_m * pl.cdiv(x.row_size, min_tile_m)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2

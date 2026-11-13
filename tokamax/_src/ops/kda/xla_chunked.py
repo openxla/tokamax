@@ -80,10 +80,11 @@ def _check_supported(
     raise NotImplementedError("`xla_chunked` requires `safe_gate=True`.")
   if chunk_size != 64:
     raise NotImplementedError("`xla_chunked` currently supports chunk_size=64.")
-  if segment_ids is None and query.shape[2] % chunk_size:
+  _, _, seq_len, _ = query.shape
+  if segment_ids is None and seq_len % chunk_size:
     raise NotImplementedError(
         "`xla_chunked` requires fixed-length T to be divisible by "
-        f"chunk_size; got T={query.shape[2]}, chunk_size={chunk_size}."
+        f"chunk_size; got T={seq_len}, chunk_size={chunk_size}."
     )
   if (
       context_parallel_metadata is not None

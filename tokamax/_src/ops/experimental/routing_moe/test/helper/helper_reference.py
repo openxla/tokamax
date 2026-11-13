@@ -82,6 +82,12 @@ def _apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
       gate = jnp.clip(gate, max=10.0)
       up = jnp.clip(up, min=-10.0, max=10.0)
       return jax.nn.silu(gate) * up
+    case str() if fuse_act.startswith("situ:"):
+      _, beta, linear_beta = fuse_act.split(":")
+      gate = float(beta) * jnp.tanh(gate / float(beta)) * jax.nn.sigmoid(gate)
+      if linear_beta != "none":
+        up = float(linear_beta) * jnp.tanh(up / float(linear_beta))
+      return gate * up
     case _:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
@@ -157,6 +163,24 @@ def unfused_gmm_scatter(
 ) -> jax.Array:
   """Runs a grouped matmul and scatters rows as an unfused XLA baseline."""
   out = reference_gmm(x_sorted, w, group_sizes)
+  mask = jnp.arange(out.shape[0]) < group_sizes.sum()
+  out = jnp.where(mask[:, None], out, 0)
+  return jnp.zeros_like(out).at[sorted_to_flat].set(out)
+
+
+@jax.jit
+def unfused_gather_gmm_gmm_scatter(
+    x: jax.Array,
+    w: arg.SingleWeightWrapper[jax.Array],
+    w2: arg.SingleWeightWrapper[jax.Array],
+    group_sizes: jax.Array,
+    gather_indices: jax.Array,
+    sorted_to_flat: jax.Array,
+) -> jax.Array:
+  """Gathers, runs gate/up and down GMMs, and scatters as an XLA baseline."""
+  out = reference_gmm(
+      x[gather_indices], w, group_sizes, w2=w2, fuse_act="silu"
+  )
   mask = jnp.arange(out.shape[0]) < group_sizes.sum()
   out = jnp.where(mask[:, None], out, 0)
   return jnp.zeros_like(out).at[sorted_to_flat].set(out)

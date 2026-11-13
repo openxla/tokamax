@@ -31,6 +31,15 @@ from typing_extensions import override
 
 AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
+# Dimensions.
+#   B: batch size
+#   H: number of heads
+#   T: sequence length
+#   N: number of sequences per batch element (varlen / packed inputs)
+#   K: key/query head dimension
+#   V: value head dimension
+#   GW: gate channel width (1 for scalar GDN gate, K for per-channel KDA gate)
+
 _Config = TypeVar("_Config")
 _Key = TypeVar("_Key")
 Output: TypeAlias = tuple[jax.Array, jax.Array | None]

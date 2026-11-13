@@ -48,18 +48,32 @@ def _cdiv(a: int, b: int) -> int:
 
 def _make_argspec(
     *,
-    name: str,
-    batch_size: int,
-    q_len: int,
     kv_len_val: int,
-    page_size: int,
-    csa_topk: int,
-    num_q_heads: int,
+    batch_size: int = 1,
+    q_len: int = 1,
+    page_size: int = 1024,
+    csa_topk: int = 2048,
+    num_q_heads: int = 64,
+    actual_batch_size: int | None = None,
     head_dim: int = _HEAD_DIM,
     q_dtype: jax.typing.DTypeLike = jnp.bfloat16,
-    tags: tuple[arg_spec.Tag, ...] = ("forward_only",),
+    primary: bool = False,
+    name: str | None = None,
 ) -> arg_spec.ArgSpec:
   """Makes a single argspec for Sparse MLA."""
+  if name is None:
+    mode = "decode" if q_len == 1 else "prefill"
+    act_str = (
+        f"_act{actual_batch_size}" if actual_batch_size is not None else ""
+    )
+    page_str = f"_p{page_size}" if page_size != 1024 else ""
+    name = (
+        f"{mode}_b{batch_size}{act_str}_q{q_len}_kv{kv_len_val}"
+        f"{page_str}_topk{csa_topk}_h{num_q_heads}"
+    )
+  tags: tuple[arg_spec.Tag, ...] = (
+      ("primary", "forward_only") if primary else ("forward_only",)
+  )
   compressed_page_size = page_size // _COMPRESSION_RATIO
   kv_len_after_compression = kv_len_val // _COMPRESSION_RATIO
   num_tokens = batch_size * q_len
@@ -69,9 +83,12 @@ def _make_argspec(
   total_pages = batch_size * pages_per_seq
   page_indices = np.arange(total_pages, dtype=np.int32)
 
-  num_decode_seqs = batch_size if q_len == 1 else 0
+  effective_batch_size = (
+      batch_size if actual_batch_size is None else actual_batch_size
+  )
+  num_decode_seqs = effective_batch_size if q_len == 1 else 0
   distribution = np.array(
-      [num_decode_seqs, num_decode_seqs, batch_size], dtype=np.int32
+      [num_decode_seqs, num_decode_seqs, effective_batch_size], dtype=np.int32
   )
 
   args = {
@@ -106,80 +123,53 @@ def _make_argspec(
 
 
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    # DeepSeek-V4 shapes
     _make_argspec(
-        name="decode_b256_q1_kv9216_topk1024_h128",
         batch_size=256,
-        q_len=1,
         kv_len_val=9216,
-        page_size=1024,
         csa_topk=1024,
         num_q_heads=128,
-        tags=("primary", "forward_only"),
+        primary=True,
     ),
     _make_argspec(
-        name="prefill_b1_q1024_kv1024_topk1024_h128",
-        batch_size=1,
-        q_len=1024,
-        kv_len_val=1024,
-        page_size=1024,
-        csa_topk=1024,
-        num_q_heads=128,
+        q_len=1024, kv_len_val=1024, csa_topk=1024, num_q_heads=128
     ),
     _make_argspec(
-        name="prefill_b1_q1024_kv8192_topk1024_h128",
-        batch_size=1,
         q_len=1024,
         kv_len_val=8192,
-        page_size=1024,
         csa_topk=1024,
         num_q_heads=128,
-        tags=("primary", "forward_only"),
+        primary=True,
     ),
     _make_argspec(
-        name="decode_b64_q1_kv1048576_topk1024_h128",
-        batch_size=64,
-        q_len=1,
-        kv_len_val=1048576,
-        page_size=1024,
-        csa_topk=1024,
-        num_q_heads=128,
+        batch_size=64, kv_len_val=1048576, csa_topk=1024, num_q_heads=128
     ),
     _make_argspec(
-        name="prefill_b1_q1024_kv1048576_topk1024_h128",
-        batch_size=1,
-        q_len=1024,
-        kv_len_val=1048576,
-        page_size=1024,
-        csa_topk=1024,
-        num_q_heads=128,
+        q_len=1024, kv_len_val=1048576, csa_topk=1024, num_q_heads=128
     ),
     _make_argspec(
-        name="decode_b256_q1_kv9216_topk512_h64",
-        batch_size=256,
-        q_len=1,
-        kv_len_val=9216,
-        page_size=1024,
-        csa_topk=512,
-        num_q_heads=64,
-        tags=("primary", "forward_only"),
+        batch_size=256, kv_len_val=9216, csa_topk=512, primary=True
     ),
-    _make_argspec(
-        name="prefill_b1_q1024_kv1024_topk512_h64",
-        batch_size=1,
-        q_len=1024,
-        kv_len_val=1024,
-        page_size=1024,
-        csa_topk=512,
-        num_q_heads=64,
-    ),
-    _make_argspec(
-        name="prefill_b1_q1024_kv8192_topk512_h64",
-        batch_size=1,
-        q_len=1024,
-        kv_len_val=8192,
-        page_size=1024,
-        csa_topk=512,
-        num_q_heads=64,
-        tags=("primary", "forward_only"),
-    ),
+    _make_argspec(q_len=1024, kv_len_val=1024, csa_topk=512),
+    _make_argspec(q_len=1024, kv_len_val=8192, csa_topk=512, primary=True),
+    # GLM-5.2 decode shapes
+    _make_argspec(batch_size=64, kv_len_val=8192),
+    _make_argspec(batch_size=128, kv_len_val=8192),
+    _make_argspec(batch_size=64, kv_len_val=9216),
+    _make_argspec(batch_size=128, kv_len_val=9216, primary=True),
+    _make_argspec(batch_size=1, kv_len_val=262144),
+    _make_argspec(batch_size=16, kv_len_val=262144),
+    _make_argspec(batch_size=32, kv_len_val=262144),
+    _make_argspec(batch_size=16, actual_batch_size=8, kv_len_val=131072),
+    _make_argspec(batch_size=64, actual_batch_size=40, kv_len_val=131072),
+    # GLM-5.2 prefill shapes
+    _make_argspec(q_len=1024, kv_len_val=1024),
+    _make_argspec(q_len=1024, kv_len_val=8192, primary=True),
+    _make_argspec(q_len=2048, kv_len_val=2048),
+    _make_argspec(q_len=2048, kv_len_val=8192),
+    _make_argspec(q_len=1024, kv_len_val=1024, page_size=256),
+    _make_argspec(q_len=1024, kv_len_val=8192, page_size=256),
+    _make_argspec(q_len=1024, kv_len_val=131072),
+    _make_argspec(q_len=4096, kv_len_val=131072),
+    _make_argspec(q_len=1024, kv_len_val=262144),
 )

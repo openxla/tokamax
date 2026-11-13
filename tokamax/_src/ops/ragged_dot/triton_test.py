@@ -32,9 +32,11 @@ except ImportError:
   _TestTritonRaggedDot: Any = object
 else:
   from tokamax._src.ops.ragged_dot import triton
-  # pyrefly: ignore[unsupported-operation]
-  _JAX_TRITON_AVAILABLE = jt.__version_info__ >= (0, 4, 1)
-  del jt
+  # Pyrefly infers a literal tuple type for `__version_info__`, which it won't
+  # compare against a tuple with different literal elements.
+  _jt_version: tuple[int, ...] = jt.__version_info__
+  _JAX_TRITON_AVAILABLE = _jt_version >= (0, 4, 1)
+  del jt, _jt_version
 
   class _TestTritonRaggedDot(triton.TritonRaggedDot):
 

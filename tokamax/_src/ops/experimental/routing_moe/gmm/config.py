@@ -50,11 +50,26 @@ class RoutingMode(enum.StrEnum):
   REMOTE = enum.auto()
 
 
+class MatmulMode(enum.StrEnum):
+  """How x and w are fed to the MXU and how their scales are applied."""
+
+  # x and w are both passed in unquantized.
+  UNQUANTIZED = enum.auto()
+  # w is passed in quantized with scales. x is passed in unquantized, and the
+  # kernel quantizes it before the matmul. The output is scaled by both x and w
+  # scales.
+  QUANTIZED = enum.auto()
+  # w is passed in quantized with scales. x is passed in unquantized and stays
+  # unquantized. The output is scaled by w scales.
+  WEIGHT_ONLY_SCALE_AFTER = enum.auto()
+
+
 @dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
 class ComputeConfig:
   """Resolved configuration for a single matrix multiplication."""
 
+  matmul_mode: MatmulMode
   matmul_dtype: jnp.dtype
   acc_dtype: jnp.dtype
   tpu_info: pltpu.TpuInfo
@@ -143,7 +158,17 @@ class RoutingGmmConfig:
           block_size=plan.x_quant_block_size
       )
 
+    if x_quant is not None and spec.w.quant is not None:
+      matmul_mode = MatmulMode.QUANTIZED
+    elif x_quant is None and spec.w.quant is not None:
+      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
+    elif x_quant is None and spec.w.quant is None:
+      matmul_mode = MatmulMode.UNQUANTIZED
+    else:
+      raise NotImplementedError("Quantizing x requires a quantized w.")
+
     compute_cfg = ComputeConfig(
+        matmul_mode=matmul_mode,
         matmul_dtype=plan.matmul_dtype,
         acc_dtype=plan.acc_dtype,
         tpu_info=tpu_info,
@@ -162,7 +187,8 @@ class RoutingGmmConfig:
     )
     cfg._validate_dtypes()
     cfg._validate_out()
-    cfg._validate_tiling_and_buffers()
+    cfg._validate_tiling()
+    cfg._validate_buffers()
     return cfg
 
   def _validate_dtypes(self) -> None:
@@ -250,8 +276,8 @@ class RoutingGmmConfig:
           f" ({self.plan.tile_n})."
       )
 
-  def _validate_tiling_and_buffers(self) -> None:
-    """Validates tile sizes, buffer counts, and SMEM footprint."""
+  def _validate_tiling(self) -> None:
+    """Validates tile sizes and sublane alignment."""
     if self.plan.tile_k != self.spec.size_k:
       raise NotImplementedError("K dim tiling is not supported yet.")
     if self.spec.w2 is not None and self.plan.tile_k2 != self.spec.size_k2:
@@ -275,20 +301,24 @@ class RoutingGmmConfig:
           f"bucket_base ({self.plan.bucket_base}) must be in (0, tile_m="
           f"{self.plan.tile_m}]."
       )
+    sublanes = self.tpu_info.num_sublanes
+    if (
+        self.plan.tile_m % sublanes != 0
+        or self.plan.bucket_base % sublanes != 0
+    ):
+      raise ValueError(
+          f"tile_m ({self.plan.tile_m}) and bucket_base"
+          f" ({self.plan.bucket_base}) must be multiples of {sublanes}."
+      )
+
+  def _validate_buffers(self) -> None:
+    """Validates pipeline buffer counts."""
     if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
       )
     if self.plan.num_w_buffers < 2:
       raise ValueError("Buffer counts must be at least 2.")
-    smem_threshold = int(0.45 * self.tpu_info.smem_capacity_bytes)
-    # 3: _to_group_id, _to_m_offset, _to_num_rows. 4: int32.
-    smem_allocation = (self.max_num_gm * 3) * 4
-    if smem_allocation >= smem_threshold:
-      raise ValueError(
-          f"Total number of SMEM allocation must be less than {smem_threshold}"
-          f" to avoid OOM. Got {smem_allocation}"
-      )
 
   @property
   def max_num_gm(self) -> int:

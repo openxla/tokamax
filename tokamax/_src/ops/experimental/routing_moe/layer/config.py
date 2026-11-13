@@ -24,9 +24,6 @@ from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
 
-Mesh = sharding.Mesh
-P = sharding.PartitionSpec
-
 
 class OutputCollective(enum.StrEnum):
   """Cross-device collective applied to unpacked MoE outputs."""
@@ -59,7 +56,7 @@ class RoutingMoEConfig:
       reduce_output: bool,
       activation: str,
       plan: plan_lib.ResolvedMoEPlan,
-      mesh: Mesh,
+      mesh: sharding.Mesh,
   ) -> Self:
     """Assembles the config and validates the plan against layer parameters."""
 
@@ -110,9 +107,11 @@ class RoutingMoEConfig:
     return tuple(ax for ax in (self.ep_axis, self.tp_axis) if ax is not None)
 
   @property
-  def act_pspec(self) -> P:
+  def act_pspec(self) -> sharding.PartitionSpec:
     """The PartitionSpec of the input activations and top-k routing tensors."""
-    return P(self.reduction_axis) if self.use_sp else P(None)
+    if self.use_sp:
+      return sharding.PartitionSpec(self.reduction_axis)
+    return sharding.PartitionSpec(None)
 
   @property
   def gmm_in_format(self) -> out_format.ResolvedActivationFormat:
@@ -126,33 +125,33 @@ class RoutingMoEConfig:
     return self.plan.scatter_format
 
   @property
-  def out_pspec(self) -> P:
+  def out_pspec(self) -> sharding.PartitionSpec:
     """The PartitionSpec of the layer output."""
     if self.reduce_output:
       return self.act_pspec
     # Ideally, we want to use P(unreduced={axis}) but that is only supported in
     # explicit mesh mode. Instead, we create an axis where output is unreduced.
     # TODO: Make gmm work in explicit mesh mode.
-    return P(self.reduction_axis)
+    return sharding.PartitionSpec(self.reduction_axis)
 
   @property
   def output_collective(self) -> OutputCollective:
     """The cross-device collective applied to unpacked MoE outputs."""
     unreduced = set(self.reduction_axis)
     if self.plan.remote_scatter:
-      output_spec = P(self.reduction_axis)
+      output_spec = sharding.PartitionSpec(self.reduction_axis)
     else:
-      output_spec = P(None, unreduced=unreduced)
+      output_spec = sharding.PartitionSpec(None, unreduced=unreduced)
 
     if self.reduce_output:
       expected_out_spec = self.act_pspec
     else:
-      expected_out_spec = P(None, unreduced=unreduced)
+      expected_out_spec = sharding.PartitionSpec(None, unreduced=unreduced)
 
     if output_spec == expected_out_spec:
       return OutputCollective.NONE
     if not output_spec.unreduced:
       return OutputCollective.ALL_GATHER
-    if expected_out_spec == P(self.reduction_axis):
+    if expected_out_spec == sharding.PartitionSpec(self.reduction_axis):
       return OutputCollective.REDUCE_SCATTER
     return OutputCollective.ALL_REDUCE

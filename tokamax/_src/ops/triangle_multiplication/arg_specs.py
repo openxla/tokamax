@@ -24,22 +24,29 @@ from tokamax._src.autotuning import arg_spec
 ShapeDtype = jax.ShapeDtypeStruct
 
 
-def _create_arg_spec(seq_len: int, triangle_type: str) -> arg_spec.ArgSpec:
+def _create_arg_spec(
+    seq_len: int,
+    triangle_type: str,
+    channels: int = 64,
+    project: str = 'alphafold',
+) -> arg_spec.ArgSpec:
   return arg_spec.ArgSpec(
       dict(
-          x=ShapeDtype((seq_len, seq_len, 64), jnp.bfloat16),
+          x=ShapeDtype((seq_len, seq_len, channels), jnp.bfloat16),
           mask=ShapeDtype((seq_len, seq_len), jnp.bool_),
-          projection_in_weights=ShapeDtype((64, 2, 64), jnp.bfloat16),
-          gate_in_weights=ShapeDtype((64, 2, 64), jnp.bfloat16),
-          projection_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
-          gate_out_weights=ShapeDtype((64, 64), jnp.bfloat16),
-          layernorm_in_scale=ShapeDtype((64,), jnp.bfloat16),
-          layernorm_in_offset=ShapeDtype((64,), jnp.bfloat16),
-          layernorm_out_scale=ShapeDtype((64,), jnp.bfloat16),
-          layernorm_out_offset=ShapeDtype((64,), jnp.bfloat16),
+          projection_in_weights=ShapeDtype(
+              (channels, 2, channels), jnp.bfloat16
+          ),
+          gate_in_weights=ShapeDtype((channels, 2, channels), jnp.bfloat16),
+          projection_out_weights=ShapeDtype((channels, channels), jnp.bfloat16),
+          gate_out_weights=ShapeDtype((channels, channels), jnp.bfloat16),
+          layernorm_in_scale=ShapeDtype((channels,), jnp.bfloat16),
+          layernorm_in_offset=ShapeDtype((channels,), jnp.bfloat16),
+          layernorm_out_scale=ShapeDtype((channels,), jnp.bfloat16),
+          layernorm_out_offset=ShapeDtype((channels,), jnp.bfloat16),
           triangle_type=triangle_type,
       ),
-      project='alphafold',
+      project=project,
   )
 
 
@@ -48,4 +55,11 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = tuple(
     for n, t in itertools.product(
         (384, 640, 1024, 2048), ('outgoing', 'incoming')
     )
+) + tuple(
+    _create_arg_spec(
+        72,
+        t,
+        channels=c,
+    )
+    for c, t in itertools.product((512, 80), ('outgoing', 'incoming'))
 )

@@ -77,14 +77,17 @@ def _attend_chunk(
     logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
   if mask is not None:
-    mask_value = float(jnp.finfo(logits.dtype).min)
+    mask_value = -float("inf")
     logits = jnp.where(jnp.asarray(mask), logits, mask_value)
 
   logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
   loc_x_max = jnp.max(logits, axis=-1)
   new_x_max = jnp.maximum(x_max, loc_x_max)
-  weights = jnp.exp(logits - new_x_max[..., None])
-  alpha = jnp.exp(x_max - new_x_max)
+  safe_new_x_max = jnp.where(jnp.isneginf(new_x_max), 0.0, new_x_max)
+  weights = jnp.exp(logits - safe_new_x_max[..., None])
+  alpha = jnp.where(
+      jnp.isneginf(x_max), 0.0, jnp.exp(x_max - safe_new_x_max)
+  )
 
   x_max = new_x_max
   accum *= alpha.mT[..., None]
@@ -234,7 +237,11 @@ def _attend_chunked(
 
     # Final normalization by the denominator.
     _, acc, _, denom = carry
-    out = acc / denom.mT[..., None] if normalize_output else acc
+    out = (
+        acc / jnp.where(denom == 0.0, 1.0, denom).mT[..., None]
+        if normalize_output
+        else acc
+    )
     return q_chunk_idx + q_chunk_size, out.astype(q.dtype)
 
   def remat_q_loop_fn(size):
@@ -325,7 +332,11 @@ def _attend_paged(
 
       # Final normalization by the denominator.
       acc, _, denom = carry
-      out = acc / denom.mT[..., None] if normalize_output else acc
+      out = (
+          acc / jnp.where(denom == 0.0, 1.0, denom).mT[..., None]
+          if normalize_output
+          else acc
+      )
       return -1, out.astype(q.dtype)
 
     if seq_q % chunk_size != 0:

@@ -120,7 +120,9 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
     head_dims = (512, 512, 256)
     x = [jax.random.normal(k, (2, 256, 2, d)) for k, d in zip(keys, head_dims)]
-    self._run_test_with_inputs(*x, impl=impl, ref_impl=ref_impl, test_vjp=False)
+    self._run_test_with_inputs(
+        *x, impl=impl, ref_impl=ref_impl, atol=5e-6, test_vjp=False
+    )
 
   def test_block_d_unquantized(self):
     assert fa is not None
@@ -176,6 +178,33 @@ class TritonFlashAttentionTest(test_base.AttentionTestBase):
       return nn.dot_product_attention(q, k, v, **kwargs)
 
     self._run_test((2, 64, 2, 5), impl=impl, ref_impl=ref_impl, test_vjp=False)
+
+  def test_quantized_bf16_qvalue_with_scale(self):
+    def quantize(x):
+      scale = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+      qvalue = (x / jnp.where(scale == 0, 1.0, scale)).astype(jnp.bfloat16)
+      return qwix.QArray(qvalue, scale.astype(jnp.float32))
+
+    def impl(q, k, v, **kwargs):
+      k, v = map(quantize, (k, v))
+      return self._attention_fn(q, k, v, **kwargs)
+
+    def ref_impl(q, k, v, **kwargs):
+      def quant_dequant(x):
+        qa = quantize(x)
+        return (qa.qvalue.astype(x.dtype) * qa.scale).astype(q.dtype)
+
+      k, v = map(quant_dequant, (k, v))
+      return nn.dot_product_attention(q, k, v, **kwargs)
+
+    self._run_test(
+        (2, 64, 2, 64),
+        dtype=jnp.bfloat16,
+        impl=impl,
+        ref_impl=ref_impl,
+        atol=0.02,
+        test_vjp=False,
+    )
 
   @parameterized.parameters(1, 2)
   def test_small_block_q(self, block_q: int):
@@ -444,6 +473,17 @@ class TritonFlashAttentionWithTritonVjpTest(test_base.AttentionTestBase):
     super()._run_test_with_inputs(
         *args, expect_supported=expect_supported, **kwargs
     )
+
+  def test_large_logits_non_pow2_logits_scale_vjp(self):
+    # `1 / sqrt(128)` is not a power of two. The VJP must still recompute the
+    # same logits as the forward pass, else large logits blow up the gradients.
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    scales = (8, 8, 1)
+    q, k, v = (
+        (s * jax.random.normal(key, (1, 128, 2, 128))).astype(jnp.bfloat16)
+        for s, key in zip(scales, keys)
+    )
+    self._run_test_with_inputs(q, k, v, atol=0.03, atol_grads=0.3)
 
   def test_normalize_output(self):
     self.skipTest("`normalize_output=False` not supported.")

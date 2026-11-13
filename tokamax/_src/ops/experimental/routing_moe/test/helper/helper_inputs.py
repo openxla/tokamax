@@ -239,6 +239,7 @@ class MoEInputs:
       max_to_mean_load: float = 1.0,
       num_skipped: int = 0,
       force_expert: int | None = None,
+      has_bias: bool = False,
   ) -> Self:
     """Generates unsharded, unquantized bfloat16 inputs for `shape`."""
     keys = jax.random.split(jax.random.key(seed), 8)
@@ -259,7 +260,7 @@ class MoEInputs:
         w1=_random_normal(keys[3], (e, h, 2 * i)),
         w2=_random_normal(keys[4], (e, i, h)),
     )
-    if shape.has_bias:
+    if shape.has_bias or has_bias:
       inputs = dataclasses.replace(
           inputs,
           w1_bias=_random_normal(keys[5], (e, 1, 2 * i)),

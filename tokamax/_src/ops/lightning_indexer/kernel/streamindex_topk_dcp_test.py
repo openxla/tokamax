@@ -23,6 +23,7 @@ import numpy as np
 from tokamax._src.ops.lightning_indexer.kernel import (
     dcp_sc_compact,
     metadata,
+    tc_topk as tc_topk_lib,
 )
 from tokamax._src.ops.lightning_indexer.kernel.streamindex_topk import (
     DCP_AXIS_NAME,
@@ -41,14 +42,17 @@ WIDTH = 256
 
 class StreamIndexTopKDcpTest(parameterized.TestCase):
 
-  def _require_sparsecore(self):
+  def _require_sparsecore(self, use_tc_topk: bool = False):
     """Probe in a test body: a chip touch at collection breaks spawned workers."""
     try:
-      if pltpu.get_tpu_info().sparse_core is not None:
-        return
+      info = pltpu.get_tpu_info()
     except Exception:  # no TPU at all
-      pass
-    self.skipTest("needs SparseCore")
+      self.skipTest("needs TPU")
+      return
+    if use_tc_topk:
+      return
+    if info.sparse_core is None or not tc_topk_lib.has_full_sparsecore_topk():
+      self.skipTest("needs full SparseCore")
 
   def _xla_pack_reference(self, vals):
     """The scatter the kernel replaced, unreachable in `src`, kept as an oracle."""
@@ -129,8 +133,8 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
     rec = jnp.concatenate([fp8, jnp.full((kv_len, 1), 127, jnp.uint8)], -1)
     return jnp.pad(rec, ((0, 0), (0, WIDTH - rec.shape[-1])))
 
-  def _need_devices(self, dcp_size):
-    self._require_sparsecore()
+  def _need_devices(self, dcp_size, *, tc_topk=False):
+    self._require_sparsecore(tc_topk)
     if pltpu.get_tpu_info().generation < 7:
       self.skipTest(
           "StreamIndex Top-K Pallas TPU kernel requires TPU v7 or newer."
@@ -139,7 +143,7 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
     if n < dcp_size:
       self.skipTest(f"needs {dcp_size} devices, have {n}")
 
-  def _dcp_case(self, dcp_size, seed):
+  def _dcp_case(self, dcp_size, seed, *, tc_topk=False):
     """Records plus the positional args and kwargs of one sharded DCP call."""
     rec = self._global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
@@ -184,6 +188,7 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
         interleave_size=1,
         num_kv_pages_per_block=2,
         num_queries_per_block=128,
+        tc_topk=tc_topk,
     )
     return rec, args, kwargs
 
@@ -237,21 +242,39 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
           {"num_rows": 33, "width": 256},
       ],
       keep_rate=[0.1, 0.5, 0.9],
+      tc_topk=[False, True],
   )
-  def test_sparsecore_pack_matches_xla(self, num_rows, width, keep_rate):
+  def test_sparsecore_pack_matches_xla(
+      self, num_rows, width, keep_rate, tc_topk
+  ):
     """Elementwise, not just as a set: both packs must emit in ascending order."""
-    self._require_sparsecore()
+    self._require_sparsecore(tc_topk)
     vals = self._sparse_fixture(num_rows, width, keep_rate)
 
     want = np.asarray(self._xla_pack_reference(jnp.asarray(vals)))
-    got = np.asarray(dcp_sc_compact.pack_nonnegative(jnp.asarray(vals)))
+    got = np.asarray(
+        dcp_sc_compact.pack_nonnegative(
+            jnp.asarray(vals),
+            tc_topk=tc_topk,
+        )
+    )
 
     np.testing.assert_array_equal(got, want)
 
-  @parameterized.parameters((2, 1), (4, 4), (8, 4), (8, 64))
-  def test_resolve_partitions_the_global_topk(self, dcp_size, interleave_c):
+  @parameterized.product(
+      [
+          {"dcp_size": 2, "interleave_c": 1},
+          {"dcp_size": 4, "interleave_c": 4},
+          {"dcp_size": 8, "interleave_c": 4},
+          {"dcp_size": 8, "interleave_c": 64},
+      ],
+      tc_topk=[False, True],
+  )
+  def test_resolve_partitions_the_global_topk(
+      self, dcp_size, interleave_c, tc_topk
+  ):
     """The ranks' packed outputs reassemble the global top-k, each entry once."""
-    self._require_sparsecore()
+    self._require_sparsecore(tc_topk)
     num_rows, k, span = 8, 32, 4096
     local_idxs, slots, want = self._simulate_merge(
         num_rows, k, span, dcp_size, interleave_c
@@ -260,7 +283,11 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
     lists = np.stack([
         np.asarray(
             dcp_sc_compact.resolve_owned_winners(
-                jnp.asarray(local_idxs[r]), jnp.asarray(slots), k, jnp.int32(r)
+                jnp.asarray(local_idxs[r]),
+                jnp.asarray(slots),
+                k,
+                jnp.int32(r),
+                tc_topk=tc_topk,
             )
         )
         for r in range(dcp_size)
@@ -285,11 +312,14 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
   # End-to-end against the unsharded kernel.
   # ===================================================================== #
 
-  @parameterized.parameters([2, 4, 8])
-  def test_dcp_reassembles_the_unsharded_global_topk(self, dcp_size):
+  @parameterized.product(
+      dcp_size=[2, 4, 8],
+      tc_topk=[False, True],
+  )
+  def test_dcp_reassembles_the_unsharded_global_topk(self, dcp_size, tc_topk):
     """Union the per-rank lists back together; it must be the global top-k"""
-    self._need_devices(dcp_size)
-    rec, args, kwargs = self._dcp_case(dcp_size, 0)
+    self._need_devices(dcp_size, tc_topk=tc_topk)
+    rec, args, kwargs = self._dcp_case(dcp_size, 0, tc_topk=tc_topk)
     q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
@@ -306,6 +336,7 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
             compression_ratio=1,
             num_kv_pages_per_block=2,
             num_queries_per_block=128,
+            tc_topk=tc_topk,
         )
     )
 
@@ -329,12 +360,13 @@ class StreamIndexTopKDcpTest(parameterized.TestCase):
   @parameterized.product(
       dcp_size=[2, 4, 8],
       chunk_tokens=[32, 64, 128],
+      tc_topk=[False, True],
   )
   def test_dcp_chunking_does_not_change_the_result(
-      self, chunk_tokens, dcp_size
+      self, chunk_tokens, dcp_size, tc_topk
   ):
-    self._need_devices(dcp_size)
-    _, args, kwargs = self._dcp_case(dcp_size, 11)
+    self._need_devices(dcp_size, tc_topk=tc_topk)
+    _, args, kwargs = self._dcp_case(dcp_size, 11, tc_topk=tc_topk)
 
     hlo = streamindex_topk_dcp.lower(
         *args, **kwargs, chunk_tokens=chunk_tokens

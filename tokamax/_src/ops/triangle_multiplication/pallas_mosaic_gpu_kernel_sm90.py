@@ -754,19 +754,19 @@ def epilogue_bwd(
             0, num_local_steps, loop_body, (init_acc_s, init_acc_o)
         )
         dw_proj = plgpu.wgmma_accumulator_load(dw_proj_acc_ref, wait_n=0)
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(0, h), :d], dw_proj, optimized=False
         )
         dw_gate = plgpu.wgmma_accumulator_load(dw_gate_acc_ref, wait_n=0)
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(h, c), :d], dw_gate, optimized=False
         )
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(h + c, 32), :h],
             acc_s,
             optimized=False,
         )
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(h + c + 32, 32), :h],
             acc_o,
             optimized=False,
@@ -1014,19 +1014,17 @@ def epilogue_bwd(
           0, num_local_steps, loop_body, (init_acc_s, init_acc_o)
       )
       dw_proj = plgpu.wgmma_accumulator_load(dw_proj_acc_ref, wait_n=0)
-      plgpu.store(
+      mgpu_lib.store(
           grad_part_gmem.at[pid, pl.ds(0, h), :d], dw_proj, optimized=False
       )
       dw_gate = plgpu.wgmma_accumulator_load(dw_gate_acc_ref, wait_n=0)
-      plgpu.store(
+      mgpu_lib.store(
           grad_part_gmem.at[pid, pl.ds(h, c), :d], dw_gate, optimized=False
       )
-      plgpu.store(
-          grad_part_gmem.at[pid, pl.ds(h + c, 32), :h],
-          acc_s,
-          optimized=False,
+      mgpu_lib.store(
+          grad_part_gmem.at[pid, pl.ds(h + c, 32), :h], acc_s, optimized=False
       )
-      plgpu.store(
+      mgpu_lib.store(
           grad_part_gmem.at[pid, pl.ds(h + c + 32, 32), :h],
           acc_o,
           optimized=False,
@@ -1311,23 +1309,23 @@ def prologue_bwd(
             0, num_local_steps, loop_body, (init_acc_s, init_acc_o)
         )
         dw_pl = plgpu.wgmma_accumulator_load(dw_pl_acc_ref, wait_n=0)
-        plgpu.store(grad_part_gmem.at[pid, :c, :h], dw_pl, optimized=False)
+        mgpu_lib.store(grad_part_gmem.at[pid, :c, :h], dw_pl, optimized=False)
         dw_pr = plgpu.wgmma_accumulator_load(dw_pr_acc_ref, wait_n=0)
-        plgpu.store(grad_part_gmem.at[pid, :c, h:], dw_pr, optimized=False)
+        mgpu_lib.store(grad_part_gmem.at[pid, :c, h:], dw_pr, optimized=False)
         dw_gl = plgpu.wgmma_accumulator_load(dw_gl_acc_ref, wait_n=0)
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(c, c), :h], dw_gl, optimized=False
         )
         dw_gr = plgpu.wgmma_accumulator_load(dw_gr_acc_ref, wait_n=0)
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(c, c), h:], dw_gr, optimized=False
         )
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(2 * c, 32), :c],
             acc_s,
             optimized=False,
         )
-        plgpu.store(
+        mgpu_lib.store(
             grad_part_gmem.at[pid, pl.ds(2 * c + 32, 32), :c],
             acc_o,
             optimized=False,
@@ -1592,17 +1590,15 @@ def prologue_bwd(
           0, num_local_steps, loop_body, (init_acc_s, init_acc_o)
       )
       dw_proj = plgpu.wgmma_accumulator_load(dw_proj_acc_ref, wait_n=0)
-      plgpu.store(grad_part_gmem.at[pid, :c, :], dw_proj, optimized=False)
+      mgpu_lib.store(grad_part_gmem.at[pid, :c, :], dw_proj, optimized=False)
       dw_gate = plgpu.wgmma_accumulator_load(dw_gate_acc_ref, wait_n=0)
-      plgpu.store(
+      mgpu_lib.store(
           grad_part_gmem.at[pid, pl.ds(c, c), :], dw_gate, optimized=False
       )
-      plgpu.store(
-          grad_part_gmem.at[pid, pl.ds(2 * c, 32), :c],
-          acc_s,
-          optimized=False,
+      mgpu_lib.store(
+          grad_part_gmem.at[pid, pl.ds(2 * c, 32), :c], acc_s, optimized=False
       )
-      plgpu.store(
+      mgpu_lib.store(
           grad_part_gmem.at[pid, pl.ds(2 * c + 32, 32), :c],
           acc_o,
           optimized=False,

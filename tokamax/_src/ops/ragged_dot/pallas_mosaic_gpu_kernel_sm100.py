@@ -226,10 +226,6 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   )
 
   profile = False
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   f = plgpu.kernel(
       kernel,
@@ -247,7 +243,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
           unsafe_no_auto_barriers=True,
           profile_space=30 if profile else 0,
           profile_dir="sponge" if profile else "",
-          lowering_semantics=lowering_semantics,
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
       ),
   )
   group_info = common.GroupInfo.create_aligned(

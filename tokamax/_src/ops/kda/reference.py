@@ -102,11 +102,12 @@ def kimi_delta_attention(
     )
 
     def _ref_conv(x_in, w_in, b_in):
-      W = w_in.shape[1]
+      _, conv_width, _ = w_in.shape
+      _, _, seq_len, _ = x_in.shape
       x_f32 = x_in.astype(jnp.float32)
       w_f32 = w_in.astype(jnp.float32)
-      acc = x_f32 * w_f32[:, None, W - 1 : W, :]
-      for lag in range(1, W):
+      acc = x_f32 * w_f32[:, None, conv_width - 1 : conv_width, :]
+      for lag in range(1, min(conv_width, seq_len)):
         x_lag = jnp.pad(
             x_f32[:, :, :-lag, :], ((0, 0), (0, 0), (lag, 0), (0, 0))
         )
@@ -116,7 +117,10 @@ def kimi_delta_attention(
           )
           same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
           x_lag = jnp.where(same_seg[None, :, :, None], x_lag, 0.0)
-        acc = acc + x_lag * w_f32[:, None, W - 1 - lag : W - lag, :]
+        acc = (
+            acc
+            + x_lag * w_f32[:, None, conv_width - 1 - lag : conv_width - lag, :]
+        )
       if b_in is not None:
         acc = acc + b_in.astype(jnp.float32)[:, None, None, :]
       return jax.nn.silu(acc).astype(x_in.dtype)
@@ -171,7 +175,7 @@ def kimi_delta_attention(
     beta_h = gather_time_axis(beta_h, 2)
     if segment_ids is not None:
       segment_ids = gather_time_axis(segment_ids, 1)
-    seq_len = q_h.shape[2]
+    _, _, seq_len, _ = q_h.shape
 
   num_states = _state_count(
       segment_ids=segment_ids,

@@ -336,10 +336,6 @@ def ragged_dot_quantized_kernel(
     grid_names = ("mn",)
 
   profile = False
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   f = plgpu.kernel(
       kernel,
@@ -355,7 +351,7 @@ def ragged_dot_quantized_kernel(
           unsafe_no_auto_barriers=True,
           profile_space=20 if profile else 0,
           profile_dir="sponge" if profile else "",
-          lowering_semantics=lowering_semantics,
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
       ),
   )
   return f(

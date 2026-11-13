@@ -322,6 +322,7 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           initial_state=initial_state[:, :, :, :-1],
       )
 
+    _, batch, seq_len, _ = q.shape
     with self.subTest(name="segment_ids"), self.assertRaises(
         jt.TypeCheckError
     ):
@@ -331,9 +332,49 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
           v,
           g,
           beta,
-          segment_ids=jnp.ones((q.shape[1], q.shape[2] + 1), jnp.int32),
+          segment_ids=jnp.ones((batch, seq_len + 1), jnp.int32),
           max_num_segments=1,
       )
+
+  def test_single_token_decode_with_fused_conv1d(self):
+    heads, batch, seq_len, dim, conv_width = 3, 1, 1, 128, 4
+    dtype = jnp.bfloat16
+    q = jnp.ones((heads, batch, seq_len, dim), dtype=dtype) * 0.1
+    k = jnp.ones((heads, batch, seq_len, dim), dtype=dtype) * 0.2
+    v = jnp.ones((heads, batch, seq_len, dim), dtype=dtype) * 0.3
+    gate = jnp.zeros((heads, batch, seq_len, dim), dtype=dtype)
+    beta = jnp.full((heads, batch, seq_len), 0.5, dtype=dtype)
+    a_log = jnp.zeros((heads,), dtype=jnp.float32)
+    dt_bias = jnp.zeros((heads * dim,), dtype=jnp.float32)
+    h0 = jnp.ones((batch, 1, heads, dim, dim), dtype=jnp.float32) * 0.05
+    cw = jnp.ones((heads, conv_width, dim), dtype=jnp.float32) * 0.25
+    segment_ids = jnp.ones((batch, seq_len), dtype=jnp.int32)
+
+    out, final_state = api.kimi_delta_attention(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a_log=a_log,
+        delta_time_bias=dt_bias,
+        initial_state=h0,
+        output_final_state=True,
+        use_qk_l2norm=True,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        segment_ids=segment_ids,
+        max_num_segments=1,
+        conv_weight_q=cw,
+        conv_weight_k=cw,
+        conv_weight_v=cw,
+        use_conv1d_in_kernel=True,
+        implementation="xla",
+    )
+    self.assertEqual(out.shape, (heads, batch, seq_len, dim))
+    self.assertIsNotNone(final_state)
+    assert final_state is not None
+    self.assertEqual(final_state.shape, (batch, 1, heads, dim, dim))
 
   def test_unsupported_implementation(self):
     q, k, v, g, beta, _ = _make_inputs(jnp.float32)

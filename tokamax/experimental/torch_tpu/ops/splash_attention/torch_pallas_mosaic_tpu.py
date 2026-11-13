@@ -52,8 +52,8 @@ class _PallasMosaicTpuSplashAttention(
   ) -> tuple[int, ...] | None:
     if config is None:
       return None
-    assert len(dataclasses.fields(config)) == 13, (
-        "Expected 13 fields in fwd config, got"
+    assert len(dataclasses.fields(config)) == 14, (
+        "Expected 14 fields in fwd config, got"
         f" {len(dataclasses.fields(config))}."
     )
     return (
@@ -70,14 +70,15 @@ class _PallasMosaicTpuSplashAttention(
         int(config.qk_diag_skip),
         config.qk_diag_grid,
         int(config.sv_diag_skip),
+        int(config.diag_band_skip),
     )
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
     config = config_parts[0]
     assert config is not None, "Forward config not set."
-    assert len(config) == 13, (
-        f"Expected 13 elements in fwd config, got {len(config)}."
+    assert len(config) == 14, (
+        f"Expected 14 elements in fwd config, got {len(config)}."
     )
     return Config(
         block_q=int(config[0]),
@@ -93,6 +94,7 @@ class _PallasMosaicTpuSplashAttention(
         qk_diag_skip=bool(config[10]),
         qk_diag_grid=int(config[11]),
         sv_diag_skip=bool(config[12]),
+        diag_band_skip=bool(config[13]),
     )
 
   @override

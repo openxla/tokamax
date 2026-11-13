@@ -278,7 +278,11 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
       # provided, as we use `custom_batching` to capture the batched arguments,
       # and `custom_batching` doesn't support `jax.vjp`.
-      bwd = lambda f_vjp, dout: f_vjp(dout[0] if return_residuals else dout)
+      @self._capture_batched_args
+      def bwd(f_vjp, dout, batched_args):
+        del batched_args  # Unused.
+        return f_vjp(dout[0] if return_residuals else dout)
+
     else:
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined

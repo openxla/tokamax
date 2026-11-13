@@ -49,24 +49,39 @@ from tokamax._src.ops.kda.utils import (
 # The conv weights are left-padded to this many taps, so W <= _CONV_HALO.
 _CONV_HALO = 8
 
+# Dimensions.
+#   B: batch size
+#   H: number of value heads (H_QK for query/key heads when GQA is active)
+#   MB: mini-batch of heads processed per grid point
+#   T: sequence length
+#   NT: number of chunks (T // BT)
+#   BT: chunk size (64 or 128)
+#   BC: sub-chunk block size (16)
+#   K: key/query head dimension
+#   V: value head dimension
+#   GW: gate channel width (1 for scalar gate, K for per-channel gate)
+
 # ─── Context-Parallel Pre-Process ──────────────────────────────────────────
 
 
 def _pre_process_kernel(
-  seqlens_ref,        # scalar prefetch: cu_seqlens [N+1]
-  chunk_to_seq_ref,   # scalar prefetch: chunk -> seq mapping [NT]
-  last_seg_idx_ref,   # scalar prefetch: real last seg idx [1], int32
-  k_ref,    # [MB, 1, BT, K_PADSIZE]
-  w_ref,    # [MB, 1, BT, K_PADSIZE]
-  u_ref,    # [MB, 1, BT, V_ALIGNED]
-  gk_ref,   # [MB, 1, BT, K_PADSIZE]
-  S_ext_ref,  # [MB, 1, K_PADSIZE, V_ALIGNED]
-  M_ref,      # [MB, 1, K_PADSIZE, K_PADSIZE]
-  h_scratch,  # [MB, K_PADSIZE, V_ALIGNED]
-  m_scratch,  # [MB, K_PADSIZE, K_PADSIZE]
-  *,
-  BT,
-  MB,
+    # Inputs.
+    seqlens_ref,  # scalar prefetch: cu_seqlens [N+1]
+    chunk_to_seq_ref,  # scalar prefetch: chunk -> seq mapping [NT]
+    last_seg_idx_ref,  # scalar prefetch: real last seg idx [1], int32
+    k_ref,  # [MB, 1, BT, K_PADSIZE]
+    w_ref,  # [MB, 1, BT, K_PADSIZE]
+    u_ref,  # [MB, 1, BT, V_ALIGNED]
+    gk_ref,  # [MB, 1, BT, K_PADSIZE]
+    # Outputs.
+    S_ext_ref,  # [MB, 1, K_PADSIZE, V_ALIGNED]
+    M_ref,  # [MB, 1, K_PADSIZE, K_PADSIZE]
+    # Scratch.
+    h_scratch,  # [MB, K_PADSIZE, V_ALIGNED]
+    m_scratch,  # [MB, K_PADSIZE, K_PADSIZE]
+    *,
+    BT,
+    MB,
 ):
   """Fused (S_ext, M) pre-process Pallas kernel for KDA CP forward.
 
@@ -208,14 +223,10 @@ def _pre_process_pallas(
   K_PADSIZE = int(align_up(K, 128))
   V_ALIGNED = int(align_up(V, 128))
 
-  # ── Auto MB: maximise VMEM utilisation, capped at min(H, 16) ──
+  # ── Auto MB: maximise VMEM utilisation ──
   # scratch per head: h_acc [K, V] + m_acc [K, K], all fp32.
   per_head_scratch = (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE) * 4
-  vmem_budget = 8 * 1024 * 1024
-  MB = max(1, vmem_budget // per_head_scratch)
-  MB = min(MB, H, 16)
-  while H % MB != 0 and MB > 1:
-    MB -= 1
+  MB = estimate_mini_batch(per_head_scratch, H)
 
   # ── Pad K/V then T (reserve trailing BT for safe gather) ──
 
@@ -987,9 +998,7 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
   """
   elem_size = dtype.itemsize if dtype is not None else 4
   per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-  hw = get_tpu_limits()
-  max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
-  return estimate_mini_batch(per_head, H, max_mb=max_mb)
+  return estimate_mini_batch(per_head, H)
 
 
 @functools.partial(
@@ -1471,8 +1480,8 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   eos = seqlens_ref[i_b, seq_idx + 1]
   t0 = i_c * BT
 
-  K = w_ref.shape[3]
-  V = u_ref.shape[3]
+  K = w_ref.shape[-1]
+  V = u_ref.shape[-1]
 
   # === Init state (first chunk of THIS sequence) — uniform across all MB heads ===
   @pl.when(t0 == bos)
@@ -1648,8 +1657,7 @@ def chunk_kda_fwd_h_o_varlen(
     out_bytes = BT * V_ALIGNED * elem_size
     scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
     per_head = in_bytes + out_bytes + scratch_bytes
-    max_mb = 32 if hw.vmem_limit_bytes > 64 * 1024 * 1024 else 16
-    MB = estimate_mini_batch(per_head, H, max_mb=max_mb)  # pylint: disable=invalid-name
+    MB = estimate_mini_batch(per_head, H)  # pylint: disable=invalid-name
   else:
     MB = mini_batch
     assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"

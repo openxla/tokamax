@@ -25,6 +25,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.sparse_mla import base
 from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu_kernel
+from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu_tc_kernel
 
 _CHUNK_SIZE_CANDIDATES = (32, 64, 128)
 _BATCH_SIZE_CANDIDATES = (4, 8, 16)
@@ -39,16 +40,15 @@ class Config:
       SparseCore gather + TensorCore attention chunk.
     attention_kernel_batch_size: Number of query tokens processed per TensorCore
       Pallas grid step inside a chunk.
-    vmem_limit_bytes: VMEM capacity limit in bytes for the Pallas kernel.
+    vmem_limit_bytes: VMEM capacity limit in bytes for the Pallas kernel, or
+      None to use the kernel's default limit.
   """
 
   gather_and_attention_chunk_size: Annotated[
       int, pydantic.Field(gt=0, multiple_of=4)
   ] = 128
   attention_kernel_batch_size: Annotated[int, pydantic.Field(gt=0)] = 16
-  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] = (
-      pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES
-  )
+  vmem_limit_bytes: Annotated[int, pydantic.Field(gt=0)] | None = None
 
 
 class PallasTpuSparseMla(base.SparseMla[Config]):
@@ -76,8 +76,14 @@ class PallasTpuSparseMla(base.SparseMla[Config]):
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[jax.Array, None]:
+    tpu_info = pltpu.get_tpu_info()
+    kernel_fn = (
+        pallas_mosaic_tpu_tc_kernel.sparse_ragged_paged_attention
+        if tpu_info.generation >= 8 or tpu_info.sparse_core is None
+        else pallas_mosaic_tpu_kernel.sparse_ragged_paged_attention
+    )
     return (
-        pallas_mosaic_tpu_kernel.sparse_ragged_paged_attention(
+        kernel_fn(
             q,
             cache_kv_nope,
             cache_kv_rope,
@@ -105,7 +111,6 @@ class PallasTpuSparseMla(base.SparseMla[Config]):
     return Config(
         gather_and_attention_chunk_size=128,
         attention_kernel_batch_size=16,
-        vmem_limit_bytes=pallas_mosaic_tpu_kernel.DEFAULT_VMEM_LIMIT_BYTES,
     )
 
   @override
@@ -126,8 +131,9 @@ class PallasTpuSparseMla(base.SparseMla[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return (
-        device.platform == "tpu"
-        and pltpu.get_tpu_info().generation >= 7
-        and pltpu.get_tpu_info().sparse_core is not None
+    if device.platform != "tpu":
+      return False
+    tpu_info = pltpu.get_tpu_info()
+    return tpu_info.generation >= 8 or (
+        tpu_info.generation == 7 and tpu_info.sparse_core is not None
     )

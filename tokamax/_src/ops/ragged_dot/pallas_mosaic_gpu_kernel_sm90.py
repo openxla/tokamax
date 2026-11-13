@@ -256,10 +256,6 @@ def ragged_contracting_dim_dot_kernel(
       config=config,
       activation=activation,
   )
-  if jax.__version_info__ >= (0, 11, 0):
-    lowering_semantics = plgpu.LoweringSemantics.Warpgroup
-  else:
-    lowering_semantics = plgpu.LoweringSemantics.Lane
 
   kernel = plgpu.kernel(
       body,
@@ -268,7 +264,7 @@ def ragged_contracting_dim_dot_kernel(
       grid_names=("m", "n", "g"),
       kernel_name="ragged_contracting_dim_dot_sm90",
       compiler_params=plgpu.CompilerParams(
-          lowering_semantics=lowering_semantics
+          lowering_semantics=plgpu.LoweringSemantics.Warpgroup
       )
   )
 

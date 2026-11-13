@@ -393,7 +393,7 @@ def _fwd_kernel(
         qs += (q,)
         q_scales += (q_scale * sm_scale,)
       else:
-        qs += ((_dequantize(q, q_scale) * sm_scale).to(qk_dtype),)
+        qs += (_dequantize(q, q_scale).to(qk_dtype),)
 
     num_k_blocks = tl.cdiv(seq_len_k, block_k)
     # Rows past ``seq_len_q`` get fill values that are neutral for the min/max
@@ -457,6 +457,8 @@ def _fwd_kernel(
             s += triton_utils.dot(
                 qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
             )
+        if not quantize_qk_dot:  # Else `sm_scale` is in `qk_scale`.
+          s *= sm_scale
         s = s.to(logits_dtype)
 
         if bias_ptr is not None:
@@ -741,7 +743,8 @@ def _split_qarray(x):
   """Returns the values and scales (or `None`) of a possibly quantized array."""
   if not isinstance(x, QArray):
     return x, None
-  if x.qvalue.dtype not in (jnp.int8, jnp.int4):
+  # bfloat16 qvalue with a separate scale is used by shared K=V KV caches
+  if x.qvalue.dtype not in (jnp.int8, jnp.int4, jnp.bfloat16):
     raise NotImplementedError(f"Unsupported quantized dtype: {x.qvalue.dtype}")
   if any(s not in (1, d) for s, d in zip(x.scale.shape[:-1], x.shape[:-1])):
     raise NotImplementedError(

@@ -781,7 +781,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         out = (
             lax.div(acc, l[:, None])
             if q_dtype == jnp.float32
-            else (acc * pl.reciprocal(l[:, None], approx=True)).astype(q_dtype)
+            else (acc * pltpu.reciprocal(l[:, None], approx=True)).astype(
+                q_dtype
+            )
         )
 
       # Wait for previous bo to be fully sent before storing new bo.
@@ -1139,7 +1141,9 @@ def _mla_batched_decode_kernel(
       out = (
           lax.div(pv_batch, l_tile)
           if q_dtype == jnp.float32
-          else (pv_batch * pl.reciprocal(l_tile, approx=True)).astype(q_dtype)
+          else (pv_batch * pltpu.reciprocal(l_tile, approx=True)).astype(
+              q_dtype
+          )
       )
 
     o_batch_x2_vmem[sem_idx, ...] = out
