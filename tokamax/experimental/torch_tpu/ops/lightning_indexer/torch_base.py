@@ -15,6 +15,7 @@
 """Base class for PyTorch interfaces to Tokamax Lightning Indexer operators."""
 
 from collections.abc import Sequence
+import inspect
 from typing import Any, TypeVar, override
 
 import jax
@@ -36,6 +37,19 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
     self.is_vjp = False
     self.fake_impl = self._fake_impl
 
+  @override
+  def get_bound_args(self, *args: Any, **kwargs: Any) -> Any:
+    bound = (
+        inspect.signature(self.__call__).bind_partial(*args, **kwargs).arguments
+    )
+    bound.pop("config", None)
+    bound.pop("configs", None)
+    if (cp_rank := bound.get("cp_rank")) is None:
+      bound["cp_rank"] = 0
+    elif isinstance(cp_rank, torch.Tensor):
+      bound["cp_rank"] = cp_rank.to(torch.int32).reshape(())
+    return super().get_bound_args(**bound)
+
   def _fake_impl(
       self,
       q: torch.Tensor,
@@ -49,7 +63,7 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       compression_ratio: int = 1,
       kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
-      cp_rank: int = 0,
+      cp_rank: torch.Tensor | None = None,
       interleave_size: int = 1,
       return_scores: bool = False,
       uniform_q_len: int | None = None,
@@ -86,15 +100,30 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: _Config | None = None,
-      configs: tuple[Any, Any] | None = None,
+      configs: tuple[_Config | None, Any] | None = None,
   ) -> Any:
-    del config, configs
+    """Runs the Lightning Indexer op.
+
+    Returns:
+      `top_indices` (`torch.int32` of shape `[num_tokens, k]`) when
+      `return_scores=False`, or `(top_indices, top_scores)` when
+      `return_scores=True`. `top_scores` is returned as a `torch.int32` tensor
+      holding the raw IEEE-754 `float32` bit pattern of the top-k scores (use
+      `top_scores.view(torch.float32)` to reinterpret as floats).
+    """
+    fwd_config = config if configs is None else configs[0]
     assert self._torch_tokamax_op is not None, (
         "Forward op not registered. This means that self.op_impl_jax is not set"
         " in the constructor."
     )
     if isinstance(cp_rank, torch.Tensor):
-      cp_rank = int(cp_rank.item())
+      cp_rank_arg: torch.Tensor | None = cp_rank.to(torch.int32).reshape(())
+    elif int(cp_rank) != 0:
+      cp_rank_arg = torch.tensor(
+          int(cp_rank), dtype=torch.int32, device=q.device
+      )
+    else:
+      cp_rank_arg = None
     top_indices, top_scores = self._torch_tokamax_op(
         q,
         indexer_weights,
@@ -107,12 +136,12 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
         compression_ratio=compression_ratio,
         kv_layout=kv_layout,
         cp_size=cp_size,
-        cp_rank=cp_rank,
+        cp_rank=cp_rank_arg,
         interleave_size=interleave_size,
         return_scores=return_scores,
         uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
-        config=None,
+        config=self.deconstruct_config(fwd_config),
     )
     return (top_indices, top_scores) if return_scores else top_indices
 
@@ -130,14 +159,13 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
       compression_ratio: int = 1,
       kv_layout: str = "head_along_sublane",
       cp_size: int = 1,
-      cp_rank: int = 0,
+      cp_rank: jax.Array | None = None,
       interleave_size: int = 1,
       return_scores: bool = False,
       uniform_q_len: int | None = None,
       return_residuals: bool = False,
       config: tuple[int, ...] | None = None,
   ) -> tuple[jax.Array, jax.Array]:
-    del config
     assert self.op_impl_jax is not None, (
         "Forward class not set. This means that self.op_impl_jax is not set"
         " in the constructor."
@@ -154,12 +182,12 @@ class _LightningIndexer(torch_op.TorchOp[_Config]):
         compression_ratio=compression_ratio,
         kv_layout=kernel_config.KVLayout(kv_layout),
         cp_size=cp_size,
-        cp_rank=cp_rank,
+        cp_rank=0 if cp_rank is None else cp_rank,
         interleave_size=interleave_size,
         return_scores=return_scores,
         uniform_q_len=uniform_q_len,
         return_residuals=return_residuals,
-        config=None,
+        config=self.reconstruct_config(config),
     )
     if return_scores:
       return out

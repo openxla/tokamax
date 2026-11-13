@@ -18,12 +18,8 @@ from collections.abc import Sequence
 import dataclasses
 from typing import Any, override
 
-import jax
 from tokamax._src.ops.lightning_indexer import pallas_mosaic_tpu as jax_pallas_mosaic_tpu
-from tokamax._src.ops.lightning_indexer.kernel import config as kernel_config
-from tokamax.experimental.torch_tpu.ops import torch_op
 from tokamax.experimental.torch_tpu.ops.lightning_indexer import torch_base
-import torch
 
 Config = jax_pallas_mosaic_tpu.Config
 
@@ -45,19 +41,19 @@ class _PallasMosaicTpuLightningIndexer(
   """Pallas Mosaic TPU Tokamax Lightning Indexer Op wrapped for PyTorch."""
 
   def __init__(self) -> None:
-    torch_op.TorchOp.__init__(self)
+    super().__init__()
     self.op_impl_jax = jax_pallas_mosaic_tpu.PallasTpuLightningIndexer()
     self.jax_op_name = "pallas_mosaic_tpu_lightning_indexer"
-    self.is_vjp = False
-    self.fake_impl = self._fake_impl
 
   @override
-  def deconstruct_config(  # pyrefly: ignore[bad-override]
-      self, config: Config | None
+  def deconstruct_config(
+      self, config: Config | tuple[Any, ...] | list[Any] | None
   ) -> tuple[int, ...] | None:
     """Deconstructs a Config object into a flat 13-int tuple for jax_op."""
     if config is None:
       return None
+    if isinstance(config, (tuple, list)):
+      return tuple(int(x) for x in config)
     assert len(dataclasses.fields(config)) == 7, (
         f"Expected 7 fields in Config, got {len(dataclasses.fields(config))}."
     )
@@ -98,106 +94,6 @@ class _PallasMosaicTpuLightningIndexer(
         enable_early_exit=bool(flat[11]),
         chunk_tokens=None if flat[12] <= 0 else int(flat[12]),
     )
-
-  @override
-  def __call__(
-      self,
-      q: torch.Tensor,
-      indexer_weights: torch.Tensor,
-      cache_kv: torch.Tensor,
-      seq_lens: torch.Tensor,
-      page_indices: torch.Tensor,
-      cu_q_lens: torch.Tensor,
-      distribution: torch.Tensor,
-      k: int,
-      compression_ratio: int = 1,
-      kv_layout: str = "head_along_sublane",
-      cp_size: int = 1,
-      cp_rank: torch.Tensor | int = 0,
-      interleave_size: int = 1,
-      return_scores: bool = False,
-      uniform_q_len: int | None = None,
-      return_residuals: bool = False,
-      config: Config | None = None,
-      configs: tuple[Config | None, Any] | None = None,
-  ) -> Any:
-    fwd_config = config if configs is None else configs[0]
-    assert self._torch_tokamax_op is not None, (
-        "Forward op not registered. This means that self.op_impl_jax is not set"
-        " in the constructor."
-    )
-    if isinstance(cp_rank, torch.Tensor):
-      cp_rank = int(cp_rank.item())
-    top_indices, top_scores = self._torch_tokamax_op(
-        q,
-        indexer_weights,
-        cache_kv,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        k=k,
-        compression_ratio=compression_ratio,
-        kv_layout=kv_layout,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        interleave_size=interleave_size,
-        return_scores=return_scores,
-        uniform_q_len=uniform_q_len,
-        return_residuals=return_residuals,
-        config=self.deconstruct_config(fwd_config),
-    )
-    return (top_indices, top_scores) if return_scores else top_indices
-
-  @override
-  def op_impl_call(
-      self,
-      q: jax.Array,
-      indexer_weights: jax.Array,
-      cache_kv: jax.Array,
-      seq_lens: jax.Array,
-      page_indices: jax.Array,
-      cu_q_lens: jax.Array,
-      distribution: jax.Array,
-      k: int,
-      compression_ratio: int = 1,
-      kv_layout: str = "head_along_sublane",
-      cp_size: int = 1,
-      cp_rank: int = 0,
-      interleave_size: int = 1,
-      return_scores: bool = False,
-      uniform_q_len: int | None = None,
-      return_residuals: bool = False,
-      config: tuple[int, ...] | None = None,
-  ) -> tuple[jax.Array, jax.Array]:
-    assert self.op_impl_jax is not None, (
-        "Forward class not set. This means that self.op_impl_jax is not set"
-        " in the constructor."
-    )
-    assert config is not None, "Forward config not set."
-    kernel_cfg = self.reconstruct_config(config)
-    out, _ = self.op_impl_jax._fwd(  # pylint: disable=protected-access
-        q,
-        indexer_weights,
-        cache_kv,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        k=k,
-        compression_ratio=compression_ratio,
-        kv_layout=kernel_config.KVLayout(kv_layout),
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        interleave_size=interleave_size,
-        return_scores=return_scores,
-        uniform_q_len=uniform_q_len,
-        return_residuals=return_residuals,
-        config=kernel_cfg,
-    )
-    if return_scores:
-      return out
-    return out, out
 
 
 # Singleton instance of Pallas Mosaic TPU LightningIndexer.

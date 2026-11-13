@@ -14,9 +14,12 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU implementation of Ragged Gather."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.ragged_gather import base as jax_base
@@ -142,22 +145,35 @@ class PallasMosaicTpuRaggedGatherTest(parameterized.TestCase):
           )
 
   def test_fake_impl(self):
+    op_pallas = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather
     with fake_tensor.FakeTensorMode():
       x_fake = torch.empty((512, 128), dtype=torch.float32)
       indices_fake = torch.empty((32,), dtype=torch.int32)
       start_fake = torch.empty((1,), dtype=torch.int32)
       end_fake = torch.empty((1,), dtype=torch.int32)
-      out = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
-          x_fake, indices_fake, start_fake, end_fake
-      )
-      out_untrimmed = torch_pallas_mosaic_tpu.PallasMosaicTpuRaggedGather(
+      out = op_pallas(x_fake, indices_fake, start_fake, end_fake)
+      out_untrimmed = op_pallas(
           x_fake, indices_fake, start_fake, end_fake, trim_rows=False
       )
+      with mock.patch.object(
+          pltpu,
+          "get_tpu_info",
+          side_effect=ValueError("Unsupported TPU device kind: cpu"),
+      ):
+        out_trimmed_no_tpu = op_pallas(
+            x_fake, indices_fake, start_fake, end_fake, trim_rows=True
+        )
+        with self.assertRaisesRegex(ValueError, "use_abstract_mesh"):
+          op_pallas(
+              x_fake, indices_fake, start_fake, end_fake, trim_rows=False
+          )
     self.assertEqual(tuple(out.shape), (32, 128))
     self.assertEqual(out.dtype, torch.float32)
     self.assertGreaterEqual(out_untrimmed.shape[0], 32)
     self.assertEqual(out_untrimmed.shape[1], 128)
     self.assertEqual(out_untrimmed.dtype, torch.float32)
+    self.assertEqual(tuple(out_trimmed_no_tpu.shape), (32, 128))
+    self.assertEqual(out_trimmed_no_tpu.dtype, torch.float32)
 
   def test_torch_compile(self):
     device = "tpu"
