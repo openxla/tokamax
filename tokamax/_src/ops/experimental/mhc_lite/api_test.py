@@ -120,6 +120,11 @@ def _end_to_end_loss(
   return jnp.sum(out.astype(jnp.float32) * cotangent.astype(jnp.float32))
 
 
+# The 4D and 2D layouts must round at the same bf16 boundaries to be compared
+# tightly, so XLA may not skip bf16 round trips on either side.
+_NO_EXCESS_PRECISION = {"xla_allow_excess_precision": False}
+
+
 def _hc_loss(
     cotangent: jax.Array,
     x_in: jax.Array,
@@ -321,7 +326,8 @@ class MhcLiteApiTest(parameterized.TestCase):
     loss_and_grad = jax.jit(
         jax.value_and_grad(
             functools.partial(_hc_loss, cotangent), argnums=(0, 1, 2)
-        )
+        ),
+        compiler_options=_NO_EXCESS_PRECISION,
     )
     loss, (dx, dweights, dw_branch) = loss_and_grad(x, hc_weights, w_branch)
     self.assertTrue(np.isfinite(float(loss)))
@@ -337,7 +343,8 @@ class MhcLiteApiTest(parameterized.TestCase):
     loss_and_grad_2d = jax.jit(
         jax.value_and_grad(
             functools.partial(_hc_loss, cotangent_2d), argnums=(0, 1, 2)
-        )
+        ),
+        compiler_options=_NO_EXCESS_PRECISION,
     )
     loss_2d, (dx_2d, dweights_2d, dw_branch_2d) = loss_and_grad_2d(
         x_2d, hc_weights, w_branch
