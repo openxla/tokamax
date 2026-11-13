@@ -66,9 +66,10 @@ def dtype_to_str(
   if dtype is None:
     return None
   if isinstance(dtype, torch.dtype):
-    return str(dtype).split(".")[-1]
+    name = str(dtype).split(".")[-1]
+    return "float4_e2m1fn" if name == "float4_e2m1fn_x2" else name
   if isinstance(dtype, str):
-    return dtype
+    return "float4_e2m1fn" if dtype == "float4_e2m1fn_x2" else dtype
   return jnp.dtype(dtype).name
 
 
@@ -85,7 +86,11 @@ def to_torch_dtype(
 ) -> torch.dtype | None:
   """Converts a PyTorch, JAX, or string dtype to a `torch.dtype`."""
   dtype_str = dtype_to_str(dtype)
-  return getattr(torch, dtype_str) if dtype_str is not None else None
+  if dtype_str is None:
+    return None
+  if dtype_str == "float4_e2m1fn" and hasattr(torch, "float4_e2m1fn_x2"):
+    return getattr(torch, "float4_e2m1fn_x2")
+  return getattr(torch, dtype_str)
 
 
 def convert_torch_to_jax_via_meta(
@@ -105,6 +110,9 @@ def convert_torch_to_jax_via_meta(
   """
   x_meta = torch_tensor.to("meta")
   dtype_str = str(x_meta.dtype).split(".")[-1]
+  if dtype_str == "float4_e2m1fn_x2":
+    shape = (*x_meta.shape[:-1], x_meta.shape[-1] * 2) if x_meta.ndim else ()
+    return jax.ShapeDtypeStruct(shape=shape, dtype=jnp.float4_e2m1fn)
   jax_dtype = getattr(jax.numpy, dtype_str)
   return jax.ShapeDtypeStruct(
       shape=tuple(x_meta.shape),

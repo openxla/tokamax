@@ -19,6 +19,7 @@ import dataclasses
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 from tokamax._src.ops.experimental.routing_moe.test.layer import moe_test_base
@@ -49,6 +50,24 @@ class ModularMoEUnitTest(moe_test_base.MoEUnitTest):
         "fold_shared_expert requires has_shared_expert and sharding.ep == 1",
     ):
       self.check_matches_reference(shape, layout, reduce_output=False)
+
+  @parameterized.product(fuse_up_and_down=[True, False])
+  def test_partial_chunk_intermediate(self, fuse_up_and_down: bool):
+    shape = helper_shapes.MoEShape("partial_chunk_640", 16, 4, 2560, 640)
+    case = helper_cases.Case(
+        "partial_chunk_640",
+        shape,
+        num_tokens=64,
+        sharding=helper_cases.MoESharding(ep=2),
+    )
+    layout = moe_test_lib.WeightLayout(case.sharding, use_sp=False)
+    self.check_case(
+        case,
+        layout,
+        gmm_plan=gmm_plan_lib.RoutingGmmPlan(
+            fuse_up_and_down=fuse_up_and_down
+        ),
+    )
 
 
 if __name__ == "__main__":
