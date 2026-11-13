@@ -367,14 +367,38 @@ class IndexBufferedRef(pltpu.BufferedRef):
     m_start = self.metadata_ref.gm_id_to_m_offset[gm_id].astype(jnp.uint32)
     m_size = self.metadata_ref.gm_id_to_num_rows[gm_id].astype(jnp.uint32)
     m_end = m_start + m_size
-    aligned_start = lax.div(m_start, block_size) * block_size
-    aligned_end = pl.cdiv(m_end, block_size) * block_size
+    prev_gm_id = jnp.where(gm_id > 0, gm_id - 1, jnp.uint32(0))
+    prev_m_start = self.metadata_ref.gm_id_to_m_offset[prev_gm_id].astype(
+        jnp.uint32
+    )
+    # Valid tiles are contiguous (m_start[gm_id] == m_end[gm_id - 1]), so tile
+    # gm_id - 1 already fetched up to cdiv(m_start, block_size) into the same
+    # SMEM block unless it started in an earlier ring revolution and wrote that
+    # block into the runway instead of the wrapped start of the ring.
+    skip_shared_block = (
+        (gm_id > 0)
+        & (m_size > 0)
+        & (lax.div(prev_m_start, ring_size) == lax.div(m_start, ring_size))
+    )
+    start_block = jnp.where(
+        skip_shared_block,
+        pl.cdiv(m_start, block_size),
+        lax.div(m_start, block_size),
+    )
+    end_block = pl.cdiv(m_end, block_size)
+    aligned_start = start_block * block_size
+    aligned_end = jnp.maximum(aligned_start, end_block * block_size)
 
     # Calculate smem address. Each odd/even n value uses a different buffer
     # to ensure first step of n + 1 never overwrites the last step of n.
     buffer_offset = lax.rem(n_id, buffer_count) * idx_buffer_size
     local_start = lax.rem(m_start, ring_size)
-    aligned_local_start = lax.div(local_start, block_size) * block_size
+    local_start_block = jnp.where(
+        skip_shared_block,
+        pl.cdiv(local_start, block_size),
+        lax.div(local_start, block_size),
+    )
+    aligned_local_start = local_start_block * block_size
     aligned_buffer_start = buffer_offset + aligned_local_start
     return aligned_start, aligned_buffer_start, aligned_end - aligned_start
 

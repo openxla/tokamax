@@ -15,6 +15,7 @@
 """Unit tests for routing_gmm against the grouped matmul reference."""
 
 import dataclasses
+from typing import Any, cast
 
 from absl import logging
 from absl.testing import absltest
@@ -806,6 +807,147 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     deq = np.asarray(gmm_test_lib.dequantize_rows(actual))[rows]
     expected = np.asarray(expected, np.float32)
     self.assertLessEqual(_rel_diff(deq, expected), 2**-3)
+
+  def _make_index_buffered_ref(
+      self, group_sizes: tuple[int, ...]
+  ) -> tuple[
+      kernel.memory_ref.IndexBufferedRef,
+      kernel.config.RoutingGmmConfig,
+      list[tuple[int, int, int]],
+  ]:
+    total_rows = sum(group_sizes)
+    num_groups = len(group_sizes)
+    tpu_info = kernel.pltpu.get_tpu_info()
+    x_spec = kernel.memory_ref.spec_lib.ActivationSpec(
+        row_size=total_rows,
+        col_size=256,
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant=None,
+    )
+    w_spec = kernel.memory_ref.spec_lib.WeightSpec(
+        group_size=num_groups,
+        in_size=256,
+        out_size=512,
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant=None,
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    routing_spec = kernel.memory_ref.spec_lib.RoutingSpec(
+        num_indices=total_rows, remote_axis=None
+    )
+    gmm_spec = kernel.gmm_spec_lib.RoutingGmmSpec(
+        x=x_spec,
+        w=w_spec,
+        w2=None,
+        gather=routing_spec,
+        scatter=None,
+        num_global_groups=num_groups,
+        fuse_act=None,
+        size_ep=1,
+        size_row_group=0,
+    )
+    resolved_out_format = kernel.out_format_lib.ResolvedActivationFormat(
+        dtype=x_spec.dtype, quant=None
+    )
+    resolved_plan = gmm_plan.ResolvedGmmPlan.create(
+        gmm_plan.RoutingGmmPlan(tile_m=256, tile_n=256),
+        spec=gmm_spec,
+        out_format=resolved_out_format,
+        tpu_info=tpu_info,
+    )
+    cfg = kernel.config.RoutingGmmConfig.create(
+        spec=gmm_spec,
+        out_format=resolved_out_format,
+        plan=resolved_plan,
+        tpu_info=tpu_info,
+    )
+
+    tile_m = cfg.plan.tile_m
+    tiles: list[tuple[int, int, int]] = []
+    offset = 0
+    for group_id, size in enumerate(group_sizes):
+      for m_start in range(offset, offset + size, tile_m):
+        tiles.append((group_id, m_start, min(offset + size - m_start, tile_m)))
+      offset += size
+
+    gm_id_to_group_id = np.zeros(cfg.max_num_gm, dtype=np.int32)
+    gm_id_to_m_offset = np.zeros(cfg.max_num_gm, dtype=np.int32)
+    gm_id_to_num_rows = np.zeros(cfg.max_num_gm, dtype=np.int32)
+    for gm_id, (group_id, m_start, m_size) in enumerate(tiles):
+      gm_id_to_group_id[gm_id] = group_id
+      gm_id_to_m_offset[gm_id] = m_start
+      gm_id_to_num_rows[gm_id] = m_size
+
+    metadata_ref = kernel.metadata.SortedMetadataRef(
+        gm_id_to_group_id=cast(Any, jnp.asarray(gm_id_to_group_id)),
+        gm_id_to_m_offset=cast(Any, jnp.asarray(gm_id_to_m_offset)),
+        gm_id_to_num_rows=cast(Any, jnp.asarray(gm_id_to_num_rows)),
+        num_gm=cast(Any, jnp.array([len(tiles)], dtype=jnp.int32)),
+        cfg=cfg,
+    )
+    index_maps = kernel.memory_ref.PipelineIndexMaps(metadata_ref, cfg)
+    block_specs = kernel.memory_ref.PipelineBlockSpecs(cfg, index_maps)
+    idx_bref = kernel.memory_ref.IndexBufferedRef.input(
+        spec=block_specs.get_index_spec(),
+        dtype_or_type=jnp.int32,
+        buffer_count=cfg.plan.num_idx_buffers,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+        fetch_offset=cfg.plan.num_xo_buffers - 1,
+    )
+    return idx_bref, cfg, tiles
+
+  @parameterized.named_parameters(
+      ("sub_block_pair", (128, 128)),
+      ("sub_block_quad", (64, 64, 64, 64)),
+      ("block_straddling", (192, 192, 128)),
+      ("ring_wrap_around", (256, 256, 256, 256, 192, 128, 192)),
+  )
+  def test_index_buffered_ref_aligned_range_no_overlap(
+      self, group_sizes: tuple[int, ...]
+  ):
+    idx_bref, cfg, tiles = self._make_index_buffered_ref(group_sizes)
+    num_gm = len(tiles)
+
+    # Out-of-bounds steps resolve to sink_gm_id and issue 0-size DMAs.
+    self.assertEqual(int(idx_bref._aligned_range(0, -1, 0)[2]), 0)
+    self.assertEqual(
+        int(idx_bref._aligned_range(cfg.num_n - 1, num_gm, 0)[2]), 0
+    )
+
+    ring_size = cfg.plan.idx_ring_size
+    buf_size = cfg.plan.idx_buffer_size
+    hbm = np.arange(sum(group_sizes) + cfg.plan.tile_m_idx, dtype=np.int32)
+    smem = np.full(cfg.plan.num_idx_buffers * buf_size, -1, dtype=np.int32)
+    window = cfg.plan.num_xo_buffers
+
+    for n_id in range(cfg.num_n):
+      ranges = [
+          tuple(int(v) for v in idx_bref._aligned_range(n_id, gm_id, 0))
+          for gm_id in range(num_gm)
+      ]
+      # Any window of num_xo_buffers consecutive tiles must have disjoint
+      # non-empty SMEM destination intervals.
+      for start in range(num_gm):
+        active = sorted(
+            (smem_start, smem_start + size)
+            for _, smem_start, size in ranges[start : start + window]
+            if size > 0
+        )
+        for (_, e0), (s1, _) in zip(active, active[1:]):
+          self.assertLessEqual(e0, s1)
+
+      # Simulate the ring-buffer DMAs and verify every tile reads exact indices.
+      buf_offset = (n_id % cfg.plan.num_idx_buffers) * buf_size
+      for gm_id, (_, m_start, m_size) in enumerate(tiles):
+        hbm_start, smem_start, size = ranges[gm_id]
+        smem[smem_start : smem_start + size] = hbm[hbm_start : hbm_start + size]
+        read_start = buf_offset + (m_start % ring_size)
+        np.testing.assert_array_equal(
+            smem[read_start : read_start + m_size],
+            np.arange(m_start, m_start + m_size, dtype=np.int32),
+        )
 
 
 class RemoteRoutingGmmUnitTest(parameterized.TestCase):
