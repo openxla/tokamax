@@ -44,6 +44,9 @@ jobs:
       - name: Test the CI scripts
         run: python3 -m unittest discover -s .github/ci -p '*_test.py'
 
+      - name: Check docs/supported_ops.md is up to date
+        run: python3 .github/ci/ops_table.py check
+
       - name: Decide which files changed
         # Writes /tmp/changed; if absent, every shard runs.
         env:
@@ -206,6 +209,9 @@ jobs:
         run: |
           printf '%s tokamax' "${PYTEST_FLAGS}" \
             | xargs pytest --collect-only -q
+
+      - name: Check ops_list
+        run: pytest tokamax/_src/ops/ops_list_test.py
 
   shard-tests:
     name: ${{ matrix.shard_name && format('shard-tests ({0}, {1})', matrix.runner_short, matrix.shard_name) || 'shard-tests (no shard selected)' }}

@@ -1,0 +1,216 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+# Presentation metadata for `docs/supported_ops.md`.
+#
+# Only fields that `_src/ops/ops_list.py` does not carry belong here: the page
+# section ordering, optional family groupings, one-line summaries, whether an
+# op is listed on the public page, and shared non-op helper directories under
+# `_src/ops/`. Hardware, backends, and PyTorch TPU API wrappers are derived
+# directly from `ops_list.py` and `experimental/torch_tpu/`.
+#
+# After editing, regenerate the page:
+#   python3 .github/ci/ops_table.py render
+
+sections = [
+    'Attention Variants',
+    'Mixture-of-Experts (MoE) Components',
+    'Miscellaneous',
+]
+
+# Shared non-op subdirectories under `_src/ops/`, if any.
+not_ops = []
+
+[families.dsa]
+title = '<a href="https://arxiv.org/abs/2512.02556">DeepSeek Sparse Attention (DSA)</a>'
+
+[ops."splash_attention"]
+section = 'Attention Variants'
+summary = 'Computes block-sparse Flash Attention (Splash Attention) for long-context Transformer training and inference.'
+
+[ops."batched_rpa"]
+section = 'Attention Variants'
+summary = 'Computes <a href="https://arxiv.org/abs/2309.06180">paged attention</a> (<code>batched_ragged_paged_attention</code>) over packed variable-length sequences and a paged KV cache for LLM inference serving.'
+
+[ops."causal_conv1d_gated_delta_rule"]
+section = 'Attention Variants'
+summary = 'Fuses causal 1D convolution with <a href="https://arxiv.org/abs/2412.06464">Gated DeltaNet (GDN)</a> or Kimi Delta Attention (KDA) linear attention state updates for inference in hybrid linear-attention models (e.g., Qwen 3.5, Kimi Linear).'
+
+[ops."deepseek_rope"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Applies interleaved <a href="https://arxiv.org/abs/2104.09864">Rotary Position Embedding (RoPE)</a> (optionally fused with RMSNorm or quantization) to queries and keys in DeepSeek-V4 attention layers.'
+
+[ops."proj_and_save_state"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Projects hidden states into KV and score states and writes them to a paged state cache as the first stage of KV cache compression in DeepSeek-V4.'
+
+[ops."dsv4_compressor"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Compresses windows of cached token states and writes the compressed representations into the KV cache for DeepSeek-V4.'
+
+[ops."lightning_indexer"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Computes lightweight query-key relevance scores over a paged KV cache and selects the top-k KV positions per query token (invoking <code>topk</code> at the end) in GLM-5.2, DeepSeek-V3.2, and DeepSeek-V4.'
+
+[ops."topk"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Selects the top-k indices per row (<code>top_k</code>) across variable-length score rows on TPU SparseCore; invoked as the selection stage of <code>lightning_indexer</code> and also available standalone.'
+
+[ops."csa_gather"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Gathers and repacks compressed KV cache entries on TPU SparseCore for selected top-k token indices; invoked as the gather stage of <code>sparse_mla</code> and also available standalone.'
+
+[ops."sparse_mla"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Computes Sparse Multi-Head Latent Attention (SparseMLA) over selected top-k compressed KV entries (invoking <code>csa_gather</code> first to gather them) for DeepSeek-V4 inference.'
+
+[ops."masked_dense_mla"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Computes Multi-Head Latent Attention (MLA) restricted to a selected top-k subset of KV positions via a dense mask, used for shorter sequences in GLM-5.2, DeepSeek-V3.2, and DeepSeek-V4.'
+
+[ops."experimental/mla_swa"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Computes Multi-Head Latent Sliding Window Attention over a paged KV cache (optionally returning partial softmax accumulators to combine with <code>sparse_mla</code>) for DeepSeek-V4 inference.'
+
+[ops."grouped_lowrank_proj"]
+section = 'Attention Variants'
+family = 'dsa'
+summary = 'Fuses inverse RoPE rotation, quantization, and grouped low-rank output projection in the DeepSeek-V4 attention output path.'
+
+[ops."attention"]
+section = 'Attention Variants'
+summary = 'Computes standard scaled dot-product attention (<a href="https://arxiv.org/abs/2205.14135">FlashAttention</a>) for Transformer training and inference.'
+
+[ops."kda"]
+section = 'Attention Variants'
+summary = 'Computes <a href="https://arxiv.org/abs/2510.26692">Kimi Delta Attention (KDA)</a> (<code>kimi_delta_attention</code>), a linear attention mechanism with delta-rule state updates used in Kimi Linear.'
+
+[ops."experimental/flex_attention"]
+section = 'Attention Variants'
+summary = 'Computes scaled dot-product attention with user-defined score modification and masking functions (<a href="https://pytorch.org/blog/flexattention/">FlexAttention</a>).'
+
+[ops."experimental/mla"]
+section = 'Attention Variants'
+summary = 'Computes <a href="https://arxiv.org/abs/2405.04434">Multi-Head Latent Attention (MLA)</a> over compressed latent KV caches for DeepSeek-V2, DeepSeek-V3, and DeepSeek-R1 inference.'
+
+[ops."experimental/moba"]
+section = 'Attention Variants'
+summary = 'Block-mean routed sparse causal attention for long-context sequences, implementing <a href="https://arxiv.org/abs/2502.13189">MoBA: Mixture of Block Attention for Long-Context LLMs</a>.'
+
+[ops."experimental/nsa"]
+section = 'Attention Variants'
+summary = 'Hardware-aligned hierarchical sparse attention combining compressed-block, selected-block, and sliding-window branches, implementing <a href="https://arxiv.org/abs/2502.11089">Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</a>.'
+
+[ops."experimental/gdn2"]
+section = 'Attention Variants'
+summary = 'Chunkwise parallel gated delta-rule linear attention with decoupled write gating, implementing <a href="https://arxiv.org/abs/2412.06464">Gated Delta Networks: Improving Mamba2 with Delta Rule</a>.'
+
+[ops."experimental/rwkv7"]
+section = 'Attention Variants'
+summary = 'Diagonal-plus-low-rank (DPLR) state-transition linear attention with vector log-decay and in-context learning rate, implementing <a href="https://arxiv.org/abs/2503.14456">RWKV-7 "Goose" with Expressive Dynamic State Evolution</a>.'
+
+[ops."experimental/raven"]
+section = 'Attention Variants'
+summary = 'Two-stage bounded-slot linear attention with decoupled slot-axis and state-axis exponential decay, implementing <a href="https://arxiv.org/abs/2409.07146">Gated Slot Attention for Efficient Linear-Time Sequence Modeling</a>.'
+
+[ops."ragged_dot"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Performs grouped matrix multiplication (<a href="https://arxiv.org/abs/2211.15841">MegaBlocks</a>; drop-in for <code>jax.lax.ragged_dot</code>, with <code>gmm_v2</code> as one of its TPU backends) to compute expert projections over routed token groups.'
+
+[ops."ragged_gather"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Gathers and permutes token activations into expert-grouped order during MoE token dispatch.'
+
+[ops."ragged_gather_reduce"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Gathers expert outputs and performs a weighted reduction per token during the MoE combine (unpermute) step.'
+
+[ops."router_topk"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Selects the top-k expert weights and indices per token from router scores for MoE routing.'
+
+[ops."experimental/fused_moe"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Executes a fused end-to-end expert-parallel MoE layer (routing, dispatch, expert projections, activation, and collectives) for LLM inference.'
+
+[ops."experimental/fused_moe_rs"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Fuses MoE expert computation with cross-device reduce-scatter into a single TPU kernel for inference.'
+
+[ops."experimental/routing_moe"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Implements a pipelined MoE layer that overlaps token gather/scatter with expert matrix multiplication.'
+
+[ops."experimental/dedup_moe"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Topology-aware expert-parallel MoE layer with split-phase wave dispatch and inter-board token deduplication on TPU.'
+listed = false
+
+[ops."experimental/fused_moe_decode"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = "Runs a MoE block's routed experts, its shared expert and the cross-rank all-reduce in one Pallas call per rank, for small token counts."
+listed = false
+
+[ops."gmm_v2"]
+section = 'Mixture-of-Experts (MoE) Components'
+summary = 'Grouped matrix multiplication Pallas TPU kernels (<code>gmm_v2</code>, <code>tgmm_v2</code>).'
+listed = false
+
+[ops."linear_softmax_cross_entropy_loss"]
+section = 'Miscellaneous'
+summary = 'Fuses the final linear projection with softmax cross-entropy loss (<code>linear_softmax_cross_entropy_loss</code>) to avoid materializing the full vocabulary logits tensor in memory.'
+
+[ops."mhc"]
+section = 'Miscellaneous'
+summary = 'Implements <a href="https://arxiv.org/abs/2512.24880">Manifold-Constrained Hyper-Connections (mHC)</a> (<code>mhc_pre</code>, <code>mhc_post</code>, and <code>mhc_fused_post_pre</code>) for mixing multiple residual streams across sublayers in DeepSeek-V4.'
+
+[ops."gated_linear_unit"]
+section = 'Miscellaneous'
+summary = 'Computes a fused <a href="https://arxiv.org/abs/2002.05202">Gated Linear Unit</a> (e.g., SwiGLU, GeGLU) for Transformer feed-forward networks.'
+
+[ops."normalization"]
+section = 'Miscellaneous'
+summary = 'Computes <a href="https://arxiv.org/abs/1607.06450">Layer Normalization</a> (LayerNorm) or <a href="https://arxiv.org/abs/1910.07467">Root Mean Square Normalization</a> (RMSNorm).'
+
+[ops."triangle_multiplication"]
+section = 'Miscellaneous'
+summary = 'Computes the triangle multiplicative update on 2D pair representations for structure prediction models such as <a href="https://www.nature.com/articles/s41586-021-03819-2">AlphaFold 2</a> and AlphaFold 3.'
+
+[ops."experimental/fused_fp8_matmul"]
+section = 'Miscellaneous'
+summary = 'Performs FP8 matrix multiplication with fused dynamic activation quantization and weight scaling.'
+
+[ops."experimental/mhc_lite"]
+section = 'Miscellaneous'
+summary = 'Lightweight Pallas TPU kernels for <a href="https://arxiv.org/abs/2512.24880">Manifold-Constrained Hyper-Connections</a> (mHC-lite).'
+listed = false
+
+[ops."experimental/ssd_scan"]
+section = 'Attention Variants'
+summary = 'Pallas Mosaic TPU kernels for Mamba-2 and Mamba-3 state-space duality (SSD) scan.'
+listed = false
+
+[ops."experimental/ragged_causal_conv1d"]
+section = 'Miscellaneous'
+summary = 'Standalone Pallas Mosaic TPU kernel for ragged causal 1D convolution.'
+listed = false

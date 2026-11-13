@@ -1,0 +1,85 @@
+name: Publish ops page
+
+# Publishes the ops status page to GitHub Pages after a passing CI-Nightly run.
+
+on:
+  workflow_dispatch:
+  # The `zizmor: ignore` below is safe because of the
+  # `workflow_run.head_repository.full_name == github.repository` check below,
+  # and because the artifacts read are JUnit XML, parsed as data.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: ["CI-Nightly"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # To download the triggering run's artifacts.
+      actions: read
+    steps:
+      - name: Checkout Tokamax
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Download nightly JUnit results
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: nightly-junit-*
+          merge-multiple: true
+          path: /tmp/junit
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Check the page and manifest
+        run: python3 .github/ci/ops_table.py check
+
+      - name: Build the site
+        env:
+          COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          junit=()
+          if [[ -d /tmp/junit ]]; then
+            junit=(--junit-dir /tmp/junit)
+          fi
+          python3 .github/ci/ops_table.py site --out _site "${junit[@]}" \
+            --commit "${COMMIT}" --run-url "${RUN_URL}"
+          cat docs/supported_ops.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0

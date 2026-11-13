@@ -395,6 +395,8 @@ OPS: tuple[Op, ...] = (
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla/pallas_mosaic_tpu.py",
+                kernel_dirs=(
+                ),
             ),
         ),
     ),
