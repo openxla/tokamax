@@ -350,6 +350,33 @@ SHARDS: ShardMap = {
         minutes=16,
         compat_minutes=1,
     ),
+    'experimental-kda-megakernel-forward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_resource_test.py',
+        ),
+        minutes=10,
+    ),
+    'experimental-kda-megakernel-backward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_bwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_remat_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_bwd_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_gradients_test.py',
+        ),
+        minutes=15,
+    ),
+    'experimental-kda-megakernel-cp': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_megakernel_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_workspace_tpu_test.py',
+        ),
+        minutes=10,
+    ),
     'experimental-routing-moe': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
