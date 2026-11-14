@@ -266,6 +266,7 @@ def flash_attention_vjp_kernel(
       precision=jax.lax.Precision.HIGHEST,
   )
 
+  @jax.enable_x64(False)
   def kernel_dq(
       q_gmem,
       k_gmem,
@@ -489,6 +490,7 @@ def flash_attention_vjp_kernel(
         in_specs=[bias_spec, v_spec, mask_spec, k_spec],  # pyrefly: ignore[bad-argument-type]
     )(bias_gmem_, v_gmem, mask_gmem_, k_gmem)
 
+  @jax.enable_x64(False)
   def kernel_dkv(
       q_gmem,
       k_gmem,

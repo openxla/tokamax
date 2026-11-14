@@ -736,6 +736,7 @@ def flash_attention_kernel(
         return step
     return 16
 
+  @jax.enable_x64(False)
   def kernel(
       q_gmem,
       k_gmem,
