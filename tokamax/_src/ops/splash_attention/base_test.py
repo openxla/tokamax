@@ -575,6 +575,136 @@ class SplashAttentionBaseTest(parameterized.TestCase):
     chex.assert_trees_all_close(dk_sharded, dk_ref, atol=1e-2)
     chex.assert_trees_all_close(dv_sharded, dv_ref, atol=1e-2)
 
+  @parameterized.parameters(
+      (base.QuantizationStrategy.UNQUANTIZED, jnp.float8_e4m3fn, -1, False),
+      (base.QuantizationStrategy.CAST, jnp.float8_e4m3fn, -1, True),
+      (base.QuantizationStrategy.PER_TENSOR, jnp.float8_e5m2, -1, True),
+      (base.QuantizationStrategy.PER_AXIS, jnp.float8_e4m3fn, -1, False),
+  )
+  def test_apply_quantization(
+      self,
+      strategy: base.QuantizationStrategy,
+      quant_dtype: jax.typing.DTypeLike,
+      contract_axis: int,
+      apply_log2e_scaling: bool,
+  ):
+    x = jnp.linspace(-3.0, 3.0, 2 * 16 * 8, dtype=jnp.bfloat16).reshape(
+        2, 16, 8
+    )
+    q_x, scale = base.apply_quantization(
+        x,
+        quant_dtype=quant_dtype,
+        strategy=strategy,
+        contract_axis=contract_axis,
+        apply_log2e_scaling=apply_log2e_scaling,
+    )
+    if strategy == base.QuantizationStrategy.UNQUANTIZED:
+      self.assertEqual(q_x.dtype, x.dtype)
+      self.assertIsNone(scale)
+    elif strategy == base.QuantizationStrategy.CAST:
+      self.assertEqual(q_x.dtype, quant_dtype)
+      self.assertIsNone(scale)
+    elif strategy == base.QuantizationStrategy.PER_TENSOR:
+      self.assertEqual(q_x.dtype, quant_dtype)
+      self.assertIsNotNone(scale)
+      self.assertEqual(scale.shape, (2, 1, 1))
+      self.assertEqual(scale.dtype, x.dtype)
+    elif strategy == base.QuantizationStrategy.PER_AXIS:
+      self.assertEqual(q_x.dtype, quant_dtype)
+      self.assertIsNotNone(scale)
+      self.assertEqual(scale.shape, (2, 16, 1))
+      self.assertEqual(scale.dtype, x.dtype)
+      _, scale_axis_m2 = base.apply_quantization(
+          x, quant_dtype=quant_dtype, strategy=strategy, contract_axis=-2
+      )
+      self.assertIsNotNone(scale_axis_m2)
+      self.assertEqual(scale_axis_m2.shape, (2, 1, 8))
+
+    dequant = q_x.astype(jnp.float32) * (
+        scale.astype(jnp.float32) if scale is not None else 1.0
+    )
+    expected_x = x.astype(jnp.float32) * (
+        reference.LOG2E if apply_log2e_scaling else 1.0
+    )
+    chex.assert_trees_all_close(dequant, expected_x, rtol=0.15, atol=0.15)
+    if apply_log2e_scaling and scale is not None:
+      _, scale_unscaled = base.apply_quantization(
+          x,
+          quant_dtype=quant_dtype,
+          strategy=strategy,
+          contract_axis=contract_axis,
+      )
+      assert scale_unscaled is not None
+      expected_scale = (
+          scale_unscaled.astype(jnp.float32) * reference.LOG2E
+      ).astype(x.dtype)
+      chex.assert_trees_all_close(scale, expected_scale, rtol=2e-2)
+
+    q_zeros, scale_zeros = base.apply_quantization(
+        jnp.zeros((2, 8), dtype=jnp.bfloat16),
+        quant_dtype=quant_dtype,
+        strategy=strategy,
+        contract_axis=-1,
+    )
+    self.assertFalse(bool(jnp.any(jnp.isnan(q_zeros))))
+    if scale_zeros is not None:
+      self.assertFalse(bool(jnp.any(jnp.isnan(scale_zeros))))
+
+    q_large, scale_large = base.apply_quantization(
+        jnp.array([[1000.0, -1000.0]], dtype=jnp.bfloat16),
+        quant_dtype=quant_dtype,
+        strategy=strategy,
+        contract_axis=-1,
+    )
+    self.assertFalse(bool(jnp.any(jnp.isnan(q_large))))
+    if scale_large is not None:
+      self.assertFalse(bool(jnp.any(jnp.isnan(scale_large))))
+    if strategy == base.QuantizationStrategy.CAST:
+      dtype_max = float(jnp.finfo(quant_dtype).max)
+      np.testing.assert_array_equal(
+          np.asarray(q_large.astype(jnp.float32)),
+          np.array([[dtype_max, -dtype_max]], dtype=np.float32),
+      )
+
+    upstream_grad = jnp.arange(x.size, dtype=jnp.bfloat16).reshape(x.shape)
+
+    @jax.custom_vjp
+    def _mock_kernel(q_fwd, q_scales, q_dk, q_dk_scales):
+      del q_scales, q_dk, q_dk_scales
+      return q_fwd.astype(jnp.bfloat16)
+
+    _mock_kernel.defvjp(
+        lambda q_fwd, q_scales, q_dk, q_dk_scales: (
+            _mock_kernel(q_fwd, q_scales, q_dk, q_dk_scales),
+            None,
+        ),
+        lambda _, ct: (ct, None, None, None),
+    )
+
+    def loss_fn(inp):
+      q_fwd, q_scales = base.apply_quantization(
+          inp,
+          quant_dtype=quant_dtype,
+          strategy=strategy,
+          contract_axis=contract_axis,
+          apply_log2e_scaling=apply_log2e_scaling,
+      )
+      q_dk, q_dk_scales = base.apply_quantization(
+          inp, quant_dtype=quant_dtype, strategy=strategy, contract_axis=-2
+      )
+      return jnp.sum(
+          _mock_kernel(q_fwd, q_scales, q_dk, q_dk_scales) * upstream_grad
+      )
+
+    grad_x = jax.grad(loss_fn)(x)
+    self.assertEqual(grad_x.dtype, x.dtype)
+    expected_grad = (
+        upstream_grad.astype(jnp.float32) * reference.LOG2E
+        if apply_log2e_scaling
+        else upstream_grad
+    ).astype(x.dtype)
+    chex.assert_trees_all_close(grad_x, expected_grad, rtol=2e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
   absltest.main()
