@@ -111,3 +111,19 @@ def test_preactivated_gate_without_normalization_or_state(key_dim):
     )
     results.append(pullback(jax.tree.map(jnp.ones_like, output)))
   forward_tests._assert_close(results[1], results[0], tolerance=0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("width", [128, 256])
+def test_normalization_storage_boundary_against_one_hot_jacobian(dtype, width):
+  # For a unit coordinate vector, normalization removes only the gradient
+  # parallel to that coordinate. All values below are exact binary fractions.
+  row = jnp.arange(64)
+  y = jax.nn.one_hot((row * 17) % width, width, dtype=dtype)[None, None]
+  rstd = jnp.where(row % 2, 2.0, 0.5)[None, None]
+  dy = jnp.broadcast_to(
+      ((jnp.arange(width) % 7 - 3) * 0.125).astype(dtype), y.shape
+  )
+  expected = jnp.where(y != 0, 0, dy.astype(jnp.float32) * rstd[..., None])
+  actual = kernels._materialized_l2norm_bwd(y, rstd, dy)
+  forward_tests._assert_close(actual, expected.astype(dtype), tolerance=0)

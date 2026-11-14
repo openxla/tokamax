@@ -70,20 +70,37 @@ from tokamax._src.ops.kda.pallas_mosaic_tpu_bwd_kernel import (
 RCP_LN2 = 1.0 / math.log(2)
 
 
-def _materialized_l2norm_bwd(y, rstd, dy):
-  """Keep FP32 normalization rounding independent of the output consumer.
+def _l2norm_backward_kernel(y_ref, rstd_ref, dy_ref, dx_ref):
+  y = y_ref[...].astype(jnp.float32)
+  dy = dy_ref[...].astype(jnp.float32)
+  rstd = rstd_ref[...].astype(jnp.float32)
+  dot = jnp.sum(dy * y, axis=-1, keepdims=True)
+  dx_ref[...] = (dy * rstd - dot * y * rstd).astype(dx_ref.dtype)
 
-  Packed Pallas stores and XLA gathers expose different fusion boundaries.
-  Materialize the FP32 products before subtraction in both paths so a BF16
-  rounding boundary cannot depend on whether token compaction is enabled.
+
+def _materialized_l2norm_bwd(y, rstd, dy):
+  """Normalize gradients in a fixed VMEM tile before either token consumer.
+
+  A Pallas output ref fixes the final BF16 storage boundary. Both gather
+  and compaction receive the same normalized buffer, rather than relying
+  on XLA optimization barriers to preserve intermediate fusion boundaries.
   """
-  barrier = jax.lax.optimization_barrier
-  y_f, dy_f = y.astype(jnp.float32), dy.astype(jnp.float32)
-  rstd_f = rstd.astype(jnp.float32)[..., None]
-  dot = jnp.sum(barrier(dy_f * y_f), axis=-1, keepdims=True)
-  left = barrier(dy_f * rstd_f)
-  right = barrier(barrier(dot * y_f) * rstd_f)
-  return (left - right).astype(y.dtype)
+  width = y.shape[-1]
+  rows = y.size // width
+  tile = 8
+  assert rows % tile == 0
+  spec = pl.BlockSpec((tile, width), lambda i: (i, 0))
+  scalar_spec = pl.BlockSpec((tile, 1), lambda i: (i, 0))
+  result = pl.pallas_call(
+      _l2norm_backward_kernel,
+      out_shape=jax.ShapeDtypeStruct((rows, width), y.dtype),
+      grid=(rows // tile,),
+      in_specs=(spec, scalar_spec, spec),
+      out_specs=spec,
+      compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+      interpret=get_interpret(),
+  )(y.reshape(rows, width), rstd.reshape(rows, 1), dy.reshape(rows, width))
+  return result.reshape(y.shape)
 
 
 def _storage_boundary(value, dtype):
