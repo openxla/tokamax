@@ -3455,9 +3455,9 @@ def _make_dynamic_splash_attention(
 
   mask_info_specs = MaskInfo(
       mask_next=mask_spec,  # pyrefly: ignore[bad-argument-type]
-      active_rows=None,
-      active_cols=None,
-      num_active_blocks=None,
+      active_rows=mask_spec,  # pyrefly: ignore[bad-argument-type]
+      active_cols=mask_spec,  # pyrefly: ignore[bad-argument-type]
+      num_active_blocks=mask_spec,  # pyrefly: ignore[bad-argument-type]
       block_mask=mask_spec,  # pyrefly: ignore[bad-argument-type]
       partial_mask_blocks=mask_spec,  # pyrefly: ignore[bad-argument-type]
       q_sequence=None,

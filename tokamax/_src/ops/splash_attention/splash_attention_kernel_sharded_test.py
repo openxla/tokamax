@@ -67,10 +67,6 @@ class SplashAttentionShardingTest(PallasBaseTest):
   def test_manual_partitioning_mha_fwd(
       self, topology, num_heads, dtype, is_segmented, is_dynamic_mask
   ):
-    # TODO: Re-enable once dynamic masks are fixed.
-    if is_dynamic_mask:
-      self.skipTest("Dynamic masks not supported.")
-
     k1, k2, k3 = random.split(random.key(0), 3)
     seq_len = 1024
     head_dim = 128
@@ -159,10 +155,6 @@ class SplashAttentionShardingTest(PallasBaseTest):
   def test_manual_partitioning_mha_bwd(
       self, topology, num_heads, dtype, is_segmented, is_dynamic_mask
   ):
-    # TODO: Re-enable once dynamic masks are fixed.
-    if is_dynamic_mask:
-      self.skipTest("Dynamic masks not supported.")
-
     assert num_heads % 2 == 0
     k1, k2, k3, k4 = random.split(random.key(0), 4)
     seq_len = 1024
