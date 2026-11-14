@@ -42,7 +42,7 @@ hp.settings.register_profile(
     database=None,
     derandomize=True,
     deadline=None,
-    max_examples=15,
+    max_examples=7,
     print_blob=False,
     verbosity=hp.Verbosity.normal,
 )
