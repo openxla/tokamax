@@ -51,7 +51,6 @@ from tokamax._src.ops.kda.utils import (
     _unalign_output,
     exp2,
     get_interpret,
-    l2norm_bwd,
     segment_ids_to_seqlens,
 )
 
@@ -69,6 +68,22 @@ from tokamax._src.ops.kda.pallas_mosaic_tpu_bwd_kernel import (
 )
 
 RCP_LN2 = 1.0 / math.log(2)
+
+
+def _materialized_l2norm_bwd(y, rstd, dy):
+  """Keep FP32 normalization rounding independent of the output consumer.
+
+  Packed Pallas stores and XLA gathers expose different fusion boundaries.
+  Materialize the FP32 products before subtraction in both paths so a BF16
+  rounding boundary cannot depend on whether token compaction is enabled.
+  """
+  barrier = jax.lax.optimization_barrier
+  y_f, dy_f = y.astype(jnp.float32), dy.astype(jnp.float32)
+  rstd_f = rstd.astype(jnp.float32)[..., None]
+  dot = jnp.sum(barrier(dy_f * y_f), axis=-1, keepdims=True)
+  left = barrier(dy_f * rstd_f)
+  right = barrier(barrier(dot * y_f) * rstd_f)
+  return (left - right).astype(y.dtype)
 
 
 def _storage_boundary(value, dtype):
@@ -1638,8 +1653,8 @@ def chunk_kda_bwd_custom(
   cu_seqlens = original_cu_seqlens
   if use_qk_l2norm:
     assert rstd_q is not None and rstd_k is not None
-    dq = l2norm_bwd(q, rstd_q, dq)
-    dk = l2norm_bwd(k, rstd_k, dk)
+    dq = _materialized_l2norm_bwd(q, rstd_q, dq)
+    dk = _materialized_l2norm_bwd(k, rstd_k, dk)
 
   if cu_seqlens is not None:
     if packed_gradients and not _cp_active:
