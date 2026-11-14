@@ -61,6 +61,12 @@ def _call_attention(implementation, q, v, **kwargs):
 
 class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
 
+  def test_forward_megakernel_options_are_opt_in(self):
+    config = pallas_mosaic_tpu.Config()
+    self.assertFalse(config.fuse_forward)
+    self.assertFalse(config.packed_forward)
+    self.assertFalse(config.packed_output)
+
   def test_tpu_limits_use_pallas_hardware_info(self):
     tpu_info = types.SimpleNamespace(
         vmem_capacity_bytes=64 * 1024 * 1024,
