@@ -113,9 +113,13 @@ def _extract_explicit_reexports(tree: ast.Module) -> frozenset[str]:
   return frozenset(reexports)
 
 
-_OPS_NON_ENTRYPOINT_EXPORTS = frozenset(
-    {"DotProductAttentionImplementation", "experimental", "gpu", "tpu"}
-)
+_OPS_NON_ENTRYPOINT_EXPORTS = frozenset({
+    "DotProductAttentionImplementation",
+    "experimental",
+    "gpu",
+    "op_fusion",
+    "tpu",
+})
 _EXP_NON_ENTRYPOINT_EXPORTS = frozenset({"tpu"})
 
 
