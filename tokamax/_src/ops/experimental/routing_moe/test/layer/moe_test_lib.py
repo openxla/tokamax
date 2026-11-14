@@ -16,6 +16,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Literal, Self
 
 import jax
@@ -75,6 +76,45 @@ def _scale_block_axis(scale: jax.Array | None, axis: AxisSpec) -> AxisSpec:
   return axis
 
 
+def _split_scale_blocks(
+    scale: jax.Array | None, w: jax.Array | None, num_shards: int
+) -> jax.Array | None:
+  """Repeats block scales so the block axis divides evenly across shards.
+
+  `w2` is sharded along its contracting dim, so each shard must own a whole
+  number of quantization blocks. When it does not (e.g. 4 blocks of 512 over 8
+  shards), each block scale is repeated so that the finer blocks still tile
+  the shard. `test_reference._dequantize` derives the block size from
+  `rows / num_blocks`, so the result dequantizes identically.
+
+  Args:
+    scale: Optional block scale tensor with block count in axis 1.
+    w: Optional weight tensor whose contracting dimension is axis 1.
+    num_shards: Number of shards along the contracting dimension.
+
+  Returns:
+    The scale tensor with its block axis repeated to divide `num_shards`, or
+    `scale` unchanged when `scale` or `w` is None or already divisible.
+
+  Raises:
+    ValueError: If `w`'s contracting dimension is not divisible by the refined
+      block count.
+  """
+  if scale is None or w is None:
+    return scale
+  num_blocks = scale.shape[1]
+  if num_blocks == 1 or num_blocks % num_shards == 0:
+    return scale
+  new_num_blocks = math.lcm(num_blocks, num_shards)
+  rows = w.shape[1]
+  if rows % new_num_blocks != 0:
+    raise ValueError(
+        f"Cannot split {num_blocks} scale blocks of {rows} rows across"
+        f" {num_shards} shards."
+    )
+  return jnp.repeat(scale, new_num_blocks // num_blocks, axis=1)
+
+
 def _shard_inputs(
     moe_in: helper_inputs.MoEInputs, mesh: Mesh, layout: WeightLayout
 ) -> helper_inputs.MoEInputs:
@@ -93,6 +133,11 @@ def _shard_inputs(
         moe_in,
         w1_shared=_interleave_gate_up(
             moe_in.w1_shared, sharding_spec.num_cores
+        ),
+        w2_shared_scale=_split_scale_blocks(
+            moe_in.w2_shared_scale,
+            moe_in.w2_shared,
+            sharding_spec.ep * sharding_spec.tp,
         ),
     )
 

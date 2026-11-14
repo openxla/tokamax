@@ -23,10 +23,38 @@ from jax import lax
 from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.gmm import compute
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
+
+
+def _matmuls(
+    act: jax.Array,
+    in_ref: memory_ref.PipelineInputs,
+    *,
+    act_dtype: jnp.dtype,
+    cfg: config.RoutingGmmConfig,
+    is_last_k2_step: bool,
+) -> jax.Array:
+  """Applies w, the activation function and the optional fused w2 to `act`."""
+  weight = in_ref.w.get_weight()
+  weight_scale = in_ref.w.get_scale() if cfg.spec.w.has_scale else None
+  weight_bias = in_ref.w.get_bias() if cfg.spec.w.has_bias else None
+  act = compute.matmul(cfg.compute, act, weight, weight_scale, weight_bias)
+  act = compute.apply_act_fn(act, cfg.spec.fuse_act)
+  if cfg.spec.w2 is None:
+    return act
+  assert in_ref.w2 is not None and cfg.compute2 is not None
+  act = act.astype(act_dtype)
+  weight2 = in_ref.w2.get_weight()
+  weight2_scale = in_ref.w2.get_scale() if cfg.spec.w2.has_scale else None
+  # The bias is added once, on the last k2 slice.
+  weight2_bias = None
+  if cfg.spec.w2.has_bias and is_last_k2_step:
+    weight2_bias = in_ref.w2.get_bias()
+  return compute.matmul(cfg.compute2, act, weight2, weight2_scale, weight2_bias)
 
 
 def _inner_pipeline(
@@ -40,6 +68,7 @@ def _inner_pipeline(
     out_hbm_ref: hijax.TransformedRef,
     metadata_ref: metadata.AbstractMetadataRef,
     cfg: config.RoutingGmmConfig,
+    out_acc_ref: hijax.TransformedRef | None = None,
 ) -> None:
   """Orchestrates DMA and computation for a single pipeline step.
 
@@ -54,54 +83,108 @@ def _inner_pipeline(
     out_hbm_ref: HBM reference of the output activation.
     metadata_ref: SMEM metadata reference for routing and tile row counts.
     cfg: Static configuration for the routing GMM kernel.
+    out_acc_ref: Optional VMEM accumulator of the output tile across
+      intermediate (k2) slices. Required when `cfg.num_k2 > 1`.
   """
 
-  n_id, gm_id, k_id = step.index
+  n_id, gm_id, k2_id, k1_id = step.index
   num_xo_buffers = cfg.plan.num_xo_buffers
 
   def _at(gm_offset: int) -> memory_ref.GridIndices:
-    return (n_id, gm_id + gm_offset, k_id)
+    return (n_id, gm_id + gm_offset, k2_id, k1_id)
 
   x_ref = pltpu.annotate(in_ref.x, no_hazard_no_deps=True)
   out_ref = pltpu.annotate(out_ref, no_hazard_no_deps=True)
 
-  def _bucket_fn(bucket_m: int) -> None:
+  def _bucket_fn(
+      bucket_m: int, *, is_first_k2_step: bool, is_last_k2_step: bool
+  ) -> None:
+    """Runs one k2 slice of a tile. Without k2 tiling, the only slice is both.
+
+    The x and out tiles stay resident across k2 slices, so x is awaited and
+    prefetched on the first slice, the previous tile is copied out on the first
+    slice, and the out slot is awaited and written on the last slice.
+
+    Args:
+      bucket_m: Static number of rows to compute.
+      is_first_k2_step: Whether this is the first k2 slice of the tile.
+      is_last_k2_step: Whether this is the last k2 slice of the tile.
+    """
     # Step 1: Wait DMA for the current step slot.
-    x_bref.branchless_wait_in(x_hbm_ref, _at(0))
-    out_bref.branchless_wait_out(out_hbm_ref, _at(-num_xo_buffers))
+    if is_first_k2_step:
+      x_bref.branchless_wait_in(x_hbm_ref, _at(0))
+    if is_last_k2_step:
+      # The out slot is only written on the last slice, so wait for its
+      # previous copy-out as late as possible to give the DMA more slack.
+      out_bref.branchless_wait_out(out_hbm_ref, _at(-num_xo_buffers))
 
     # Step 2: Start DMA for previous step slot.
     # NOTE: While we typically issue DMA for the other slots before waiting for
     # current slot, that will prevent DMA instructions to be pipelined with
     # compute. Therefore, DMA is issued after the waiting.
-    x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
+    if is_first_k2_step:
+      x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
     # Step 3: Read input from VMEM.
     act = x_bref.read_vmem(x_ref.at[:bucket_m], _at(0))
 
     # Step 4: Perform computation.
-    weight = in_ref.w.get_weight()
-    weight_scale = in_ref.w.get_scale() if cfg.spec.w.has_scale else None
-    weight_bias = in_ref.w.get_bias() if cfg.spec.w.has_bias else None
-    act = compute.matmul(cfg.compute, act, weight, weight_scale, weight_bias)
-    act = compute.apply_act_fn(act, cfg.spec.fuse_act)
-    if cfg.spec.w2 is not None:
-      assert in_ref.w2 is not None and cfg.compute2 is not None
-      act = act.astype(x_ref.dtype)
-      weight2 = in_ref.w2.get_weight()
-      weight2_scale = in_ref.w2.get_scale() if cfg.spec.w2.has_scale else None
-      weight2_bias = in_ref.w2.get_bias() if cfg.spec.w2.has_bias else None
-      act = compute.matmul(
-          cfg.compute2, act, weight2, weight2_scale, weight2_bias
-      )
+    act = _matmuls(
+        act,
+        in_ref,
+        act_dtype=x_ref.dtype,
+        cfg=cfg,
+        is_last_k2_step=is_last_k2_step,
+    )
 
     # Start output DMA for previous step slot after the loads because a remote
     # DMA is a global memory barrier, so issuing it earlier would hold every
     # load and the matmul behind it instead of sharing bundles with the matmul.
-    out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
+    if is_first_k2_step:
+      out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
-    # Step 5: Write output into VMEM.
-    out_bref.write_vmem(out_ref.at[:bucket_m], act, _at(0))
+    # Later k2 slices accumulate onto the partial sum of earlier slices.
+    if not is_first_k2_step:
+      assert out_acc_ref is not None
+      act += out_acc_ref[:bucket_m]
+
+    # Step 5: Write output into VMEM, or stash the partial sum across k2 slices.
+    if is_last_k2_step:
+      out_bref.write_vmem(out_ref.at[:bucket_m], act, _at(0))
+    else:
+      assert out_acc_ref is not None
+      out_acc_ref[:bucket_m] = act
+
+  def bucket_fn(bucket_m: int) -> None:
+    @jax.named_scope(f"bm{bucket_m}_first_last")
+    def bucket_fn_first_last():
+      _bucket_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=True)
+
+    @jax.named_scope(f"bm{bucket_m}_first")
+    def bucket_fn_first():
+      _bucket_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=False)
+
+    @jax.named_scope(f"bm{bucket_m}_mid")
+    def bucket_fn_mid():
+      _bucket_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=False)
+
+    @jax.named_scope(f"bm{bucket_m}_last")
+    def bucket_fn_last():
+      _bucket_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=True)
+
+    # Only compile the variants that can run for the given num_k2.
+    is_first_k2 = k2_id == 0
+    is_last_k2 = k2_id == cfg.num_k2 - 1
+    if cfg.num_k2 == 1:
+      bucket_fn_first_last()
+    elif cfg.num_k2 == 2:
+      lax.cond(is_first_k2, bucket_fn_first, bucket_fn_last)
+    else:
+      lax.cond(
+          is_first_k2,
+          bucket_fn_first,
+          lambda: lax.cond(is_last_k2, bucket_fn_last, bucket_fn_mid),
+      )
 
   # Select which bucket to choose based on number of active rows of given tile.
   num_rows = metadata_ref.gm_id_to_num_rows[gm_id]
@@ -112,7 +195,7 @@ def _inner_pipeline(
   lax.switch(
       bucket_idx,
       [
-          functools.partial(_bucket_fn, bucket_m)
+          functools.partial(bucket_fn, bucket_m)
           for bucket_m in cfg.plan.bucket_rows
       ],
   )
@@ -130,20 +213,20 @@ def _prologue(
     # Prefetch num_xo_buffers - 1 worth of indices into gather SMEM.
     offset = gather_idx.fetch_offset
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
-      gather_idx.copy_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
+      gather_idx.copy_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0, 0))
     # NOTE: Even if number of gather idx buffers is smaller than
     # num_xo_buffers - 1, it does not cause any race condition as semaphores
     # merely counts the size of the total data transfer without concerning
     # each individual DMA instructions.
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
-      gather_idx.wait_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0))
+      gather_idx.wait_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0, 0))
 
   final_allocs.inputs.x.prologue()
   final_allocs.out.prologue()
 
   # Prefetch first num_xo_buffers - 1 input tiles.
   for gm_id in range(cfg.plan.num_xo_buffers - 1):
-    final_allocs.inputs.x.branchless_copy_in(in_hbm_ref.x, (0, gm_id, 0))
+    final_allocs.inputs.x.branchless_copy_in(in_hbm_ref.x, (0, gm_id, 0, 0))
 
 
 def _epilogue(
@@ -158,17 +241,17 @@ def _epilogue(
   scatter_idx = final_allocs.inputs.scatter_idx
   last_n = cfg.num_n - 1
   if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
-    scatter_idx.wait_in(in_hbm_ref.scatter_idx, (last_n, num_gm, 0))
+    scatter_idx.wait_in(in_hbm_ref.scatter_idx, (last_n, num_gm, 0, 0))
 
   # Issue DMA for final compute tile and drain all output buffers.
   # NOTE: If output is written into VMEM at step i, output DMA is performed
   # at step i + 1. Therefore, output from last compute step had no
   # crresponding copy_out dma performed. Below code ensures that the output
   # from the last step is correctly issued.
-  final_allocs.out.branchless_copy_out(out_hbm_ref, (last_n, num_gm - 1, 0))
+  final_allocs.out.branchless_copy_out(out_hbm_ref, (last_n, num_gm - 1, 0, 0))
   for buf_idx in range(cfg.plan.num_xo_buffers):
     final_allocs.out.branchless_wait_out(
-        out_hbm_ref, (last_n, num_gm - cfg.plan.num_xo_buffers + buf_idx, 0)
+        out_hbm_ref, (last_n, num_gm - cfg.plan.num_xo_buffers + buf_idx, 0, 0)
     )
 
   final_allocs.inputs.x.epilogue(in_hbm_ref.x)
@@ -223,10 +306,11 @@ def outer_pipeline(
             out_bref=final_allocs.out,
             x_hbm_ref=in_hbm_ref.x,
             out_hbm_ref=out_hbm_ref,
+            out_acc_ref=final_allocs.out_acc,
         ),
         in_specs=(allocs.in_specs,),
         out_specs=allocs.out_spec,
-        grid=(cfg.num_n, num_gm, cfg.num_k),
+        grid=(cfg.num_n, num_gm, cfg.num_k2, cfg.num_k),
         _explicit_indices=True,
     )(in_hbm_ref, out_hbm_ref, allocations=final_allocs.all_tree)
 

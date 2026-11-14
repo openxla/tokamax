@@ -288,14 +288,56 @@ class RoutingGmmConfig:
 
   def _validate_tiling(self) -> None:
     """Validates tile sizes and sublane alignment."""
-    if self.plan.tile_k != self.spec.size_k:
+    self._validate_k_tiling()
+    self._validate_w2_tiling()
+    self._validate_n_tiling()
+    self._validate_m_tiling()
+
+  def _validate_k_tiling(self) -> None:
+    """Validates that the K dim is not tiled."""
+    is_k_tiled = self.plan.tile_k != self.spec.size_k
+    if is_k_tiled and self.num_k2 > 1:
+      raise NotImplementedError(
+          "K dim tiling is not supported together with k2 tiling."
+      )
+    if is_k_tiled:
       raise NotImplementedError("K dim tiling is not supported yet.")
-    if self.spec.w2 is not None and self.plan.tile_k2 != self.spec.size_k2:
-      raise NotImplementedError("K2 dim tiling is not supported yet.")
-    if self.spec.w2 is not None and self.plan.tile_n != self.spec.size_out_n:
+
+  def _validate_w2_tiling(self) -> None:
+    """Validates the k2 tiling of the fused w2."""
+    if self.spec.w2 is None:
+      return
+    size_k2 = self.spec.size_k2
+    assert size_k2 is not None and self.plan.tile_k2 is not None
+    if size_k2 % self.plan.tile_k2 != 0:
+      raise ValueError(
+          f"tile_k2 ({self.plan.tile_k2}) must divide size_k2 ({size_k2})."
+      )
+    if self.plan.tile_k2 % self.tpu_info.num_lanes != 0:
+      raise ValueError(
+          f"tile_k2 ({self.plan.tile_k2}) must be a multiple of"
+          f" {self.tpu_info.num_lanes}."
+      )
+    w2_quant = self.spec.w2.quant
+    if w2_quant is not None:
+      if not isinstance(w2_quant, tensor_spec.SubchannelQuantSpec):
+        raise NotImplementedError(
+            f"Fused w2 does not support {type(w2_quant).__name__}."
+        )
+      sizes = (self.plan.tile_k2, w2_quant.block_size)
+      if max(sizes) % min(sizes) != 0:
+        raise ValueError(
+            f"tile_k2 ({self.plan.tile_k2}) and the w2 quantization block"
+            f" size ({w2_quant.block_size}) must divide one"
+            " another."
+        )
+    if self.plan.tile_n != self.spec.size_out_n:
       raise NotImplementedError(
           "N dim tiling is not supported when w2 is fused."
       )
+
+  def _validate_n_tiling(self) -> None:
+    """Validates that tile_n evenly splits the output."""
     if self.spec.size_out_n % self.plan.tile_n != 0:
       raise ValueError(
           f"tile_n ({self.plan.tile_n}) must divide the output width"
@@ -306,6 +348,9 @@ class RoutingGmmConfig:
           f"tile_n ({self.plan.tile_n}) must be a multiple of the output's"
           " compact chunk width."
       )
+
+  def _validate_m_tiling(self) -> None:
+    """Validates tile_m and bucket_base sizes and sublane alignment."""
     if not 0 < self.plan.bucket_base <= self.plan.tile_m:
       raise ValueError(
           f"bucket_base ({self.plan.bucket_base}) must be in (0, tile_m="
@@ -348,11 +393,27 @@ class RoutingGmmConfig:
     return num_k
 
   @property
+  def num_k2(self) -> int:
+    """Number of intermediate (k2) slices the fused down projection runs."""
+    size_k2 = self.spec.size_k2
+    if size_k2 is None:
+      return 1
+    assert self.plan.tile_k2 is not None
+    return pl.cdiv(size_k2, self.plan.tile_k2)
+
+  @property
   def kernel_name(self) -> str:
+    """Kernel name encoding the modes, shapes and tiling."""
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.spec.size_local_groups}-m{self.spec.size_out_m}"
-    name += f"-k{self.spec.size_k}-n{self.spec.size_out_n}"
-    name += f"-tm{self.plan.tile_m}-tn{self.plan.tile_n}"
+    name += f"-k{self.spec.size_k}"
+    if self.spec.size_k2 is not None:
+      name += f"-k2{self.spec.size_k2}"
+    name += f"-n{self.spec.size_out_n}"
+    name += f"-tm{self.plan.tile_m}"
+    if self.plan.tile_k2 is not None:
+      name += f"-tk2{self.plan.tile_k2}"
+    name += f"-tn{self.plan.tile_n}"
     return name
 
   @property

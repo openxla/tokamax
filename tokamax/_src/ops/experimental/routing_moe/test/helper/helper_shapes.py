@@ -78,6 +78,16 @@ MISTRAL_3_LARGE = MoEShape(
     4096,
     w_dtype=jnp.dtype(jnp.float8_e4m3fn),
 )
+GLM_5_3 = MoEShape(
+    "glm_5_3",
+    256,
+    8,
+    6144,
+    2048,
+    w_dtype=jnp.dtype(jnp.float8_e4m3fn),
+    w_quant_block_size=512,
+    has_shared_expert=True,
+)
 QWEN_35_397B = MoEShape(
     "qwen_35_397b",
     512,

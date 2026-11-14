@@ -24,7 +24,7 @@ carrying `None` unions past planning.
 from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Self
+from typing import Self
 
 import jax
 from jax.experimental import pallas as pl
@@ -73,11 +73,20 @@ class RoutingGmmPlan:
   # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
   # Revisit it based on per-group DMA vs. compute time.
   max_num_w_buffers: int | None = None
+  # Upper bound on tile_m when it spans more than one bucket.
+  max_tile_m: int | None = None
+  # Upper bound on the number of buckets (tile_m / bucket_base).
+  max_num_buckets: int | None = None
 
 
 @dataclass_util.resolves_from(
     RoutingGmmPlan,
-    dropped=("vmem_usage_fraction", "max_num_w_buffers"),
+    dropped=(
+        "vmem_usage_fraction",
+        "max_num_w_buffers",
+        "max_tile_m",
+        "max_num_buckets",
+    ),
 )
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedGmmPlan:
@@ -162,9 +171,7 @@ class ResolvedGmmPlan:
 
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
-    capped_vmem_limit_bytes = int(vmem_usage_fraction * vmem_limit_bytes)
-    tiling_fn = functools.partial(
-        calculate_tiling,
+    tiling, fuse_up_and_down = resolve_tiling_and_fusion(
         plan,
         spec=spec,
         matmul_dtype=matmul_dtype,
@@ -173,46 +180,17 @@ class ResolvedGmmPlan:
         out_quant=out_format.quant,
         num_stash_buffers=num_stash_buffers,
         stash_dtype=stash_dtype,
-        vmem_limit_bytes=capped_vmem_limit_bytes,
+        vmem_limit_bytes=int(vmem_usage_fraction * vmem_limit_bytes),
         tpu_info=tpu_info,
     )
-    can_fuse = None
-    if spec.w2 is not None:
-      can_fuse = functools.partial(
-          can_fuse_up_and_down,
-          spec=spec,
-          matmul_dtype=matmul_dtype,
-          acc_dtype=acc_dtype,
-          out_dtype=out_format.dtype,
-          out_quant=out_format.quant,
-          num_stash_buffers=num_stash_buffers,
-          stash_dtype=stash_dtype,
-          vmem_limit_bytes=capped_vmem_limit_bytes,
-          tpu_info=tpu_info,
-      )
-    tiling, fuse_up_and_down = _choose_tiling_and_fusion(
-        plan, tiling_fn=tiling_fn, can_fuse=can_fuse
-    )
-    (
-        tile_m,
-        tile_k,
-        tile_k2,
-        tile_n,
-        bucket_base,
-        num_xo_buffers,
-        num_w_buffers,
-    ) = tiling
-    if not fuse_up_and_down and plan.tile_k2 is not None:
-      raise ValueError("tile_k2 requires fuse_up_and_down=True.")
-
     resolved = cls(
-        tile_m=tile_m,
-        tile_k=tile_k,
-        tile_k2=tile_k2,
-        tile_n=tile_n,
-        bucket_base=bucket_base,
-        num_xo_buffers=num_xo_buffers,
-        num_w_buffers=num_w_buffers,
+        tile_m=tiling.tile_m,
+        tile_k=tiling.tile_k,
+        tile_k2=tiling.tile_k2,
+        tile_n=tiling.tile_n,
+        bucket_base=tiling.bucket_base,
+        num_xo_buffers=tiling.num_xo_buffers,
+        num_w_buffers=tiling.num_w_buffers,
         num_stash_buffers=num_stash_buffers,
         acc_dtype=acc_dtype,
         matmul_dtype=matmul_dtype,
@@ -252,6 +230,170 @@ def check_smem(allocations: dict[str, int], tpu_info: pltpu.TpuInfo) -> None:
       f" the budget of {budget} bytes. Reduce the tokens, or set"
       " live_group_walk=False if row_group is large."
   )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Tiling:
+  """Tile sizes and buffer counts of the routing GMM kernel."""
+
+  tile_m: int
+  tile_k: int
+  tile_k2: int | None
+  tile_n: int
+  bucket_base: int
+  num_xo_buffers: int
+  num_w_buffers: int
+
+
+def resolve_tiling_and_fusion(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    matmul_dtype: jnp.dtype,
+    acc_dtype: jnp.dtype,
+    out_dtype: jnp.dtype,
+    out_quant: out_format_lib.ResolvedQuantFormat | None,
+    num_stash_buffers: int | None = None,
+    stash_dtype: jnp.dtype | None = None,
+    vmem_limit_bytes: int,
+    tpu_info: pltpu.TpuInfo,
+) -> tuple[Tiling, bool]:
+  """Decides together whether to fuse the projections and how to tile them.
+
+  With w2, try in order:
+    1. Fused gate/up and down projections without k2 tiling with the largest
+       possible tile_m.
+    2. With a remote scatter (remote unpermute) only: fused projections with
+       the largest possible tile_m and the k2 dim sliced as little as fits VMEM.
+    3. Two unfused kernels.
+
+  Args:
+    plan: User plan. Fields that are set are kept.
+    spec: Validated input specifications and operator semantics.
+    matmul_dtype: Dtype in which inputs are fed to the MXU.
+    acc_dtype: Accumulator dtype.
+    out_dtype: Output dtype of the layer.
+    out_quant: Optional output quantization format of the layer.
+    num_stash_buffers: Stash buffer count when `out_quant` is set, else None.
+    stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
+    vmem_limit_bytes: VMEM budget of the kernel.
+    tpu_info: TPU the kernel runs on.
+
+  Returns:
+    The tiling, and whether the gate/up and down projections are fused.
+
+  Raises:
+    ValueError: If `plan.fuse_up_and_down` is True but no fused tiling fits.
+  """
+  if spec.w2 is not None and (
+      plan.fuse_up_and_down is None or plan.fuse_up_and_down
+  ):
+    tiling = _fused_tiling(
+        plan,
+        spec=spec,
+        matmul_dtype=matmul_dtype,
+        acc_dtype=acc_dtype,
+        out_dtype=out_dtype,
+        out_quant=out_quant,
+        num_stash_buffers=num_stash_buffers,
+        stash_dtype=stash_dtype,
+        vmem_limit_bytes=vmem_limit_bytes,
+        tpu_info=tpu_info,
+    )
+    if tiling is not None:
+      return tiling, True
+    if plan.fuse_up_and_down:
+      raise ValueError(
+          "fuse_up_and_down=True, but no fused tiling fits the VMEM budget of"
+          f" {vmem_limit_bytes} bytes (even with the intermediate dim sliced)."
+      )
+  if plan.tile_k2 is not None:
+    raise ValueError("tile_k2 requires fuse_up_and_down=True.")
+  tiling = calculate_tiling(
+      plan,
+      spec=spec,
+      matmul_dtype=matmul_dtype,
+      acc_dtype=acc_dtype,
+      out_dtype=out_dtype,
+      out_quant=out_quant,
+      num_stash_buffers=num_stash_buffers,
+      stash_dtype=stash_dtype,
+      vmem_limit_bytes=vmem_limit_bytes,
+      tpu_info=tpu_info,
+  )
+  return tiling, False
+
+
+def _max_group_rows(
+    x: tensor_spec.ActivationSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> int:
+  """Rows a tile ever needs, rounded up to whole sublane tiles.
+
+  A group gets at most one row per input token, so a tile never needs more
+  rows than there are tokens (e.g. decode). Compact VMEM loads and stores
+  operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
+
+  Args:
+    x: Activation spec.
+    tpu_info: TPU the kernel runs on.
+
+  Returns:
+    Maximum number of rows a tile needs, rounded up to `num_sublanes`.
+  """
+  min_tile_m = tpu_info.num_sublanes
+  return min_tile_m * pl.cdiv(x.row_size, min_tile_m)
+
+
+def _tile_m_limits(plan: RoutingGmmPlan) -> tuple[int, int]:
+  """Returns the max tile_m and max number of buckets of the heuristic."""
+  # max_tile_m Defaults to 256.
+  # TODO: Lift the 256 cap once larger tiles are validated.
+
+  # max_num_buckets Defaults to 2.
+  # TODO: The default was chosen empirically. Revisit it based on
+  # instruction memory size.
+  return plan.max_tile_m or 256, plan.max_num_buckets or 2
+
+
+def _tile_m_candidates(
+    plan: RoutingGmmPlan, *, bucket_base: int, max_group_rows: int
+) -> list[int]:
+  """The tile_m values the heuristic may pick, largest first."""
+  if plan.tile_m is not None:
+    return [plan.tile_m]
+  max_tile_m, max_num_buckets = _tile_m_limits(plan)
+  candidates = set()
+  for num_buckets in range(1, max_num_buckets + 1):
+    tile_m = num_buckets * bucket_base
+    # Like _resolve_tile_m, a single bucket is always a candidate.
+    if num_buckets > 1 and tile_m > max_tile_m:
+      break
+    if plan.bucket_base is None:
+      tile_m = min(tile_m, max_group_rows)
+    candidates.add(tile_m)
+  return sorted(candidates, reverse=True)
+
+
+def _tile_k2_candidates(
+    size_k2: int, w2: tensor_spec.WeightSpec, tpu_info: pltpu.TpuInfo
+) -> list[int]:
+  """The k2 tilings the fused kernel accepts, fewest first."""
+  candidates = []
+  for num_k2_tiles in range(1, pl.cdiv(size_k2, tpu_info.num_lanes) + 1):
+    if size_k2 % num_k2_tiles != 0:
+      continue
+    tile_k2 = size_k2 // num_k2_tiles
+    if tile_k2 % tpu_info.num_lanes != 0:
+      continue
+    if w2.quant is not None:
+      if not isinstance(w2.quant, tensor_spec.SubchannelQuantSpec):
+        continue
+      sizes = (tile_k2, w2.quant.block_size)
+      if max(sizes) % min(sizes) != 0:
+        continue
+    candidates.append(tile_k2)
+  return candidates
 
 
 def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
@@ -384,54 +526,196 @@ def _resolve_stash(
   return num_stash_buffers, stash_dtype
 
 
-def _choose_tiling_and_fusion(
+def _supports_fusion(
+    plan: RoutingGmmPlan, *, spec: gmm_spec_lib.RoutingGmmSpec
+) -> bool:
+  """Returns whether the fused kernel supports the weights and K/N tiling."""
+  w, w2 = spec.w, spec.w2
+  assert w2 is not None
+  if w.dtype != w2.dtype or (w.quant is None) != (w2.quant is None):
+    # The intermediate is fed to the down projection in x's dtype, which is
+    # only valid when both weights share a precision.
+    return False
+  # Fused execution does not support weight tiling along K or N.
+  tile_k = plan.tile_k or spec.size_k
+  tile_n = plan.tile_n or spec.size_out_n
+  return tile_k == spec.size_k and tile_n == spec.size_out_n
+
+
+def _w_buffer_range(plan: RoutingGmmPlan) -> tuple[int, int]:
+  """Returns the min and max number of weight buffers to try."""
+  min_num_w_buffers = plan.num_w_buffers or 2
+  if plan.num_w_buffers is not None:
+    return min_num_w_buffers, min_num_w_buffers
+  return min_num_w_buffers, plan.max_num_w_buffers or 3
+
+
+def _max_fitting_w_buffers(
+    fits: Callable[[int], bool],
+    *,
+    min_num_w_buffers: int,
+    max_num_w_buffers: int,
+) -> int | None:
+  """Returns the most weight buffers that fit, or None if the min doesn't."""
+  if not fits(min_num_w_buffers):
+    return None
+  # Spend spare VMEM on deeper weight prefetch.
+  num_w_buffers = min_num_w_buffers
+  while num_w_buffers < max_num_w_buffers and fits(num_w_buffers + 1):
+    num_w_buffers += 1
+  return num_w_buffers
+
+
+def _may_slice_k2(
+    plan: RoutingGmmPlan, *, spec: gmm_spec_lib.RoutingGmmSpec
+) -> bool:
+  """Returns whether the fused kernel may slice the k2 dim."""
+  # Output rows are DMAed straight to the owning device (remote unpermute).
+  remote_scatter = (
+      spec.scatter is not None and spec.scatter.remote_axis is not None
+  )
+  return bool(
+      remote_scatter or plan.fuse_up_and_down or plan.tile_k2 is not None
+  )
+
+
+def _sliced_tile_k2_candidates(
     plan: RoutingGmmPlan,
     *,
-    tiling_fn: Callable[..., tuple[Any, ...]],
-    can_fuse: Callable[..., bool] | None,
-) -> tuple[tuple[Any, ...], bool]:
-  """Picks the tiling and whether the gate/up and down projections are fused.
+    size_k2: int,
+    w2: tensor_spec.WeightSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> list[int]:
+  """The tile_k2 values to try with k2 sliced, fewest slices first."""
+  if plan.tile_k2 is not None:
+    return [plan.tile_k2]
+  return [
+      tile_k2
+      for tile_k2 in _tile_k2_candidates(size_k2, w2, tpu_info)
+      if tile_k2 < size_k2
+  ]
+
+
+def _fused_tiling(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    matmul_dtype: jnp.dtype,
+    acc_dtype: jnp.dtype,
+    out_dtype: jnp.dtype,
+    out_quant: out_format_lib.ResolvedQuantFormat | None,
+    num_stash_buffers: int | None = None,
+    stash_dtype: jnp.dtype | None = None,
+    vmem_limit_bytes: int,
+    tpu_info: pltpu.TpuInfo,
+) -> Tiling | None:
+  """Returns the tiling of the fused kernel, or None if none fits VMEM.
+
+  Tries in order:
+    1. No k2 tiling with the largest possible tile_m.
+    2. Largest possible tile_m with the fewest k2 slices that fit.
 
   Args:
-    plan: User plan.
-    tiling_fn: `calculate_tiling` with the problem bound. Takes
-      `allow_vmem_growth`.
-    can_fuse: `can_fuse_up_and_down` with everything but the tiling bound, or
-      None if there is no down projection.
+    plan: User plan. Fields that are set are kept.
+    spec: Validated input specifications and operator semantics. Must have w2.
+    matmul_dtype: Dtype in which inputs are fed to the MXU.
+    acc_dtype: Accumulator dtype.
+    out_dtype: Output dtype.
+    out_quant: Optional output quantization format.
+    num_stash_buffers: Stash buffer count when `out_quant` is set, else None.
+    stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
+    vmem_limit_bytes: VMEM budget of the kernel.
+    tpu_info: TPU the kernel runs on.
 
   Returns:
-    The tiling as returned by `calculate_tiling`, and whether to fuse.
+    The fused kernel tiling, or None if no fused tiling fits VMEM.
   """
-  tiling = tiling_fn()
-  # TODO: fusion-or-not, number of buffers for weights and
-  # activations, and tiling should be decided together by a single function
-  # with VMEM limit instead of separately.
-  if can_fuse is None:
-    return tiling, False
-  if plan.fuse_up_and_down is not None and not plan.fuse_up_and_down:
-    return tiling, False
+  x, w, w2 = spec.x, spec.w, spec.w2
+  size_k2 = spec.size_k2
+  assert w2 is not None and size_k2 is not None
+  if not _supports_fusion(plan, spec=spec):
+    return None
+  tile_k, tile_n = spec.size_k, spec.size_out_n
 
-  def fits(tiling: tuple[Any, ...]) -> bool:
-    tile_m, tile_k, tile_k2, tile_n, _, num_xo_buffers, num_w_buffers = tiling
-    return can_fuse(
+  max_group_rows = _max_group_rows(x, tpu_info)
+  num_xo_buffers = plan.num_xo_buffers or 3
+  min_num_w_buffers, max_num_w_buffers = _w_buffer_range(plan)
+
+  estimate_vmem = functools.partial(
+      _vmem_estimate,
+      x=x,
+      w=w,
+      w2=w2,
+      is_fused_act=spec.is_fused_act,
+      matmul_dtype=matmul_dtype,
+      acc_dtype=acc_dtype,
+      out_dtype=out_dtype,
+      out_quant=out_quant,
+      tile_k=tile_k,
+      tile_n=tile_n,
+      num_xo_buffers=num_xo_buffers,
+      num_stash_buffers=num_stash_buffers,
+      stash_dtype=stash_dtype,
+      tpu_info=tpu_info,
+  )
+
+  def try_fit(tile_m: int, tile_k2: int, bucket_base: int) -> Tiling | None:
+    num_w_buffers = _max_fitting_w_buffers(
+        lambda n: estimate_vmem(tile_m=tile_m, tile_k2=tile_k2, num_w_buffers=n)
+        <= vmem_limit_bytes,
+        min_num_w_buffers=min_num_w_buffers,
+        max_num_w_buffers=max_num_w_buffers,
+    )
+    if num_w_buffers is None:
+      return None
+    return Tiling(
         tile_m=tile_m,
         tile_k=tile_k,
         tile_k2=tile_k2,
         tile_n=tile_n,
+        bucket_base=bucket_base,
         num_xo_buffers=num_xo_buffers,
         num_w_buffers=num_w_buffers,
     )
 
-  if fits(tiling):
-    return tiling, True
-  # calculate_tiling only budgets w, so heuristics that use more VMEM than the
-  # default tiling (e.g. more weight buffers) can push the fused kernel past
-  # VMEM. Losing fusion costs more than they save, so keep the default tiling
-  # if it fuses, or if fusion is requested.
-  default_tiling = tiling_fn(allow_vmem_growth=False)
-  if plan.fuse_up_and_down or fits(default_tiling):
-    return default_tiling, True
-  return tiling, False
+  bucket_base = _resolve_bucket_base(
+      plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
+  )
+  largest_tile_m = _tile_m_candidates(
+      plan, bucket_base=bucket_base, max_group_rows=max_group_rows
+  )[0]
+
+  # Step 1: Try fusion + largest possible tile_m.
+  # tile_m has more impact on performance than fusion based on some experiments.
+  # Heuristic: It may not worth to use fusion with a smaller tile_m vs unfused
+  # with a larger tile_m.
+  if plan.tile_k2 is None or plan.tile_k2 == size_k2:
+    tiling = try_fit(largest_tile_m, size_k2, bucket_base)
+    if tiling is not None:
+      return tiling
+
+  # Step 2: Slice k2 with largest possible tile_m.
+  if not _may_slice_k2(plan, spec=spec):
+    return None
+  tile_k2_candidates = _sliced_tile_k2_candidates(
+      plan, size_k2=size_k2, w2=w2, tpu_info=tpu_info
+  )
+
+  # If fusion requires k2 tiling, the weights can't be reused across m tiles,
+  # so we only attempt to do fusion + k2 tiling when remote scatter (to overlap
+  # ICI with a larger block of computation) and tile_m is sufficiently large
+  # (for HBM bw and compute overlap).
+  bucket_base = _resolve_bucket_base(
+      dataclasses.replace(plan, tile_m=largest_tile_m),
+      w=w,
+      matmul_dtype=matmul_dtype,
+      max_group_rows=max_group_rows,
+  )
+  for tile_k2 in tile_k2_candidates:
+    tiling = try_fit(largest_tile_m, tile_k2, bucket_base)
+    if tiling is not None:
+      return tiling
+  return None
 
 
 def smem_estimate(
@@ -467,6 +751,43 @@ def smem_estimate(
         )
 
   return allocs
+
+
+def _matmul_vmem_estimate(
+    weight: tensor_spec.WeightSpec,
+    k_tile: int,
+    n_tile: int,
+    num_w_refs: int,
+    *,
+    tile_m: int,
+    num_w_buffers: int,
+    matmul_bits: int,
+    acc_bits: int,
+    is_dynamic_quantized: bool,
+    is_w_dequantized_before: bool,
+) -> int:
+  """Estimates VMEM usage in bytes of a single matmul's weights and scratch."""
+  w_bits = jax.dtypes.itemsize_bits(weight.dtype)
+  w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
+  scale_vmem = 0
+  bytes_per_fp32 = 4
+  if weight.quant is not None:
+    assert isinstance(weight.quant, tensor_spec.SubchannelQuantSpec)
+    num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
+    scale_vmem = (
+        num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
+    )
+  bias_vmem = 0
+  if weight.has_bias:
+    bias_vmem = num_w_refs * num_w_buffers * n_tile * bytes_per_fp32
+  acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
+  # Dynamic quantization materializes a quantized copy of the x tile.
+  if is_dynamic_quantized:
+    acc_vmem += tile_m * k_tile * matmul_bits // 8
+  # Dequantizing before the matmul materializes a dequantized copy of w.
+  elif is_w_dequantized_before:
+    acc_vmem += num_w_refs * k_tile * n_tile * matmul_bits // 8
+  return w_vmem + scale_vmem + bias_vmem + acc_vmem
 
 
 # SMEM is estimated from the spec and plan by smem_estimate, and checked
@@ -517,39 +838,27 @@ def _vmem_estimate(
     out_vmem += num_stash_buffers * tile_m * tile_n * stash_bits // 8
     out_vmem += num_stash_buffers * (1 + stash_ratio) * tile_m * chunk_bytes
 
-  def _matmul_vmem(
-      weight: tensor_spec.WeightSpec, k_tile: int, n_tile: int, num_w_refs: int
-  ) -> int:
-    w_bits = jax.dtypes.itemsize_bits(weight.dtype)
-    w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
-    scale_vmem = 0
-    bytes_per_fp32 = 4
-    if weight.quant is not None:
-      assert isinstance(weight.quant, tensor_spec.SubchannelQuantSpec)
-      num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
-      scale_vmem = (
-          num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
-      )
-    bias_vmem = 0
-    if weight.has_bias:
-      bias_vmem = num_w_refs * num_w_buffers * n_tile * bytes_per_fp32
-    acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
-    # Dynamic quantization materializes a quantized copy of the x tile.
-    if is_dynamic_quantized:
-      acc_vmem += tile_m * k_tile * matmul_bits // 8
-    # Dequantizing before the matmul materializes a dequantized copy of w.
-    elif is_w_dequantized_before:
-      acc_vmem += num_w_refs * k_tile * n_tile * matmul_bits // 8
-    return w_vmem + scale_vmem + bias_vmem + acc_vmem
+  estimate_matmul_vmem = functools.partial(
+      _matmul_vmem_estimate,
+      tile_m=tile_m,
+      num_w_buffers=num_w_buffers,
+      matmul_bits=matmul_bits,
+      acc_bits=acc_bits,
+      is_dynamic_quantized=is_dynamic_quantized,
+      is_w_dequantized_before=is_w_dequantized_before,
+  )
 
   num_w1_refs = 2 if is_fused_act else 1
   if w2 is None:
-    matmul_vmem = _matmul_vmem(w, tile_k, tile_n, num_w1_refs)
+    matmul_vmem = estimate_matmul_vmem(w, tile_k, tile_n, num_w1_refs)
   else:
     assert tile_k2 is not None
-    matmul_vmem = _matmul_vmem(w, tile_k, tile_k2, num_w1_refs)
-    matmul_vmem += _matmul_vmem(w2, tile_k2, tile_n, 1)
+    matmul_vmem = estimate_matmul_vmem(w, tile_k, tile_k2, num_w1_refs)
+    matmul_vmem += estimate_matmul_vmem(w2, tile_k2, tile_n, 1)
     matmul_vmem += tile_m * tile_k2 * jax.dtypes.itemsize_bits(x.dtype) // 8
+    if tile_k2 < w2.in_size:
+      # Output accumulator kept across k2 slices (PipelineAllocs.out_acc).
+      matmul_vmem += tile_m * tile_n * acc_bits // 8
 
   return x_vmem + out_vmem + matmul_vmem
 
@@ -613,12 +922,8 @@ def _resolve_tile_m(
   """Resolves `tile_m` from user plan or VMEM-fitting bucket multiples."""
   if plan.tile_m is not None:
     return plan.tile_m
-  # TODO: Lift the 256 cap once larger tiles are validated.
-  max_tile_m = 256
-  # TODO: max number of bucket was choosen empiirically.
-  # Revisit the value to be based on number of instruction memory size.
-  max_num_buckets = 2
   # Largest multiple of bucket_base that stays within max_tile_m and VMEM.
+  max_tile_m, max_num_buckets = _tile_m_limits(plan)
   tile_m = bucket_base
   for num_buckets in range(2, max_num_buckets + 1):
     candidate = num_buckets * bucket_base
@@ -637,14 +942,13 @@ def _grow_num_w_buffers(
     plan: RoutingGmmPlan,
     *,
     num_w_buffers: int,
-    allow_vmem_growth: bool,
     tile_m: int,
     w_tile_n: int,
     estimate_vmem: Callable[..., int],
     vmem_limit_bytes: int,
 ) -> int:
-  """Grows weight buffer count into spare VMEM when permitted."""
-  if plan.num_w_buffers is not None or not allow_vmem_growth:
+  """Grows weight buffer count into spare VMEM unless the plan fixes it."""
+  if plan.num_w_buffers is not None:
     return num_w_buffers
   max_num_w_buffers = plan.max_num_w_buffers or 3
   while num_w_buffers < max_num_w_buffers and (
@@ -669,9 +973,8 @@ def calculate_tiling(
     stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
-    allow_vmem_growth: bool = True,
-) -> tuple[int, int, int | None, int, int, int, int]:
-  """Resolves tile sizes and buffer counts for routing GMM.
+) -> Tiling:
+  """Resolves tile sizes and buffer counts of the unfused routing GMM.
 
   Args:
     plan: User plan. Fields that are set are kept.
@@ -684,20 +987,13 @@ def calculate_tiling(
     stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
-    allow_vmem_growth: Whether heuristics may pick settings that use more VMEM
-      than the default tiling (e.g. more weight buffers).
 
   Returns:
-    (tile_m, tile_k, tile_k2, tile_n, bucket_base, num_xo_buffers,
-    num_w_buffers).
+    The tiling of the unfused kernel.
   """
   x, w = spec.x, spec.w
   # Step 1: Set default values.
-  # A group gets at most one row per input token, so a tile never needs more
-  # rows than there are tokens (e.g. decode). Compact VMEM loads and stores
-  # operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
-  min_tile_m = tpu_info.num_sublanes
-  max_group_rows = min_tile_m * pl.cdiv(x.row_size, min_tile_m)
+  max_group_rows = _max_group_rows(x, tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
@@ -764,7 +1060,6 @@ def calculate_tiling(
   num_w_buffers = _grow_num_w_buffers(
       plan,
       num_w_buffers=num_w_buffers,
-      allow_vmem_growth=allow_vmem_growth,
       tile_m=tile_m,
       w_tile_n=w_tile_n,
       estimate_vmem=estimate_vmem,
@@ -787,60 +1082,12 @@ def calculate_tiling(
     tile_k2 = w_tile_n
     tile_n = plan.tile_n or spec.size_out_n
 
-  return (
-      tile_m,
-      tile_k,
-      tile_k2,
-      tile_n,
-      bucket_base,
-      num_xo_buffers,
-      num_w_buffers,
-  )
-
-
-def can_fuse_up_and_down(
-    *,
-    spec: gmm_spec_lib.RoutingGmmSpec,
-    matmul_dtype: jnp.dtype,
-    acc_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
-    out_quant: out_format_lib.ResolvedQuantFormat | None = None,
-    tile_m: int,
-    tile_k: int,
-    tile_k2: int,
-    tile_n: int,
-    num_xo_buffers: int,
-    num_w_buffers: int,
-    num_stash_buffers: int | None = None,
-    stash_dtype: jnp.dtype | None = None,
-    vmem_limit_bytes: int,
-    tpu_info: pltpu.TpuInfo,
-) -> bool:
-  """Whether gate/up and down projections should run as one fused kernel."""
-  x, w, w2 = spec.x, spec.w, spec.w2
-  assert w2 is not None
-  if w.dtype != w2.dtype or (w.quant is None) != (w2.quant is None):
-    return False
-  # Fused execution does not support weight tiling along K, K2, or N.
-  if tile_k != x.col_size or tile_k2 != w2.in_size or tile_n != w2.out_size:
-    return False
-  estimate = _vmem_estimate(
-      x=x,
-      w=w,
-      w2=w2,
-      is_fused_act=spec.is_fused_act,
-      matmul_dtype=matmul_dtype,
-      acc_dtype=acc_dtype,
-      out_dtype=out_dtype,
-      out_quant=out_quant,
+  return Tiling(
       tile_m=tile_m,
       tile_k=tile_k,
       tile_k2=tile_k2,
       tile_n=tile_n,
+      bucket_base=bucket_base,
       num_xo_buffers=num_xo_buffers,
       num_w_buffers=num_w_buffers,
-      num_stash_buffers=num_stash_buffers,
-      stash_dtype=stash_dtype,
-      tpu_info=tpu_info,
   )
-  return estimate <= vmem_limit_bytes

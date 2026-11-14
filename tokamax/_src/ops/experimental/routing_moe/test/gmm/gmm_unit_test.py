@@ -511,6 +511,130 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=6e-2,
     )
 
+  @parameterized.named_parameters(
+      dict(testcase_name="no_quant", tile_k2=512),
+      dict(testcase_name="quant", tile_k2=512, quant=True),
+      dict(
+          testcase_name="quant_block_256",
+          tile_k2=512,
+          quant=True,
+          w_q_block_size=256,
+      ),
+      dict(
+          testcase_name="quant_fp8_out", tile_k2=512, quant=True, fp8_out=True
+      ),
+      # 4 k2 slices, so the middle (neither first nor last) slices run too.
+      dict(
+          testcase_name="quant_fp8_out_4_slices",
+          tile_k2=256,
+          quant=True,
+          fp8_out=True,
+      ),
+      # Each k2 slice must add its own columns of the w1 bias.
+      dict(testcase_name="bias_4_slices", tile_k2=256, has_bias=True),
+      # x stays unquantized, so each k2 slice must apply its own w scales.
+      dict(
+          testcase_name="weight_only_4_slices",
+          tile_k2=256,
+          quant=True,
+          weight_only=True,
+      ),
+      dict(
+          testcase_name="weight_only_block_128_4_slices",
+          tile_k2=256,
+          quant=True,
+          w_q_block_size=128,
+          weight_only=True,
+      ),
+  )
+  def test_fused_split_k2_gather_gmm_gmm_scatter(
+      self,
+      tile_k2: int,
+      quant: bool = False,
+      w_q_block_size: int | None = None,
+      fp8_out: bool = False,
+      has_bias: bool = False,
+      weight_only: bool = False,
+  ):
+    """Forces the fused kernel to slice the intermediate (k2) dim."""
+    case_spec = helper_cases.PREFILL_8K
+    size_k2 = case_spec.shape.intermediate_size
+    self.assertLess(tile_k2, size_k2, "tile_k2 must slice the k2 dim.")
+    case_spec = dataclasses.replace(
+        case_spec,
+        shape=dataclasses.replace(
+            case_spec.shape, w_quant_block_size=w_q_block_size
+        ),
+    )
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, quant_w1=quant, quant_w2=quant, has_bias=has_bias
+    )
+    w1 = case.w1
+    if has_bias:
+      # At ×1 the bias is too small to detect a slice mix-up.
+      assert w1.bias is not None
+      w1 = arg.SingleWeightWrapper.create(
+          w1.weight, w1.scale, w1.bias * 10, fused_gate_up=True
+      )
+    routing = case.routing
+    # Matching x's dtype keeps x unquantized. Otherwise, keep the dynamic
+    # quantization blocks of the intermediate within a k2 slice, so the sliced
+    # and unsliced kernels quantize identically.
+    x_quant = quant and not weight_only
+    plan_kwargs = dict(
+        fuse_up_and_down=True,
+        matmul_dtype=case.x.dtype if weight_only else None,
+        x_quant_block_size=min(512, tile_k2) if x_quant else None,
+    )
+    kwargs = dict(
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        out_format=_FP8_OUT_FORMAT if fp8_out else None,
+        **routing.kernel_kwargs,
+    )
+    actual = kernel.routing_gmm(
+        case.x_compact,
+        w1,
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_k2=tile_k2, **plan_kwargs),
+        **kwargs,
+    )
+    # Against the reference.
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    if fp8_out:
+      self.assertEqual(actual.data.dtype, FP8)
+      rows = np.asarray(routing.scattered_rows)
+      deq = np.asarray(gmm_test_lib.dequantize_rows(actual.data))[rows]
+      expected = np.asarray(expected, np.float32)
+      self.assertLessEqual(_rel_diff(deq, expected), 2**-3)
+    else:
+      actual = gmm_test_lib.to_large_layout(actual)[routing.scattered_rows]
+      # The ×10 bias widens the output range, so allow a bit more rounding.
+      atol = 8e-2 if has_bias else 6e-2
+      np.testing.assert_allclose(actual, expected, rtol=6e-2, atol=atol)
+    # Benchmark and capture an XProf trace (with Percale link) of the kernel.
+    timed = helper_util.Timed.create(
+        kernel.routing_gmm,
+        case.x_compact,
+        w1,
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_k2=tile_k2, **plan_kwargs),
+        **kwargs,
+    )
+    logging.info(
+        "%s tile_k2=%d: %.1f us %s",
+        self._testMethodName,
+        tile_k2,
+        timed.latency_us(),
+        timed.trace(),
+    )
+
   @parameterized.product(fuse_up_and_down=[None, False])
   def test_w4a8(self, fuse_up_and_down: bool | None):
     # We pass bf16 activations to the kernel. The kernel sees that matmul_dtype

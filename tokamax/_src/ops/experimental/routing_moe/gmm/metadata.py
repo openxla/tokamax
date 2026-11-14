@@ -73,35 +73,42 @@ class AbstractMetadataRef(abc.ABC):
     return self.cfg.num_n * self.num_gm[0]
 
   def step(
-      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
   ) -> jax.Array:
-    """Convert (n, gm, k) grid into a linear grid."""
+    """Convert (n, gm, k2, k1) grid into a linear grid over (n, gm)."""
     # TODO: Fold k into the step once num_k > 1 is supported.
-    del k_id
+    del k2_id, k1_id
     return n_id * self.num_gm[0] + gm_id
 
   def slot(
       self,
       n_id: jax.Array | int,
       gm_id: jax.Array | int,
-      k_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
       buffer_count: int,
   ) -> jax.Array:
+    """Returns the buffer slot index for the given grid coordinates."""
     # Because gm_id is used for lookahead/lookback, the smallest possible
     # value is -buffer_count. To protect against uint underflow, we add
     # buffer_count first to ensure slot indexing is always correct.
-    step_u32 = self.step(n_id, gm_id + buffer_count, k_id).astype(jnp.uint32)
-    return lax.rem(step_u32, jnp.uint32(buffer_count))
+    step = self.step(n_id, gm_id + buffer_count, k2_id, k1_id)
+    return lax.rem(step.astype(jnp.uint32), jnp.uint32(buffer_count))
 
   def resolve(
       self,
       n_id: jax.Array | int,
       gm_id: jax.Array | int,
-      k_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
       dtype: jax.typing.DTypeLike = jnp.int32,
-  ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Maps a possibly out-of-range (n, gm, k) to an in-range or the sink."""
-    step = self.step(n_id, gm_id, k_id)
+  ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Maps a possibly out-of-range (n, gm, k2, k1) to in-range or the sink."""
+    step = self.step(n_id, gm_id, k2_id, k1_id)
     valid = jnp.logical_and(0 <= step, step < self.num_steps)
     # TODO: Add equivalent logic for K tiling when the feature lands.
     if self.cfg.num_n > 1:
@@ -120,7 +127,8 @@ class AbstractMetadataRef(abc.ABC):
     return (
         jnp.asarray(n_id, dtype),
         jnp.asarray(gm_id, dtype),
-        jnp.asarray(k_id, dtype),
+        jnp.asarray(k2_id, dtype),
+        jnp.asarray(k1_id, dtype),
     )
 
 

@@ -279,13 +279,8 @@ def matmul(
     w: jax.Array,
     w_scale: jax.Array | None,
     w_bias: jax.Array | None,
-    *,
-    is_last_k_step: bool = True,
-    is_first_k_step: bool = True,
 ) -> jax.Array:
   """Performs stateless matrix multiplication for a single tile."""
-  # TODO: Support multiple N/K tiles.
-  assert is_last_k_step and is_first_k_step
 
   match cfg.matmul_mode:
     case config.MatmulMode.UNQUANTIZED:

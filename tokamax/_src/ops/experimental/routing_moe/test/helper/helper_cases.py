@@ -171,6 +171,15 @@ PROD_CASES = (
         max_to_mean_loads=(1.67,),
     ),
     *_prod_sweep(
+        helper_shapes.GLM_5_3,
+        (
+            8,
+            256,
+            8192,
+        ),
+        shardings=(MoESharding(ep=8),),
+    ),
+    *_prod_sweep(
         helper_shapes.QWEN_35_397B,
         (8, 32, 256, 8192),
         shardings=(
