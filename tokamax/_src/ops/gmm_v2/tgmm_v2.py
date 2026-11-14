@@ -437,12 +437,16 @@ def tgmm_inner_kernel(
     )
     rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[:bucket_m], 0)  # pyrefly: ignore[bad-index]
 
+    is_int_dot = jnp.issubdtype(lhs_masked.dtype, jnp.integer) and (
+        jnp.issubdtype(rhs_masked.dtype, jnp.integer)
+    )
+    pref_dtype = jnp.int32 if is_int_dot else jnp.float32
     acc = jax.lax.dot_general(
         lhs_masked,
         rhs_masked,
         (((0,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
+        preferred_element_type=pref_dtype,
+    ).astype(acc_ref.dtype)
 
     if not is_new_group:
       acc += acc_ref[...]

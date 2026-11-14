@@ -51,6 +51,7 @@ def reference_gmm(
     rhs_bias: jax.Array | None = None,
     partial_sum: jax.Array | None = None,  # [m, n]
     group_offset: jax.Array | None = None,  # int32[1]
+    lhs_scale: jax.Array | None = None,
 ):
   num_tokens = lhs.shape[0]
   num_groups, in_size, out_size = rhs.shape
@@ -93,6 +94,8 @@ def reference_gmm(
         if rhs_scale is not None:
           acc *= rhs_scale[group][block]
         out += acc
+      if lhs_scale is not None:
+        out *= lhs_scale
       if rhs_bias is not None:
         out = out + rhs_bias[group]
       if partial_sum is not None:
@@ -2443,6 +2446,132 @@ class GmmTest(parameterized.TestCase):
       chex.assert_trees_all_close(actual, expected, atol=6e-1, rtol=6e-1)
     else:
       assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      has_rhs_scale=[False, True],
+      has_bias=[False, True],
+      group_offset=[0, 2],
+  )
+  def test_gmm_prequantized_lhs_with_lhs_scale(
+      self, has_rhs_scale, has_bias, group_offset
+  ):
+    """Pre-quantized int8 lhs with per-tensor post-matmul lhs_scale."""
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 8
+    num_local_groups = num_groups - group_offset
+    k0, k1, k2 = jax.random.split(jax.random.key(7), 3)
+    lhs_f = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    lhs_q, lhs_scale = quantize_tensor(
+        lhs_f.reshape(1, -1),
+        jnp.dtype(jnp.int8),
+        axis=1,
+        block_size=lhs_f.size,
+    )
+    lhs_q = lhs_q.reshape(lhs_f.shape)
+    lhs_scale = lhs_scale.reshape(1, 1)
+
+    rhs_q, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(jnp.int8), axis=1, block_size=256
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2) if has_rhs_scale else None
+
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.uniform(
+          k2, (num_local_groups, 1, out_size), jnp.float32, -1, 1
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array(group_offset, dtype=jnp.int32)
+
+    actual = gmm_v2.gmm_v2(
+        lhs_q,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_offset=group_offset_arr,
+        lhs_scale=lhs_scale,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = reference_gmm(
+        lhs_q.astype(jnp.float32),
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_offset=group_offset_arr,
+        lhs_scale=lhs_scale,
+    )
+    assert_arrays_all_close(actual, expected)
+
+  def test_int8_lhs_rejects_pre_matmul_rhs_dequant(self):
+    """Integer lhs with sub-MXU rhs quant blocks raises ValueError."""
+    batch_size, in_size, out_size, num_groups = 128, 256, 256, 4
+    lhs = jnp.zeros((batch_size, in_size), dtype=jnp.int8)
+    rhs = jnp.zeros((num_groups, in_size, out_size), dtype=jnp.int8)
+    # quant_block_size = 256 // 8 = 32 < mxu_column_size (128 or 256).
+    rhs_scale = jnp.ones((num_groups, 8, 1, out_size), dtype=jnp.float32)
+    group_sizes = jnp.array([32, 32, 32, 32], dtype=jnp.int32)
+    with self.assertRaisesRegex(ValueError, "integer lhs"):
+      gmm_v2.gmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          rhs_scale=rhs_scale,
+          maybe_quantize_lhs=False,
+          preferred_element_type=jnp.float32,
+      )
+
+  @parameterized.product(
+      has_rhs_scale=[False, True],
+      group_offset=[0, 2],
+  )
+  def test_tgmm_int8(self, has_rhs_scale, group_offset):
+    """tgmm_v2 uses int32 accumulation for int8 x int8 dots."""
+    batch_size, in_size, out_size, num_groups = 256, 256, 256, 8
+    num_local_groups = num_groups - group_offset
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs_f = jax.random.uniform(key1, (batch_size, in_size), jnp.float32, -1, 1)
+    grad_f = jax.random.uniform(
+        key2, (batch_size, out_size), jnp.float32, -1, 1
+    )
+    lhs_q, lhs_scale = quantize_tensor(
+        lhs_f, jnp.dtype(jnp.int8), axis=1, block_size=in_size
+    )
+    # Fold per-token lhs_scale into grad before quantizing grad per-channel
+    # along out_size (matching how MaxText prepares tgmm_v2 inputs).
+    grad_q, grad_scale = quantize_tensor(
+        grad_f * lhs_scale,
+        jnp.dtype(jnp.int8),
+        axis=0,
+        block_size=batch_size,
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, out_size]
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs_f.swapaxes(0, 1),
+        grad_f,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset_arr,
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs_q,
+        grad_q,
+        group_sizes,
+        num_local_groups,
+        rhs_scale=grad_scale if has_rhs_scale else None,
+        group_offset=group_offset_arr,
+        preferred_element_type=jnp.float32,
+    )
+    if not has_rhs_scale:
+      actual = actual * grad_scale
+    chex.assert_trees_all_close(actual, expected, atol=2e-1, rtol=5e-2)
 
 
 _VMEM_LIMIT_BYTES = int(64 * 1024 * 1024 * 0.9)
