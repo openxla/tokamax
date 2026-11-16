@@ -281,6 +281,14 @@ def _diag_grid_pair(grid: int | tuple[int, int]) -> tuple[int, int]:
   return (grid, grid) if isinstance(grid, int) else grid
 
 
+def _fine_diag_splits(active_size: int, max_splits: int = 8) -> int:
+  """Largest power-of-2 split <= max_splits with NUM_LANES-aligned subblocks."""
+  splits = 1
+  while splits < max_splits and active_size % (2 * splits * NUM_LANES) == 0:
+    splits *= 2
+  return splits
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class SplashConfig:
   """Tile sizes parameterizing SplashAttention kernels.
@@ -371,6 +379,10 @@ class SplashConfig:
   #   the queries it attends to. Accumulates dq in VMEM scratch when present
   #   (dq_reduction_steps=1), or per query band in f32 registers otherwise.
   diag_band_skip: bool = False
+  # With diag_band_skip, refine square backward diagonal row-bands down to
+  # max(num_lanes, mxu_column_size) so strictly above-diagonal sub-bands skip
+  # MXU and softmax/derivative vector ops without under-filling the MXU.
+  bwd_diag_tip_subskip: bool = True
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
   # `prng_key` passed at call time, so it costs no HBM traffic and is never
@@ -598,50 +610,134 @@ def _apply_mask_and_soft_cap(
     k_in_lanes=True,
     mask_function=None,
     has_partial_mask: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    unmasked_prefix_cols: int = 0,
+    unmasked_suffix_cols: int = 0,
+    unmasked_suffix_rows: int = 0,
+    diag_splits: int = 1,
+) -> jax.Array:
   assert mask_ref is None or q_sequence_ref is None
   assert (q_sequence_ref is None) == (mask_function is None)
 
-  masks = []
-  if has_partial_mask:
+  def cap_logits(logits):
+    if attn_logits_soft_cap is not None:
+      return jnp.tanh(logits / attn_logits_soft_cap) * attn_logits_soft_cap
+    return logits
+
+  def _eval_partial_mask(
+      q_slice: slice,
+      kv_slice: pl.Slice,
+      kv_off: int | jax.Array,
+      q_len: int,
+  ) -> jax.Array:
     if mask_ref is not None:
-      mask = mask_ref[:, k_slice] if k_in_lanes else mask_ref[k_slice, :]
-      masks.append(mask.astype(jnp.bool_))
-    elif mask_function is not None:
-      # Compute the mask using the given q_sequence indices.
-      # KV indices are computed on the fly. This works because we only support Q
-      # sequence sharding. If we wanted to compute Q indices too, then we would
-      # need to keep into account the current shard along Q sequence.
+      m = (
+          mask_ref[q_slice, kv_slice]
+          if k_in_lanes
+          else mask_ref[kv_slice, q_slice]
+      )
+      return m.astype(jnp.bool_)
+    # Compute the mask using the given q_sequence indices.
+    # KV indices are computed on the fly. This works because we only support Q
+    # sequence sharding. If we wanted to compute Q indices too, then we would
+    # need to keep into account the current shard along Q sequence.
+    assert q_sequence_ref is not None and mask_function is not None
+    if k_in_lanes:
+      assert q_sequence_ref.shape == (bq, NUM_LANES)
+      k_sequence = kv_off + jax.lax.broadcasted_iota(
+          jnp.int32, (q_len, kv_slice.size), 1
+      )
+      repeats, rem = divmod(kv_slice.size, NUM_LANES)
+      assert rem == 0
+      q_sequence = jnp.tile(q_sequence_ref[q_slice, :], (1, repeats))
+    else:
+      assert q_sequence_ref.shape == (NUM_SUBLANES, bq)
+      k_sequence = kv_off + jax.lax.broadcasted_iota(
+          jnp.int32, (kv_slice.size, q_len), 0
+      )
+      q_sequence = jnp.broadcast_to(
+          q_sequence_ref[:1, q_slice], (kv_slice.size, q_len)
+      )
+    computed_mask = mask_function(q_sequence, k_sequence)
+    if computed_mask.dtype != jnp.dtype(jnp.bool_):
+      raise ValueError(
+          "Mask function must return a boolean-valued array, but got:"
+          f" {computed_mask.dtype}"
+      )
+    return computed_mask
 
-      if k_in_lanes:
-        assert q_sequence_ref.shape == (bq, NUM_LANES)  # pyrefly: ignore[missing-attribute]
-
-        k_sequence = k_offset + jax.lax.broadcasted_iota(
-            jnp.int32, (bq, k_slice.size), 1
+  masks = []
+  already_capped = False
+  k_size = k_slice.size
+  assert isinstance(k_size, int)
+  active = (bq - unmasked_suffix_rows) if k_in_lanes else k_size
+  use_subblock_mask = (
+      has_partial_mask
+      and active > 0
+      and active % diag_splits == 0
+      and (active // diag_splits) % NUM_LANES == 0
+      and (
+          unmasked_prefix_cols > 0
+          or unmasked_suffix_cols > 0
+          or unmasked_suffix_rows > 0
+          or diag_splits > 1
+      )
+  )
+  if has_partial_mask and (mask_ref is not None or mask_function is not None):
+    if use_subblock_mask:
+      total_cols = k_size if k_in_lanes else bq
+      assert active == (
+          total_cols - unmasked_prefix_cols
+          if k_in_lanes
+          else total_cols - unmasked_suffix_cols
+      )
+      d = active // diag_splits
+      out_rows = []
+      for split_idx in range(diag_splits):
+        r_lo, r_hi = split_idx * d, (split_idx + 1) * d
+        c_lo = (unmasked_prefix_cols if k_in_lanes else 0) + r_lo
+        c_hi = c_lo + d
+        sub_mask = _eval_partial_mask(
+            slice(r_lo, r_hi) if k_in_lanes else slice(c_lo, c_hi),
+            pl.ds(k_slice.start + (c_lo if k_in_lanes else r_lo), d),
+            k_offset + (c_lo if k_in_lanes else r_lo),
+            d,
         )
-
-        repeats, rem = divmod(k_slice.size, NUM_LANES)
-        assert rem == 0
-        q_sequence = jnp.tile(
-            q_sequence_ref[...], (1, repeats)  # pyrefly: ignore[unsupported-operation]
-        )  # [bq, k_slice.size]
-      else:
-        assert q_sequence_ref.shape == (NUM_SUBLANES, bq)  # pyrefly: ignore[missing-attribute]
-
-        k_sequence = k_offset + jax.lax.broadcasted_iota(
-            jnp.int32, (k_slice.size, bq), 0
+        if sub_mask.ndim == 2 and qk.ndim == 3:
+          sub_mask = jnp.expand_dims(sub_mask, axis=0)
+        tip = jnp.where(
+            sub_mask, cap_logits(qk[..., r_lo:r_hi, c_lo:c_hi]), mask_value
         )
-        q_sequence = q_sequence_ref[:1, :]  # [1, bq]  # pyrefly: ignore[unsupported-operation]
-        q_sequence = jnp.broadcast_to(q_sequence, (k_slice.size, bq))
-
-      assert q_sequence.shape == k_sequence.shape
-      computed_mask = mask_function(q_sequence, k_sequence)
-      if computed_mask.dtype != jnp.dtype(jnp.bool_):
-        raise ValueError(
-            "Mask function must return a boolean-valued array, but got:"
-            f" {computed_mask.dtype}"
+        parts = []
+        if c_lo > 0:
+          if k_in_lanes:
+            parts.append(cap_logits(qk[..., r_lo:r_hi, :c_lo]))
+          else:
+            parts.append(
+                jnp.full((*qk.shape[:-2], d, c_lo), mask_value, qk.dtype)
+            )
+        parts.append(tip)
+        if c_hi < total_cols:
+          if k_in_lanes:
+            parts.append(
+                jnp.full(
+                    (*qk.shape[:-2], d, total_cols - c_hi), mask_value, qk.dtype
+                )
+            )
+          else:
+            parts.append(cap_logits(qk[..., r_lo:r_hi, c_hi:]))
+        out_rows.append(
+            parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=-1)
         )
-      masks.append(computed_mask)
+      if k_in_lanes and unmasked_suffix_rows > 0:
+        out_rows.append(cap_logits(qk[..., active:, :]))
+      qk = (
+          out_rows[0]
+          if len(out_rows) == 1
+          else jnp.concatenate(out_rows, axis=-2)
+      )
+      already_capped = True
+    else:
+      masks.append(_eval_partial_mask(slice(None), k_slice, k_offset, bq))
 
   if q_segment_ids_ref is not None:
     if k_in_lanes:
@@ -661,22 +757,16 @@ def _apply_mask_and_soft_cap(
       q_ids = q_segment_ids_ref[:1, :]  # [1, bq]
     masks.append(q_ids == kv_ids)
 
-  def cap_logits(logits):
-    if attn_logits_soft_cap is not None:
-      logits = jnp.tanh(qk / attn_logits_soft_cap)
-      return logits * attn_logits_soft_cap
-    else:
-      return logits
-
   if masks:
     masks = [m.astype(jnp.bool_) for m in masks]
     mask = functools.reduce(jnp.logical_and, masks)
-    qk = cap_logits(qk)
+    if not already_capped:
+      qk = cap_logits(qk)
     if mask.ndim == 2 and qk.ndim == 3:
       mask = jnp.expand_dims(mask, axis=0)
 
     qk = jnp.where(mask, qk, mask_value)
-  else:
+  elif not already_capped:
     qk = cap_logits(qk)
   return qk
 
@@ -984,6 +1074,14 @@ def flash_attention_kernel(
     qk_flat = qk_matmul(q_flat, k, qk_dims, diag=diag)
     qk = qk_flat.reshape((num_stacked_q_heads, nq, nk))
 
+    unmasked_prefix_cols = r0 if band is not None else 0
+    unmasked_suffix_rows = nq - bkv_compute if diag else 0
+    diag_splits = 1
+    if band is not None:
+      diag_splits = _fine_diag_splits(nq)
+    elif diag:
+      diag_splits = _fine_diag_splits(bkv_compute)
+
     qk = _apply_mask_and_soft_cap(
         qk,
         mask_value,
@@ -997,6 +1095,9 @@ def flash_attention_kernel(
         bq=nq,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
+        unmasked_prefix_cols=unmasked_prefix_cols,
+        unmasked_suffix_rows=unmasked_suffix_rows,
+        diag_splits=diag_splits,
     )
 
     if max_logit_estimate is None:
@@ -2065,6 +2166,15 @@ def _flash_attention_dq_kernel(
     dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
 
+def _min_bwd_tip_subtile() -> int:
+  """Minimum MXU-filling sub-tile size for backward diagonal tip splitting."""
+  try:
+    info = pltpu.get_tpu_info()
+    return max(info.num_lanes, info.mxu_column_size)
+  except (ValueError, RuntimeError):
+    return NUM_LANES
+
+
 def _flash_attention_dkv_kernel(
     # Prefetched inputs
     active_rows_ref,
@@ -2197,10 +2307,32 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
-  def body(i, _, has_partial_mask=False):
-    dropout_mask = None
-    slice_k = pl.ds(i * bkv_compute, bkv_compute)
-    q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
+  def body(
+      i,
+      _,
+      has_partial_mask: bool = False,
+      band: tuple[int, int, int, dict[int, jax.Array]] | None = None,
+  ):
+    if band is not None:
+      ki, sk, sq, dq_acc = band
+      q0, k0 = ki * sq, ki * sk
+      nq, nk = bq - q0, sk
+      sliced_q = True
+    else:
+      ki = sk = sq = q0 = k0 = 0
+      dq_acc = None
+      nq, nk = bq, bkv_compute
+      sliced_q = False
+
+    slice_k = pl.ds(i * bkv_compute + k0, nk)
+    qs = pl.ds(q0, nq)
+    q_view = lambda ref: ref.at[:, qs] if sliced_q and ref is not None else ref
+    if not sliced_q:
+      q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
+    elif config.q_layout == HEAD_DIM_MINOR:
+      q = q_ref[qs, :]
+    else:
+      q = q_ref[:, qs]
     if config.use_base2_exp and not config.q_prescaled_log2e:
       if q.dtype == jnp.float8_e4m3fn:
         scaled_q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
@@ -2216,153 +2348,47 @@ def _flash_attention_dkv_kernel(
 
     k = _load_kv(k_ref, config.k_layout)
     v = _load_kv(v_ref, config.v_layout)
-    logsumexp = logsumexp_ref[:1, :]
-    do = do_ref[...]
-    di = di_ref[:1, :]
+    logsumexp = logsumexp_ref[:1, qs] if sliced_q else logsumexp_ref[:1, :]
+    do = do_ref[qs, :] if sliced_q else do_ref[...]
+    di = di_ref[:1, qs] if sliced_q else di_ref[:1, :]
 
     qk_dims = (
         NT_DIM_NUMBERS if config.q_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     )
     gq, gk = _diag_grid_pair(config.active_qk_diag_grid_dkv)
-    sk, sq = bkv_compute // gk, bq // gq
-    if (
-        config.qk_diag_skip
-        and config.diag_band_skip
-        and gq == gk
-        and has_partial_mask
-        and not dropout_rate
-        and (
-            dq_scratch_ref is not None
-            or dq_ref is None
-            or (bq == bkv == bkv_compute and block_mask_ref is not None)
-        )
-        and bkv_compute % gk == 0
-        and bq % gq == 0
-        and sk % NUM_LANES == 0
-        and sq % NUM_LANES == 0
-    ):
-      # Row-band diagonal skip: on an aligned causal diagonal block, kv band ki
-      # only attends to queries [ki * sq, bq), so run the backward for each band
-      # on that contiguous query suffix instead of the full tile.
-      exp = jnp.exp2 if config.use_base2_exp else jnp.exp
-      dk_dims = (
-          NN_DIM_NUMBERS
-          if config.q_layout == HEAD_DIM_MINOR
-          else NT_DIM_NUMBERS
-      )
-      q_view = lambda ref, s: None if ref is None else ref.at[:, s]
-      dq_acc: dict[int, jax.Array] = {}
-      for ki in range(gk):
-        q0, k0 = ki * sq, ki * sk
-        qs = pl.ds(q0, bq - q0)
-        if config.q_layout == HEAD_DIM_MINOR:
-          q_b, scaled_q_b = q[q0:, :], scaled_q[q0:, :]
-        else:
-          q_b, scaled_q_b = q[:, q0:], scaled_q[:, q0:]
-        k_b, v_b, do_b = k[k0 : k0 + sk, :], v[k0 : k0 + sk, :], do[q0:, :]
-        qk_b = lax.dot_general(
-            k_b, scaled_q_b, qk_dims, preferred_element_type=jnp.float32
-        )
-        p_b = exp(
-            _apply_mask_and_soft_cap(
-                qk_b,
-                mask_value,
-                q_view(mask_ref, qs),
-                q_view(q_sequence_ref, qs),
-                q_view(q_segment_ids_ref, qs),
-                kv_segment_ids_ref,
-                attn_logits_soft_cap=attn_logits_soft_cap,
-                k_slice=pl.ds(i * bkv_compute + k0, sk),
-                k_offset=kv_index * bkv + i * bkv_compute + k0,
-                bq=bq - q0,
-                k_in_lanes=False,
-                mask_function=mask_function,
-                has_partial_mask=True,
-            )
-            - logsumexp[:, q0:]
-        )
-        dp_b = lax.dot_general(
-            v_b, do_b, NT_DIM_NUMBERS, preferred_element_type=jnp.float32
-        )
-        ds_b = (dp_b - di[:, q0:]) * p_b
-        if attn_logits_soft_cap is not None:
-          d = jnp.tanh(qk_b / attn_logits_soft_cap)
-          ds_b = ds_b * (1 - d * d)
-        kv_rows = pl.ds(i * bkv_compute + k0, sk)
-        dv_scratch_ref[kv_rows, :] += lax.dot(
-            p_b.astype(do.dtype), do_b, preferred_element_type=jnp.float32
-        ).astype(dv_scratch_ref.dtype)
-        dk_b = lax.dot_general(
-            ds_b.astype(do.dtype),
-            scaled_q_b if config.dkv_reuse_scaled_q else q_b,
-            dk_dims,
-            preferred_element_type=jnp.float32,
-        )
-        if config.use_base2_exp and (
-            config.dkv_reuse_scaled_q or config.q_prescaled_log2e
-        ):
-          dk_b = dk_b / LOG2E
-        dk_scratch_ref[kv_rows, :] += dk_b.astype(dk_scratch_ref.dtype)
-        if dq_scratch_ref is not None or dq_ref is not None:
-          dq_b = lax.dot_general(
-              ds_b.T if _is_fp8(k) else ds_b.T.astype(k.dtype),
-              k_b,
-              NN_DIM_NUMBERS,
-              preferred_element_type=jnp.float32,
-          )
-          if config.q_prescaled_log2e:
-            dq_b = dq_b / LOG2E
-          if dq_scratch_ref is not None:
-            dq_scratch_ref[q0:, :] += dq_b
-          elif dq_ref is not None:
-            # Square dkv tiles imply num_iters == 1 (i == 0), and query band ki
-            # only attends to kv bands 0..ki, so dq_acc.pop(ki) is this block's
-            # complete dq contribution for q_band once iteration ki finishes.
-            for qb in range(ki, gk):
-              part = dq_b[(qb - ki) * sq : (qb - ki + 1) * sq]
-              prev = dq_acc.get(qb)
-              dq_acc[qb] = part if prev is None else prev + part
-            dq_band = dq_acc.pop(ki)
-            q_band = pl.ds(q0, sq)
-            if dq_alias is not None:
-              dq_ref[q_band, :] = (
-                  dq_alias[q_band, :].astype(jnp.float32) + dq_band
-              ).astype(dq_ref.dtype)
-            else:
-              dq_ref[q_band, :] = dq_band.astype(dq_ref.dtype)
-      return
-
-    if (
-        config.qk_diag_skip
+    use_dkv_diag = (
+        not sliced_q
+        and config.qk_diag_skip
         and has_partial_mask
         and bkv_compute % gk == 0
         and bq % gq == 0
-    ):
+    )
+    if use_dkv_diag:
       # Diagonal skip (backward dkv): qk tile is [kv, q]. On an aligned square
       # diagonal block, a sub-tile (kv-band ki, q-band qj) that lies entirely in
       # kv > q is overwritten to mask_value anyway -> skip its matmul; assemble
       # the full tile for the single exp/ds/dv/dk.
-      sk = bkv_compute // gk
-      sq = bq // gq
-      k_parts = [k[t * sk : (t + 1) * sk, :] for t in range(gk)]
+      sk_d = bkv_compute // gk
+      sq_d = bq // gq
+      k_parts = [k[t * sk_d : (t + 1) * sk_d, :] for t in range(gk)]
       # `scaled_q` is kept in its original layout here (it is always the RHS of
       # the qk matmul), so the q sequence axis is the minor one under
       # SEQ_MINOR and the major one under HEAD_DIM_MINOR.
       if config.q_layout == HEAD_DIM_MINOR:
-        q_parts = [scaled_q[t * sq : (t + 1) * sq, :] for t in range(gq)]
+        q_parts = [scaled_q[t * sq_d : (t + 1) * sq_d, :] for t in range(gq)]
       else:
-        q_parts = [scaled_q[:, t * sq : (t + 1) * sq] for t in range(gq)]
+        q_parts = [scaled_q[:, t * sq_d : (t + 1) * sq_d] for t in range(gq)]
       _mm = lambda kk, qq: lax.dot_general(
           kk, qq, qk_dims, preferred_element_type=jnp.float32
       )
       rows = []
-      for ki in range(gk):  # kv row-band
+      for r_i in range(gk):  # kv row-band
         cols = []
-        for qj in range(gq):  # q col-band
-          if _above_diag(qj, sq, ki, sk):  # fully masked -> skip matmul
-            cols.append(jnp.full((sk, sq), mask_value, dtype=jnp.float32))
+        for q_j in range(gq):  # q col-band
+          if _above_diag(q_j, sq_d, r_i, sk_d):  # fully masked -> skip matmul
+            cols.append(jnp.full((sk_d, sq_d), mask_value, dtype=jnp.float32))
           else:
-            cols.append(_mm(k_parts[ki], q_parts[qj]))
+            cols.append(_mm(k_parts[r_i], q_parts[q_j]))
         rows.append(jnp.concatenate(cols, axis=1))
       qk_uncapped = jnp.concatenate(rows, axis=0)
     else:
@@ -2370,20 +2396,27 @@ def _flash_attention_dkv_kernel(
           k, scaled_q, qk_dims, preferred_element_type=jnp.float32
       )
 
+    dkv_diag_splits = 1
+    if sliced_q and nk == sq:
+      dkv_diag_splits = _fine_diag_splits(nk)
+    elif use_dkv_diag and block_mask_ref is not None and bkv_compute == bq:
+      dkv_diag_splits = _fine_diag_splits(bq)
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
         mask_value,
-        mask_ref,
-        q_sequence_ref,
-        q_segment_ids_ref,
+        q_view(mask_ref),
+        q_view(q_sequence_ref),
+        q_view(q_segment_ids_ref),
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
-        k_offset=kv_index * bkv + i * bkv_compute,
-        bq=bq,
+        k_offset=kv_index * bkv + i * bkv_compute + k0,
+        bq=nq,
         k_in_lanes=False,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
+        unmasked_suffix_cols=nq - sq if sliced_q else 0,
+        diag_splits=dkv_diag_splits,
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
@@ -2465,10 +2498,27 @@ def _flash_attention_dkv_kernel(
       if config.q_prescaled_log2e:
         dq = dq / LOG2E
       if dq_scratch_ref is not None:
-        # Compute block size != memory block size
-        dq_scratch_ref[...] += dq
+        if sliced_q:
+          dq_scratch_ref[qs, :] += dq
+        else:
+          dq_scratch_ref[...] += dq
+      elif sliced_q:
+        assert dq_acc is not None
+        # Query band ki only attends to kv bands 0..ki, so dq_acc.pop(ki) is
+        # this block's complete dq contribution once band ki finishes.
+        for qb in range(ki, bq // sq):
+          part = dq[(qb - ki) * sq : (qb - ki + 1) * sq]
+          prev = dq_acc.get(qb)
+          dq_acc[qb] = part if prev is None else prev + part
+        dq_band = dq_acc.pop(ki)
+        q_band = pl.ds(q0, sq)
+        if dq_alias is not None:
+          dq_ref[q_band, :] = (
+              dq_alias[q_band, :].astype(jnp.float32) + dq_band
+          ).astype(dq_ref.dtype)
+        else:
+          dq_ref[q_band, :] = dq_band.astype(dq_ref.dtype)
       else:
-        # Compute block size == memory block size
         if dq_alias is not None:
           dq_ref[...] = (dq_alias[...].astype(jnp.float32) + dq).astype(
               dq_ref.dtype
@@ -2490,6 +2540,24 @@ def _flash_attention_dkv_kernel(
   num_iters = (
       k_ref.shape[0 if config.k_layout is HEAD_DIM_MINOR else 1] // bkv_compute
   )
+  gq, gk = _diag_grid_pair(config.active_qk_diag_grid_dkv)
+  sk_init, sq_init = bkv_compute // gk, bq // gq
+  use_diag_band = (
+      config.qk_diag_skip
+      and config.diag_band_skip
+      and num_iters == 1
+      and gq == gk
+      and not dropout_rate
+      and (
+          dq_scratch_ref is not None
+          or dq_ref is None
+          or (bq == bkv == bkv_compute and block_mask_ref is not None)
+      )
+      and bkv_compute % gk == 0
+      and bq % gq == 0
+      and sk_init % NUM_LANES == 0
+      and sq_init % NUM_LANES == 0
+  )
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
@@ -2497,9 +2565,25 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
-    lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-    )
+    if use_diag_band:
+      min_tip = _min_bwd_tip_subtile()
+      eff_g = gk
+      if (
+          config.bwd_diag_tip_subskip
+          and bq == bkv_compute
+          and sk_init > min_tip
+          and sk_init % min_tip == 0
+          and min_tip % NUM_LANES == 0
+      ):
+        eff_g = bkv_compute // min_tip
+      sk_b, sq_b = bkv_compute // eff_g, bq // eff_g
+      dq_acc: dict[int, jax.Array] = {}
+      for ki in range(eff_g):
+        body(0, None, has_partial_mask=True, band=(ki, sk_b, sq_b, dq_acc))
+    else:
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   if dq_scratch_ref is not None:
 
