@@ -22,6 +22,7 @@ from jaxtyping import Array, Float, Int, Shaped  # pylint: disable=g-multiple-im
 import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
+from tokamax._src.ops.batched_rpa import arg_specs
 from tokamax._src.ops.batched_rpa import reference
 from tokamax._src.ops.batched_rpa.kernel.configs import AttentionScope
 from tokamax._src.ops.batched_rpa.kernel.configs import BlockSizes
@@ -195,3 +196,9 @@ class BatchedRpa(op.Op[Any, Any, None, _Config, Any]):
     if return_lse:
       return (ref_res[0], ref_res[1], ref_res[2]), None
     return (ref_res[0], ref_res[1]), None
+
+  @override
+  def _get_autotuning_cache_key(self, ba: op.BoundArguments) -> Any:
+    return super()._get_autotuning_cache_key(
+        ba.replace(arguments={**ba.arguments, "sm_scale": arg_specs.SM_SCALE})
+    )

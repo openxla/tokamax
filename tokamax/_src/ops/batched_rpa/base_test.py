@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
+from tokamax._src.ops.batched_rpa import arg_specs
 from tokamax._src.ops.batched_rpa import base
 from tokamax._src.ops.batched_rpa import reference
 
@@ -184,6 +185,32 @@ class BatchedRpaBaseTest(parameterized.TestCase):
     )
     self.assertEqual(out_std.shape, queries.shape)
     self.assertEqual(new_cache_std.shape, kv_cache.shape)
+
+  def test_autotuning_cache_key_canonicalizes_sm_scale(self):
+    rpa_op = base.BatchedRpa()
+    dummy_q = jnp.zeros((4, 4, 64), dtype=jnp.bfloat16)
+    dummy_kv = jnp.zeros((4, 2, 64), dtype=jnp.bfloat16)
+    dummy_cache = jnp.zeros((8, 8, 2, 2, 128), dtype=jnp.bfloat16)
+    args = (
+        dummy_q,
+        dummy_kv,
+        dummy_kv,
+        dummy_cache,
+        jnp.array([4], dtype=jnp.int32),
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([0, 4], dtype=jnp.int32),
+        jnp.array([0, 1, 1], dtype=jnp.int32),
+    )
+    ba1 = rpa_op.bind(*args, sm_scale=0.5)
+    ba2 = rpa_op.bind(*args, sm_scale=1.0)
+    key1 = rpa_op._get_autotuning_cache_key(ba1)
+    key2 = rpa_op._get_autotuning_cache_key(ba2)
+    self.assertEqual(key1, key2)
+    self.assertEqual(key1["sm_scale"], arg_specs.SM_SCALE)
+
+  def test_arg_specs_bind_cache_key_sm_scale(self):
+    for spec in arg_specs.ARG_SPECS:
+      self.assertEqual(spec.args["sm_scale"], arg_specs.SM_SCALE, spec.name)
 
 
 if __name__ == "__main__":
