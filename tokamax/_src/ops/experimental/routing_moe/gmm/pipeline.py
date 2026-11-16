@@ -15,6 +15,7 @@
 
 """Main kernel module for orchestrating DMA and computation pipeline."""
 
+from collections.abc import Callable
 import dataclasses
 import functools
 
@@ -57,6 +58,45 @@ def _matmuls(
   return compute.matmul(cfg.compute2, act, weight2, weight2_scale, weight2_bias)
 
 
+def _dispatch_k2_slice(
+    k2_id: jax.Array,
+    num_k2: int,
+    bucket_m: int,
+    slice_fn: Callable[..., None],
+) -> None:
+  """Dispatches the k2 slice variant for `bucket_m`."""
+
+  @jax.named_scope(f"bm{bucket_m}_first_last")
+  def bucket_fn_first_last():
+    slice_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=True)
+
+  @jax.named_scope(f"bm{bucket_m}_first")
+  def bucket_fn_first():
+    slice_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=False)
+
+  @jax.named_scope(f"bm{bucket_m}_mid")
+  def bucket_fn_mid():
+    slice_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=False)
+
+  @jax.named_scope(f"bm{bucket_m}_last")
+  def bucket_fn_last():
+    slice_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=True)
+
+  # Only compile the variants that can run for the given num_k2.
+  is_first_k2 = k2_id == 0
+  is_last_k2 = k2_id == num_k2 - 1
+  if num_k2 == 1:
+    bucket_fn_first_last()
+  elif num_k2 == 2:
+    lax.cond(is_first_k2, bucket_fn_first, bucket_fn_last)
+  else:
+    lax.cond(
+        is_first_k2,
+        bucket_fn_first,
+        lambda: lax.cond(is_last_k2, bucket_fn_last, bucket_fn_mid),
+    )
+
+
 def _inner_pipeline(
     step: pltpu.PipelineStep,
     in_ref: memory_ref.PipelineInputs,
@@ -89,6 +129,7 @@ def _inner_pipeline(
 
   n_id, gm_id, k2_id, k1_id = step.index
   num_xo_buffers = cfg.plan.num_xo_buffers
+  is_remote_out = cfg.out.mode == config.RoutingMode.REMOTE
 
   def _at(gm_offset: int) -> memory_ref.GridIndices:
     return (n_id, gm_id + gm_offset, k2_id, k1_id)
@@ -123,6 +164,10 @@ def _inner_pipeline(
     # current slot, that will prevent DMA instructions to be pipelined with
     # compute. Therefore, DMA is issued after the waiting.
     if is_first_k2_step:
+      if not is_remote_out:
+        # Enqueue before `x` copy-in so the store-before-DMA fence sits above
+        # both DMA loops and lets them pack into matmul bundles.
+        out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
       x_bref.branchless_copy_in(x_hbm_ref, _at(num_xo_buffers - 1))
 
     # Step 3: Read input from VMEM.
@@ -137,12 +182,6 @@ def _inner_pipeline(
         is_last_k2_step=is_last_k2_step,
     )
 
-    # Start output DMA for previous step slot after the loads because a remote
-    # DMA is a global memory barrier, so issuing it earlier would hold every
-    # load and the matmul behind it instead of sharing bundles with the matmul.
-    if is_first_k2_step:
-      out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
-
     # Later k2 slices accumulate onto the partial sum of earlier slices.
     if not is_first_k2_step:
       assert out_acc_ref is not None
@@ -155,36 +194,10 @@ def _inner_pipeline(
       assert out_acc_ref is not None
       out_acc_ref[:bucket_m] = act
 
-  def bucket_fn(bucket_m: int) -> None:
-    @jax.named_scope(f"bm{bucket_m}_first_last")
-    def bucket_fn_first_last():
-      _bucket_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=True)
-
-    @jax.named_scope(f"bm{bucket_m}_first")
-    def bucket_fn_first():
-      _bucket_fn(bucket_m, is_first_k2_step=True, is_last_k2_step=False)
-
-    @jax.named_scope(f"bm{bucket_m}_mid")
-    def bucket_fn_mid():
-      _bucket_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=False)
-
-    @jax.named_scope(f"bm{bucket_m}_last")
-    def bucket_fn_last():
-      _bucket_fn(bucket_m, is_first_k2_step=False, is_last_k2_step=True)
-
-    # Only compile the variants that can run for the given num_k2.
-    is_first_k2 = k2_id == 0
-    is_last_k2 = k2_id == cfg.num_k2 - 1
-    if cfg.num_k2 == 1:
-      bucket_fn_first_last()
-    elif cfg.num_k2 == 2:
-      lax.cond(is_first_k2, bucket_fn_first, bucket_fn_last)
-    else:
-      lax.cond(
-          is_first_k2,
-          bucket_fn_first,
-          lambda: lax.cond(is_last_k2, bucket_fn_last, bucket_fn_mid),
-      )
+    if is_first_k2_step and is_remote_out:
+      # Remote DMAs act as a load barrier on the matmul if issued in Step 2, and
+      # `act` must already be stored so it does not spill across that barrier.
+      out_bref.branchless_copy_out(out_hbm_ref, _at(-1))
 
   # Select which bucket to choose based on number of active rows of given tile.
   num_rows = metadata_ref.gm_id_to_num_rows[gm_id]
@@ -195,7 +208,9 @@ def _inner_pipeline(
   lax.switch(
       bucket_idx,
       [
-          functools.partial(bucket_fn, bucket_m)
+          functools.partial(
+              _dispatch_k2_slice, k2_id, cfg.num_k2, bucket_m, _bucket_fn
+          )
           for bucket_m in cfg.plan.bucket_rows
       ],
   )
