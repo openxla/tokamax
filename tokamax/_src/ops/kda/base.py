@@ -20,6 +20,7 @@ import jax
 from jax.experimental import checkify
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.kda import reference
@@ -106,7 +107,7 @@ class KimiDeltaAttention(op.Op[Any, Output, Residuals, _Config, _Key]):
       use_gate_in_kernel: bool = False,
       per_channel_gate: bool = True,
       chunk_size: int | None = None,
-      segment_ids: Int[Array | AbstractArray, "B T"] | None = None,
+      segment_ids: Int[Array | np.ndarray | AbstractArray, "B T"] | None = None,
       lower_bound: float | None = None,
       context_parallel_metadata: ContextParallelMetadata | None = None,
       max_num_segments: int | None = None,

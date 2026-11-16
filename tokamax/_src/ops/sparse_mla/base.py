@@ -19,9 +19,12 @@ from typing import Any, override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.sparse_mla import reference
+
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 
 class SparseMla[C](op.Op[Any, jax.Array, None, C, Any]):
@@ -30,17 +33,17 @@ class SparseMla[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      q: Float[Array, "T H D"],
-      cache_kv_nope: Int[Array, "P S 128"],
-      cache_kv_rope: Int[Array, "P R 128"],
-      topk_indices: Int[Array, "T K"],
-      page_indices: Int[Array, "N"],
-      cu_q_lens: Int[Array, "B"],
-      distribution: Int[Array, "3"],
-      attention_sinks: Float[Array, "H"],
-      swa_accumution: Float[Array, "T H D"],
-      swa_l: Float[Array, "T H"],
-      swa_m: Float[Array, "T H"],
+      q: Float[Array | AbstractArray, "T H D"],
+      cache_kv_nope: Int[Array | AbstractArray, "P S 128"],
+      cache_kv_rope: Int[Array | AbstractArray, "P R 128"],
+      topk_indices: Int[Array | AbstractArray, "T K"],
+      page_indices: Int[Array | np.ndarray | AbstractArray, "N"],
+      cu_q_lens: Int[Array | np.ndarray | AbstractArray, "B"],
+      distribution: Int[Array | np.ndarray | AbstractArray, "3"],
+      attention_sinks: Float[Array | AbstractArray, "H"],
+      swa_accumution: Float[Array | AbstractArray, "T H D"],
+      swa_l: Float[Array | AbstractArray, "T H"],
+      swa_m: Float[Array | AbstractArray, "T H"],
       *,
       sm_scale: float = 1.0,
       return_residuals: bool = False,

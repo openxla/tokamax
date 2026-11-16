@@ -16,6 +16,7 @@
 
 from absl.testing import absltest
 import jax.numpy as jnp
+from tokamax._src.ops.masked_dense_mla import arg_specs
 from tokamax._src.ops.masked_dense_mla import base
 from tokamax._src.ops.masked_dense_mla import test_base
 
@@ -43,6 +44,12 @@ class BaseMaskedDenseMlaTest(test_base.MaskedDenseMlaTestBase):
     inputs, _ = test_base.make_inputs(batch_size=2, topk=64)
     with self.assertRaisesRegex(ValueError, "max_kv_len"):
       base.MaskedDenseMla().bind(*inputs, max_kv_len=100000)
+
+  def test_all_arg_specs_bind(self):
+    op = base.MaskedDenseMla()
+    for spec in arg_specs.ARG_SPECS:
+      with self.subTest(spec.name):
+        self.assertIsNotNone(op.bind(**spec.args).autotuning_cache_key)
 
 
 if __name__ == "__main__":

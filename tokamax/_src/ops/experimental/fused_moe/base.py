@@ -22,6 +22,7 @@ from tokamax._src.ops import op
 from tokamax._src.ops.experimental.fused_moe import reference
 from typing_extensions import override
 
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 _Config = TypeVar("_Config")
 
 
@@ -31,19 +32,19 @@ class FusedMoe(op.Op[Any, jax.Array, None, _Config, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      x: Float[Array, "T H"],
-      w1: Array,
-      w2: Array,
-      gating: Float[Array, "T E"],
-      w1_scale: Array | None = None,
-      w2_scale: Array | None = None,
-      w1_bias: Array | None = None,
-      w2_bias: Array | None = None,
+      x: Float[Array | AbstractArray, "T H"],
+      w1: Array | AbstractArray,
+      w2: Array | AbstractArray,
+      gating: Float[Array | AbstractArray, "T E"],
+      w1_scale: Array | AbstractArray | None = None,
+      w2_scale: Array | AbstractArray | None = None,
+      w1_bias: Array | AbstractArray | None = None,
+      w2_bias: Array | AbstractArray | None = None,
       *,
       topk: int = 2,
       renormalize: bool = True,
       act_fn: str = "silu",
-      mesh: jax.sharding.Mesh | None = None,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     """Binds arguments for Fused MoE operator."""

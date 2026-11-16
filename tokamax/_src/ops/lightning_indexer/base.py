@@ -19,6 +19,7 @@ from typing import Any, ClassVar, override
 
 import jax
 from jaxtyping import Array, Float, Int, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.lightning_indexer import reference
@@ -43,10 +44,10 @@ class LightningIndexer[C](
       q: Float[Array | AbstractArray, "T H D"],
       indexer_weights: Float[Array | AbstractArray, "T H"],
       cache_kv: UInt8[Array | AbstractArray, "P _ 4 _"],
-      seq_lens: Int[Array | AbstractArray, "B"],
-      page_indices: Int[Array | AbstractArray, "_"],
-      cu_q_lens: Int[Array | AbstractArray, "_"],
-      distribution: Int[Array | AbstractArray, "3"],
+      seq_lens: Int[Array | np.ndarray | AbstractArray, "B"],
+      page_indices: Int[Array | np.ndarray | AbstractArray, "_"],
+      cu_q_lens: Int[Array | np.ndarray | AbstractArray, "_"],
+      distribution: Int[Array | np.ndarray | AbstractArray, "3"],
       *,
       k: int,
       compression_ratio: int = 1,
