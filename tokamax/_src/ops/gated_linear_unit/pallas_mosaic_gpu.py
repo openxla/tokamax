@@ -16,15 +16,14 @@
 
 from collections.abc import Callable
 import dataclasses
-import functools
-from typing import Any, ClassVar, Final, override
+from typing import Any, ClassVar, override
 
 import immutabledict
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
 from tokamax._src import gpu_utils
-from tokamax._src import precision as precision_lib
+from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_common as common
@@ -35,10 +34,6 @@ from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu_kernel_sm90 as 
 Residuals = base.Residuals
 Config = common.Config
 type Key = immutabledict.immutabledict[str, Any]
-
-_SUPPORTED_DTYPES: Final[frozenset[jnp.dtype]] = frozenset(
-    {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)}
-)
 
 
 def _get_kernel_module():
@@ -58,6 +53,7 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
   """Pallas-Mosaic-GPU gated linear unit."""
 
   config_cls: ClassVar[type[Config]] = Config
+  supports_symbolic_shapes: ClassVar[bool] = False
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
@@ -67,6 +63,7 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
         or gpu_utils.is_sm100(device)
     )
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
@@ -78,34 +75,49 @@ class PallasMosaicGpuGatedLinearUnit(base.GatedLinearUnit[Config, Key]):
       return_residuals: bool,
       config: Config,
   ) -> tuple[Float[Array, "*B M N"], Residuals | None]:
-    # TODO: Add support for unfused weights.
-    weights = (
-        jnp.stack(weights, axis=-2) if isinstance(weights, tuple) else weights
-    )
+    if isinstance(weights, tuple):
+      if jnp.dtype(weights[0].dtype) != jnp.dtype(weights[1].dtype):
+        raise NotImplementedError(
+            "Mosaic GPU GLU requires matching gate and projection weight"
+            f" dtypes, got {weights[0].dtype} vs {weights[1].dtype}."
+        )
+      w_dtype = weights[0].dtype
+    else:
+      w_dtype = weights.dtype
+
+    store_dtype = jnp.dtype(x.dtype)
+    preset, _, _ = common.resolve_dot_precision(store_dtype, w_dtype, precision)
+    approx_math = preset != jax.lax.DotAlgorithmPreset.F32_F32_F32
 
     activation = activation or (lambda x: x)
-    if return_residuals:
-      return base.GatedLinearUnit._fwd(  # pylint: disable=protected-access
-          self,
-          x,
-          weights,
-          activation=activation,
-          precision=precision,
-          return_residuals=True,
-          config=config,
-      )
-
-    if not precision_lib.is_default(x.dtype, weights.dtype, precision):
-      raise NotImplementedError(f"{precision=} is not supported.")
-
-    if jnp.dtype(x.dtype) not in _SUPPORTED_DTYPES:
-      raise NotImplementedError(
-          f"Mosaic GPU GLU only supports {_SUPPORTED_DTYPES}, got {x.dtype}."
-      )
-
     glu_fn = _get_kernel_module().gated_linear_unit
-    fn = functools.partial(glu_fn, activation=activation, config=config)
-    fn = self._with_vmap(fn, fallback_to_sequential=False)
+
+    def fwd_single(
+        x_arg: jax.Array, w_arg: jax.Array | tuple[jax.Array, jax.Array]
+    ):
+      all_dims = (
+          *x_arg.shape,
+          *(d for w in jax.tree.leaves(w_arg) for d in w.shape),
+      )
+      if not all(isinstance(d, int) for d in all_dims):
+        raise NotImplementedError(
+            "Mosaic GPU GLU requires static integer dimensions, got"
+            f" {x_arg.shape=} and {[w.shape for w in jax.tree.leaves(w_arg)]}."
+        )
+      x_dot, w_dot = common.prepare_dot_inputs(x_arg, w_arg, preset)
+      return glu_fn(
+          x_dot,
+          w_dot,
+          activation=activation,
+          config=config,
+          out_dtype=store_dtype,
+          return_residuals=return_residuals,
+          approx_math=approx_math,
+      )
+
+    fn = self._with_vmap(fwd_single, fallback_to_sequential=False)
+    if return_residuals:
+      return fn(x, weights)
     return fn(x, weights), None
 
   @override

@@ -16,15 +16,18 @@
 
 from collections.abc import Callable
 import dataclasses
-import functools
 import math
 from typing import ClassVar, override
 
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 import jax_triton as jt
 from jaxtyping import Array, Float  # pylint: disable=g-importing-member,g-multiple-import
+import pydantic
 from tokamax._src import gpu_utils
+from tokamax._src import jaxtyping
+from tokamax._src import pydantic as pydantic_lib
 from tokamax._src import triton_utils
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import base
@@ -49,13 +52,18 @@ def _and_masks(a, b):
 def _gated_linear_unit_kernel(
     x_ptr,
     w_ptr,
+    v_ptr,
     out_ptr,
     res_ptr,
+    batch_shape: tl.constexpr,
+    batch_strides: tl.constexpr,
+    is_batched: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
     k: tl.constexpr,
     x_strides: tl.constexpr,
     w_strides: tl.constexpr,
+    v_strides: tl.constexpr,
     out_strides: tl.constexpr,
     res_strides: tl.constexpr,
     grid_m: tl.constexpr,
@@ -69,9 +77,22 @@ def _gated_linear_unit_kernel(
     input_precision: tl.constexpr,
     activation: tl.constexpr,
     return_residuals: tl.constexpr,
+    use_int64_k_step: tl.constexpr,
 ):
   """Triton GLU kernel."""
   pid = tl.program_id(axis=0)
+  if is_batched:
+    num_mn_blocks: tl.constexpr = grid_m * grid_n
+    pid_b = (pid // num_mn_blocks).to(tl.int64)
+    pid = pid % num_mn_blocks
+    x_bstrides, w_bstrides, v_bstrides = batch_strides
+    x_ptr += triton_utils.batch_offset(pid_b, batch_shape, x_bstrides)
+    w_ptr += triton_utils.batch_offset(pid_b, batch_shape, w_bstrides)
+    if v_ptr is not None:
+      v_ptr += triton_utils.batch_offset(pid_b, batch_shape, v_bstrides)
+    out_ptr += pid_b * m * n
+    if return_residuals:
+      res_ptr += pid_b * m * 2 * n
   pid_m, pid_n = get_pids_fn(pid, grid_m, grid_n, group_size)
 
   offs_m = (
@@ -84,9 +105,6 @@ def _gated_linear_unit_kernel(
 
   stride_xm: tl.constexpr = x_strides[0]
   stride_xk: tl.constexpr = x_strides[1]
-  stride_wk: tl.constexpr = w_strides[0]
-  stride_wg: tl.constexpr = w_strides[1]
-  stride_wn: tl.constexpr = w_strides[2]
   stride_om: tl.constexpr = out_strides[0]
   stride_on: tl.constexpr = out_strides[1]
 
@@ -95,18 +113,53 @@ def _gated_linear_unit_kernel(
       + triton_utils.row_offset(offs_m, m, stride_xm)
       + offs_k[None, :] * stride_xk
   )
-  w_ptrs = (
-      w_ptr
-      + triton_utils.row_offset(offs_k, 0, stride_wk)
-      + offs_n[None, :] * stride_wn
-  )
-  v_ptrs = w_ptrs + stride_wg
-
-  gates = tl.zeros((block_m, block_n), dtype=tl.float32)
-  proj = tl.zeros((block_m, block_n), dtype=tl.float32)
+  if v_ptr is None:
+    stride_wk: tl.constexpr = w_strides[0]
+    stride_wg: tl.constexpr = w_strides[1]
+    stride_wn: tl.constexpr = w_strides[2]
+    stride_vk: tl.constexpr = stride_wk
+    w_ptrs = (
+        w_ptr
+        + triton_utils.row_offset(offs_k, 0, stride_wk)
+        + offs_n[None, :] * stride_wn
+    )
+    v_ptrs = w_ptrs + stride_wg
+  else:
+    stride_wk: tl.constexpr = w_strides[0]
+    stride_wn: tl.constexpr = w_strides[1]
+    stride_vk: tl.constexpr = v_strides[0]
+    stride_vn: tl.constexpr = v_strides[1]
+    w_ptrs = (
+        w_ptr
+        + triton_utils.row_offset(offs_k, 0, stride_wk)
+        + offs_n[None, :] * stride_wn
+    )
+    v_ptrs = (
+        v_ptr
+        + triton_utils.row_offset(offs_k, 0, stride_vk)
+        + offs_n[None, :] * stride_vn
+    )
 
   m_mask = (offs_m[:, None] < m) if m % block_m != 0 else None
   n_mask = (offs_n[None, :] < n) if n % block_n != 0 else None
+  gates = tl.zeros((block_m, block_n), dtype=tl.float32)
+  proj = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+  x_k_step = (
+      tl.full((), block_k * stride_xk, tl.int64)
+      if use_int64_k_step
+      else block_k * stride_xk
+  )
+  w_k_step = (
+      tl.full((), block_k * stride_wk, tl.int64)
+      if use_int64_k_step
+      else block_k * stride_wk
+  )
+  v_k_step = (
+      tl.full((), block_k * stride_vk, tl.int64)
+      if use_int64_k_step
+      else block_k * stride_vk
+  )
 
   for start_k in range(0, k, block_k):
     start_k = tl.multiple_of(start_k, block_k)
@@ -121,12 +174,12 @@ def _gated_linear_unit_kernel(
     w = w.to(dot_dtype)
     v = v.to(dot_dtype)
 
-    gates = tl.dot(x, w, acc=gates, input_precision=input_precision)
-    proj = tl.dot(x, v, acc=proj, input_precision=input_precision)
+    gates = triton_utils.dot(x, w, acc=gates, input_precision=input_precision)
+    proj = triton_utils.dot(x, v, acc=proj, input_precision=input_precision)
 
-    x_ptrs += block_k * stride_xk
-    w_ptrs += block_k * stride_wk
-    v_ptrs += block_k * stride_wk
+    x_ptrs += x_k_step
+    w_ptrs += w_k_step
+    v_ptrs += v_k_step
 
   out_mask = _and_masks(m_mask, n_mask)
 
@@ -140,8 +193,8 @@ def _gated_linear_unit_kernel(
         + offs_n[None, :] * stride_res_n
     )
     res_ptrs_1 = res_ptrs_0 + stride_res_g
-    tl.store(res_ptrs_0, gates.to(x_ptr.dtype.element_ty), mask=out_mask)
-    tl.store(res_ptrs_1, proj.to(x_ptr.dtype.element_ty), mask=out_mask)
+    tl.store(res_ptrs_0, gates.to(res_ptr.dtype.element_ty), mask=out_mask)
+    tl.store(res_ptrs_1, proj.to(res_ptr.dtype.element_ty), mask=out_mask)
 
   if activation is not None:
     gates = activation(gates)
@@ -155,30 +208,114 @@ def _gated_linear_unit_kernel(
   tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+@pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
-  block_m: int
-  block_n: int
-  block_k: int
-  num_warps: int
-  num_stages: int
+  block_m: pydantic_lib.PowerOfTwo
+  block_n: pydantic_lib.PowerOfTwo
+  block_k: pydantic_lib.PowerOfTwo
+  num_warps: pydantic_lib.PowerOfTwo
+  num_stages: pydantic.PositiveInt
 
 
-def _get_best_block_size(m: int, n: int) -> tuple[int, int, int]:
-  """Returns the best block size for the given shape."""
-  min_block_dim = 32
-  block_m = min(max(min_block_dim, triton.next_power_of_2(m)), 128)
-  block_n = min(max(min_block_dim, triton.next_power_of_2(n)), 256)
-  block_n = min(block_n, (128 * 128) // block_m)
-  block_k = 32
-  num_sms = jax.devices()[0].core_count
-  num_blocks = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
-  while num_blocks < num_sms:
-    if block_m == min_block_dim:
-      break
-    block_m //= 2
-    num_blocks = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
-  return block_m, block_n, block_k
+def _unbatched_weights_x_shape(x, weights) -> tuple[int, ...]:
+  """Returns effective `x` shape after collapsing unbatched-weights vmap axes."""
+  x_vmap_axes = getattr(x, 'vmap_axes', ())
+  if not x_vmap_axes:
+    return x.shape
+  w_leaves = jax.tree.leaves(weights)
+  shape = list(x.shape)
+  for i in range(len(x_vmap_axes) - 1, -1, -1):
+    x_axis = x_vmap_axes[i]
+    w_batched = any(
+        i < len(w_axes := getattr(w, 'vmap_axes', ()))
+        and w_axes[i] is not None
+        for w in w_leaves
+    )
+    if x_axis is not None and not w_batched:
+      shape.insert(*x_axis)
+  return tuple(shape)
+
+
+def _max_smem_bytes() -> int:
+  if gpu_utils.is_sm90() or gpu_utils.is_sm100():
+    return 224 * 1024
+  return 160 * 1024
+
+
+def _smem_bytes(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_stages: int,
+    x_itemsize: int,
+    w_pair_itemsize: int,
+) -> int:
+  return (
+      max(1, num_stages)
+      * block_k
+      * (block_m * x_itemsize + block_n * w_pair_itemsize)
+  )
+
+
+def _is_valid_config(
+    cfg: Config,
+    *,
+    x_itemsize: int,
+    w_pair_itemsize: int,
+    input_precision: str | None,
+    max_smem: int,
+) -> bool:
+  is_multi_or_simt = input_precision in (
+      'ieee',
+      'bf16x3',
+      'bf16x6',
+      'tf32x3',
+  )
+  max_area = 64 * 128 if is_multi_or_simt else 128 * 128
+  if cfg.block_m * cfg.block_n > max_area:
+    return False
+  if cfg.block_m * cfg.block_n >= 128 * 128 and cfg.num_warps < 8:
+    return False
+  if (
+      _smem_bytes(
+          cfg.block_m,
+          cfg.block_n,
+          cfg.block_k,
+          cfg.num_stages,
+          x_itemsize,
+          w_pair_itemsize,
+      )
+      > max_smem
+  ):
+    return False
+  return True
+
+
+def _extract_problem_info(
+    ba: op.BoundArguments,
+) -> tuple[int, int, int, int, int, str | None]:
+  """Extracts `(m, n, k, x_itemsize, w_pair_itemsize, input_precision)`."""
+  x = ba.arguments['x']
+  weights = ba.arguments['weights']
+  x_shape = _unbatched_weights_x_shape(x, weights)
+  m = math.prod(x_shape[:-1])
+  k = x_shape[-1]
+  w_leaves = jax.tree.leaves(weights)
+  n = w_leaves[0].shape[-1]
+  x_itemsize = jnp.dtype(x.dtype).itemsize
+  w_pair_itemsize = (
+      sum(jnp.dtype(w.dtype).itemsize for w in w_leaves)
+      if isinstance(weights, tuple)
+      else 2 * jnp.dtype(weights.dtype).itemsize
+  )
+  rhs_dtype = jnp.result_type(*(w.dtype for w in w_leaves))
+  try:
+    _, input_precision = triton_utils.get_dot_dtype_and_precision(
+        ba.arguments['precision'], x.dtype, rhs_dtype
+    )
+  except (NotImplementedError, KeyError):
+    input_precision = None
+  return m, n, k, x_itemsize, w_pair_itemsize, input_precision
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -188,6 +325,7 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
+  @jaxtyping.jaxtyped
   @override
   def _fwd(
       self,
@@ -200,37 +338,61 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       config: Config,
   ) -> tuple[Float[Array, '*B M N'], Residuals | None]:
     supported_dtypes = {jnp.float16, jnp.bfloat16, jnp.float32}
-    if x.dtype.type not in supported_dtypes:
-      raise NotImplementedError(
-          f'Triton kernel does not support input datatype {x.dtype}. Must be'
-          f' one of {supported_dtypes}.'
-      )
+    for arr in (x, *jax.tree.leaves(weights)):
+      if arr.dtype.type not in supported_dtypes:
+        raise NotImplementedError(
+            f'Triton kernel does not support input datatype {arr.dtype}. Must'
+            f' be one of {supported_dtypes}.'
+        )
 
     block_m = config.block_m
     block_n = config.block_n
     block_k = config.block_k
 
-    # TODO: Avoid stacking weights.
-    weights = (
-        jnp.stack(weights, axis=1) if isinstance(weights, tuple) else weights
-    )
-
     triton_act = triton_utils.get_triton_activation(activation)
+    rhs_dtype = jnp.result_type(*jax.tree.leaves(weights))
+    res_dtype = jnp.result_type(x.dtype, rhs_dtype)
     dot_dtype, input_precision = triton_utils.get_dot_dtype_and_precision(
-        precision, x.dtype, weights.dtype
+        precision, x.dtype, rhs_dtype
     )
 
     def fn(x, weights):
-      out_shape = x.shape[:-1] + (weights.shape[-1],)
+      if isinstance(weights, tuple):
+        w, v = weights
+      else:
+        w, v = weights, None
+      n = w.shape[-1]
+      out_shape = x.shape[:-1] + (n,)
       x = jax.lax.collapse(x, 0, -1)
       m, k = x.shape
-      n = weights.shape[-1]
+      if v is not None:
+        if w.shape != (k, n) or v.shape != (k, n):
+          raise ValueError(
+              f'Incompatible shapes: x={x.shape}, weights=({w.shape},'
+              f' {v.shape})'
+          )
+      elif w.shape != (k, 2, n):
+        raise ValueError(f'Incompatible shapes: x={x.shape}, weights={w.shape}')
+      if m == 0 or n == 0 or k == 0:
+        out = jnp.zeros(out_shape, dtype=x.dtype)
+        residuals = (
+            jnp.zeros(out_shape[:-1] + (2, n), dtype=res_dtype)
+            if return_residuals
+            else None
+        )
+        return out, residuals
+
       # We re-order the program IDs to minimize cache usage.
       grid_m = triton.cdiv(m, block_m)
       grid_n = triton.cdiv(n, block_n)
 
       block_m_cost = block_m * k * jnp.dtype(x.dtype).itemsize
-      block_n_cost = block_n * k * jnp.dtype(weights.dtype).itemsize * 2
+      w_itemsize = (
+          jnp.dtype(w.dtype).itemsize + jnp.dtype(v.dtype).itemsize
+          if v is not None
+          else jnp.dtype(w.dtype).itemsize * 2
+      )
+      block_n_cost = block_n * k * w_itemsize
       group_size, get_pids_fn = triton_utils.get_cheapest_grid_pids(
           grid_m=grid_m,
           grid_n=grid_n,
@@ -244,45 +406,71 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
       if return_residuals:
         name += '_fwd_res'
 
-      out_shapes = (
-          jax.ShapeDtypeStruct((m, n), x.dtype),
-          jax.ShapeDtypeStruct(
-              (m, 2, n) if return_residuals else (0,), x.dtype
-          ),
+      x_strides = jt.strides_from_shape(x.shape)
+      w_strides = jt.strides_from_shape(w.shape)
+      v_strides = () if v is None else jt.strides_from_shape(v.shape)
+      out_strides = jt.strides_from_shape((m, n))
+      res_strides = (
+          jt.strides_from_shape((m, 2, n)) if return_residuals else ()
       )
 
-      out, residuals = jt.triton_call(
-          x,
-          weights,
-          kernel=_gated_linear_unit_kernel,
-          out_type=out_shapes,
-          grid=(grid_m * grid_n,),
-          name=name,
-          num_warps=config.num_warps,
-          num_stages=config.num_stages,
-          m=m,
-          n=n,
-          k=k,
-          x_strides=jt.strides_from_shape(x.shape),
-          w_strides=jt.strides_from_shape(weights.shape),
-          out_strides=jt.strides_from_shape(out_shapes[0].shape),
-          res_strides=(
-              jt.strides_from_shape(out_shapes[1].shape)
-              if return_residuals
-              else ()
-          ),
-          grid_m=grid_m,
-          grid_n=grid_n,
-          group_size=group_size,
-          get_pids_fn=get_pids_fn,
-          block_m=block_m,
-          block_n=block_n,
-          block_k=block_k,
-          dot_dtype=dot_dtype,
-          input_precision=input_precision,
-          activation=triton_act,
-          return_residuals=return_residuals,
+      k_padded = triton.cdiv(k, block_k) * block_k
+      use_int64_k_step = (
+          max(
+              k_padded * x_strides[1],
+              k_padded * w_strides[0],
+              0 if v is None else k_padded * v_strides[0],
+          )
+          > 2**31 - 1
       )
+
+      @triton_utils.vmap_kernel
+      def launch(batch_shape, batch_strides, x, w, v):
+        out_shapes = (
+            jax.ShapeDtypeStruct((*batch_shape, m, n), x.dtype),
+            jax.ShapeDtypeStruct(
+                (*batch_shape, m, 2, n)
+                if return_residuals
+                else (*batch_shape, 0),
+                res_dtype,
+            ),
+        )
+        return jt.triton_call(
+            x,
+            w,
+            v_ptr=v,
+            kernel=_gated_linear_unit_kernel,
+            out_type=out_shapes,
+            grid=(math.prod(batch_shape) * grid_m * grid_n,),
+            name=name,
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+            batch_shape=batch_shape,
+            batch_strides=batch_strides,
+            is_batched=bool(batch_shape),
+            m=m,
+            n=n,
+            k=k,
+            x_strides=x_strides,
+            w_strides=w_strides,
+            v_strides=v_strides,
+            out_strides=out_strides,
+            res_strides=res_strides,
+            grid_m=grid_m,
+            grid_n=grid_n,
+            group_size=group_size,
+            get_pids_fn=get_pids_fn,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            dot_dtype=dot_dtype,
+            input_precision=input_precision,
+            activation=triton_act,
+            return_residuals=return_residuals,
+            use_int64_k_step=use_int64_k_step,
+        )
+
+      out, residuals = launch(x, w, v)
 
       if return_residuals:
         residuals = residuals.reshape(out_shape[:-1] + (2, n))
@@ -296,41 +484,124 @@ class TritonGatedLinearUnit(base.GatedLinearUnit[Config, None]):
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    x, weights = ba.args  # TODO: Use batched args.
-    m = math.prod(x.shape[:-1])
-    n = weights[0].shape[-1] if isinstance(weights, tuple) else weights.shape[2]
-    if n >= m:  # Prefer `block_n` > `block_m`.
-      block_m, block_n, block_k = _get_best_block_size(m, n)
-    else:
-      block_n, block_m, block_k = _get_best_block_size(n, m)
+    m, n, k, x_itemsize, w_pair_itemsize, input_precision = (
+        _extract_problem_info(ba)
+    )
+    if m == 0 or n == 0 or k == 0:
+      return Config(
+          block_m=32, block_n=32, block_k=32, num_warps=4, num_stages=1
+      )
+
+    is_wgmma_or_tcgen05 = (
+        gpu_utils.is_sm90() or gpu_utils.is_sm100()
+    ) and input_precision != 'ieee'
+    min_block_m = 64 if is_wgmma_or_tcgen05 else 32
+    min_block_n = 32
+    is_multi_or_simt = input_precision in (
+        'ieee',
+        'bf16x3',
+        'bf16x6',
+        'tf32x3',
+    )
+    max_area = 64 * 128 if is_multi_or_simt else 128 * 128
+
+    block_m = min(max(min_block_m, triton.next_power_of_2(m)), 128)
+    # Gate and projection hold separate RHS tiles and float32 accumulators.
+    block_n = min(
+        max(min_block_n, triton.next_power_of_2(n) // 2),
+        128,
+        max_area // block_m,
+    )
+    num_sms = getattr(backend.get_default_device(), 'core_count', 1)
+    while (
+        triton.cdiv(m, block_m) * triton.cdiv(n, block_n) < num_sms
+        and block_m > min_block_m
+    ):
+      block_m //= 2
+    while (
+        triton.cdiv(m, block_m) * triton.cdiv(n, block_n) < num_sms
+        and block_n > max(min_block_n, 64)
+    ):
+      block_n //= 2
+
+    block_k = (
+        64 if (k >= 64 and x_itemsize <= 2 and w_pair_itemsize <= 4) else 32
+    )
+    max_smem = _max_smem_bytes()
+    num_stages = min(4, max(1, triton.cdiv(k, block_k)))
+    while (
+        num_stages > 1
+        and _smem_bytes(
+            block_m, block_n, block_k, num_stages, x_itemsize, w_pair_itemsize
+        )
+        > max_smem
+    ):
+      num_stages -= 1
+    if (
+        _smem_bytes(
+            block_m, block_n, block_k, num_stages, x_itemsize, w_pair_itemsize
+        )
+        > max_smem
+        and block_k > 32
+    ):
+      block_k = 32
+
+    num_warps = 8 if block_m * block_n >= 128 * 64 else 4
     return Config(
         block_m=block_m,
-        block_n=block_n // 2,  # We have two blocks for RHS, so halve `block_n`.
+        block_n=block_n,
         block_k=block_k,
-        num_warps=4,
-        num_stages=4,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
+  @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    # Simple autotuning search space that can be improved upon.
-    x, weights = ba.args  # TODO: Use batched args.
-    m_pow2 = triton.next_power_of_2(math.prod(x.shape[:-1]))
-    n = weights[0].shape[-1] if isinstance(weights, tuple) else weights.shape[2]
-    n_pow2 = triton.next_power_of_2(n)
+    m, n, k, x_itemsize, w_pair_itemsize, input_precision = (
+        _extract_problem_info(ba)
+    )
+    if m == 0 or n == 0 or k == 0:
+      return set()
+
+    is_wgmma_or_tcgen05 = (
+        gpu_utils.is_sm90() or gpu_utils.is_sm100()
+    ) and input_precision != 'ieee'
+    min_block_m = 64 if is_wgmma_or_tcgen05 else 32
+    m_pow2 = max(min_block_m, triton.next_power_of_2(m))
+    n_pow2 = max(32, triton.next_power_of_2(n))
+    block_m_cands = tuple(
+        bm for bm in (32, 64, 128) if min_block_m <= bm <= m_pow2
+    )
+    block_n_cands = tuple(bn for bn in (32, 64, 128) if bn <= n_pow2)
+    block_k_cands = (
+        (32, 64)
+        if (k >= 64 and x_itemsize <= 2 and w_pair_itemsize <= 4)
+        else (32,)
+    )
+    max_smem = _max_smem_bytes()
+
     autotuning_configs = set()
-    for block_m in (32, *filter(lambda x: x <= m_pow2, (64, 128))):
-      for block_n in (32, *filter(lambda x: x <= n_pow2, (64, 128, 256))):
-        for num_warps in (4, 8):
-          for num_stages in range(1, 6):
-            autotuning_configs.add(
-                Config(
-                    block_m=block_m,
-                    block_n=block_n,
-                    block_k=32,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
-            )
+    for block_m in block_m_cands:
+      for block_n in block_n_cands:
+        for block_k in block_k_cands:
+          max_stages = min(5, max(1, triton.cdiv(k, block_k)))
+          for num_warps in (4, 8):
+            for num_stages in range(1, max_stages + 1):
+              cfg = Config(
+                  block_m=block_m,
+                  block_n=block_n,
+                  block_k=block_k,
+                  num_warps=num_warps,
+                  num_stages=num_stages,
+              )
+              if _is_valid_config(
+                  cfg,
+                  x_itemsize=x_itemsize,
+                  w_pair_itemsize=w_pair_itemsize,
+                  input_precision=input_precision,
+                  max_smem=max_smem,
+              ):
+                autotuning_configs.add(cfg)
     return autotuning_configs
 
   @override

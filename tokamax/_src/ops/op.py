@@ -273,8 +273,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out, residuals = self._fwd(*args, config=config, **kwargs)
 
       ret = (out, residuals) if return_residuals else out
-      full_residuals = Residuals(args, kwargs, out, residuals)
-      return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      if self.vjp is None:
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      return ret, (out, residuals)
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
@@ -286,12 +288,20 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
       # provided, as we use `custom_batching` to capture the batched arguments,
       # and `custom_batching` doesn't support `jax.vjp`.
+      fwd_vjp = fwd
+
       @self._capture_batched_args
       def bwd(f_vjp, dout, batched_args):
         del batched_args  # Unused.
         return f_vjp(dout[0] if return_residuals else dout)
-
     else:
+
+      def fwd_vjp(*arrays):
+        ret, (out, residuals) = fwd(*arrays, fwd_res=True)
+        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        kwargs["return_residuals"] = True
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined
         residuals = residuals.tree.unflatten(residuals.values)
@@ -326,7 +336,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
     f = jax.custom_vjp(f)
-    f.defvjp(fwd, bwd, optimize_remat=True)
+    f.defvjp(fwd_vjp, bwd, optimize_remat=True)
     return f(*arrays)
 
   def bind(
