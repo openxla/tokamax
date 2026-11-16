@@ -79,6 +79,52 @@ class ComputeConfig:
   dynamic_quant: tensor_spec.SubchannelQuantSpec | None
 
 
+def _make_compute_config(
+    x_dtype: jnp.dtype,
+    matmul_dtype: jnp.dtype,
+    *,
+    w: tensor_spec.WeightSpec,
+    acc_dtype: jnp.dtype,
+    block_size: int | None,
+    tpu_info: pltpu.TpuInfo,
+) -> ComputeConfig:
+  """Builds the `ComputeConfig` for one projection from its LHS dtype."""
+  dynamic_quant = None
+  if matmul_dtype != x_dtype:
+    if block_size is None:
+      raise ValueError(
+          "x_quant_block_size must be set when matmul_dtype != x.dtype."
+      )
+    dynamic_quant = tensor_spec.SubchannelQuantSpec(block_size=block_size)
+  if dynamic_quant is not None and w.quant is not None:
+    matmul_mode = MatmulMode.QUANTIZED
+  elif plan_lib.dequantizes_w_before_matmul(
+      x_dtype=x_dtype, matmul_dtype=matmul_dtype, w=w, tpu_info=tpu_info
+  ):
+    matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
+  elif dynamic_quant is None and w.quant is not None:
+    matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
+  elif dynamic_quant is None and w.quant is None:
+    matmul_mode = MatmulMode.UNQUANTIZED
+  else:
+    raise NotImplementedError("Quantizing x requires a quantized w.")
+  return ComputeConfig(
+      matmul_mode=matmul_mode,
+      matmul_dtype=matmul_dtype,
+      acc_dtype=acc_dtype,
+      tpu_info=tpu_info,
+      dynamic_quant=dynamic_quant,
+  )
+
+
+def _check_lhs_not_narrower(lhs_dtype: jnp.dtype, w_dtype: jnp.dtype) -> None:
+  if jax.dtypes.itemsize_bits(lhs_dtype) < jax.dtypes.itemsize_bits(w_dtype):
+    raise ValueError(
+        f"matmul_dtype ({lhs_dtype}) must not be narrower than w dtype"
+        f" ({w_dtype})."
+    )
+
+
 def _resolve_mode(routing: tensor_spec.RoutingSpec | None) -> RoutingMode:
   """Resolves the DMA routing mode from a routing specification."""
   if routing is None:
@@ -154,36 +200,24 @@ class RoutingGmmConfig:
     # Because x only states the input storage dtype while plan states the MXU
     # execution dtype, neither alone defines whether dynamic quantization runs.
     # Config reconciles both into ComputeConfig.
-    x_quant = None
-    if plan.matmul_dtype != spec.x.dtype:
-      assert plan.x_quant_block_size is not None
-      x_quant = tensor_spec.SubchannelQuantSpec(
-          block_size=plan.x_quant_block_size
-      )
-
-    if x_quant is not None and spec.w.quant is not None:
-      matmul_mode = MatmulMode.QUANTIZED
-    elif plan_lib.dequantizes_w_before_matmul(
-        x_dtype=spec.x.dtype,
-        matmul_dtype=plan.matmul_dtype,
+    compute_cfg = _make_compute_config(
+        spec.x.dtype,
+        plan.matmul_dtype,
         w=spec.w,
-        tpu_info=tpu_info,
-    ):
-      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
-    elif x_quant is None and spec.w.quant is not None:
-      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
-    elif x_quant is None and spec.w.quant is None:
-      matmul_mode = MatmulMode.UNQUANTIZED
-    else:
-      raise NotImplementedError("Quantizing x requires a quantized w.")
-
-    compute_cfg = ComputeConfig(
-        matmul_mode=matmul_mode,
-        matmul_dtype=plan.matmul_dtype,
         acc_dtype=plan.acc_dtype,
+        block_size=plan.x_quant_block_size,
         tpu_info=tpu_info,
-        dynamic_quant=x_quant,
     )
+    compute2_cfg = None
+    if spec.w2 is not None and plan.w2_matmul_dtype is not None:
+      compute2_cfg = _make_compute_config(
+          spec.x.dtype,
+          plan.w2_matmul_dtype,
+          w=spec.w2,
+          acc_dtype=plan.acc_dtype,
+          block_size=plan.x_quant_block_size,
+          tpu_info=tpu_info,
+      )
     out_spec = _resolve_out_spec(spec=spec, plan=plan, out_format=out_format)
 
     cfg = cls(
@@ -191,7 +225,7 @@ class RoutingGmmConfig:
         plan=plan,
         x=ActivationConfig(spec=spec.x, mode=_resolve_mode(spec.gather)),
         compute=compute_cfg,
-        compute2=None if spec.w2 is None else compute_cfg,
+        compute2=compute2_cfg,
         out=ActivationConfig(spec=out_spec, mode=_resolve_mode(spec.scatter)),
         tpu_info=tpu_info,
     )
@@ -204,29 +238,31 @@ class RoutingGmmConfig:
   def _validate_dtypes(self) -> None:
     """Validates precision and quantization invariants."""
     w, w2 = self.spec.w, self.spec.w2
+    if (w2 is None) != (self.plan.w2_matmul_dtype is None):
+      raise ValueError("w2 and plan.w2_matmul_dtype must be set together.")
     if w2 is not None and (
         w2.dtype != w.dtype or (w2.quant is None) != (w.quant is None)
     ):
       # The intermediate is fed to the second matmul in x's execution dtype,
       # which is only valid when both weights share a precision.
       raise NotImplementedError("w2 must match the precision of w.")
+    w2_quant = None if self.compute2 is None else self.compute2.dynamic_quant
     if (
         self.compute.dynamic_quant is None
+        and w2_quant is None
         and self.plan.x_quant_block_size is not None
     ):
       raise ValueError(
-          "plan.x_quant_block_size has no effect when x is not quantized."
+          "plan.x_quant_block_size has no effect when neither x nor the w2"
+          " input is quantized."
       )
     if self.plan.acc_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype):
       raise ValueError(
           f"acc_dtype must be bfloat16 or float32. Got {self.plan.acc_dtype}."
       )
-    x_bits = jax.dtypes.itemsize_bits(self.plan.matmul_dtype)
-    if x_bits < jax.dtypes.itemsize_bits(w.dtype):
-      raise ValueError(
-          f"matmul_dtype ({self.plan.matmul_dtype}) must not be narrower"
-          f" than w dtype ({w.dtype})."
-      )
+    _check_lhs_not_narrower(self.plan.matmul_dtype, w.dtype)
+    if w2 is not None and self.plan.w2_matmul_dtype is not None:
+      _check_lhs_not_narrower(self.plan.w2_matmul_dtype, w2.dtype)
 
   def _validate_out(self) -> None:
     """Validates output dtype, quantization, and chunk alignment."""

@@ -931,6 +931,55 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     expected = np.asarray(expected, np.float32)
     self.assertLessEqual(_rel_diff(deq, expected), 2**-3)
 
+  @parameterized.parameters(None, 256)
+  def test_decode_mixed_precision_w2_matches_reference(
+      self, w_q_block_size: int | None
+  ) -> None:
+    case_spec = helper_cases.DECODE_16
+    if w_q_block_size is not None:
+      shape = dataclasses.replace(
+          case_spec.shape, w_quant_block_size=w_q_block_size
+      )
+      case_spec = dataclasses.replace(case_spec, shape=shape)
+    case = gmm_test_lib.GmmCase.make_case(
+        case_spec, quant_w1=True, quant_w2=True
+    )
+    routing = case.routing
+    kwargs = dict(
+        w2=case.w2,
+        gather=routing.gather,
+        scatter=routing.scatter,
+        fuse_act="silu",
+        **routing.kernel_kwargs,
+    )
+    mixed_w2 = kernel.routing_gmm(case.x_compact, case.w1, **kwargs)
+    quant_w2 = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=FP8),
+        **kwargs,
+    )
+    expected = helper_reference.reference_gmm(
+        case.x_sorted[routing.row_start : routing.row_end],
+        case.w1,
+        routing.local_group_sizes,
+        w2=case.w2,
+        fuse_act="silu",
+    )
+    rows = routing.scattered_rows
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(mixed_w2)[rows],
+        expected,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(mixed_w2)[rows],
+        gmm_test_lib.to_large_layout(quant_w2)[rows],
+        rtol=6e-2,
+        atol=6e-2,
+    )
+
 
 class RemoteRoutingGmmUnitTest(parameterized.TestCase):
 

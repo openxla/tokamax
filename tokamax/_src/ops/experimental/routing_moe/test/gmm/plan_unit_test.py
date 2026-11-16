@@ -336,6 +336,70 @@ class NumWBuffersTest(parameterized.TestCase):
         self.assertEqual(resolved.num_w_buffers, 2)
 
 
+class W2MatmulDtypeTest(parameterized.TestCase):
+  """Checks automatic mixed-precision selection for the down projection."""
+
+  def test_small_tile_uses_unquantized_lhs_when_hw_supports_mixed_matmul(self):
+    resolved = _resolve(8, with_down=True)
+    self.assertEqual(resolved.matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.bfloat16))
+
+  def test_large_tile_uses_quantized_lhs(self):
+    resolved = _resolve(512, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_explicit_matmul_dtype_overrides_w2(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_explicit_w2_matmul_dtype_is_kept(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(w2_matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_w2_matmul_dtype_without_down_projection_raises(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(w2_matmul_dtype=jnp.bfloat16)
+    with self.assertRaisesRegex(ValueError, "w2_matmul_dtype requires w2"):
+      _resolve(8, custom_plan, with_down=False)
+
+  def test_w2_matmul_dtype_without_fusion_raises(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(
+        fuse_up_and_down=False, w2_matmul_dtype=jnp.bfloat16
+    )
+    with self.assertRaisesRegex(
+        ValueError, "w2_matmul_dtype requires fuse_up_and_down=True"
+    ):
+      _resolve(8, custom_plan, with_down=True)
+
+  def test_w2_matmul_dtype_is_none_without_down_projection(self):
+    self.assertIsNone(_resolve(8, with_down=False).w2_matmul_dtype)
+
+  def test_falls_back_to_quantized_lhs_without_mixed_matmul_support(self):
+    # TPU 7x has no native bf16 x int8 matmul.
+    resolved = _resolve(8, with_down=True, w_dtype=jnp.dtype(jnp.int8))
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.int8))
+
+  def test_small_w2_quant_block_uses_quantized_lhs(self):
+    gmm_spec = _make_spec(8, with_down=True)
+    assert gmm_spec.w2 is not None
+    small_block_w2 = dataclasses.replace(
+        gmm_spec.w2, quant=spec.SubchannelQuantSpec(block_size=128)
+    )
+    gmm_spec = dataclasses.replace(gmm_spec, w2=small_block_w2)
+    out_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=gmm_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=gmm_spec, out_format=out_fmt, tpu_info=_tpu_info()
+    )
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+
 class QuantStashPlanTest(parameterized.TestCase):
 
   def test_unquantized_out_resolves_stash_fields_to_none(self):

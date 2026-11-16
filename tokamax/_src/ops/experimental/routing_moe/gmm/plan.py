@@ -55,6 +55,9 @@ class RoutingGmmPlan:
   # Dtype in which inputs are fed to the MXU. Performs dynamic quantization if
   # the dtype does not match with storage dtype.
   matmul_dtype: jax.typing.DTypeLike | None = None
+  # Dtype in which the intermediate is fed to the MXU for the fused down
+  # projection `w2`.
+  w2_matmul_dtype: jax.typing.DTypeLike | None = None
   # Block size if dynamic quantization is performed.
   x_quant_block_size: int | None = None
   # VMEM staging dtype for output tiles before output quantization.
@@ -104,6 +107,8 @@ class ResolvedGmmPlan:
   num_stash_buffers: int | None
   acc_dtype: jnp.dtype
   matmul_dtype: jnp.dtype
+  # It is None unless w2 is set.
+  w2_matmul_dtype: jnp.dtype | None
   # It is None unless x is dynamically quantized.
   x_quant_block_size: int | None
   # It is None unless the output is quantized.
@@ -168,6 +173,8 @@ class ResolvedGmmPlan:
       raise ValueError("tile_k2 requires w2 to be set.")
     if spec.w2 is None and plan.fuse_up_and_down:
       raise ValueError("fuse_up_and_down=True requires w2 to be set.")
+    if spec.w2 is None and plan.w2_matmul_dtype is not None:
+      raise ValueError("w2_matmul_dtype requires w2 to be set.")
 
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
@@ -183,6 +190,16 @@ class ResolvedGmmPlan:
         vmem_limit_bytes=int(vmem_usage_fraction * vmem_limit_bytes),
         tpu_info=tpu_info,
     )
+    if not fuse_up_and_down and plan.w2_matmul_dtype is not None:
+      raise ValueError("w2_matmul_dtype requires fuse_up_and_down=True.")
+    w2_matmul_dtype = _resolve_w2_matmul_dtype(
+        plan,
+        x=spec.x,
+        w2=spec.w2,
+        matmul_dtype=matmul_dtype,
+        tile_m=tiling.tile_m,
+        tpu_info=tpu_info,
+    )
     resolved = cls(
         tile_m=tiling.tile_m,
         tile_k=tiling.tile_k,
@@ -194,6 +211,7 @@ class ResolvedGmmPlan:
         num_stash_buffers=num_stash_buffers,
         acc_dtype=acc_dtype,
         matmul_dtype=matmul_dtype,
+        w2_matmul_dtype=w2_matmul_dtype,
         x_quant_block_size=x_quant_block_size,
         stash_dtype=stash_dtype,
         fuse_up_and_down=fuse_up_and_down,
@@ -526,6 +544,49 @@ def _resolve_stash(
   return num_stash_buffers, stash_dtype
 
 
+def _resolve_w2_matmul_dtype(
+    plan: RoutingGmmPlan,
+    *,
+    x: tensor_spec.ActivationSpec,
+    w2: tensor_spec.WeightSpec | None,
+    matmul_dtype: jnp.dtype,
+    tile_m: int,
+    tpu_info: pltpu.TpuInfo,
+) -> jnp.dtype | None:
+  """Resolves the LHS execution dtype for the fused down projection `w2`.
+
+  Args:
+    plan: User plan. `w2_matmul_dtype` and `matmul_dtype` overrides are kept.
+    x: Input activation spec.
+    w2: Down-projection weight spec, or None if there is no `w2`.
+    matmul_dtype: Resolved MXU input dtype of the gate/up projection.
+    tile_m: Resolved row tile size.
+    tpu_info: TPU the kernel runs on.
+
+  Returns:
+    None when there is no `w2`, otherwise the dtype the intermediate is fed to
+    the MXU in.
+  """
+  if w2 is None:
+    return None
+  if plan.w2_matmul_dtype is not None:
+    return jnp.dtype(plan.w2_matmul_dtype)
+  if plan.matmul_dtype is not None:
+    return matmul_dtype
+  # On small tiles, dynamically quantizing the intermediate activation costs
+  # more on VPU than feeding it directly to a hardware mixed-precision MXU,
+  # provided w2's quantization block is at least mxu_column_size (narrower
+  # blocks would dequantize the full w2 weight tensor before matmul).
+  if (
+      isinstance(w2.quant, tensor_spec.SubchannelQuantSpec)
+      and w2.quant.block_size >= tpu_info.mxu_column_size
+      and tile_m <= 2 * tpu_info.num_sublanes
+      and tpu_info.is_matmul_supported(x.dtype, w2.dtype)
+  ):
+    return x.dtype
+  return matmul_dtype
+
+
 def _supports_fusion(
     plan: RoutingGmmPlan, *, spec: gmm_spec_lib.RoutingGmmSpec
 ) -> bool:
@@ -660,8 +721,21 @@ def _fused_tiling(
   )
 
   def try_fit(tile_m: int, tile_k2: int, bucket_base: int) -> Tiling | None:
+    w2_matmul_dtype = _resolve_w2_matmul_dtype(
+        plan,
+        x=x,
+        w2=w2,
+        matmul_dtype=matmul_dtype,
+        tile_m=tile_m,
+        tpu_info=tpu_info,
+    )
     num_w_buffers = _max_fitting_w_buffers(
-        lambda n: estimate_vmem(tile_m=tile_m, tile_k2=tile_k2, num_w_buffers=n)
+        lambda n: estimate_vmem(
+            tile_m=tile_m,
+            tile_k2=tile_k2,
+            num_w_buffers=n,
+            w2_matmul_dtype=w2_matmul_dtype,
+        )
         <= vmem_limit_bytes,
         min_num_w_buffers=min_num_w_buffers,
         max_num_w_buffers=max_num_w_buffers,
@@ -799,6 +873,7 @@ def _vmem_estimate(
     w2: tensor_spec.WeightSpec | None = None,
     is_fused_act: bool = False,
     matmul_dtype: jnp.dtype,
+    w2_matmul_dtype: jnp.dtype | None = None,
     acc_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
     out_quant: out_format_lib.ResolvedQuantFormat | None = None,
@@ -813,11 +888,6 @@ def _vmem_estimate(
     tpu_info: pltpu.TpuInfo,
 ) -> int:
   """Estimates VMEM usage in bytes for routing GMM."""
-  is_dynamic_quantized = matmul_dtype != x.dtype
-  is_w_dequantized_before = dequantizes_w_before_matmul(
-      x_dtype=x.dtype, matmul_dtype=matmul_dtype, w=w, tpu_info=tpu_info
-  )
-  matmul_bits = jax.dtypes.itemsize_bits(matmul_dtype)
   acc_bits = jax.dtypes.itemsize_bits(acc_dtype)
 
   # Chunk size equals the bytes of a single sublane.
@@ -838,23 +908,40 @@ def _vmem_estimate(
     out_vmem += num_stash_buffers * tile_m * tile_n * stash_bits // 8
     out_vmem += num_stash_buffers * (1 + stash_ratio) * tile_m * chunk_bytes
 
-  estimate_matmul_vmem = functools.partial(
-      _matmul_vmem_estimate,
-      tile_m=tile_m,
-      num_w_buffers=num_w_buffers,
-      matmul_bits=matmul_bits,
-      acc_bits=acc_bits,
-      is_dynamic_quantized=is_dynamic_quantized,
-      is_w_dequantized_before=is_w_dequantized_before,
-  )
+  def _estimate_for_weight(
+      weight: tensor_spec.WeightSpec,
+      lhs_dtype: jnp.dtype,
+      k_tile: int,
+      n_tile: int,
+      num_w_refs: int,
+  ) -> int:
+    return _matmul_vmem_estimate(
+        weight,
+        k_tile,
+        n_tile,
+        num_w_refs,
+        tile_m=tile_m,
+        num_w_buffers=num_w_buffers,
+        matmul_bits=jax.dtypes.itemsize_bits(lhs_dtype),
+        acc_bits=acc_bits,
+        is_dynamic_quantized=lhs_dtype != x.dtype,
+        is_w_dequantized_before=dequantizes_w_before_matmul(
+            x_dtype=x.dtype, matmul_dtype=lhs_dtype, w=weight, tpu_info=tpu_info
+        ),
+    )
 
   num_w1_refs = 2 if is_fused_act else 1
   if w2 is None:
-    matmul_vmem = estimate_matmul_vmem(w, tile_k, tile_n, num_w1_refs)
+    matmul_vmem = _estimate_for_weight(
+        w, matmul_dtype, tile_k, tile_n, num_w1_refs
+    )
   else:
     assert tile_k2 is not None
-    matmul_vmem = estimate_matmul_vmem(w, tile_k, tile_k2, num_w1_refs)
-    matmul_vmem += estimate_matmul_vmem(w2, tile_k2, tile_n, 1)
+    w2_lhs_dtype = matmul_dtype if w2_matmul_dtype is None else w2_matmul_dtype
+    matmul_vmem = _estimate_for_weight(
+        w, matmul_dtype, tile_k, tile_k2, num_w1_refs
+    )
+    matmul_vmem += _estimate_for_weight(w2, w2_lhs_dtype, tile_k2, tile_n, 1)
     matmul_vmem += tile_m * tile_k2 * jax.dtypes.itemsize_bits(x.dtype) // 8
     if tile_k2 < w2.in_size:
       # Output accumulator kept across k2 slices (PipelineAllocs.out_acc).
