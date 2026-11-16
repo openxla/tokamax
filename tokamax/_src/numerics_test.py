@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
 from unittest import mock
 
 from absl.testing import absltest
@@ -70,6 +71,36 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(summary_diff.max_absolute_diff_values, (2.0, -2.0))
     self.assertEqual(summary_diff.max_absolute_diff, 4.0)
     self.assertEqual(summary_diff.l2_diff, 5.0)
+
+  @parameterized.parameters([True, False])
+  def test_array_diff_summary_chunked_matches_unchunked(self, equal_nan):
+    # Exercise multi-chunk boundaries with leading/trailing NaNs, infinities,
+    # and all-NaN chunks.
+    x = np.array(
+        [[np.nan, np.nan, 1.0], [10.0, np.inf, 2.0], [3.0, np.nan, 4.0]],
+        dtype=np.float32,
+    )
+    y = np.array(
+        [[np.nan, np.nan, 1.0], [7.0, 0.0, 6.0], [3.0, 1.0, 4.0]],
+        dtype=np.float32,
+    )
+    unchunked = numerics.array_diff_summary(x, y, equal_nan=equal_nan)
+    with mock.patch.object(numerics, '_DIFF_CHUNK_SIZE', 2):
+      chunked = numerics.array_diff_summary(x, y, equal_nan=equal_nan)
+
+    chex.assert_trees_all_close(
+        dataclasses.asdict(chunked), dataclasses.asdict(unchunked)
+    )
+    self.assertEqual(chunked.allclose, unchunked.allclose)
+
+    all_nan = np.full((2, 3), np.nan, dtype=np.float32)
+    with mock.patch.object(numerics, '_DIFF_CHUNK_SIZE', 2):
+      if equal_nan:
+        with self.assertRaises(ValueError):
+          numerics.array_diff_summary(all_nan, all_nan, equal_nan=True)
+      else:
+        summary = numerics.array_diff_summary(all_nan, all_nan, equal_nan=False)
+        self.assertTrue(np.isnan(summary.max_absolute_diff))
 
   def test_random_initialize_consistency(self):
     # To allow numerics comparisons over time, the random initializer should
