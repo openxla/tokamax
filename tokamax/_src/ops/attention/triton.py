@@ -994,16 +994,22 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
     devices = op.infer_devices(ba) or {backend.get_default_device()}
     is_sm80 = any(map(gpu_utils.is_sm80, devices))
 
-    if is_sm80:
-      head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
-      if head_dim_bytes >= 512:
-        num_stages = 1
+    # Unlike the VJP kernel, the forward kernel stages Q/K/V in their input
+    # dtype before casting for dot products, so shared memory scales with
+    # `q.dtype` itemsize.
+    head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
+    if head_dim_bytes >= (512 if is_sm80 else 1024):
+      num_stages = 1
+      # Work around a Triton bug on SM100 where `block_q=64` triggers
+      # `CUDA_ERROR_MISALIGNED_ADDRESS`.
+      if head_dim >= 512 and any(map(gpu_utils.is_sm100, devices)):
+        block_q = min(block_q, 32)
 
-      if _can_have_block_d(q, k, v):
-        block_qk = block_q * block_k
-        block_d = max(
-            16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
-        )
+    if is_sm80 and _can_have_block_d(q, k, v):
+      block_qk = block_q * block_k
+      block_d = max(
+          16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+      )
 
     return Config(
         block_q=block_q,
