@@ -99,7 +99,7 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
         not is_causal or q_indices is not None or k_end is not None
     ):
       if q_indices is None:
-        q_indices = jnp.arange(q.shape[-3])
+        q_indices = jnp.arange(q.shape[-3], dtype=jnp.int32)
       k_end_ = q_indices + (causal_mask.offset + 1)
       k_end = k_end_ if k_end is None else jnp.minimum(k_end, k_end_)
       if causal_mask.window_size is not None:
@@ -110,9 +110,9 @@ def decompose_mask(mask, q, k, q_indices, k_indices):
       is_causal = False
 
     if k_start is not None:
-      k_start = jax.lax.broadcast_to_rank(k_start, 2)
+      k_start = jax.lax.broadcast_to_rank(k_start, 2).astype(jnp.int32)
     if k_end is not None:
-      k_end = jax.lax.broadcast_to_rank(k_end, 2)
+      k_end = jax.lax.broadcast_to_rank(k_end, 2).astype(jnp.int32)
 
   q_len_or_indices = q.shape[-3] if q_indices is None else q_indices
   k_len_or_indices = k.shape[-3] if k_indices is None else k_indices
@@ -195,10 +195,10 @@ def extract_q_range(
   q_end = None
   if mask.q_start is not None and mask.q_start.shape[-1] == 1:
     mask, q_start = mask.take("q_start")
-    q_start = _broadcast_to_rank(q_start, q_ndim - 1)
+    q_start = jax.lax.broadcast_to_rank(q_start, q_ndim - 1).astype(jnp.int32)
   if mask.q_end is not None and mask.q_end.shape[-1] == 1:
     mask, q_end = mask.take("q_end")
-    q_end = _broadcast_to_rank(q_end, q_ndim - 1)
+    q_end = jax.lax.broadcast_to_rank(q_end, q_ndim - 1).astype(jnp.int32)
   return mask, q_start, q_end
 
 
