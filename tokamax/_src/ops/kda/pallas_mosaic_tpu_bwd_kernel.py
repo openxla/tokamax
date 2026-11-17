@@ -3711,6 +3711,9 @@ def compute_gdn_local_cp_bwd_summary(
         "per_channel_gate",
         "mini_batch",
         "two_pass_bf16",
+        "fuse_backward",
+        "fuse_rematerialization",
+        "packed_gradients",
     ],
 )
 @jaxtyping.jaxtyped
@@ -3733,6 +3736,10 @@ def chunk_kda_bwd_custom(
     per_channel_gate: bool = True,
     mini_batch: int | None = None,
     two_pass_bf16: bool = False,
+    fuse_backward: bool = False,
+    fuse_rematerialization: bool = False,
+    packed_gradients: bool = False,
+    packed_inputs: tuple[jax.Array | None, ...] | None = None,
 ) -> tuple[
     Float[Array, "H B T_ORIG K"],
     Float[Array, "H B T_ORIG K"],
@@ -3751,6 +3758,39 @@ def chunk_kda_bwd_custom(
     Float[Array, "H V"] | None,
 ]:
   """Runs the full KDA backward pipeline from forward residuals."""
+  if (
+      not two_pass_bf16
+      and per_channel_gate
+      and chunk_size == 64
+      and residuals.q_raw is None
+      and mini_batch is None
+      and (
+          fuse_backward
+          or fuse_rematerialization
+          or packed_gradients
+          or packed_inputs is not None
+      )
+  ):
+    from tokamax._src.ops.kda import pallas_mosaic_tpu_bwd_optimized as optimized
+
+    result = optimized.chunk_kda_bwd_custom(
+        scale,
+        use_qk_l2norm,
+        use_gate_in_kernel,
+        lower_bound,
+        disable_recompute,
+        context_parallel_metadata,
+        chunk_size,
+        max_num_segments,
+        has_initial_state,
+        residuals,
+        grad_outputs,
+        fuse_backward=fuse_backward,
+        fuse_rematerialization=fuse_rematerialization,
+        packed_gradients=packed_gradients,
+        packed_inputs=packed_inputs,
+    )
+    return (*result, None, None, None, None, None, None)
   do, dht = grad_outputs
   # `do` stays in its input dtype (normally bf16) and is cast to f32 inside each
   # kernel after it is loaded into VMEM. Accumulation is f32 through
@@ -3788,6 +3828,7 @@ def chunk_kda_bwd_custom(
         cu_seqlens,
         align=chunk_size,
         aligned_cu_seqlens=aligned_cu,
+        token_order=residuals.token_order,
     )
     cu_seqlens_bwd = aligned_cu
   elif do.shape[2] < q.shape[2]:
@@ -4294,6 +4335,25 @@ def chunk_kda_bwd_custom(
       packed_chunk_keep=packed_chunk_keep,
   )
 
+  # Padding chunks need not write their backward output buffers. Clear those
+  # lanes before gate-parameter reductions, rather than reducing uninitialized
+  # values or multiplying a raw-gate -inf sentinel by a zero cotangent.
+  if segment_ids is not None:
+    valid = segment_ids[None, :, :] != 0
+    if residuals.q_raw is not None:
+      dq = jnp.where(valid[..., None], dq, 0)
+      dk = jnp.where(valid[..., None], dk, 0)
+      dv = jnp.where(valid[..., None], dv, 0)
+    dg = jnp.where(valid[..., None], dg, 0)
+    if g_org is not None:
+      g_org = jnp.where(valid[..., None], g_org, 0)
+
+  # Empty sequences preserve their initial state, so their initial-state
+  # gradient is exactly the final-state cotangent (zero when not requested).
+  if dh0 is not None and cu_seqlens is not None:
+    empty = (jnp.diff(cu_seqlens, axis=-1) == 0)[..., None, None, None]
+    dh0 = jnp.where(empty, 0 if dht_m4 is None else dht_m4, dh0)
+
   dA, dbias = None, None
   if use_gate_in_kernel:
     assert g_org is not None and a_log is not None
@@ -4398,11 +4458,11 @@ def chunk_kda_bwd_custom(
       )
 
   if cu_seqlens is not None:
-    dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig)
-    dk = _unalign_output(dk, cu_seqlens, aligned_cu, T_orig)
-    dv = _unalign_output(dv, cu_seqlens, aligned_cu, T_orig)
-    dg = _unalign_output(dg, cu_seqlens, aligned_cu, T_orig)
-    db = _unalign_output(db, cu_seqlens, aligned_cu, T_orig)
+    dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig, token_order=residuals.token_unpermute)
+    dk = _unalign_output(dk, cu_seqlens, aligned_cu, T_orig, token_order=residuals.token_unpermute)
+    dv = _unalign_output(dv, cu_seqlens, aligned_cu, T_orig, token_order=residuals.token_unpermute)
+    dg = _unalign_output(dg, cu_seqlens, aligned_cu, T_orig, token_order=residuals.token_unpermute)
+    db = _unalign_output(db, cu_seqlens, aligned_cu, T_orig, token_order=residuals.token_unpermute)
   elif T_orig is not None:
     dq = dq[:, :, :T_orig, :]
     dk = dk[:, :, :T_orig, :]
