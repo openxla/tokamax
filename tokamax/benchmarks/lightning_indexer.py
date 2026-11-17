@@ -43,6 +43,19 @@ EXAMPLES = immutabledict.immutabledict({
     for spec in lightning_indexer_specs.ARG_SPECS
     if 'primary' in spec.tags
 })
+# The XLA implementation materializes all [q, heads, kv] scores, which needs
+# 132 GB of HBM for this spec.
+_XLA_EXCLUDED_SPECS = frozenset({'prefill_b1_q4096_kv262144_k2048_sal'})
+_PARAMETERS = tuple(
+    dict(
+        implementation=implementation,
+        benchmark_mode='forward',
+        args_spec_name=name,
+    )
+    for implementation in (None, 'mosaic', 'xla')
+    for name in EXAMPLES
+    if not (implementation == 'xla' and name in _XLA_EXCLUDED_SPECS)
+)
 
 
 class LightningIndexerBenchmark(parameterized.TestCase):
@@ -55,11 +68,7 @@ class LightningIndexerBenchmark(parameterized.TestCase):
       arr.delete()
     jax.clear_caches()
 
-  @parameterized.product(
-      implementation=(None, 'mosaic', 'xla'),
-      benchmark_mode=('forward',),
-      args_spec_name=tuple(EXAMPLES.keys()),
-  )
+  @parameterized.parameters(*_PARAMETERS)
   def test_lightning_indexer(
       self, implementation, benchmark_mode, args_spec_name
   ):
