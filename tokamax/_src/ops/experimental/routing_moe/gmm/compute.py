@@ -17,6 +17,7 @@
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
@@ -291,6 +292,15 @@ def matmul(
     case config.MatmulMode.QUANTIZED:
       assert w_scale is not None
       acc = _quantized_matmul(cfg, x, w, w_scale)
+    case config.MatmulMode.BLOCK_SCALED:
+      assert w_scale is not None
+      acc = block_scaled.matmul(
+          x,
+          w,
+          w_scale,
+          matmul_dtype=cfg.matmul_dtype,
+          acc_dtype=cfg.acc_dtype,
+      )
     case config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER:
       assert w_scale is not None
       acc = _scale_after_matmul(cfg, x, w, w_scale)

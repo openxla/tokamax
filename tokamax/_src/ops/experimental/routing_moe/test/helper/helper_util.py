@@ -24,6 +24,8 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 from tokamax._src import benchmarking
+from tokamax._src import block_scaled
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 
 
@@ -37,6 +39,17 @@ def skip_unless_supported(
     test_case.skipTest("Requires TPU generation >= 7.")
   if jax.device_count() < min_devices:
     test_case.skipTest(f"Requires at least {min_devices} devices.")
+
+
+def skip_unless_block_scaled_supported(
+    test_case: absltest.TestCase, *, min_devices: int = 1
+) -> None:
+  """Skips `test_case` unless block-scaled matmul and TPU_8T+ are available."""
+  if not block_scaled.is_available():
+    test_case.skipTest("Block-scaled matmul is not available in OSS.")
+  skip_unless_supported(test_case, min_devices=min_devices)
+  if not gmm_plan.is_block_scaled_tpu(pltpu.get_tpu_info()):
+    test_case.skipTest("Block-scaled matmul requires TPU_8T or newer.")
 
 
 def check_gmm_supported(

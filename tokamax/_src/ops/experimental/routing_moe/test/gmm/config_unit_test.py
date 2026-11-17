@@ -15,6 +15,7 @@
 """Unit tests for RoutingGmmConfig."""
 
 import dataclasses
+from typing import Any, cast
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,6 +25,7 @@ from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config as gmm_config
+from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 
@@ -635,6 +637,38 @@ class OutSpecAndValidationTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, expected_regex):
       _make_config(num_tokens, custom_plan, routed=routed, top_k=top_k)
 
+  def test_block_scaled_scale_block_spec_uses_kernel_3d_shape(self):
+    in_size = tile_k = 512
+    gmm_spec, resolved_fmt, _, tpu_8t = self._block_scaled_fixture()
+    w_spec = dataclasses.replace(gmm_spec.w, in_size=in_size)
+    x_spec = dataclasses.replace(gmm_spec.x, col_size=in_size)
+    cur_spec = dataclasses.replace(gmm_spec, x=x_spec, w=w_spec)
+    cur_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=cur_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    cfg = gmm_config.RoutingGmmConfig.create(
+        spec=cur_spec, out_format=resolved_fmt, plan=cur_plan, tpu_info=tpu_8t
+    )
+    index_maps = memory_ref.PipelineIndexMaps(cast(Any, None), cfg)
+    block_specs = memory_ref.PipelineBlockSpecs(cfg, index_maps)
+    scale_spec = block_specs.get_scale_spec(w_spec, tile_k=tile_k, tile_n=256)
+    weight_spec = block_specs.get_weight_spec(tile_k=tile_k, tile_n=256)
+    self.assertEqual(
+        scale_spec.block_shape,
+        (None, block_scaled.kernel_scale_rows(tile_k), 256),
+    )
+    self.assertEqual(scale_spec.index_map, weight_spec.index_map)
+
+  def test_block_scaled_scale_block_spec_rejects_unsupported_tile_k(self):
+    gmm_spec, resolved_fmt, plan_8t, tpu_8t = self._block_scaled_fixture()
+    cfg = gmm_config.RoutingGmmConfig.create(
+        spec=gmm_spec, out_format=resolved_fmt, plan=plan_8t, tpu_info=tpu_8t
+    )
+    index_maps = memory_ref.PipelineIndexMaps(cast(Any, None), cfg)
+    block_specs = memory_ref.PipelineBlockSpecs(cfg, index_maps)
+    with self.assertRaises(ValueError):
+      block_specs.get_scale_spec(gmm_spec.w, tile_k=1, tile_n=256)
+
 
 class IndexWindowTest(parameterized.TestCase):
 
@@ -658,7 +692,6 @@ class IndexWindowTest(parameterized.TestCase):
             ring_size=cfg.plan.idx_ring_size,
         ),
     )
-
 
 if __name__ == "__main__":
   absltest.main()

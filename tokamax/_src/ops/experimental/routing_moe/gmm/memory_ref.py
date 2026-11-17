@@ -27,6 +27,7 @@ from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
@@ -126,7 +127,8 @@ class ContiguousFusedWeightRef[T](SingleWeightRef[T]):
 
   @override
   def get_scale(self, replicate_size: int | None = None) -> jax.Array:
-    s_gate, s_up = jnp.split(super().get_scale(replicate_size), 2, axis=2)
+    # Split along last axis: subchannel scales are 3D, block scales are 2D.
+    s_gate, s_up = jnp.split(super().get_scale(replicate_size), 2, axis=-1)
     return layout_util.large_interleave_lane(s_gate, s_up)
 
   @override
@@ -1037,6 +1039,11 @@ class PipelineBlockSpecs:
         self.index_map_provider.out_index,
     )
 
+  def _weight_index_map(self, *, is_w2: bool) -> Callable[..., Any]:
+    if is_w2:
+      return functools.partial(self.index_map_provider.weight_index, is_w2=True)
+    return self.index_map_provider.weight_index
+
   def get_weight_spec(
       self, tile_k: int, tile_n: int, *, is_w2: bool = False
   ) -> pl.BlockSpec:
@@ -1044,9 +1051,7 @@ class PipelineBlockSpecs:
     block_shape = (None, tile_k, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=functools.partial(
-            self.index_map_provider.weight_index, is_w2=is_w2
-        ),
+        index_map=self._weight_index_map(is_w2=is_w2),
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
@@ -1065,16 +1070,27 @@ class PipelineBlockSpecs:
       is_w2: bool = False,
   ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
-    assert isinstance(w_spec.quant, spec_lib.SubchannelQuantSpec)
-    # A per-channel scale (one block over the full K) also covers a k2 slice
-    # of w2 that is smaller than the block.
-    num_blocks = max(1, tile_k // w_spec.quant.block_size)
-    block_shape = (None, num_blocks, 1, tile_n)
+    assert w_spec.quant is not None
+    match w_spec.quant:
+      case spec_lib.SubchannelQuantSpec(block_size=block_size):
+        # A per-channel scale (one block over the full K) also covers a k2
+        # slice of w2 that is smaller than the block.
+        num_blocks = max(1, tile_k // block_size)
+        block_shape = (None, num_blocks, 1, tile_n)
+        index_map = functools.partial(
+            self.index_map_provider.scale_index, is_w2=is_w2
+        )
+      case spec_lib.BlockScaledQuantSpec():
+        block_scaled.check_tile_k(tile_k, w_spec.in_size, w_spec.dtype)
+        block_shape = (
+            None,
+            block_scaled.kernel_scale_rows(tile_k, dtype=w_spec.dtype),
+            tile_n,
+        )
+        index_map = self._weight_index_map(is_w2=is_w2)
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=functools.partial(
-            self.index_map_provider.scale_index, is_w2=is_w2
-        ),
+        index_map=index_map,
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
