@@ -131,6 +131,149 @@ class PallasMosaicTpuBatchedRpaTest(parameterized.TestCase):
     self.assertEqual(pallas_out.shape, ref_out.shape)
     chex.assert_trees_all_close(pallas_out, ref_out, atol=0.15, rtol=0.15)
 
+  def test_pallas_return_lse_matches_reference(self):
+    seq_lens = [128, 128]
+    q_lens = [1, 128]
+    distribution = [1, 2, 2]
+    page_size = 128
+    num_seqs = len(seq_lens)
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    head_dim_aligned = 128
+
+    total_q_tokens = sum(q_lens)
+    cu_q_lens = jnp.array([0, 1, 129], dtype=jnp.int32)
+    pages_per_seq = max(
+        (seq_len + page_size - 1) // page_size for seq_len in seq_lens
+    )
+    total_pages = num_seqs * pages_per_seq
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+    kv_lens = jnp.array(seq_lens, dtype=jnp.int32)
+    distribution_jax = jnp.array(distribution, dtype=jnp.int32)
+
+    key1, key2, key3, key4 = jax.random.split(jax.random.key(100), 4)
+    queries = jax.random.normal(
+        key1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        key2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        key3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    kv_cache = jax.random.normal(
+        key4,
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.bfloat16,
+    )
+
+    op_base = base.BatchedRpa()
+    op_pallas = pallas_mosaic_tpu.PallasTpuBatchedRpa()
+
+    ref_out, _, ref_lse = op_base(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution_jax,
+        return_lse=True,
+    )
+    pallas_out, _, pallas_lse = op_pallas(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution_jax,
+        return_lse=True,
+    )
+
+    self.assertEqual(ref_lse.dtype, jnp.bfloat16)
+    self.assertEqual(pallas_lse.dtype, jnp.bfloat16)
+    self.assertEqual(pallas_lse.shape, ref_lse.shape)
+    chex.assert_trees_all_close(pallas_out, ref_out, atol=0.15, rtol=0.15)
+    chex.assert_trees_all_close(pallas_lse, ref_lse, atol=0.2, rtol=0.2)
+
+  def test_pallas_scales_match_reference(self):
+    seq_lens = [128, 128]
+    q_lens = [1, 128]
+    distribution = [1, 2, 2]
+    page_size = 128
+    num_seqs = len(seq_lens)
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    head_dim_aligned = 128
+
+    total_q_tokens = sum(q_lens)
+    cu_q_lens = jnp.array([0, 1, 129], dtype=jnp.int32)
+    pages_per_seq = max(
+        (seq_len + page_size - 1) // page_size for seq_len in seq_lens
+    )
+    total_pages = num_seqs * pages_per_seq
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+    kv_lens = jnp.array(seq_lens, dtype=jnp.int32)
+    distribution_jax = jnp.array(distribution, dtype=jnp.int32)
+
+    key1, key2, key3, key4 = jax.random.split(jax.random.key(123), 4)
+    queries = jax.random.normal(
+        key1, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    keys = jax.random.normal(
+        key2, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    values = jax.random.normal(
+        key3, (total_q_tokens, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    kv_cache = jax.random.normal(
+        key4,
+        (total_pages, page_size, num_kv_heads, 2, head_dim_aligned),
+        dtype=jnp.bfloat16,
+    )
+
+    q_scale = 0.5
+    k_scale = 0.25
+    v_scale = 0.75
+
+    op_base = base.BatchedRpa()
+    op_pallas = pallas_mosaic_tpu.PallasTpuBatchedRpa()
+
+    ref_out, _ = op_base(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution_jax,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    pallas_out, _ = op_pallas(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kv_cache,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution_jax,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    self.assertEqual(pallas_out.shape, ref_out.shape)
+    chex.assert_trees_all_close(pallas_out, ref_out, atol=0.15, rtol=0.15)
+
 
 if __name__ == "__main__":
   absltest.main()
