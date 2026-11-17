@@ -438,6 +438,16 @@ class RoutingGmmConfig:
     return pl.cdiv(size_k2, self.plan.tile_k2)
 
   @property
+  def use_weight_lookahead(self) -> bool:
+    """Whether weight BufferedRefs scan ahead to deduplicate expert tiles."""
+    return self.spec.x.row_size > self.plan.tile_m
+
+  @property
+  def contiguous_fused_w(self) -> bool:
+    """Whether fused gate and up weights are fetched as one `[K, 2*N]` block."""
+    return self.spec.is_fused_act and self.num_n == 1 and self.num_k2 == 1
+
+  @property
   def kernel_name(self) -> str:
     """Kernel name encoding the modes, shapes and tiling."""
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"

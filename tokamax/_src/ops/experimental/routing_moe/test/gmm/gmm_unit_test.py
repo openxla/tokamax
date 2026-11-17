@@ -980,6 +980,39 @@ class RoutingGmmUnitTest(parameterized.TestCase):
         atol=6e-2,
     )
 
+  @parameterized.parameters((False, True), (True, False))
+  def test_contiguous_fused_w_matches_split_tiles(
+      self, quant_w1: bool, has_bias: bool
+  ) -> None:
+    case = gmm_test_lib.GmmCase.make_case(
+        helper_cases.DECODE_16, quant_w1=quant_w1, has_bias=has_bias
+    )
+    routing = case.routing
+    contiguous = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        gather=routing.gather,
+        fuse_act="silu",
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=None),
+        **routing.kernel_kwargs,
+    )
+    split = kernel.routing_gmm(
+        case.x_compact,
+        case.w1,
+        gather=routing.gather,
+        fuse_act="silu",
+        # Two N tiles, so the gate/up halves are fetched as separate tiles.
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_n=256),
+        **routing.kernel_kwargs,
+    )
+    rows = routing.sorted_rows
+    np.testing.assert_allclose(
+        gmm_test_lib.to_large_layout(contiguous)[rows],
+        gmm_test_lib.to_large_layout(split)[rows],
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
 
 class RemoteRoutingGmmUnitTest(parameterized.TestCase):
 

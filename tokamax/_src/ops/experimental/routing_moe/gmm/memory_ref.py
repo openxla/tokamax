@@ -114,6 +114,27 @@ class FusedWeightsRef[T](AbstractWeightRef):
     return layout_util.large_interleave_lane(b_gate, b_up)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class ContiguousFusedWeightRef[T](SingleWeightRef[T]):
+  """Fused gate and up weights fetched together in one `[K, 2*N]` buffer."""
+
+  @override
+  def get_weight(self) -> jax.Array:
+    w_gate, w_up = jnp.split(super().get_weight(), 2, axis=1)
+    return layout_util.large_interleave_lane(w_gate, w_up)
+
+  @override
+  def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+    s_gate, s_up = jnp.split(super().get_scale(replicate_size), 2, axis=2)
+    return layout_util.large_interleave_lane(s_gate, s_up)
+
+  @override
+  def get_bias(self) -> jax.Array:
+    b_gate, b_up = jnp.split(super().get_bias(), 2, axis=1)
+    return layout_util.large_interleave_lane(b_gate, b_up)
+
+
 class _BypassBufferedRef(pltpu.BufferedRef):
 
   # NOTE: This is extremely hacky and only here until JAX version update
@@ -1020,7 +1041,7 @@ class PipelineBlockSpecs:
         # after JAX version update.
         pipeline_mode=pl.Buffered(
             buffer_count=self.cfg.plan.num_w_buffers,
-            use_lookahead=True,
+            use_lookahead=self.cfg.use_weight_lookahead,
         ),
     )
 
@@ -1048,7 +1069,7 @@ class PipelineBlockSpecs:
         # after JAX version update.
         pipeline_mode=pl.Buffered(
             buffer_count=self.cfg.plan.num_w_buffers,
-            use_lookahead=True,
+            use_lookahead=self.cfg.use_weight_lookahead,
         ),
     )
 
@@ -1072,7 +1093,8 @@ class PipelineBlockSpecs:
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers,
+            use_lookahead=self.cfg.use_weight_lookahead,
         ),
     )
 
@@ -1121,12 +1143,71 @@ class PipelineInputs[T]:
     if not cfg.spec.is_fused_act:
       return self
     assert isinstance(self.w, SingleWeightRef)
+    if cfg.contiguous_fused_w:
+      w_fused = ContiguousFusedWeightRef(
+          weight=self.w.weight, scale=self.w.scale, bias=self.w.bias
+      )
+      return dataclasses.replace(self, w=w_fused)
     n = cfg.spec.w.out_size // 2
     w_fused = FusedWeightsRef(
         gate=self.w,
         up=jax.tree.map(lambda ref: ref.at[..., n:], self.w),
     )
     return dataclasses.replace(self, w=w_fused)
+
+
+def _make_weight_bref(
+    w_hbm_ref: AbstractWeightRef,
+    w_spec: spec_lib.WeightSpec,
+    tile_k: int,
+    tile_n: int,
+    *,
+    block_specs: PipelineBlockSpecs,
+    cfg: config.RoutingGmmConfig,
+    fuse_act: bool = False,
+    contiguous_fused: bool = False,
+    is_w2: bool = False,
+) -> AbstractWeightRef:
+  """Allocates `BufferedRef`s for one expert weight projection."""
+  assert isinstance(w_hbm_ref, SingleWeightRef)
+  dma_tile_n = tile_n * 2 if contiguous_fused else tile_n
+  scale_bref = None
+  if w_spec.has_scale:
+    assert w_hbm_ref.scale is not None
+    scale_bref = pltpu.BufferedRef.input(
+        spec=block_specs.get_scale_spec(
+            w_spec, tile_k, dma_tile_n, is_w2=is_w2
+        ),
+        dtype_or_type=w_hbm_ref.scale.dtype,
+        buffer_count=cfg.plan.num_w_buffers,
+        use_lookahead=cfg.use_weight_lookahead,
+        grid_rank=4,
+    )
+  weight_bref = pltpu.BufferedRef.input(
+      spec=block_specs.get_weight_spec(tile_k, dma_tile_n, is_w2=is_w2),
+      dtype_or_type=w_hbm_ref.weight.dtype,
+      buffer_count=cfg.plan.num_w_buffers,
+      use_lookahead=cfg.use_weight_lookahead,
+      grid_rank=4,
+  )
+  bias_bref = None
+  if w_spec.has_bias:
+    assert w_hbm_ref.bias is not None
+    bias_bref = pltpu.BufferedRef.input(
+        spec=block_specs.get_bias_spec(w_spec, tile_k, dma_tile_n, is_w2=is_w2),
+        dtype_or_type=w_hbm_ref.bias.dtype,
+        buffer_count=cfg.plan.num_w_buffers,
+        use_lookahead=cfg.use_weight_lookahead,
+        grid_rank=4,
+    )
+  if contiguous_fused:
+    return ContiguousFusedWeightRef(
+        weight=weight_bref, scale=scale_bref, bias=bias_bref
+    )
+  w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=bias_bref)
+  if fuse_act:
+    return FusedWeightsRef(gate=w_bref, up=w_bref)
+  return w_bref
 
 
 @jax.tree_util.register_dataclass
@@ -1159,63 +1240,16 @@ class PipelineAllocs:
     pipeline_index_maps = PipelineIndexMaps(metadata_ref, cfg)
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
 
-    def _make_weight_bref(
-        w_hbm_ref: AbstractWeightRef,
-        w_spec: spec_lib.WeightSpec,
-        tile_k: int,
-        tile_n: int,
-        *,
-        fuse_act: bool = False,
-        is_w2: bool = False,
-    ) -> AbstractWeightRef:
-      assert isinstance(w_hbm_ref, SingleWeightRef)
-      scale_bref = None
-      if w_spec.has_scale:
-        assert w_hbm_ref.scale is not None
-        scale_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_scale_spec(
-                w_spec, tile_k, tile_n, is_w2=is_w2
-            ),
-            dtype_or_type=w_hbm_ref.scale.dtype,
-            buffer_count=cfg.plan.num_w_buffers,
-            use_lookahead=True,
-            grid_rank=4,
-        )
-      weight_bref = pltpu.BufferedRef.input(
-          spec=pipeline_block_specs.get_weight_spec(
-              tile_k, tile_n, is_w2=is_w2
-          ),
-          dtype_or_type=w_hbm_ref.weight.dtype,
-          buffer_count=cfg.plan.num_w_buffers,
-          use_lookahead=True,
-          grid_rank=4,
-      )
-      bias_bref = None
-      if w_spec.has_bias:
-        assert w_hbm_ref.bias is not None
-        bias_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_bias_spec(
-                w_spec, tile_k, tile_n, is_w2=is_w2
-            ),
-            dtype_or_type=w_hbm_ref.bias.dtype,
-            buffer_count=cfg.plan.num_w_buffers,
-            use_lookahead=True,
-            grid_rank=4,
-        )
-      w_bref = SingleWeightRef(
-          weight=weight_bref, scale=scale_bref, bias=bias_bref
-      )
-      if fuse_act:
-        w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
-      return w_bref
-
     w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
     w_bref = _make_weight_bref(
         in_hbm_ref.w,
         cfg.spec.w,
         cfg.plan.tile_k,
         w_tile_n,
+        block_specs=pipeline_block_specs,
+        cfg=cfg,
         fuse_act=cfg.spec.is_fused_act,
+        contiguous_fused=cfg.contiguous_fused_w,
     )
     w2_bref = None
     if cfg.spec.w2 is not None:
@@ -1225,6 +1259,8 @@ class PipelineAllocs:
           cfg.spec.w2,
           cfg.plan.tile_k2,
           cfg.plan.tile_n,
+          block_specs=pipeline_block_specs,
+          cfg=cfg,
           is_w2=True,
       )
 

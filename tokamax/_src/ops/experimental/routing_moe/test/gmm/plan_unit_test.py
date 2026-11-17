@@ -302,38 +302,39 @@ class NumWBuffersTest(parameterized.TestCase):
   @parameterized.product(
       num_tokens=[1, 8, 128, 256, 4096], quantized=[True, False]
   )
-  def test_spare_vmem_grows_weight_buffers_to_three(
+  def test_spare_vmem_grows_weight_buffers_to_default_max(
       self, num_tokens: int, quantized: bool
   ):
     resolved = _resolve(num_tokens, quantized=quantized)
-    self.assertEqual(resolved.num_w_buffers, 3)
+    self.assertEqual(resolved.num_w_buffers, 8)
 
-  @parameterized.parameters(2, 4)
+  @parameterized.parameters(2, 4, 6)
   def test_max_num_w_buffers_caps_growth(self, max_num_w_buffers: int):
     custom_plan = gmm_plan.RoutingGmmPlan(max_num_w_buffers=max_num_w_buffers)
     resolved = _resolve(8, custom_plan)
     self.assertEqual(resolved.num_w_buffers, max_num_w_buffers)
 
-  @parameterized.parameters(2, 4)
+  @parameterized.parameters(2, 4, 6)
   def test_explicit_num_w_buffers_is_kept(self, num_w_buffers: int):
     custom_plan = gmm_plan.RoutingGmmPlan(num_w_buffers=num_w_buffers)
     self.assertEqual(_resolve(8, custom_plan).num_w_buffers, num_w_buffers)
 
-  def test_extra_weight_buffers_do_not_break_fusion(self):
+  def test_extra_weight_buffers_step_down_smoothly_for_fusion(self):
     resolved = _resolve(8, with_down=True)
     self.assertTrue(resolved.fuse_up_and_down)
-    self.assertEqual(resolved.num_w_buffers, 3)
-    # This VMEM limit fits the fused kernel with 2 weight buffers but not with
-    # 3, so the default 2 is kept and the projections stay fused.
-    for fuse_up_and_down in (None, True):
-      with self.subTest(fuse_up_and_down=fuse_up_and_down):
-        custom_plan = gmm_plan.RoutingGmmPlan(
-            vmem_limit_bytes=16 * 1024 * 1024,
-            fuse_up_and_down=fuse_up_and_down,
-        )
-        resolved = _resolve(8, custom_plan, with_down=True)
-        self.assertTrue(resolved.fuse_up_and_down)
-        self.assertEqual(resolved.num_w_buffers, 2)
+    self.assertEqual(resolved.num_w_buffers, 8)
+    # 32 MiB fits 7 buffers for w alone, and steps down smoothly to 5 buffers
+    # once w2 is included; 16 MiB steps all the way down to 2 buffers.
+    for vmem_mib, expected_buffers in ((32, 5), (16, 2)):
+      for fuse_up_and_down in (None, True):
+        with self.subTest(vmem_mib=vmem_mib, fuse_up_and_down=fuse_up_and_down):
+          custom_plan = gmm_plan.RoutingGmmPlan(
+              vmem_limit_bytes=vmem_mib * 1024 * 1024,
+              fuse_up_and_down=fuse_up_and_down,
+          )
+          resolved = _resolve(8, custom_plan, with_down=True)
+          self.assertTrue(resolved.fuse_up_and_down)
+          self.assertEqual(resolved.num_w_buffers, expected_buffers)
 
 
 class W2MatmulDtypeTest(parameterized.TestCase):

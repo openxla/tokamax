@@ -38,6 +38,8 @@ def _make_config(
     size_n: int = 1280,
     quantize_w: bool = True,
     w_q_block_size: int | None = None,
+    fuse_act: str | None = None,
+    with_w2: bool = False,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a RoutingGmmConfig for a 512-expert, top-10 MoE layer."""
   num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
@@ -61,8 +63,22 @@ def _make_config(
       if quantize_w
       else None,
       has_bias=False,
-      fused_gate_up=False,
+      fused_gate_up=fuse_act is not None,
   )
+  w2 = None
+  if with_w2:
+    assert fuse_act is not None
+    w2 = spec.WeightSpec(
+        group_size=num_experts // ep_size,
+        in_size=size_n // 2,
+        out_size=size_k,
+        dtype=jnp.dtype(jnp.float8_e4m3fn if quantize_w else jnp.bfloat16),
+        quant=spec.SubchannelQuantSpec(block_size=w_q_block_size)
+        if quantize_w
+        else None,
+        has_bias=False,
+        fused_gate_up=False,
+    )
   routed_rows = num_tokens * top_k
   gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
   scatter = spec.RoutingSpec(
@@ -79,11 +95,11 @@ def _make_config(
   gmm_spec = gmm_spec_lib.RoutingGmmSpec(
       x=x,
       w=w,
-      w2=None,
+      w2=w2,
       gather=gather,
       scatter=scatter,
       num_global_groups=num_experts,
-      fuse_act=None,
+      fuse_act=fuse_act,
       size_ep=size_ep,
       size_row_group=routed_rows,
   )
@@ -256,6 +272,72 @@ class OutSpecAndValidationTest(parameterized.TestCase):
     )
     with self.assertRaisesRegex(NotImplementedError, expected_regex):
       _make_config(8, custom_plan, out_format=fmt, size_n=1024)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="below_tile_m", num_tokens=8, expected=False),
+      dict(testcase_name="at_tile_m", num_tokens=16, expected=False),
+      dict(testcase_name="above_tile_m", num_tokens=17, expected=True),
+  )
+  def test_use_weight_lookahead(self, num_tokens: int, expected: bool):
+    cfg = _make_config(num_tokens, gmm_plan.RoutingGmmPlan(tile_m=16))
+    self.assertEqual(cfg.use_weight_lookahead, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="untiled_fused",
+          fuse_act="silu",
+          tile_n=None,
+          expected=True,
+      ),
+      dict(
+          testcase_name="unfused",
+          fuse_act=None,
+          tile_n=None,
+          expected=False,
+      ),
+      dict(
+          testcase_name="tiled_fused",
+          fuse_act="silu",
+          tile_n=256,
+          expected=False,
+      ),
+      dict(
+          testcase_name="untiled_fused_w2",
+          fuse_act="silu",
+          with_w2=True,
+          tile_n=None,
+          expected=True,
+      ),
+      dict(
+          testcase_name="tiled_k2_fused_w2",
+          fuse_act="silu",
+          with_w2=True,
+          tile_n=None,
+          tile_k2=512,
+          expected=False,
+      ),
+  )
+  def test_contiguous_fused_w(
+      self,
+      fuse_act: str | None,
+      tile_n: int | None,
+      expected: bool,
+      with_w2: bool = False,
+      tile_k2: int | None = None,
+  ):
+    cfg = _make_config(
+        8,
+        gmm_plan.RoutingGmmPlan(
+            tile_n=tile_n,
+            tile_k2=tile_k2,
+            fuse_up_and_down=True if with_w2 else None,
+        ),
+        size_n=2048 if with_w2 else 1536,
+        w_q_block_size=512 if with_w2 else None,
+        fuse_act=fuse_act,
+        with_w2=with_w2,
+    )
+    self.assertEqual(cfg.contiguous_fused_w, expected)
 
 
 if __name__ == "__main__":

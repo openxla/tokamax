@@ -72,9 +72,6 @@ class RoutingGmmPlan:
   vmem_usage_fraction: float | None = None
   # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
   # groups' weight DMAs stay in flight during the current group's compute.
-  # TODO: The default of 3 was chosen empirically (on decode tiles
-  # 3 buffers were faster than 2, 4 were even with 3 and 6 were slower).
-  # Revisit it based on per-group DMA vs. compute time.
   max_num_w_buffers: int | None = None
   # Upper bound on tile_m when it spans more than one bucket.
   max_tile_m: int | None = None
@@ -608,7 +605,7 @@ def _w_buffer_range(plan: RoutingGmmPlan) -> tuple[int, int]:
   min_num_w_buffers = plan.num_w_buffers or 2
   if plan.num_w_buffers is not None:
     return min_num_w_buffers, min_num_w_buffers
-  return min_num_w_buffers, plan.max_num_w_buffers or 3
+  return min_num_w_buffers, plan.max_num_w_buffers or 8
 
 
 def _max_fitting_w_buffers(
@@ -1037,7 +1034,7 @@ def _grow_num_w_buffers(
   """Grows weight buffer count into spare VMEM unless the plan fixes it."""
   if plan.num_w_buffers is not None:
     return num_w_buffers
-  max_num_w_buffers = plan.max_num_w_buffers or 3
+  max_num_w_buffers = plan.max_num_w_buffers or 8
   while num_w_buffers < max_num_w_buffers and (
       estimate_vmem(
           tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
