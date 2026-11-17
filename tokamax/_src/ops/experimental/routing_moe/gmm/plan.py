@@ -79,6 +79,27 @@ class RoutingGmmPlan:
   max_num_buckets: int | None = None
 
 
+def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
+  """Bytes of TensorCore VMEM allocatable to a kernel after XLA reserves."""
+  # XLA carves out top-of-VMEM regions before allocating scoped kernel VMEM:
+  # - TPU <= 7: 16 `(num_sublanes, num_lanes)` f32 chunks (64 KiB on v5p-7x)
+  #   for compiler overlay register spills.
+  # - TPU >= 8: SparseCore subcore SPMEM mirrored in TensorCore VMEM (e.g.
+  #   2 MiB on 8i, 8 MiB on 8t).
+  # Compiler flags or future XLA changes can reserve additional module-level
+  # VMEM; default planning absorbs that headroom via `vmem_usage_fraction`.
+  if tpu_info.generation >= 8:
+    sc = tpu_info.sparse_core
+    reserved = (
+        0
+        if sc is None
+        else sc.num_cores * sc.num_subcores * sc.vmem_capacity_bytes
+    )
+  else:
+    reserved = 16 * tpu_info.num_sublanes * tpu_info.num_lanes * 4
+  return tpu_info.vmem_capacity_bytes - reserved
+
+
 @dataclass_util.resolves_from(
     RoutingGmmPlan,
     dropped=(
@@ -174,7 +195,8 @@ class ResolvedGmmPlan:
       raise ValueError("w2_matmul_dtype requires w2 to be set.")
 
     vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
-    vmem_limit_bytes = plan.vmem_limit_bytes or tpu_info.vmem_capacity_bytes
+    vmem_budget = vmem_budget_bytes(tpu_info)
+    vmem_limit_bytes = min(plan.vmem_limit_bytes or vmem_budget, vmem_budget)
     tiling, fuse_up_and_down = resolve_tiling_and_fusion(
         plan,
         spec=spec,
@@ -670,7 +692,8 @@ def _fused_tiling(
   """Returns the tiling of the fused kernel, or None if none fits VMEM.
 
   Tries in order:
-    1. No k2 tiling with the largest possible tile_m.
+    1. No k2 tiling with the largest possible tile_m (stepping tile_m down when
+       `plan.fuse_up_and_down` is True).
     2. Largest possible tile_m with the fewest k2 slices that fit.
 
   Args:
@@ -764,6 +787,14 @@ def _fused_tiling(
     tiling = try_fit(largest_tile_m, size_k2, bucket_base)
     if tiling is not None:
       return tiling
+    if plan.fuse_up_and_down and plan.tile_m is None:
+      floor_m = max(tpu_info.num_sublanes, plan.bucket_base or 0)
+      cand_m = largest_tile_m
+      while cand_m > floor_m:
+        cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
+        tiling = try_fit(cand_m, size_k2, min(bucket_base, cand_m))
+        if tiling is not None:
+          return tiling
 
   # Step 2: Slice k2 with largest possible tile_m.
   if not _may_slice_k2(plan, spec=spec):

@@ -213,4 +213,11 @@ PROD_CASES = (
         (4, 8, 12, 16384),
         shardings=(MoESharding(tp=4),),
     ),
+    # Dual-core MoE-TP=2 serving (all 512 experts, 384-wide intermediate
+    # slice): 16 = decode at 16 sequences, 4096 = one 2 x 2K prefill step.
+    *_prod_sweep(
+        helper_shapes.QWEN_38_FLASH_NEXT,
+        (16, 4096),
+        shardings=(MoESharding(tp=2),),
+    ),
 )

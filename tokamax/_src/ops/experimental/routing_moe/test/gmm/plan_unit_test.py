@@ -223,6 +223,94 @@ class TileMTest(parameterized.TestCase):
     custom_plan = gmm_plan.RoutingGmmPlan(tile_m=128)
     self.assertEqual(_resolve(8, custom_plan).tile_m, 128)
 
+  @parameterized.named_parameters(
+      ("tpu_7x_overlay_reserve", pltpu.ChipVersion.TPU_7X, 64 * 1024),
+      ("tpu_8i_sc_spmem_reserve", pltpu.ChipVersion.TPU_8I, 2 * 1024 * 1024),
+      ("tpu_8t_sc_spmem_reserve", pltpu.ChipVersion.TPU_8T, 8 * 1024 * 1024),
+  )
+  def test_default_vmem_limit_reserves_xla_headroom(
+      self, chip: pltpu.ChipVersion, expected_reserve: int
+  ):
+    tpu_info = pltpu.get_tpu_info_for_chip(chip, 1)
+    expected = tpu_info.vmem_capacity_bytes - expected_reserve
+    self.assertEqual(gmm_plan.vmem_budget_bytes(tpu_info), expected)
+    self.assertEqual(_resolve(8, tpu_info=tpu_info).vmem_limit_bytes, expected)
+    oversized = gmm_plan.RoutingGmmPlan(
+        vmem_limit_bytes=tpu_info.vmem_capacity_bytes
+    )
+    self.assertEqual(
+        _resolve(8, oversized, tpu_info=tpu_info).vmem_limit_bytes, expected
+    )
+
+  def test_forced_fusion_steps_tile_m_down_to_fit_vmem(self):
+    # At 16,384 tokens, unquantized bf16 fused weights need tile_m stepped down
+    # under a 32 MiB budget when fusion is forced, while default plan unfuses.
+    tight_budget = dict(
+        vmem_limit_bytes=32 * 1024 * 1024, vmem_usage_fraction=1.0
+    )
+    default_plan = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(**tight_budget),
+        quantized=False,
+        with_down=True,
+    )
+    forced_fused = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(fuse_up_and_down=True, **tight_budget),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertFalse(default_plan.fuse_up_and_down)
+    self.assertEqual(default_plan.tile_m, 256)
+    self.assertTrue(forced_fused.fuse_up_and_down)
+    self.assertEqual(forced_fused.tile_m, 128)
+    self.assertEqual(forced_fused.bucket_rows, [128])
+
+  def test_forced_fusion_step_down_aligns_non_power_of_two_tile_m(self):
+    # At 200 tokens, default tile_m is clamped to 200 (25 * 8, ~30.1 MiB);
+    # stepping down under a 28 MiB budget must stay a multiple of num_sublanes
+    # (128 at ~27.4 MiB, not 200 // 2 = 100).
+    cfg = _make_config(
+        200,
+        gmm_plan.RoutingGmmPlan(
+            fuse_up_and_down=True,
+            vmem_limit_bytes=28 * 1024 * 1024,
+            vmem_usage_fraction=1.0,
+        ),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertTrue(cfg.plan.fuse_up_and_down)
+    self.assertEqual(cfg.plan.tile_m, 128)
+    self.assertEqual(cfg.plan.bucket_rows, [128])
+
+  def test_forced_fusion_step_down_respects_explicit_bucket_base(self):
+    # Under a 26 MiB budget, tile_m=128 (~27.4 MiB) does not fit while tile_m=64
+    # (~25.0 MiB) does; an explicit bucket_base=128 bounds the step-down so
+    # RoutingGmmConfig validation never sees tile_m < bucket_base.
+    tighter_budget = dict(
+        vmem_limit_bytes=26 * 1024 * 1024, vmem_usage_fraction=1.0
+    )
+    unbounded = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(fuse_up_and_down=True, **tighter_budget),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertEqual(unbounded.tile_m, 64)
+    self.assertEqual(unbounded.bucket_rows, [64])
+
+    cfg = _make_config(
+        16384,
+        gmm_plan.RoutingGmmPlan(
+            fuse_up_and_down=True, bucket_base=128, **tighter_budget
+        ),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertEqual(cfg.plan.bucket_base, 128)
+    self.assertGreaterEqual(cfg.plan.tile_m, cfg.plan.bucket_base)
+
 
 class FusedK2SlicingTest(parameterized.TestCase):
   """Checks when the fused kernel slices the intermediate (k2) dim."""

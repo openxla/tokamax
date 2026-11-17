@@ -100,9 +100,10 @@ class GmmCase:
       num_skipped: int = 0,
       balanced_ep: int | None = None,
       has_bias: bool = False,
+      fused_up_and_down: bool = False,
   ) -> Self:
     """Builds the layer inputs of `case` for the shard at `group_offset`."""
-    helper_util.check_gmm_supported(case)
+    helper_util.check_gmm_supported(case, fused_up_and_down=fused_up_and_down)
     shape = dataclasses.replace(
         case.shape, intermediate_size=case.local_intermediate_size
     )
