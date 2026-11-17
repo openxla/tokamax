@@ -299,14 +299,36 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs, rhs = ba.args
     _is_fp8 = lambda x: _input_qtype(x) == jnp.float8_e4m3fn
     _is_int8 = lambda x: _input_qtype(x) == jnp.int8
+    is_x8 = _is_fp8(lhs) or _is_int8(lhs)
 
     # avoid OOMs by having too large block_k
     rhs_subchannel = _input_subchannel(rhs)
-    block_k = min(rhs_subchannel, 256) if rhs_subchannel is not None else 128
+    if (
+        gpu_utils.is_sm100()
+        and is_x8
+        and rhs_subchannel is not None
+        and rhs_subchannel % 512 == 0
+    ):
+      max_block_k = 512
+    else:
+      max_block_k = 256
+    block_k = (
+        min(rhs_subchannel, max_block_k)
+        if rhs_subchannel is not None
+        else 128
+    )
     if gpu_utils.is_sm100():
       # Clamp to the activation subchannel so a finer lhs (e.g. fp8 output of a
       # previous dot) keeps `tile_xk % block_k == 0`.
       lhs_subchannel = _input_subchannel(lhs)
+      if (
+          _is_fp8(lhs)
+          and isinstance(lhs, QArray)
+          and rhs_subchannel is not None
+          and lhs.scale.dtype == jnp.float32
+          and lhs.scale.shape[-1] == 2 * (lhs.shape[-1] // rhs_subchannel)
+      ):
+        lhs_subchannel = rhs_subchannel
       if lhs_subchannel is not None:
         block_k = min(block_k, lhs_subchannel)
 
@@ -330,6 +352,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
               block_k=block_k,
               num_stages=2,
               split_k=1,
+              grid_minor_dim=common.MatmulDimension.M,
+              grid_tile_width=1,
           )
         elif _is_fp8(lhs):
           preferred_element_type = ba.arguments.get("preferred_element_type")
@@ -338,13 +362,24 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if self.enable_fused_epilogue_quant and preferred_element_type == jnp.float8_e4m3fn:
             epilogue_quant_qtype = jnp.float8_e4m3fn
             epilogue_quant_subchannel_size = 128
+          dim_nums = ba.arguments.get(
+              "ragged_dot_dimension_numbers", base.DEFAULT_RAGGED_DOT_DIM_NUMS
+          )
+          out_n = (
+              rhs.shape[1]
+              if dim_nums == base.TRANS_RHS_RAGGED_DOT_DIM_NUMS
+              else rhs.shape[2]
+          )
+          use_collective = lhs.shape[0] >= 32 and out_n % 256 == 0
           return Config(
               block_m=16,
               block_n=128,
               block_k=block_k,
-              collective=False,
+              collective=use_collective,
               num_stages=2,
               split_k=1,
+              grid_minor_dim=common.MatmulDimension.M,
+              grid_tile_width=2 if use_collective else 1,
               epilogue_quant_qtype=epilogue_quant_qtype,
               epilogue_quant_subchannel_size=epilogue_quant_subchannel_size,
           )
