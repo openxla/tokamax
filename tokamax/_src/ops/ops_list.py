@@ -717,6 +717,11 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/normalization/base.py",
             ),
             Impl(
+                name="mosaic",
+                backend=MOSAIC_GPU,
+                module="_src/ops/normalization/mosaic.py",
+            ),
+            Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/normalization/triton.py",
