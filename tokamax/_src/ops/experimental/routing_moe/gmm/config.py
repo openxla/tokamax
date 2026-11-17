@@ -575,6 +575,17 @@ class RoutingGmmConfig:
     return name
 
   @property
+  def llo_flags(self) -> dict[str, bool]:
+    """Per-kernel LLO compiler flags."""
+    # Spreads critical nodes so the DMAs don't contend for resources.
+    flags = {"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True}
+    # The critical path scheduler issues the per-row scatter DMAs as one block
+    # ahead of the matmul. Without it they overlap the matmul.
+    if self.x.mode == RoutingMode.DIRECT and self.out.mode == RoutingMode.LOCAL:
+      flags["XLA_TPU_DISABLE_CRITICAL_PATH_SCHEDULER"] = True
+    return flags
+
+  @property
   def kernel_metadata(self) -> dict[str, str]:
     """The JSON-serialized config metadata for XProf."""
 

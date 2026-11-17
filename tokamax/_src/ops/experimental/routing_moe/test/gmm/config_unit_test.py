@@ -15,6 +15,7 @@
 """Unit tests for RoutingGmmConfig."""
 
 import dataclasses
+from typing import Any
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -45,6 +46,7 @@ def _make_config(
     with_w2: bool = False,
     routed: bool = True,
     top_k: int = 10,
+    with_gather: bool = True,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a RoutingGmmConfig for a 512-expert, top-`top_k` MoE layer."""
   num_experts, ep_size, size_k = 512, 4, 2560
@@ -54,7 +56,8 @@ def _make_config(
       else size_k
   )
   x = spec.ActivationSpec(
-      row_size=num_tokens,
+      # Without a gather, x already holds one row per routed token.
+      row_size=num_tokens * top_k if routed and not with_gather else num_tokens,
       col_size=size_k,
       dtype=jnp.dtype(jnp.bfloat16),
       quant=None,
@@ -87,7 +90,8 @@ def _make_config(
   routed_rows = num_tokens * top_k
   gather = scatter = None
   if routed:
-    gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
+    if with_gather:
+      gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
     scatter = spec.RoutingSpec(
         num_indices=routed_rows,
         remote_axis=None if size_ep == 1 else "ep",
@@ -123,6 +127,36 @@ def _make_config(
       plan=resolved_plan,
       tpu_info=tpu_info,
   )
+
+
+class LloFlagsTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="direct_to_local",
+          kwargs=dict(with_gather=False),
+          expected=True,
+      ),
+      dict(testcase_name="local_to_local", kwargs={}, expected=False),
+      dict(
+          testcase_name="direct_to_remote",
+          kwargs=dict(with_gather=False, size_ep=4),
+          expected=False,
+      ),
+      dict(
+          testcase_name="direct_to_direct",
+          kwargs=dict(routed=False),
+          expected=False,
+      ),
+  )
+  def test_critical_path_scheduler_disabled_only_for_direct_to_local(
+      self, kwargs: dict[str, Any], expected: bool
+  ):
+    flags = _make_config(8, **kwargs).llo_flags
+    self.assertTrue(flags["XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES"])
+    self.assertEqual(
+        flags.get("XLA_TPU_DISABLE_CRITICAL_PATH_SCHEDULER", False), expected
+    )
 
 
 class OutSpecAndValidationTest(parameterized.TestCase):
