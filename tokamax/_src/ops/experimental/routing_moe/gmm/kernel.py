@@ -95,7 +95,8 @@ def _prepare_kernel_args(
   # Wrap inputs in the pipeline's parameter object. emit_pipeline needs HBM
   # refs and VMEM allocations to share one pytree structure, so the API
   # wrappers are reduced to their data here.
-  pad_size = cfg.plan.tile_m_idx
+  smem_indices = cfg.plan.smem_indices
+  pad_size = 0 if smem_indices else cfg.plan.tile_m_idx
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
       w=_weight_ref(w),
@@ -109,7 +110,8 @@ def _prepare_kernel_args(
       group_sizes.astype(jnp.int32), group_offset, cfg, row_group=row_group_i32
   )
 
-  inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
+  idx_space = pltpu.SMEM if smem_indices else pltpu.HBM
+  inputs = inputs.with_memory_constraints(idx_space=idx_space)
   metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
   out = pltpu.HBM(cfg.out.spec.physical_compact_shape, cfg.out.spec.dtype)
   return metadata_in, metadata_scratch, inputs, out

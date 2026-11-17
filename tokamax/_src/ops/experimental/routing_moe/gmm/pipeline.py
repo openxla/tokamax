@@ -208,8 +208,9 @@ def _prologue(
     cfg: config.RoutingGmmConfig,
 ) -> None:
   """Prefetches gather indices and initial input activation tiles."""
-  gather_idx = final_allocs.inputs.gather_idx
-  if isinstance(gather_idx, memory_ref.IndexBufferedRef):
+  gather_idx = final_allocs.gather_bref
+  if gather_idx is not None:
+    assert in_hbm_ref.gather_idx is not None
     # Prefetch num_xo_buffers - 1 worth of indices into gather SMEM.
     offset = gather_idx.fetch_offset
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
@@ -221,12 +222,12 @@ def _prologue(
     for gm_id in range(cfg.plan.num_xo_buffers - 1):
       gather_idx.wait_in(in_hbm_ref.gather_idx, (0, gm_id - offset, 0, 0))
 
-  final_allocs.inputs.x.prologue()
+  final_allocs.x_bref.prologue()
   final_allocs.out.prologue()
 
   # Prefetch first num_xo_buffers - 1 input tiles.
   for gm_id in range(cfg.plan.num_xo_buffers - 1):
-    final_allocs.inputs.x.branchless_copy_in(in_hbm_ref.x, (0, gm_id, 0, 0))
+    final_allocs.x_bref.branchless_copy_in(in_hbm_ref.x, (0, gm_id, 0, 0))
 
 
 def _epilogue(
@@ -238,9 +239,10 @@ def _epilogue(
     cfg: config.RoutingGmmConfig,
 ) -> None:
   """Issues the final output DMA and drains all output buffers."""
-  scatter_idx = final_allocs.inputs.scatter_idx
+  scatter_idx = final_allocs.scatter_bref
   last_n = cfg.num_n - 1
-  if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
+  if scatter_idx is not None:
+    assert in_hbm_ref.scatter_idx is not None
     scatter_idx.wait_in(in_hbm_ref.scatter_idx, (last_n, num_gm, 0, 0))
 
   # Issue DMA for final compute tile and drain all output buffers.
@@ -254,7 +256,7 @@ def _epilogue(
         out_hbm_ref, (last_n, num_gm - cfg.plan.num_xo_buffers + buf_idx, 0, 0)
     )
 
-  final_allocs.inputs.x.epilogue(in_hbm_ref.x)
+  final_allocs.x_bref.epilogue(in_hbm_ref.x)
   final_allocs.out.epilogue(out_hbm_ref)
 
 
@@ -270,7 +272,8 @@ def outer_pipeline(
 
   Args:
     metadata_in_ref: SMEM references for inputs required for metadata compute.
-    in_hbm_ref: HBM references for the pipelined kernel inputs.
+    in_hbm_ref: HBM references for kernel inputs (or SMEM for unstreamed
+      indices).
     out_hbm_ref: HBM reference for the kernel output.
     metadata_ref: SMEM scratch reference for routing and tile scheduling.
     cfg: Static configuration for the routing GMM kernel.
@@ -283,26 +286,24 @@ def outer_pipeline(
 
   @functools.partial(pl.run_scoped, final_allocs=allocs)
   def _run(final_allocs: memory_ref.PipelineAllocs) -> None:
-
-    inputs = final_allocs.inputs
-    out = final_allocs.out
-    gather_idx = inputs.gather_idx
-    scatter_idx = inputs.scatter_idx
-    if isinstance(gather_idx, memory_ref.IndexBufferedRef):
-      inputs = dataclasses.replace(inputs, x=inputs.x.bind_idx_ref(gather_idx))
-    if isinstance(scatter_idx, memory_ref.IndexBufferedRef):
-      out = out.bind_idx_ref(scatter_idx)
-    final_allocs = dataclasses.replace(final_allocs, inputs=inputs, out=out)
+    final_allocs = final_allocs.bind_idx_refs(in_hbm_ref)
 
     _prologue(final_allocs, in_hbm_ref, cfg=cfg)
 
     # Body:
+    # Unbuffered SMEM index refs stay None in `allocs.in_specs` (after
+    # `bind_idx_refs` above), so omit them here to match the PyTree structure.
+    pipeline_in_ref = (
+        dataclasses.replace(in_hbm_ref, gather_idx=None, scatter_idx=None)
+        if cfg.plan.smem_indices
+        else in_hbm_ref
+    )
     pltpu.emit_pipeline(
         functools.partial(
             _inner_pipeline,
             cfg=cfg,
             metadata_ref=metadata_ref,
-            x_bref=final_allocs.inputs.x,
+            x_bref=final_allocs.x_bref,
             out_bref=final_allocs.out,
             x_hbm_ref=in_hbm_ref.x,
             out_hbm_ref=out_hbm_ref,
@@ -312,6 +313,6 @@ def outer_pipeline(
         out_specs=allocs.out_spec,
         grid=(cfg.num_n, num_gm, cfg.num_k2, cfg.num_k),
         _explicit_indices=True,
-    )(in_hbm_ref, out_hbm_ref, allocations=final_allocs.all_tree)
+    )(pipeline_in_ref, out_hbm_ref, allocations=final_allocs.all_tree)
 
     _epilogue(final_allocs, in_hbm_ref, out_hbm_ref, num_gm=num_gm, cfg=cfg)

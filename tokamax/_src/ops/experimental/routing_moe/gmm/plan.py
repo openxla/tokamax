@@ -69,6 +69,8 @@ class RoutingGmmPlan:
   # Walk only the groups with rows when building the metadata (needs the
   # row_group input of routing_gmm).
   live_group_walk: bool | None = None
+  # Keep routing gather/scatter indices in SMEM instead of streaming from HBM.
+  smem_indices: bool | None = None
   # These fields bound the heuristic search and are omitted once resolved.
   vmem_usage_fraction: float | None = None
   # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
@@ -99,6 +101,27 @@ def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
   else:
     reserved = 16 * tpu_info.num_sublanes * tpu_info.num_lanes * 4
   return tpu_info.vmem_capacity_bytes - reserved
+
+
+def _resolve_smem_indices(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> bool:
+  """Resolves whether routing indices reside entirely in SMEM."""
+  if plan.smem_indices is not None:
+    return plan.smem_indices
+  num_idx = int(spec.gather is not None) + int(spec.scatter is not None)
+  size_out_m = spec.size_out_m
+  # Empirical cutoff: up to 4096 routed rows (8 bytes per row for a
+  # gather/scatter pair within 1/32 of SMEM), SMEM indices measured neutral to
+  # faster than HBM index ring buffers, including 32-512 token batches at
+  # tile_m=256, and they also skip padding the index tables on XLA.
+  # The full plan, index tables included, is checked against
+  # smem_budget_bytes by check_smem in ResolvedGmmPlan.create.
+  max_idx_bytes = tpu_info.smem_capacity_bytes // 32
+  return num_idx > 0 and 0 < size_out_m * 8 <= max_idx_bytes
 
 
 @dataclass_util.resolves_from(
@@ -135,6 +158,7 @@ class ResolvedGmmPlan:
   fuse_up_and_down: bool
   vmem_limit_bytes: int
   live_group_walk: bool
+  smem_indices: bool
 
   @property
   def bucket_rows(self) -> list[int]:
@@ -187,6 +211,7 @@ class ResolvedGmmPlan:
     )
 
     live_group_walk = _resolve_live_group_walk(plan, spec=spec)
+    smem_indices = _resolve_smem_indices(plan, spec=spec, tpu_info=tpu_info)
 
     if spec.w2 is None and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires w2 to be set.")
@@ -237,6 +262,7 @@ class ResolvedGmmPlan:
         fuse_up_and_down=fuse_up_and_down,
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
+        smem_indices=smem_indices,
     )
     if spec.w2 is None or fuse_up_and_down:
       check_smem(smem_estimate(spec, resolved), tpu_info)
@@ -844,9 +870,21 @@ def smem_estimate(
     spec: gmm_spec_lib.RoutingGmmSpec,
     plan: ResolvedGmmPlan,
     *,
-    smem_indices: bool = False,
+    smem_indices: bool | None = None,
 ) -> dict[str, int]:
-  """Estimates SMEM allocation sizes in bytes for routing GMM."""
+  """Estimates SMEM allocation sizes in bytes for routing GMM.
+
+  Args:
+    spec: Problem spec.
+    plan: Resolved plan.
+    smem_indices: Whether routing indices are SMEM kernel inputs. Defaults to
+      `plan.smem_indices`.
+
+  Returns:
+    SMEM bytes of each kernel allocation, keyed by name.
+  """
+  if smem_indices is None:
+    smem_indices = plan.smem_indices
   allocs = {}
   allocs["group_sizes"] = 4 * spec.num_global_groups
   allocs["group_offset"] = 4
@@ -866,7 +904,7 @@ def smem_estimate(
   ):
     if routing is not None:
       if smem_indices:
-        allocs[name] = 4 * (routing.num_indices + plan.tile_m_idx)
+        allocs[name] = 4 * routing.num_indices
       else:
         allocs[f"{name}_buffers"] = (
             4 * plan.num_idx_buffers * plan.idx_buffer_size

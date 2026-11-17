@@ -43,9 +43,11 @@ def _make_config(
     w_q_block_size: int | None = None,
     fuse_act: str | None = None,
     with_w2: bool = False,
+    routed: bool = True,
+    top_k: int = 10,
 ) -> gmm_config.RoutingGmmConfig:
-  """Builds a RoutingGmmConfig for a 512-expert, top-10 MoE layer."""
-  num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
+  """Builds a RoutingGmmConfig for a 512-expert, top-`top_k` MoE layer."""
+  num_experts, ep_size, size_k = 512, 4, 2560
   w_q_block_size = (
       w_q_block_size
       if w_q_block_size is not None
@@ -83,11 +85,13 @@ def _make_config(
         fused_gate_up=False,
     )
   routed_rows = num_tokens * top_k
-  gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
-  scatter = spec.RoutingSpec(
-      num_indices=routed_rows,
-      remote_axis=None if size_ep == 1 else "ep",
-  )
+  gather = scatter = None
+  if routed:
+    gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
+    scatter = spec.RoutingSpec(
+        num_indices=routed_rows,
+        remote_axis=None if size_ep == 1 else "ep",
+    )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       out_format,
       default_dtype=x.dtype,
@@ -596,6 +600,64 @@ class OutSpecAndValidationTest(parameterized.TestCase):
           plan=bad_plan,
           tpu_info=_tpu_info(),
       )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="without_routing",
+          num_tokens=8,
+          routed=False,
+          top_k=10,
+          expected_regex="smem_indices=True requires gather or scatter",
+      ),
+      dict(
+          testcase_name="zero_rows",
+          num_tokens=8,
+          routed=True,
+          top_k=0,
+          expected_regex="size_out_m > 0",
+      ),
+      dict(
+          testcase_name="smem_overflow",
+          num_tokens=65536,
+          routed=True,
+          top_k=10,
+          expected_regex="SMEM allocation",
+      ),
+  )
+  def test_invalid_smem_indices_raises_value_error(
+      self,
+      num_tokens: int,
+      routed: bool,
+      top_k: int,
+      expected_regex: str,
+  ):
+    custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=True)
+    with self.assertRaisesRegex(ValueError, expected_regex):
+      _make_config(num_tokens, custom_plan, routed=routed, top_k=top_k)
+
+
+class IndexWindowTest(parameterized.TestCase):
+
+  def test_smem_indices_window_is_whole_table(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=True)
+    cfg = _make_config(8, custom_plan)
+    # 8 tokens * top-10 = 80 routed rows in one unbuffered window.
+    self.assertEqual(
+        cfg.idx_window,
+        gmm_config.IndexWindow(num_buffers=1, buffer_size=0, ring_size=80),
+    )
+
+  def test_streamed_indices_window_uses_ring_buffers(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=False)
+    cfg = _make_config(8, custom_plan)
+    self.assertEqual(
+        cfg.idx_window,
+        gmm_config.IndexWindow(
+            num_buffers=2,
+            buffer_size=cfg.plan.idx_buffer_size,
+            ring_size=cfg.plan.idx_ring_size,
+        ),
+    )
 
 
 if __name__ == "__main__":

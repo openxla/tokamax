@@ -161,14 +161,16 @@ class RoutingBufferedRef(_BypassBufferedRef):
   metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
-  idx_ref: Any = dataclasses.field(default=None, metadata=dict(static=True))
+  idx_ref: jax.Ref | hijax.TransformedRef | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
   act_cfg: config.ActivationConfig = dataclasses.field(
       metadata=dict(static=True)
   )
 
-  def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
-    return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
+  def bind_idx_ref(self, idx_ref: jax.Ref | hijax.TransformedRef) -> Self:
+    return dataclasses.replace(self, idx_ref=idx_ref)
 
   @classmethod
   @override
@@ -378,8 +380,9 @@ class IndexBufferedRef(pltpu.BufferedRef):
   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (hbm start, local start, size) aligned to tile_m_idx."""
     block_size = jnp.uint32(self.cfg.plan.tile_m_idx)
-    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
-    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
+    window = self.cfg.idx_window
+    ring_size = jnp.uint32(window.ring_size)
+    idx_buffer_size = jnp.uint32(window.buffer_size)
     buffer_count = jnp.uint32(self.buffer_count)
     n_id, gm_id, *_ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
     # Calculate hbm address.
@@ -623,15 +626,23 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       self, grid_indices: GridIndices, rows_ds: pl.Slice
   ) -> jax.Array:
     """SMEM offset that accounts for N tile dim buffering."""
-    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
-    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
-    num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
+    window = self.cfg.idx_window
     n_id, *_ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
     # Buffer is divided into two where only even/odd n_id can use to avoid
     # first step of n_id oveerwriting value of last step at n_id - 1.
-    n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
+    n_offset = lax.rem(n_id, jnp.uint32(window.num_buffers)) * jnp.uint32(
+        window.buffer_size
+    )
     rows_ds_start = jnp.uint32(rows_ds.start)
-    return n_offset + lax.rem(rows_ds_start, ring_size)
+    return n_offset + lax.rem(rows_ds_start, jnp.uint32(window.ring_size))
+
+  def _read_idx(self, offset: jax.Array, row_in_tile: int) -> jax.Array:
+    """Loads row index `offset + row_in_tile`, clamping dead rows in SMEM."""
+    assert self.idx_ref is not None
+    idx = offset + row_in_tile
+    if self.cfg.plan.smem_indices:
+      idx = jnp.minimum(idx, jnp.uint32(self.cfg.spec.size_out_m - 1))
+    return self.idx_ref[idx]
 
   @override
   def write_vmem(
@@ -661,7 +672,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
 
     for r in range(self.cfg.plan.tile_m):
       size = jnp.where(r < rows_ds.size, 1, 0)
-      row = self.idx_ref[offset + r]
+      row = self._read_idx(offset, r)
       pltpu.make_async_copy(
           src_ref=src_ref.at[pl.ds(row, size), cols_ds],
           dst_ref=vmem_dst.at[pl.ds(r, size), pl.ds(0, cols_ds.size)],
@@ -704,7 +715,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       live = r < rows_ds.size
       size = jnp.where(live, 1, 0)
       src = vmem_src.at[pl.ds(r, size), pl.ds(0, cols_ds.size)]
-      row = self.idx_ref[offset + r]
+      row = self._read_idx(offset, r)
       self._copy_out_row(src, dst_ref, row, size, cols_ds, live, sem)
 
   def _copy_out_row(
@@ -1138,6 +1149,19 @@ class PipelineInputs[T]:
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
+  def with_memory_constraints(
+      self, *, idx_space: pltpu.MemorySpace = pltpu.HBM
+  ) -> Self:
+    """Applies HBM constraints to operands and `idx_space` to index tables."""
+    return dataclasses.replace(
+        self,
+        x=map_memory_constraint(self.x, pltpu.HBM),
+        w=map_memory_constraint(self.w, pltpu.HBM),
+        w2=map_memory_constraint(self.w2, pltpu.HBM),
+        gather_idx=map_memory_constraint(self.gather_idx, idx_space),
+        scatter_idx=map_memory_constraint(self.scatter_idx, idx_space),
+    )
+
   def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
     if not cfg.spec.is_fused_act:
@@ -1210,6 +1234,36 @@ def _make_weight_bref(
   return w_bref
 
 
+def _make_index_bref(
+    idx_ref: hijax.TransformedRef | None,
+    *,
+    block_specs: PipelineBlockSpecs,
+    metadata_ref: metadata.AbstractMetadataRef,
+    cfg: config.RoutingGmmConfig,
+    fetch_offset: int,
+) -> IndexBufferedRef | None:
+  """Allocates an `IndexBufferedRef` when streaming indices from HBM."""
+  if idx_ref is None or cfg.plan.smem_indices:
+    return None
+  return IndexBufferedRef.input(
+      spec=block_specs.get_index_spec(),
+      dtype_or_type=idx_ref.dtype,
+      # IndexBufferedRef alternates two buffers by n. This ensures first tile
+      # of n + 1 never overwrites the last tile's n.
+      buffer_count=cfg.plan.num_idx_buffers,
+      cfg=cfg,
+      metadata_ref=metadata_ref,
+      fetch_offset=fetch_offset,
+  )
+
+
+def _as_index_bref(bref: pltpu.BufferedRef | None) -> IndexBufferedRef | None:
+  if bref is None:
+    return None
+  assert isinstance(bref, IndexBufferedRef)
+  return bref
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class PipelineAllocs:
@@ -1225,9 +1279,25 @@ class PipelineAllocs:
       (k2) slices. Allocated only when the fused down projection is sliced.
   """
 
-  inputs: PipelineInputs[RoutingBufferedRef]
+  inputs: PipelineInputs[pltpu.BufferedRef]
   out: RoutingBufferedRef
   out_acc: hijax.TransformedRef | None = None
+
+  @property
+  def x_bref(self) -> RoutingBufferedRef:
+    """The input activation RoutingBufferedRef."""
+    assert isinstance(self.inputs.x, RoutingBufferedRef)
+    return self.inputs.x
+
+  @property
+  def gather_bref(self) -> IndexBufferedRef | None:
+    """The optional gather IndexBufferedRef when streamed from HBM."""
+    return _as_index_bref(self.inputs.gather_idx)
+
+  @property
+  def scatter_bref(self) -> IndexBufferedRef | None:
+    """The optional scatter IndexBufferedRef when streamed from HBM."""
+    return _as_index_bref(self.inputs.scatter_idx)
 
   @classmethod
   def create(
@@ -1283,33 +1353,22 @@ class PipelineAllocs:
         metadata_ref=metadata_ref,
     )
 
-    # TODO: Support use case when indices are not stream from HBM and
-    # instead entirely stored in SMEM.
-    gather_bref = scatter_bref = None
-    if in_hbm_ref.gather_idx is not None:
-      # At step i the inner_pipeline gathers tile i + (num_xo_buffers - 1).
-      fetch_offset = cfg.plan.num_xo_buffers - 1
-      gather_bref = IndexBufferedRef.input(
-          spec=pipeline_block_specs.get_index_spec(),
-          dtype_or_type=in_hbm_ref.gather_idx.dtype,
-          # IndexBufferedRef alternates two buffers by n. This ensures first
-          # tile of n + 1 never overwrites the last tile's n.
-          buffer_count=cfg.plan.num_idx_buffers,
-          cfg=cfg,
-          metadata_ref=metadata_ref,
-          fetch_offset=fetch_offset,
-      )
-    if in_hbm_ref.scatter_idx is not None:
-      # At step i the inner_pipeline scatters tile i - 1.
-      fetch_offset = -1
-      scatter_bref = IndexBufferedRef.input(
-          spec=pipeline_block_specs.get_index_spec(),
-          dtype_or_type=in_hbm_ref.scatter_idx.dtype,
-          buffer_count=cfg.plan.num_idx_buffers,
-          cfg=cfg,
-          metadata_ref=metadata_ref,
-          fetch_offset=fetch_offset,
-      )
+    # At step i the inner_pipeline gathers tile i + (num_xo_buffers - 1) and
+    # scatters tile i - 1.
+    gather_bref = _make_index_bref(
+        in_hbm_ref.gather_idx,
+        block_specs=pipeline_block_specs,
+        metadata_ref=metadata_ref,
+        cfg=cfg,
+        fetch_offset=cfg.plan.num_xo_buffers - 1,
+    )
+    scatter_bref = _make_index_bref(
+        in_hbm_ref.scatter_idx,
+        block_specs=pipeline_block_specs,
+        metadata_ref=metadata_ref,
+        cfg=cfg,
+        fetch_offset=-1,
+    )
 
     out_acc = None
     if cfg.num_k2 > 1:
@@ -1329,10 +1388,34 @@ class PipelineAllocs:
         out_acc=out_acc,
     )
 
+  def bind_idx_refs(
+      self,
+      in_ref: PipelineInputs[hijax.TransformedRef],
+  ) -> Self:
+    """Binds buffered or direct SMEM index refs onto `inputs.x` and `out`."""
+
+    def _idx_ref(
+        idx_bref: IndexBufferedRef | None,
+        raw_ref: hijax.TransformedRef | None,
+    ) -> jax.Ref | hijax.TransformedRef | None:
+      return raw_ref if idx_bref is None else idx_bref.window_ref
+
+    inputs = self.inputs
+    out = self.out
+    gather_ref = _idx_ref(self.gather_bref, in_ref.gather_idx)
+    if gather_ref is not None:
+      inputs = dataclasses.replace(
+          inputs, x=self.x_bref.bind_idx_ref(gather_ref)
+      )
+    scatter_ref = _idx_ref(self.scatter_bref, in_ref.scatter_idx)
+    if scatter_ref is not None:
+      out = out.bind_idx_ref(scatter_ref)
+    return dataclasses.replace(self, inputs=inputs, out=out)
+
   @property
   def all_tree(
       self,
-  ) -> tuple[PipelineInputs[RoutingBufferedRef], RoutingBufferedRef]:
+  ) -> tuple[PipelineInputs[pltpu.BufferedRef], RoutingBufferedRef]:
     """The tuple of (inputs, out) BufferedRefs for pipeline allocation."""
     return (self.inputs, self.out)
 

@@ -60,6 +60,7 @@ def _make_spec(
     has_bias: bool = False,
     num_w_q_blocks: int = 1,
     w_q_block_size: int | None = None,
+    routed: bool = True,
 ) -> gmm_spec_lib.RoutingGmmSpec:
   """Builds a RoutingGmmSpec, by default for a 512-expert, top-10 MoE layer."""
   if with_down:
@@ -99,18 +100,20 @@ def _make_spec(
   w = weight_spec(size_k, size_n, fused_gate_up=with_down)
   w2 = weight_spec(size_n // 2, size_k) if with_down else None
   routed_rows = num_tokens * top_k
-  scatter_spec = None
-  if with_scatter:
-    scatter_spec = spec.RoutingSpec(
-        num_indices=routed_rows,
-        remote_axis="ep" if remote_scatter else None,
-    )
+  gather = scatter = None
+  if routed:
+    gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
+    if with_scatter:
+      scatter = spec.RoutingSpec(
+          num_indices=routed_rows,
+          remote_axis="ep" if remote_scatter else None,
+      )
   return gmm_spec_lib.RoutingGmmSpec(
       x=x,
       w=w,
       w2=w2,
-      gather=spec.RoutingSpec(num_indices=routed_rows, remote_axis=None),
-      scatter=scatter_spec,
+      gather=gather,
+      scatter=scatter,
       num_global_groups=num_experts,
       fuse_act="silu" if with_down else None,
       size_ep=ep_size if remote_scatter else 1,
@@ -887,9 +890,42 @@ class SmemEstimateMatchesKernelTest(parameterized.TestCase):
     self.assertIn("scatter_idx", est_smem)
     assert cfg.spec.gather is not None and cfg.spec.scatter is not None
     num_idx = cfg.spec.gather.num_indices
-    tile_m_idx = cfg.plan.tile_m_idx
-    self.assertEqual(est_smem["gather_idx"], 4 * (num_idx + tile_m_idx))
-    self.assertEqual(est_smem["scatter_idx"], 4 * (num_idx + tile_m_idx))
+    # SMEM index tables are unpadded; dead rows are clamped in the kernel.
+    self.assertEqual(est_smem["gather_idx"], 4 * num_idx)
+    self.assertEqual(est_smem["scatter_idx"], 4 * num_idx)
+
+
+class SmemIndicesTest(parameterized.TestCase):
+  """Checks the smem_indices heuristic."""
+
+  @parameterized.named_parameters(
+      # The cutoff is 4096 routed rows (num_tokens * top_k).
+      dict(testcase_name="decode_1", num_tokens=1, top_k=10, expected=True),
+      dict(
+          testcase_name="at_threshold", num_tokens=4096, top_k=1, expected=True
+      ),
+      dict(
+          testcase_name="above_threshold",
+          num_tokens=4097,
+          top_k=1,
+          expected=False,
+      ),
+  )
+  def test_smem_indices_default(
+      self, num_tokens: int, top_k: int, expected: bool
+  ):
+    self.assertEqual(_resolve(num_tokens, top_k=top_k).smem_indices, expected)
+
+  def test_smem_indices_default_with_gather_only(self):
+    self.assertTrue(_resolve(8, with_scatter=False).smem_indices)
+
+  def test_smem_indices_default_is_off_in_direct_mode(self):
+    self.assertFalse(_resolve(8, routed=False).smem_indices)
+
+  @parameterized.parameters(True, False)
+  def test_explicit_smem_indices_is_kept(self, smem_indices: bool):
+    custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=smem_indices)
+    self.assertEqual(_resolve(410, custom_plan).smem_indices, smem_indices)
 
   def _block_scaled_spec_and_fmt(self):
     if not block_scaled.is_available():

@@ -73,6 +73,25 @@ class MatmulMode(enum.StrEnum):
 
 @dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
+class IndexWindow:
+  """Layout of a routing index table in SMEM.
+
+  The index of global row `m` at N tile `n` is read from
+  `(n % num_buffers) * buffer_size + m % ring_size`.
+
+  Attributes:
+    num_buffers: Number of buffers, alternated by N tile.
+    buffer_size: Words per buffer.
+    ring_size: Rows of the table addressable within one buffer.
+  """
+
+  num_buffers: int
+  buffer_size: int
+  ring_size: int
+
+
+@dataclass_util.require_no_default
+@dataclasses.dataclass(frozen=True)
 class ComputeConfig:
   """Resolved configuration for a single matrix multiplication."""
 
@@ -473,13 +492,36 @@ class RoutingGmmConfig:
       )
 
   def _validate_buffers(self) -> None:
-    """Validates pipeline buffer counts."""
+    """Validates pipeline buffer counts and routing index placement."""
     if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
       )
     if self.plan.num_w_buffers < 2:
       raise ValueError("Buffer counts must be at least 2.")
+    has_routed_io = (
+        self.spec.gather is not None or self.spec.scatter is not None
+    )
+    if self.plan.smem_indices and (
+        not has_routed_io or self.spec.size_out_m <= 0
+    ):
+      raise ValueError(
+          "smem_indices=True requires gather or scatter and size_out_m > 0."
+      )
+
+  @property
+  def idx_window(self) -> IndexWindow:
+    """SMEM layout of the routing index tables read by the pipeline."""
+    if self.plan.smem_indices:
+      # The whole table is resident, so global and local addresses match.
+      return IndexWindow(
+          num_buffers=1, buffer_size=0, ring_size=self.spec.size_out_m
+      )
+    return IndexWindow(
+        num_buffers=self.plan.num_idx_buffers,
+        buffer_size=self.plan.idx_buffer_size,
+        ring_size=self.plan.idx_ring_size,
+    )
 
   @property
   def max_num_gm(self) -> int:
