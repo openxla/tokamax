@@ -75,8 +75,8 @@ del _IMPLEMENTATIONS
 
 
 def ragged_dot(
-    lhs: Float[Array | QArray, "M K"],
-    rhs: Float[Array | QArray, "G K N"],
+    lhs: Float[Array | QArray | base.AsQArray, "M K"],
+    rhs: Float[Array | QArray | base.AsQArray, "G K N"],
     group_sizes: Int[Array, "G"] | base.GroupSizes,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
@@ -148,8 +148,8 @@ def ragged_dot(
 
 
 def ragged_dot_general(
-    lhs: jax.Array | QArray,
-    rhs: jax.Array | QArray,
+    lhs: jax.Array | QArray | base.AsQArray,
+    rhs: jax.Array | QArray | base.AsQArray,
     group_sizes: Int[Array, "G"] | base.GroupSizes,
     ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
     precision: jax.lax.PrecisionLike = None,
