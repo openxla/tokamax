@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
@@ -94,7 +95,7 @@ def _quantized_block_matmul(
     preferred_element_type: jnp.dtype,
 ) -> jax.Array:
   """Computes one dynamically quantized K-block matmul over weight blocks."""
-  assert cfg.dynamic_quant is not None
+  assert isinstance(cfg.dynamic_quant, tensor_spec.SubchannelQuantSpec)
   x_q_dtype = cfg.matmul_dtype
   block_k = block_x.shape[1]
 
@@ -145,7 +146,7 @@ def _quantized_matmul(
     w_scale: jax.Array,
 ) -> jax.Array:
   """Computes dynamically quantized matrix multiplication for a single tile."""
-  assert cfg.dynamic_quant is not None
+  assert isinstance(cfg.dynamic_quant, tensor_spec.SubchannelQuantSpec)
   mxu_size = cfg.tpu_info.mxu_column_size
   tile_k, tile_n = w.shape
   num_w_blocks = w_scale.shape[0]

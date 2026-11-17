@@ -40,6 +40,7 @@ def _compute_config(
       dynamic_quant=spec.SubchannelQuantSpec(block_size=_X_Q_BLOCK_SIZE)
       if mode == config.MatmulMode.QUANTIZED
       else None,
+      w_quant=None,
   )
 
 

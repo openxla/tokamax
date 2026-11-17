@@ -28,6 +28,7 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec
@@ -618,11 +619,11 @@ def _weight_wrapper(
 ) -> arg.SingleWeightWrapper | None:
   if weight_spec is None:
     return None
-  scale = (
-      None
-      if weight_spec.quant is None
-      else jax.ShapeDtypeStruct(weight_spec.scale_shape, jnp.float32)
-  )
+  scale = None
+  if weight_spec.quant is not None:
+    scale = jax.ShapeDtypeStruct(
+        weight_spec.scale_shape, weight_spec.scale_dtype
+    )
   return arg.SingleWeightWrapper(
       weight=jax.ShapeDtypeStruct(weight_spec.shape, weight_spec.dtype),
       scale=scale,
@@ -890,6 +891,104 @@ class SmemEstimateMatchesKernelTest(parameterized.TestCase):
     self.assertEqual(est_smem["gather_idx"], 4 * (num_idx + tile_m_idx))
     self.assertEqual(est_smem["scatter_idx"], 4 * (num_idx + tile_m_idx))
 
+  def _block_scaled_spec_and_fmt(self):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    base = _make_spec(8, with_down=True)
+    w = dataclasses.replace(
+        base.w,
+        quant=spec.BlockScaledQuantSpec(
+            scale_rows=block_scaled.scale_rows(base.w.in_size)
+        ),
+    )
+    assert base.w2 is not None
+    w2 = dataclasses.replace(
+        base.w2,
+        quant=spec.BlockScaledQuantSpec(
+            scale_rows=block_scaled.scale_rows(base.w2.in_size)
+        ),
+    )
+    bs_spec = dataclasses.replace(base, w=w, w2=w2)
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=bs_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    return bs_spec, resolved_fmt
+
+  @parameterized.named_parameters(
+      dict(testcase_name="default_matmul_dtype", custom_plan=None),
+      dict(
+          testcase_name="explicit_matmul_dtype",
+          custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn),
+      ),
+  )
+  def test_block_scaled_plan_rejects_unsupported_chip(
+      self, custom_plan: gmm_plan.RoutingGmmPlan | None
+  ):
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt()
+    with self.assertRaisesRegex(NotImplementedError, "requires TPU_8T"):
+      gmm_plan.ResolvedGmmPlan.create(
+          custom_plan,
+          spec=bs_spec,
+          out_format=resolved_fmt,
+          tpu_info=_tpu_info(),
+      )
+
+  def test_block_scaled_tpu_8t_plan_and_smem(self):
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt()
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=bs_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    self.assertEqual(resolved.tile_m, 16)
+    self.assertEqual(resolved.bucket_rows, [16])
+    self.assertIsNone(resolved.x_quant_block_size)
+    self.assertTrue(resolved.fuse_up_and_down)
+    cfg = gmm_config.RoutingGmmConfig.create(
+        spec=bs_spec,
+        out_format=resolved_fmt,
+        plan=resolved,
+        tpu_info=tpu_8t,
+    )
+    self.assertEqual(
+        gmm_plan.smem_estimate(cfg.spec, cfg.plan), _kernel_smem(cfg)
+    )
+
+  def test_block_scaled_mixed_w2_quant_disables_fusion(self):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    base = _make_spec(8, with_down=True)
+    mixed_spec = dataclasses.replace(
+        base,
+        w=dataclasses.replace(
+            base.w,
+            quant=spec.BlockScaledQuantSpec(
+                scale_rows=block_scaled.scale_rows(base.w.in_size)
+            ),
+        ),
+    )
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=mixed_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=mixed_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    self.assertFalse(resolved.fuse_up_and_down)
+
 
 class VmemEstimateTest(parameterized.TestCase):
 
@@ -998,6 +1097,55 @@ class VmemEstimateTest(parameterized.TestCase):
         num_w_buffers * 19 * size_n * bytes_per_f32
         + size_k * size_n * bytes_per_bf16,
     )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="single", with_down=False),
+      dict(testcase_name="up_down", with_down=True),
+  )
+  def test_vmem_estimate_block_scaled_scale(self, with_down: bool):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    num_w_buffers = 3
+    tile_m = 64
+
+    def estimate(use_block_scaled: bool) -> int:
+      base = _make_spec(8, with_down=with_down)
+      quant = (
+          spec.BlockScaledQuantSpec(scale_rows=64) if use_block_scaled else None
+      )
+      w = dataclasses.replace(base.w, quant=quant)
+      w2 = None
+      if base.w2 is not None:
+        w2 = dataclasses.replace(base.w2, quant=quant)
+      return gmm_plan._vmem_estimate(
+          x=base.x,
+          w=w,
+          w2=w2,
+          is_fused_act=base.is_fused_act,
+          matmul_dtype=jnp.dtype(jnp.float8_e4m3fn),
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=base.x.dtype,
+          tile_m=tile_m,
+          tile_k=base.size_k,
+          tile_k2=base.size_k2,
+          tile_n=base.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    # Each weight adds its kernel scales per buffer plus one tile of in-kernel
+    # activation scales.
+    base = _make_spec(8, with_down=with_down)
+    weights = [(base.w, base.size_k)]
+    if base.w2 is not None:
+      weights.append((base.w2, base.w2.in_size))
+    expected = sum(
+        num_w_buffers * block_scaled.kernel_scale_rows(k) * w.out_size
+        + block_scaled.activation_scale_vmem_bytes(tile_m, k)
+        for w, k in weights
+    )
+    self.assertEqual(estimate(True) - estimate(False), expected)
 
 
 if __name__ == "__main__":

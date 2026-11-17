@@ -14,10 +14,13 @@
 # ==============================================================================
 """Unit tests for RoutingGmmConfig."""
 
+import dataclasses
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config as gmm_config
@@ -338,6 +341,261 @@ class OutSpecAndValidationTest(parameterized.TestCase):
         with_w2=with_w2,
     )
     self.assertEqual(cfg.contiguous_fused_w, expected)
+
+  def _block_scaled_fixture(self):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    x = spec.ActivationSpec(
+        row_size=16,
+        col_size=1024,
+        dtype=jnp.dtype(jnp.bfloat16),
+        quant=None,
+    )
+    w = spec.WeightSpec(
+        group_size=8,
+        in_size=1024,
+        out_size=1024,
+        dtype=jnp.dtype(jnp.float8_e5m2),
+        quant=spec.BlockScaledQuantSpec(scale_rows=64),
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    gmm_spec = gmm_spec_lib.RoutingGmmSpec(
+        x=x,
+        w=w,
+        w2=None,
+        gather=None,
+        scatter=None,
+        num_global_groups=8,
+        fuse_act=None,
+        size_ep=1,
+        size_row_group=0,
+    )
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    plan_8t = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=gmm_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    return gmm_spec, resolved_fmt, plan_8t, tpu_8t
+
+  def test_block_scaled_config_resolves_w_quant(self):
+    gmm_spec, resolved_fmt, plan_8t, tpu_8t = self._block_scaled_fixture()
+    cfg = gmm_config.RoutingGmmConfig.create(
+        spec=gmm_spec, out_format=resolved_fmt, plan=plan_8t, tpu_info=tpu_8t
+    )
+    self.assertEqual(
+        cfg.compute.matmul_mode, gmm_config.MatmulMode.BLOCK_SCALED
+    )
+    self.assertIsNone(cfg.compute.dynamic_quant)
+    self.assertEqual(
+        cfg.compute.w_quant, spec.BlockScaledQuantSpec(scale_rows=64)
+    )
+    self.assertIsNone(cfg.compute2)
+    self.assertEqual(cfg.compute.matmul_dtype, jnp.dtype(jnp.float8_e5m2))
+    self.assertIsNone(cfg.plan.x_quant_block_size)
+
+    w1 = dataclasses.replace(gmm_spec.w, fused_gate_up=True)
+    w2 = spec.WeightSpec(
+        group_size=8,
+        in_size=512,
+        out_size=1024,
+        dtype=jnp.dtype(jnp.float8_e5m2),
+        quant=spec.BlockScaledQuantSpec(scale_rows=32),
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    up_down_spec = dataclasses.replace(gmm_spec, w=w1, w2=w2, fuse_act="silu")
+    up_down_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=up_down_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    up_down_cfg = gmm_config.RoutingGmmConfig.create(
+        spec=up_down_spec,
+        out_format=resolved_fmt,
+        plan=up_down_plan,
+        tpu_info=tpu_8t,
+    )
+    self.assertEqual(
+        up_down_cfg.compute.matmul_mode, gmm_config.MatmulMode.BLOCK_SCALED
+    )
+    self.assertIsNone(up_down_cfg.compute.dynamic_quant)
+    self.assertEqual(
+        up_down_cfg.compute.w_quant,
+        spec.BlockScaledQuantSpec(scale_rows=64),
+    )
+    assert up_down_cfg.compute2 is not None
+    self.assertEqual(
+        up_down_cfg.compute2.matmul_mode, gmm_config.MatmulMode.BLOCK_SCALED
+    )
+    self.assertIsNone(up_down_cfg.compute2.dynamic_quant)
+    self.assertEqual(
+        up_down_cfg.compute2.w_quant,
+        spec.BlockScaledQuantSpec(scale_rows=32),
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="tpu_7x", bad_chip=pltpu.ChipVersion.TPU_7X),
+      dict(testcase_name="tpu_8i", bad_chip=pltpu.ChipVersion.TPU_8I),
+  )
+  def test_block_scaled_config_rejects_unsupported_chip(
+      self, bad_chip: pltpu.ChipVersion
+  ):
+    gmm_spec, resolved_fmt, plan_8t, _ = self._block_scaled_fixture()
+    with self.assertRaisesRegex(NotImplementedError, "requires TPU_8T"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=gmm_spec,
+          out_format=resolved_fmt,
+          plan=plan_8t,
+          tpu_info=pltpu.get_tpu_info_for_chip(bad_chip, 1),
+      )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="x_quant_block_size_set",
+          custom_plan=gmm_plan.RoutingGmmPlan(x_quant_block_size=512),
+          exc=ValueError,
+          err="not supported with BlockScaledQuantSpec",
+      ),
+      dict(
+          testcase_name="invalid_matmul_dtype",
+          custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.bfloat16),
+          exc=ValueError,
+          err="Block-scaled matmul_dtype must be in",
+      ),
+  )
+  def test_block_scaled_config_rejects_invalid_plan_options(
+      self, custom_plan: gmm_plan.RoutingGmmPlan, exc: type[Exception], err: str
+  ):
+    gmm_spec, resolved_fmt, _, tpu_8t = self._block_scaled_fixture()
+    bad_plan = gmm_plan.ResolvedGmmPlan.create(
+        custom_plan, spec=gmm_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    with self.assertRaisesRegex(exc, err):
+      gmm_config.RoutingGmmConfig.create(
+          spec=gmm_spec, out_format=resolved_fmt, plan=bad_plan, tpu_info=tpu_8t
+      )
+
+  def test_block_scaled_config_rejects_non_bf16_x(self):
+    gmm_spec, _, plan_8t, tpu_8t = self._block_scaled_fixture()
+    f32_x = dataclasses.replace(gmm_spec.x, dtype=jnp.dtype(jnp.float32))
+    f32_spec = dataclasses.replace(gmm_spec, x=f32_x)
+    f32_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=f32_x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    with self.assertRaisesRegex(NotImplementedError, "requires bfloat16 x"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=f32_spec, out_format=f32_fmt, plan=plan_8t, tpu_info=tpu_8t
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="w2_unquantized", w2_quant=None),
+      dict(
+          testcase_name="w2_subchannel",
+          w2_quant=spec.SubchannelQuantSpec(block_size=512),
+      ),
+  )
+  def test_block_scaled_config_rejects_mismatched_w2_quant(
+      self, w2_quant: spec.WeightQuantSpec | None
+  ):
+    gmm_spec, resolved_fmt, _, tpu_8t = self._block_scaled_fixture()
+    w1 = dataclasses.replace(gmm_spec.w, fused_gate_up=True)
+    w2 = spec.WeightSpec(
+        group_size=8,
+        in_size=512,
+        out_size=1024,
+        dtype=jnp.dtype(jnp.float8_e5m2),
+        quant=w2_quant,
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    mismatch_spec = dataclasses.replace(gmm_spec, w=w1, w2=w2, fuse_act="silu")
+    mismatch_plan = gmm_plan.ResolvedGmmPlan.create(
+        None,
+        spec=mismatch_spec,
+        out_format=resolved_fmt,
+        tpu_info=tpu_8t,
+    )
+    with self.assertRaisesRegex(
+        NotImplementedError, "w2 must match the precision of w"
+    ):
+      gmm_config.RoutingGmmConfig.create(
+          spec=mismatch_spec,
+          out_format=resolved_fmt,
+          plan=mismatch_plan,
+          tpu_info=tpu_8t,
+      )
+
+  def test_block_scaled_config_rejects_unaligned_tile_k_and_tile_k2(self):
+    gmm_spec, resolved_fmt, plan_8t, tpu_8t = self._block_scaled_fixture()
+    unaligned_k_spec = dataclasses.replace(
+        gmm_spec,
+        x=dataclasses.replace(gmm_spec.x, col_size=128),
+        w=dataclasses.replace(gmm_spec.w, in_size=128),
+    )
+    unaligned_k_plan = dataclasses.replace(plan_8t, tile_k=128)
+    with self.assertRaisesRegex(ValueError, "tile_k .* compact chunk width"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=unaligned_k_spec,
+          out_format=resolved_fmt,
+          plan=unaligned_k_plan,
+          tpu_info=tpu_8t,
+      )
+
+    w1 = dataclasses.replace(gmm_spec.w, out_size=384, fused_gate_up=True)
+    w2 = spec.WeightSpec(
+        group_size=8,
+        in_size=192,
+        out_size=1024,
+        dtype=jnp.dtype(jnp.float8_e5m2),
+        quant=spec.BlockScaledQuantSpec(scale_rows=64),
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    unaligned_k2_spec = dataclasses.replace(
+        gmm_spec, w=w1, w2=w2, fuse_act="silu"
+    )
+    unaligned_k2_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=unaligned_k2_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    with self.assertRaisesRegex(ValueError, "tile_k2 .* multiple of 128"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=unaligned_k2_spec,
+          out_format=resolved_fmt,
+          plan=unaligned_k2_plan,
+          tpu_info=tpu_8t,
+      )
+
+  def test_subchannel_config_rejects_missing_x_quant_block_size(self):
+    cfg = _make_config(8)
+    bad_plan = dataclasses.replace(cfg.plan, x_quant_block_size=None)
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=cfg.spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    with self.assertRaisesRegex(
+        ValueError, "x_quant_block_size is required for subchannel"
+    ):
+      gmm_config.RoutingGmmConfig.create(
+          spec=cfg.spec,
+          out_format=resolved_fmt,
+          plan=bad_plan,
+          tpu_info=_tpu_info(),
+      )
 
 
 if __name__ == "__main__":

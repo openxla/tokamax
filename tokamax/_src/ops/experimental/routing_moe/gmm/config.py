@@ -29,6 +29,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
@@ -55,10 +56,13 @@ class MatmulMode(enum.StrEnum):
 
   # x and w are both passed in unquantized.
   UNQUANTIZED = enum.auto()
-  # w is passed in quantized with scales. x is passed in unquantized, and the
-  # kernel quantizes it before the matmul. The output is scaled by both x and w
-  # scales.
+  # w is passed in quantized with subchannel scales. x is passed in unquantized,
+  # and the kernel quantizes it before the matmul. The output is scaled by both
+  # x and w scales.
   QUANTIZED = enum.auto()
+  # w is passed in quantized with float8_e8m0fnu block scales. x is passed in
+  # unquantized and block-scaled dynamically before the matmul.
+  BLOCK_SCALED = enum.auto()
   # w is passed in quantized with scales. x is passed in unquantized and stays
   # unquantized. The output is scaled by w scales.
   WEIGHT_ONLY_SCALE_AFTER = enum.auto()
@@ -77,6 +81,7 @@ class ComputeConfig:
   acc_dtype: jnp.dtype
   tpu_info: pltpu.TpuInfo
   dynamic_quant: tensor_spec.SubchannelQuantSpec | None
+  w_quant: tensor_spec.WeightQuantSpec | None
 
 
 def _make_compute_config(
@@ -89,31 +94,45 @@ def _make_compute_config(
     tpu_info: pltpu.TpuInfo,
 ) -> ComputeConfig:
   """Builds the `ComputeConfig` for one projection from its LHS dtype."""
-  dynamic_quant = None
-  if matmul_dtype != x_dtype:
-    if block_size is None:
-      raise ValueError(
-          "x_quant_block_size must be set when matmul_dtype != x.dtype."
-      )
-    dynamic_quant = tensor_spec.SubchannelQuantSpec(block_size=block_size)
-  if dynamic_quant is not None and w.quant is not None:
-    matmul_mode = MatmulMode.QUANTIZED
-  elif plan_lib.dequantizes_w_before_matmul(
-      x_dtype=x_dtype, matmul_dtype=matmul_dtype, w=w, tpu_info=tpu_info
-  ):
-    matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
-  elif dynamic_quant is None and w.quant is not None:
-    matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
-  elif dynamic_quant is None and w.quant is None:
-    matmul_mode = MatmulMode.UNQUANTIZED
-  else:
-    raise NotImplementedError("Quantizing x requires a quantized w.")
+  match w.quant:
+    case None:
+      if matmul_dtype != x_dtype:
+        raise NotImplementedError("Quantizing x requires a quantized w.")
+      matmul_mode = MatmulMode.UNQUANTIZED
+      dynamic_quant = None
+    case tensor_spec.BlockScaledQuantSpec():
+      matmul_mode = MatmulMode.BLOCK_SCALED
+      dynamic_quant = None
+    case tensor_spec.SubchannelQuantSpec():
+      if matmul_dtype == x_dtype:
+        is_scale_before = plan_lib.dequantizes_w_before_matmul(
+            x_dtype=x_dtype,
+            matmul_dtype=matmul_dtype,
+            w=w,
+            tpu_info=tpu_info,
+        )
+        matmul_mode = (
+            MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
+            if is_scale_before
+            else MatmulMode.WEIGHT_ONLY_SCALE_AFTER
+        )
+        dynamic_quant = None
+      else:
+        if block_size is None:
+          raise ValueError(
+              "plan.x_quant_block_size is required for subchannel dynamic"
+              " quantization."
+          )
+        matmul_mode = MatmulMode.QUANTIZED
+        dynamic_quant = tensor_spec.SubchannelQuantSpec(block_size=block_size)
+
   return ComputeConfig(
       matmul_mode=matmul_mode,
       matmul_dtype=matmul_dtype,
       acc_dtype=acc_dtype,
       tpu_info=tpu_info,
       dynamic_quant=dynamic_quant,
+      w_quant=w.quant,
   )
 
 
@@ -196,6 +215,11 @@ class RoutingGmmConfig:
     if spec.x.quant is not None:
       # TODO: Load pre-computed scales in compute.
       raise NotImplementedError("Pre-quantized x is not supported yet.")
+    if spec.w2 is not None and (
+        spec.w2.dtype != spec.w.dtype
+        or type(spec.w2.quant) is not type(spec.w.quant)
+    ):
+      raise NotImplementedError("w2 must match the precision of w.")
 
     # Because x only states the input storage dtype while plan states the MXU
     # execution dtype, neither alone defines whether dynamic quantization runs.
@@ -241,13 +265,15 @@ class RoutingGmmConfig:
     if (w2 is None) != (self.plan.w2_matmul_dtype is None):
       raise ValueError("w2 and plan.w2_matmul_dtype must be set together.")
     if w2 is not None and (
-        w2.dtype != w.dtype or (w2.quant is None) != (w.quant is None)
+        w2.dtype != w.dtype or type(w2.quant) is not type(w.quant)
     ):
       # The intermediate is fed to the second matmul in x's execution dtype,
       # which is only valid when both weights share a precision.
       raise NotImplementedError("w2 must match the precision of w.")
     w2_quant = None if self.compute2 is None else self.compute2.dynamic_quant
-    if (
+    if self.compute.matmul_mode == MatmulMode.BLOCK_SCALED:
+      self._validate_block_scaled_dtypes()
+    elif (
         self.compute.dynamic_quant is None
         and w2_quant is None
         and self.plan.x_quant_block_size is not None
@@ -263,6 +289,36 @@ class RoutingGmmConfig:
     _check_lhs_not_narrower(self.plan.matmul_dtype, w.dtype)
     if w2 is not None and self.plan.w2_matmul_dtype is not None:
       _check_lhs_not_narrower(self.plan.w2_matmul_dtype, w2.dtype)
+
+  def _validate_block_scaled_dtypes(self) -> None:
+    """Validates block-scaled precision and chip invariants."""
+    if self.plan.x_quant_block_size is not None:
+      raise ValueError(
+          "plan.x_quant_block_size is not supported with BlockScaledQuantSpec."
+      )
+    if not plan_lib.is_block_scaled_tpu(self.tpu_info):
+      raise NotImplementedError(
+          "Block-scaled quantization requires TPU_8T or newer. Got"
+          f" {self.tpu_info.chip_version}."
+      )
+    if self.x.spec.dtype != jnp.bfloat16.dtype:
+      raise NotImplementedError(
+          "Block-scaled dynamic quantization requires bfloat16 x. Got"
+          f" {self.x.spec.dtype}."
+      )
+    if self.plan.matmul_dtype not in block_scaled.FP8_DTYPES:
+      raise ValueError(
+          f"Block-scaled matmul_dtype must be in {block_scaled.FP8_DTYPES}."
+          f" Got {self.plan.matmul_dtype}."
+      )
+    if (
+        self.plan.w2_matmul_dtype is not None
+        and self.plan.w2_matmul_dtype not in block_scaled.FP8_DTYPES
+    ):
+      raise ValueError(
+          "Block-scaled w2_matmul_dtype must be in"
+          f" {block_scaled.FP8_DTYPES}. Got {self.plan.w2_matmul_dtype}."
+      )
 
   def _validate_out(self) -> None:
     """Validates output dtype, quantization, and chunk alignment."""
@@ -338,6 +394,14 @@ class RoutingGmmConfig:
       )
     if is_k_tiled:
       raise NotImplementedError("K dim tiling is not supported yet.")
+    x_chunk_cols = (
+        layout_util.get_packing(self.x.spec.dtype) * self.tpu_info.num_lanes
+    )
+    if self.plan.tile_k % x_chunk_cols != 0:
+      raise ValueError(
+          f"tile_k ({self.plan.tile_k}) must be a multiple of the input's"
+          f" compact chunk width ({x_chunk_cols})."
+      )
 
   def _validate_w2_tiling(self) -> None:
     """Validates the k2 tiling of the fused w2."""
@@ -356,16 +420,22 @@ class RoutingGmmConfig:
       )
     w2_quant = self.spec.w2.quant
     if w2_quant is not None:
-      if not isinstance(w2_quant, tensor_spec.SubchannelQuantSpec):
+      if isinstance(w2_quant, tensor_spec.BlockScaledQuantSpec):
+        if self.num_k2 > 1:
+          raise NotImplementedError(
+              "k2 tiling is not supported with BlockScaledQuantSpec."
+          )
+      elif isinstance(w2_quant, tensor_spec.SubchannelQuantSpec):
+        sizes = (self.plan.tile_k2, w2_quant.block_size)
+        if max(sizes) % min(sizes) != 0:
+          raise ValueError(
+              f"tile_k2 ({self.plan.tile_k2}) and the w2 quantization block"
+              f" size ({w2_quant.block_size}) must divide one"
+              " another."
+          )
+      else:
         raise NotImplementedError(
             f"Fused w2 does not support {type(w2_quant).__name__}."
-        )
-      sizes = (self.plan.tile_k2, w2_quant.block_size)
-      if max(sizes) % min(sizes) != 0:
-        raise ValueError(
-            f"tile_k2 ({self.plan.tile_k2}) and the w2 quantization block"
-            f" size ({w2_quant.block_size}) must divide one"
-            " another."
         )
     if self.plan.tile_n != self.spec.size_out_n:
       raise NotImplementedError(

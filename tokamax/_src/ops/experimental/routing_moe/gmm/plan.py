@@ -30,6 +30,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
@@ -445,13 +446,20 @@ def _fits_in(src: jnp.dtype, dst: jnp.dtype) -> bool:
   )
 
 
-def w_has_small_quant_block(
+def is_block_scaled_tpu(tpu_info: pltpu.TpuInfo) -> bool:
+  """Returns whether `tpu_info` supports block-scaled matmul."""
+  tpu_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+  return (tpu_8t is not None and tpu_info.chip_version == tpu_8t) or (
+      tpu_info.generation > 8
+  )
+
+
+def _w_has_small_quant_block(
     w: tensor_spec.WeightSpec, tpu_info: pltpu.TpuInfo
 ) -> bool:
   """Returns whether w's quant blocks are narrower than the MXU."""
-  if w.quant is None:
+  if not isinstance(w.quant, tensor_spec.SubchannelQuantSpec):
     return False
-  assert isinstance(w.quant, tensor_spec.SubchannelQuantSpec)
   return w.quant.block_size < tpu_info.mxu_column_size
 
 
@@ -463,7 +471,7 @@ def dequantizes_w_before_matmul(
     tpu_info: pltpu.TpuInfo,
 ) -> bool:
   """Returns whether w is dequantized in VMEM before the matmul."""
-  return matmul_dtype == x_dtype and w_has_small_quant_block(w, tpu_info)
+  return matmul_dtype == x_dtype and _w_has_small_quant_block(w, tpu_info)
 
 
 def _quantized_x_dtype(
@@ -497,29 +505,41 @@ def _resolve_dtypes(
     tpu_info: pltpu.TpuInfo,
 ) -> tuple[jnp.dtype, jnp.dtype, int | None]:
   """Resolves execution dtypes and `x` quantization block size."""
-  # A pre-quantized x already fixes the MXU dtype. Otherwise w's storage
-  # dtype is used so that both operands enter the MXU in the same dtype.
-  if plan.matmul_dtype is not None:
-    matmul_dtype = jnp.dtype(plan.matmul_dtype)
-  elif x.quant is None and w_has_small_quant_block(w, tpu_info):
-    # Small w blocks are dequantized in VMEM before the matmul, and the
-    # dequantized w is wider than w.dtype, so x stays unquantized.
-    # Otherwise, fp8 @ bf16 costs precision and buys no speed.
-    matmul_dtype = x.dtype
-  elif x.quant is None and w.quant is not None:
-    matmul_dtype = _quantized_x_dtype(w.dtype, tpu_info)
-  else:
-    matmul_dtype = x.dtype
-
   x_quant_block_size = plan.x_quant_block_size
-  if x_quant_block_size is None and matmul_dtype != x.dtype:
+  match w.quant:
+    case None:
+      default_matmul_dtype = x.dtype
+    case tensor_spec.BlockScaledQuantSpec():
+      if not is_block_scaled_tpu(tpu_info):
+        raise NotImplementedError(
+            "Block-scaled quantization requires TPU_8T or newer. Got"
+            f" {tpu_info.chip_version}."
+        )
+      default_matmul_dtype = w.dtype if x.quant is None else x.dtype
+    case tensor_spec.SubchannelQuantSpec():
+      if x.quant is None and not _w_has_small_quant_block(w, tpu_info):
+        default_matmul_dtype = _quantized_x_dtype(w.dtype, tpu_info)
+      else:
+        default_matmul_dtype = x.dtype
+
+  matmul_dtype = (
+      default_matmul_dtype
+      if plan.matmul_dtype is None
+      else jnp.dtype(plan.matmul_dtype)
+  )
+  if (
+      x_quant_block_size is None
+      and matmul_dtype != x.dtype
+      and not isinstance(w.quant, tensor_spec.BlockScaledQuantSpec)
+  ):
     # TODO: Choose different block size based on HW.
     x_quant_block_size = 512
 
-  if plan.acc_dtype is None:
-    acc_dtype = jnp.bfloat16.dtype
-  else:
-    acc_dtype = jnp.dtype(plan.acc_dtype)
+  acc_dtype = (
+      jnp.bfloat16.dtype
+      if plan.acc_dtype is None
+      else jnp.dtype(plan.acc_dtype)
+  )
   return matmul_dtype, acc_dtype, x_quant_block_size
 
 
@@ -612,7 +632,7 @@ def _supports_fusion(
   """Returns whether the fused kernel supports the weights and K/N tiling."""
   w, w2 = spec.w, spec.w2
   assert w2 is not None
-  if w.dtype != w2.dtype or (w.quant is None) != (w2.quant is None):
+  if w.dtype != w2.dtype or type(w.quant) is not type(w2.quant):
     # The intermediate is fed to the down projection in x's dtype, which is
     # only valid when both weights share a precision.
     return False
@@ -855,40 +875,54 @@ def smem_estimate(
   return allocs
 
 
-def _matmul_vmem_estimate(
+def _matmul_vmem_bytes(
     weight: tensor_spec.WeightSpec,
+    *,
+    x_dtype: jnp.dtype,
+    lhs_dtype: jnp.dtype,
+    acc_bits: int,
+    tile_m: int,
     k_tile: int,
     n_tile: int,
-    num_w_refs: int,
-    *,
-    tile_m: int,
     num_w_buffers: int,
-    matmul_bits: int,
-    acc_bits: int,
-    is_dynamic_quantized: bool,
-    is_w_dequantized_before: bool,
+    num_w_refs: int,
+    tpu_info: pltpu.TpuInfo,
 ) -> int:
-  """Estimates VMEM usage in bytes of a single matmul's weights and scratch."""
+  """Estimates VMEM bytes for one matmul's weights, scales, and accumulators."""
   w_bits = jax.dtypes.itemsize_bits(weight.dtype)
   w_vmem = num_w_refs * num_w_buffers * k_tile * n_tile * w_bits // 8
   scale_vmem = 0
   bytes_per_fp32 = 4
-  if weight.quant is not None:
-    assert isinstance(weight.quant, tensor_spec.SubchannelQuantSpec)
-    num_blocks = pl.cdiv(k_tile, weight.quant.block_size)
-    scale_vmem = (
-        num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
-    )
+  match weight.quant:
+    case None:
+      pass
+    case tensor_spec.SubchannelQuantSpec(block_size=block_size):
+      num_blocks = pl.cdiv(k_tile, block_size)
+      scale_vmem = (
+          num_w_refs * num_w_buffers * num_blocks * n_tile * bytes_per_fp32
+      )
+    case tensor_spec.BlockScaledQuantSpec():
+      scale_vmem = (
+          num_w_refs
+          * num_w_buffers
+          * block_scaled.kernel_scale_rows(k_tile, dtype=weight.dtype)
+          * n_tile
+      )
   bias_vmem = 0
   if weight.has_bias:
     bias_vmem = num_w_refs * num_w_buffers * n_tile * bytes_per_fp32
   acc_vmem = num_w_refs * tile_m * n_tile * acc_bits // 8
-  # Dynamic quantization materializes a quantized copy of the x tile.
-  if is_dynamic_quantized:
-    acc_vmem += tile_m * k_tile * matmul_bits // 8
-  # Dequantizing before the matmul materializes a dequantized copy of w.
-  elif is_w_dequantized_before:
-    acc_vmem += num_w_refs * k_tile * n_tile * matmul_bits // 8
+  lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
+  if lhs_dtype != x_dtype:
+    acc_vmem += tile_m * k_tile * lhs_bits // 8
+    if isinstance(weight.quant, tensor_spec.BlockScaledQuantSpec):
+      acc_vmem += block_scaled.activation_scale_vmem_bytes(
+          tile_m, k_tile, weight.dtype
+      )
+  elif dequantizes_w_before_matmul(
+      x_dtype=x_dtype, matmul_dtype=lhs_dtype, w=weight, tpu_info=tpu_info
+  ):
+    acc_vmem += num_w_refs * k_tile * n_tile * lhs_bits // 8
   return w_vmem + scale_vmem + bias_vmem + acc_vmem
 
 
@@ -936,40 +970,36 @@ def _vmem_estimate(
     out_vmem += num_stash_buffers * tile_m * tile_n * stash_bits // 8
     out_vmem += num_stash_buffers * (1 + stash_ratio) * tile_m * chunk_bytes
 
-  def _estimate_for_weight(
-      weight: tensor_spec.WeightSpec,
-      lhs_dtype: jnp.dtype,
-      k_tile: int,
-      n_tile: int,
-      num_w_refs: int,
-  ) -> int:
-    return _matmul_vmem_estimate(
-        weight,
-        k_tile,
-        n_tile,
-        num_w_refs,
-        tile_m=tile_m,
-        num_w_buffers=num_w_buffers,
-        matmul_bits=jax.dtypes.itemsize_bits(lhs_dtype),
-        acc_bits=acc_bits,
-        is_dynamic_quantized=lhs_dtype != x.dtype,
-        is_w_dequantized_before=dequantizes_w_before_matmul(
-            x_dtype=x.dtype, matmul_dtype=lhs_dtype, w=weight, tpu_info=tpu_info
-        ),
-    )
-
   num_w1_refs = 2 if is_fused_act else 1
-  if w2 is None:
-    matmul_vmem = _estimate_for_weight(
-        w, matmul_dtype, tile_k, tile_n, num_w1_refs
-    )
-  else:
+  w1_n_tile = tile_n if w2 is None else tile_k2
+  assert w1_n_tile is not None
+  matmul_vmem = _matmul_vmem_bytes(
+      w,
+      x_dtype=x.dtype,
+      lhs_dtype=matmul_dtype,
+      acc_bits=acc_bits,
+      tile_m=tile_m,
+      k_tile=tile_k,
+      n_tile=w1_n_tile,
+      num_w_buffers=num_w_buffers,
+      num_w_refs=num_w1_refs,
+      tpu_info=tpu_info,
+  )
+  if w2 is not None:
     assert tile_k2 is not None
     w2_lhs_dtype = matmul_dtype if w2_matmul_dtype is None else w2_matmul_dtype
-    matmul_vmem = _estimate_for_weight(
-        w, matmul_dtype, tile_k, tile_k2, num_w1_refs
+    matmul_vmem += _matmul_vmem_bytes(
+        w2,
+        x_dtype=x.dtype,
+        lhs_dtype=w2_lhs_dtype,
+        acc_bits=acc_bits,
+        tile_m=tile_m,
+        k_tile=tile_k2,
+        n_tile=tile_n,
+        num_w_buffers=num_w_buffers,
+        num_w_refs=1,
+        tpu_info=tpu_info,
     )
-    matmul_vmem += _estimate_for_weight(w2, w2_lhs_dtype, tile_k2, tile_n, 1)
     matmul_vmem += tile_m * tile_k2 * jax.dtypes.itemsize_bits(x.dtype) // 8
     if tile_k2 < w2.in_size:
       # Output accumulator kept across k2 slices (PipelineAllocs.out_acc).
