@@ -21,7 +21,7 @@ consumed by config construction and the kernel. Keeping them separate avoids
 carrying `None` unions past planning.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 import dataclasses
 import functools
 import math
@@ -511,6 +511,39 @@ def _tile_m_candidates(
   return sorted(candidates, reverse=True)
 
 
+def _fused_tile_m_candidates(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    max_group_rows: int,
+    largest_tile_m: int,
+    bucket_base: int,
+    tpu_info: pltpu.TpuInfo,
+) -> Iterator[tuple[int, int]]:
+  """Yields (tile_m, bucket_base) pairs to try without k2 tiling, best first."""
+  # Groups averaging more than 256 rows span multiple 256-row tiles. 512-row
+  # tiles are slower for K > 4096.
+  avg_group_rows = spec.size_out_m / max(spec.num_global_groups, 1)
+  if (
+      isinstance(spec.w.quant, tensor_spec.BlockScaledQuantSpec)
+      and plan.tile_m is None
+      and plan.bucket_base is None
+      and plan.max_tile_m is None
+      and plan.max_num_buckets is None
+      and avg_group_rows > 256
+      and max_group_rows >= 512
+      and spec.size_k <= 4096
+  ):
+    yield 512, 256
+  yield largest_tile_m, bucket_base
+  if plan.fuse_up_and_down and plan.tile_m is None:
+    floor_m = max(tpu_info.num_sublanes, plan.bucket_base or 0)
+    cand_m = largest_tile_m
+    while cand_m > floor_m:
+      cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
+      yield cand_m, min(bucket_base, cand_m)
+
+
 def _tile_k2_candidates(
     size_k2: int, w2: tensor_spec.WeightSpec, tpu_info: pltpu.TpuInfo
 ) -> list[int]:
@@ -920,17 +953,17 @@ def _fused_tiling(
   # Heuristic: It may not worth to use fusion with a smaller tile_m vs unfused
   # with a larger tile_m.
   if plan.tile_k2 is None or plan.tile_k2 == size_k2:
-    tiling = try_fit(largest_tile_m, size_k2, bucket_base)
-    if tiling is not None:
-      return tiling
-    if plan.fuse_up_and_down and plan.tile_m is None:
-      floor_m = max(tpu_info.num_sublanes, plan.bucket_base or 0)
-      cand_m = largest_tile_m
-      while cand_m > floor_m:
-        cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
-        tiling = try_fit(cand_m, size_k2, min(bucket_base, cand_m))
-        if tiling is not None:
-          return tiling
+    for cand_m, cand_bucket_base in _fused_tile_m_candidates(
+        plan,
+        spec=spec,
+        max_group_rows=max_group_rows,
+        largest_tile_m=largest_tile_m,
+        bucket_base=bucket_base,
+        tpu_info=tpu_info,
+    ):
+      tiling = try_fit(cand_m, size_k2, cand_bucket_base)
+      if tiling is not None:
+        return tiling
 
   # Step 2: Slice k2 with largest possible tile_m.
   if not _may_slice_k2(plan, spec=spec):

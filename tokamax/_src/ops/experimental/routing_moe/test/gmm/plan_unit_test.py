@@ -1111,10 +1111,10 @@ class SmemIndicesTest(parameterized.TestCase):
         _resolve(6500, custom_plan, top_k=10).smem_indices, smem_indices
     )
 
-  def _block_scaled_spec_and_fmt(self):
+  def _block_scaled_spec_and_fmt(self, num_tokens: int = 8):
     if not block_scaled.is_available():
       self.skipTest("Block-scaled matmul is not available in this build.")
-    base = _make_spec(8, with_down=True)
+    base = _make_spec(num_tokens, with_down=True)
     w = dataclasses.replace(
         base.w,
         quant=spec.BlockScaledQuantSpec(
@@ -1157,17 +1157,42 @@ class SmemIndicesTest(parameterized.TestCase):
           tpu_info=_tpu_info(),
       )
 
-  def test_block_scaled_tpu_8t_plan_and_smem(self):
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="decode_8",
+          num_tokens=8,
+          expected_tile_m=16,
+          expected_buckets=[16],
+      ),
+      dict(
+          testcase_name="prefill_8192",
+          num_tokens=8192,
+          expected_tile_m=256,
+          expected_buckets=[128, 256],
+      ),
+      dict(
+          testcase_name="prefill_16384",
+          num_tokens=16384,
+          expected_tile_m=512,
+          expected_buckets=[256, 512],
+      ),
+  )
+  def test_block_scaled_tpu_8t_plan_and_smem(
+      self,
+      num_tokens: int,
+      expected_tile_m: int,
+      expected_buckets: list[int],
+  ):
     chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
     if chip_8t is None:
       self.skipTest("TPU_8T is not available in this JAX version.")
     tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
-    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt()
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt(num_tokens)
     resolved = gmm_plan.ResolvedGmmPlan.create(
         None, spec=bs_spec, out_format=resolved_fmt, tpu_info=tpu_8t
     )
-    self.assertEqual(resolved.tile_m, 16)
-    self.assertEqual(resolved.bucket_rows, [16])
+    self.assertEqual(resolved.tile_m, expected_tile_m)
+    self.assertEqual(resolved.bucket_rows, expected_buckets)
     self.assertIsNone(resolved.x_quant_block_size)
     self.assertTrue(resolved.fuse_up_and_down)
     cfg = gmm_config.RoutingGmmConfig.create(
@@ -1179,6 +1204,36 @@ class SmemIndicesTest(parameterized.TestCase):
     self.assertEqual(
         gmm_plan.smem_estimate(cfg.spec, cfg.plan), _kernel_smem(cfg)
     )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="max_tile_m",
+          custom_plan=gmm_plan.RoutingGmmPlan(max_tile_m=256),
+          expected_tile_m=256,
+      ),
+      dict(
+          testcase_name="max_num_buckets",
+          custom_plan=gmm_plan.RoutingGmmPlan(max_num_buckets=1),
+          expected_tile_m=128,
+      ),
+      dict(
+          testcase_name="bucket_base",
+          custom_plan=gmm_plan.RoutingGmmPlan(bucket_base=256),
+          expected_tile_m=256,
+      ),
+  )
+  def test_block_scaled_large_tile_respects_tile_m_overrides(
+      self, custom_plan: gmm_plan.RoutingGmmPlan, expected_tile_m: int
+  ):
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt(16384)
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        custom_plan, spec=bs_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    self.assertEqual(resolved.tile_m, expected_tile_m)
 
   def test_block_scaled_mixed_w2_quant_disables_fusion(self):
     if not block_scaled.is_available():
