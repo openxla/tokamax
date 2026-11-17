@@ -1,0 +1,266 @@
+# Copyright 2026 Ant Group. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Inference-only Kimi Delta Attention forward operator.
+
+This module deliberately does not import ``chunk.py`` or register a custom
+VJP.  It provides a small public API around the native segment-ID Pallas
+mega-kernel so inference optimization cannot change the training path.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+from tokamax._src import jaxtyping
+
+from tokamax._src.ops.kda.pallas_mosaic_tpu_inference_kernel import _chunk_kda_fwd_native_segids
+
+
+@jaxtyping.jaxtyped
+def kimi_delta_attention_inference(
+    q: Float[Array, "B T H K"],
+    k: Float[Array, "B T H K"],
+    v: Float[Array, "B T H V"],
+    g: Float[Array, "B T H K"],
+    beta: Float[Array, "B T H"],
+    *,
+    segment_ids: Int[Array, "B T"] | Int[Array, "T"],
+    a_log: Float[Array, "H"] | None = None,
+    delta_time_bias: Float[Array, "H*K"] | None = None,
+    scale: float | None = None,
+    initial_state: (
+        Float[Array, "B N H K V"] | Float[Array, "N H K V"] | None
+    ) = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    safe_gate: bool = True,
+    lower_bound: float | None = None,
+    max_num_segments: int | None = None,
+) -> tuple[Float[Array, "B T H V"], Float[Array, "B N H K V"] | None]:
+  """Run the standalone KDA inference forward kernel.
+
+  Args:
+    q: Query tensor ``[B, T, H, K]`` in BF16.
+    k: Key tensor ``[B, T, H, K]`` with the same dtype as ``q``.
+    v: Value tensor ``[B, T, H, V]`` with the same dtype as ``q``.
+    g: Raw gate tensor ``[B, T, H, K]`` when
+      ``use_gate_in_kernel=True``; otherwise an activated log-space gate.
+    beta: Update coefficient ``[B, T, H]``.
+    segment_ids: One-indexed packed-sequence IDs ``[B, T]`` or ``[T]``;
+      zero denotes padding.
+    a_log: Per-head log decay ``[H]``. Required for fused gate activation.
+    delta_time_bias: Flattened gate bias ``[H*K]``. Required for fused gate activation.
+    scale: Attention scale. Defaults to ``K**-0.5``.
+    initial_state: Optional FP32 state ``[B, N, H, K, V]`` or
+      ``[N, H, K, V]``.
+    output_final_state: Return FP32 final state ``[B, N, H, K, V]``.
+    use_qk_l2norm_in_kernel: Must be True. Normalization bounds the
+      triangular-solve coefficients.
+    use_gate_in_kernel: Must be True so gate decay is bounded in the kernel.
+    safe_gate: Must be True.
+    lower_bound: Sigmoid-gate lower bound in the safe range ``[-5, 0)``.
+    max_num_segments: Static maximum number of packed segments.
+
+  Returns:
+    A pair ``(output, final_state)``. Output is ``[B, T, H, V]`` and has
+    the input dtype. ``final_state`` is FP32 when requested, otherwise None.
+
+  Raises:
+    ValueError: If shapes, dtypes, or static inference options are invalid.
+  """
+  if any(d <= 0 for d in q.shape) or v.shape[-1] <= 0:
+    raise ValueError("tensor dimensions must be positive")
+  if q.dtype != jnp.bfloat16:
+    raise ValueError(
+        f"kimi_delta_attention_inference currently requires BF16, got {q.dtype}"
+    )
+  if not (q.dtype == k.dtype == v.dtype == g.dtype):
+    raise ValueError("q, k, v, and g must have the same dtype")
+  if beta.dtype != q.dtype:
+    raise ValueError("beta must have the same dtype as q")
+  if q.shape[:3] != k.shape[:3] or q.shape != g.shape:
+    raise ValueError("q, k, and g must agree on [B, T, H, K]")
+  if q.shape[:3] != v.shape[:3] or q.shape[:3] != beta.shape:
+    raise ValueError("v and beta must agree with q on [B, T, H]")
+  if q.shape[-1] != k.shape[-1]:
+    raise ValueError("q and k must have the same key dimension")
+  if q.shape[1] % 64:
+    raise ValueError("T must be padded to a multiple of 64")
+  if segment_ids.ndim == 1:
+    # A shared [T] segment map covers every batch element, so broadcast it
+    # to the documented [B, T] form. The native kernel already accepts this
+    # broadcast semantics for a 1D map; only the shape check rejected it.
+    segment_ids = jnp.broadcast_to(
+        segment_ids[None, :], (q.shape[0], segment_ids.shape[0])
+    )
+  if segment_ids.shape != q.shape[:2]:
+    raise ValueError(
+        f"segment_ids must have shape {q.shape[:2]}, got {segment_ids.shape}"
+    )
+  if segment_ids.dtype != jnp.int32:
+    raise ValueError(f"segment_ids must use int32, got {segment_ids.dtype}")
+  if use_gate_in_kernel and (a_log is None or delta_time_bias is None):
+    raise ValueError("fused gate activation requires a_log and delta_time_bias")
+  if not use_qk_l2norm_in_kernel:
+    raise ValueError(
+        "standalone inference requires in-kernel Q/K L2 normalization "
+        "to bound the triangular solve"
+    )
+  if not use_gate_in_kernel or not safe_gate:
+    raise ValueError("standalone inference requires safe fused gate activation")
+  if lower_bound is None or not (-5 <= lower_bound < 0):
+    raise ValueError(
+        "safe fused gate activation requires lower_bound in [-5, 0)"
+    )
+  if max_num_segments is None:
+    if initial_state is not None:
+      max_num_segments = initial_state.shape[-4]
+    else:
+      raise ValueError(
+          "max_num_segments is required when initial_state is None"
+      )
+  if max_num_segments <= 0:
+    raise ValueError("max_num_segments must be positive")
+  if a_log.shape != (q.shape[2],) or delta_time_bias.shape != (
+      q.shape[2] * q.shape[-1],
+  ):
+    raise ValueError("gate parameters must match the head and key dimensions")
+  if initial_state is not None and initial_state.shape not in (
+      (q.shape[0], max_num_segments, q.shape[2], q.shape[-1], v.shape[-1]),
+      (max_num_segments, q.shape[2], q.shape[-1], v.shape[-1]),
+  ):
+    raise ValueError(
+        "initial_state shape must match batch, segments, heads, K and V"
+    )
+  if initial_state is not None and initial_state.dtype != jnp.float32:
+    raise ValueError("initial_state must use float32")
+
+  # The native inference kernel clips beta before the Stage 2 solve. Keeping
+  # the batch-first tensor here avoids a separate head-first layout module.
+  # exp(80) is finite in FP32 and already far beyond the sigmoid saturation
+  # point. This preserves valid model values while preventing exp(a_log) from
+  # becoming inf before gate activation.
+  a_log = jnp.minimum(a_log, jnp.asarray(80.0, dtype=a_log.dtype))
+
+  actual_scale = q.shape[-1] ** -0.5 if scale is None else scale
+
+  def run(xs, ids_i, state_i, capacity):
+    q_i, k_i, v_i, g_i, beta_i = xs
+    output, final_state, *_ = _chunk_kda_fwd_native_segids(
+        q=q_i,
+        k=k_i,
+        v=v_i,
+        g=g_i,
+        beta=beta_i,
+        segment_ids=ids_i,
+        initial_state=state_i,
+        output_final_state=output_final_state,
+        scale=actual_scale,
+        chunk_size=64,
+        store_h=False,
+        store_v_new=False,
+        disable_recompute=False,
+        only_fwd=True,
+        safe_gate=safe_gate,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=a_log,
+        dt_bias=delta_time_bias,
+        lower_bound=lower_bound,
+        mini_batch=None,
+        N_max=capacity,
+        residual_chunk_layout=False,
+        batch_first=True,
+    )
+    return output, final_state
+
+  valid = (segment_ids > 0) & (segment_ids <= max_num_segments)
+  ids = jnp.where(valid, segment_ids, 0)
+  keys = jnp.where(
+      valid,
+      ids.astype(jnp.uint32),
+      jnp.asarray(jnp.iinfo(jnp.uint32).max, jnp.uint32),
+  )
+  previous = jax.lax.associative_scan(jnp.maximum, ids, axis=1)
+  needs = jnp.any(valid & (ids < previous)) | jnp.any(ids != segment_ids)
+  state = initial_state
+  if state is not None and state.ndim == 4:
+    state = jnp.broadcast_to(state[None], (q.shape[0],) + state.shape)
+
+  def corrected(xs):
+    batch, tokens = ids.shape
+    if state is None and not output_final_state:
+      # Upstream stateless recurrence starts a new span when a label is
+      # reused after another active label. Padding preserves the active span.
+      from tokamax._src.ops.kda.utils import canonicalize_packed_segment_ids
+      spans, _, _ = canonicalize_packed_segment_ids(ids)
+      return run(xs, spans, None, tokens)
+    order = jnp.argsort(keys, axis=1, stable=True).astype(jnp.int32)
+    inverse = (
+        jnp.zeros_like(order)
+        .at[jnp.arange(batch)[:, None], order]
+        .set(jnp.arange(tokens)[None])
+    )
+    packed = jnp.take_along_axis(ids, order, axis=1)
+    positive = packed > 0
+    starts = positive & (packed != jnp.pad(packed[:, :-1], ((0, 0), (1, 0))))
+    canonical = jnp.where(positive, jnp.cumsum(starts, axis=1), 0)
+    capacity = min(max_num_segments, tokens)
+    positions = jax.vmap(
+        lambda row: jnp.nonzero(row, size=capacity, fill_value=tokens)[0]
+    )(starts)
+    labels = jnp.where(
+        positions < tokens,
+        jnp.take_along_axis(packed, jnp.minimum(positions, tokens - 1), axis=1),
+        0,
+    )
+    compact_state = None
+    if state is not None:
+      compact_state = jnp.take_along_axis(
+          state, jnp.maximum(labels - 1, 0)[..., None, None, None], axis=1
+      )
+      compact_state = jnp.where(
+          (labels > 0)[..., None, None, None], compact_state, 0
+      )
+
+    def take(x, index):
+      return jnp.take_along_axis(
+          x, index.reshape(index.shape + (1,) * (x.ndim - 2)), axis=1
+      )
+
+    output, final = run(
+        tuple(take(x, order) for x in xs), canonical, compact_state, capacity
+    )
+    output = jnp.where(valid[..., None, None], take(output, inverse), 0)
+    if final is not None:
+      logical = (
+          jnp.zeros((batch, max_num_segments) + final.shape[2:], final.dtype)
+          if state is None
+          else state
+      )
+      destination = jnp.where(labels > 0, labels - 1, max_num_segments)
+      final = logical.at[jnp.arange(batch)[:, None], destination].set(
+          final, mode="drop"
+      )
+    return output, final
+
+  return jax.lax.cond(
+      needs,
+      corrected,
+      lambda xs: run(xs, segment_ids, state, max_num_segments),
+      (q, k, v, g, beta),
+  )

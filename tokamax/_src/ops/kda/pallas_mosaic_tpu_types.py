@@ -20,7 +20,6 @@ from typing import TypeAlias
 import jax
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 
-
 CpMetadata: TypeAlias = (
     tuple[
         jax.Array | bool | None,
@@ -77,6 +76,10 @@ class KdaResiduals:
   two_pass_bf16: bool = dataclasses.field(
       default=False, metadata=dict(static=True)
   )
+
+
+  token_order: Int[Array, "B T_ORIG"] | None = None
+  token_unpermute: Int[Array, "B T_ORIG"] | None = None
 
 
 @jax.tree_util.register_dataclass
