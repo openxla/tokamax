@@ -40,6 +40,10 @@ MaskInfo = mask_info_lib.MaskInfo
 partial = functools.partial
 NUM_LANES = 128
 NUM_SUBLANES = 8
+# kv band width of `dkv_segment_kv_trim`. At most two bands are trimmed, so the
+# trimmed dots keep M >= 512 (on TPU7x an M=128 dot rounds differently, see
+# `sv_matmul`).
+_DKV_KV_TRIM_BAND = 256
 # We predefine some useful dimension numbers for dot_general
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
@@ -371,6 +375,15 @@ class SplashConfig:
   #   the queries it attends to. Accumulates dq in VMEM scratch when present
   #   (dq_reduction_steps=1), or per query band in f32 registers otherwise.
   diag_band_skip: bool = False
+  # Backward (dkv), with segment ids and block_kv_dkv == block_kv_dkv_compute:
+  # on a full tile whose first one or two _DKV_KV_TRIM_BAND-row kv bands share
+  # no segment id with the q block, run the tile over the remaining kv rows
+  # only. The skipped rows have p == 0 exactly, so dq, dk and dv are unchanged.
+  # Needs every q row to see a kv of its own segment: a pure CausalMask
+  # (offset 0) with equal q and kv ids (checked at run time). Ignored (set to
+  # False) unless `make_splash_mha` / `make_splash_mqa` see such a mask with
+  # q_seq_shards=1.
+  dkv_segment_kv_trim: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
   # `prng_key` passed at call time, so it costs no HBM traffic and is never
@@ -2085,6 +2098,7 @@ def _flash_attention_dkv_kernel(
     di_ref,
     mask_ref,
     q_sequence_ref,
+    seg_trim_ref,
     # aliases
     dq_alias,
     dk_alias,
@@ -2197,9 +2211,10 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
-  def body(i, _, has_partial_mask=False):
+  def body(i, _, has_partial_mask=False, k0=0):
+    # k0 > 0 (`dkv_segment_kv_trim`, full tiles only): skip the first k0 kv rows.
     dropout_mask = None
-    slice_k = pl.ds(i * bkv_compute, bkv_compute)
+    slice_k = pl.ds(i * bkv_compute + k0, bkv_compute - k0)
     q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
     if config.use_base2_exp and not config.q_prescaled_log2e:
       if q.dtype == jnp.float8_e4m3fn:
@@ -2379,7 +2394,7 @@ def _flash_attention_dkv_kernel(
         kv_segment_ids_ref,
         attn_logits_soft_cap=attn_logits_soft_cap,
         k_slice=slice_k,
-        k_offset=kv_index * bkv + i * bkv_compute,
+        k_offset=kv_index * bkv + i * bkv_compute + k0,
         bq=bq,
         k_in_lanes=False,
         mask_function=mask_function,
@@ -2493,7 +2508,28 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(should_not_mask, should_run))
   def _():
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    if seg_trim_ref is None:
+      lax.fori_loop(0, num_iters, body, None, unroll=True)
+      return
+    # A kv band whose [min, max] segment ids miss the q block's has p == 0.
+    # Rows: q block lo, q block hi, kv band lo, kv band hi.
+    q_block = active_cols_ref[grid_idx].astype(jnp.int32)
+    q_lo, q_hi = seg_trim_ref[0, q_block], seg_trim_ref[1, q_block]
+
+    def dead(b):
+      band = kv_index * (bkv // _DKV_KV_TRIM_BAND) + b
+      return jnp.logical_or(
+          seg_trim_ref[3, band] < q_lo, seg_trim_ref[2, band] > q_hi
+      )
+
+    d0 = dead(0)
+    d1 = jnp.logical_and(d0, dead(1))
+    for k0, run in (
+        (0, _not(d0)),
+        (_DKV_KV_TRIM_BAND, jnp.logical_and(d0, _not(d1))),
+        (2 * _DKV_KV_TRIM_BAND, d1),
+    ):
+      pl.when(run)(partial(body, 0, None, k0=k0))
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
@@ -2849,6 +2885,45 @@ def _splash_attention_bwd_dkv(
       q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
 
+  seg_trim = None
+  if (
+      config.dkv_segment_kv_trim
+      and segment_ids is not None
+      and dynamic_grid
+      and bkv == bkv_compute
+      and bkv % _DKV_KV_TRIM_BAND == 0
+      and bkv > 2 * _DKV_KV_TRIM_BAND
+      and not config.dropout_rate
+      and q_seq_len == kv_seq_len
+  ):
+    # Per q block and kv band [min, max] segment ids, by reshape + min/max (no
+    # gather), on sublanes so the table can be vmapped. With different q and kv
+    # ids a q row may see no kv at all, so no band is trimmed.
+    q_ids, kv_ids = segment_ids.q, segment_ids.kv
+    assert isinstance(q_ids, jax.Array) and isinstance(kv_ids, jax.Array)
+    seg_q = q_ids.astype(jnp.int32).reshape(q_steps, bq)
+    seg_kv = kv_ids.astype(jnp.int32).reshape(-1, _DKV_KV_TRIM_BAND)
+    same_ids = jnp.all(q_ids == kv_ids)
+    i32 = jnp.iinfo(jnp.int32)
+    seg_rows = [
+        jnp.where(same_ids, seg_q.min(axis=-1), i32.min),
+        jnp.where(same_ids, seg_q.max(axis=-1), i32.max),
+        seg_kv.min(axis=-1),
+        seg_kv.max(axis=-1),
+    ]
+    width = max(r.shape[0] for r in seg_rows)
+    seg_trim = jnp.stack(
+        [jnp.pad(r, (0, width - r.shape[0])) for r in seg_rows]
+        + [jnp.zeros((width,), jnp.int32)] * (NUM_SUBLANES - len(seg_rows))
+    )
+    in_specs.append(
+        pl.BlockSpec(
+            (NUM_SUBLANES, width), lambda *_: (0, 0), memory_space=pltpu.SMEM
+        )
+    )
+  else:
+    in_specs.append(None)
+
   in_specs += [dq_alias_spec]
 
   # `use_vmem_dq_reduction` also provides `dq_scratch` for `diag_band_skip`
@@ -2942,6 +3017,7 @@ def _splash_attention_bwd_dkv(
       di,
       mask_info.partial_mask_blocks,
       q_sequence,
+      seg_trim,
   ]
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
@@ -3361,6 +3437,23 @@ def _make_splash_attention(
   else:
     dkv_mask_sparsity = 1.0
 
+  if config.dkv_segment_kv_trim:
+    # Every q row sees itself (causal, identity positions), and
+    # exp(mask_value - lse) underflows to 0 for any real lse.
+    kv_trim_ok = (
+        q_seq_shards == 1
+        and isinstance(mask, mask_lib.CausalMask)
+        and mask.offset == 0
+        and mask.shape[0] == mask.shape[1]
+        and np.array_equal(
+            mask.q_sequence, np.arange(mask.shape[0], dtype=np.int32)
+        )
+        and mask_value <= -1e30
+        and not config.dropout_rate
+    )
+    if not kv_trim_ok:
+      config = dataclasses.replace(config, dkv_segment_kv_trim=False)
+
   return SplashAttentionKernel(
       fwd_mask_info,
       dkv_mask_info,
@@ -3416,6 +3509,7 @@ def _make_dynamic_splash_attention(
           3 if config.dq_reduction_steps is None else config.dq_reduction_steps
       ),
       dkv_q_blocks_are_contiguous=False,
+      dkv_segment_kv_trim=False,
   )
 
   def process_mask_shard(mask):
