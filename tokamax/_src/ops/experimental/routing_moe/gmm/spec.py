@@ -115,6 +115,10 @@ class RoutingGmmSpec:
     return self.fuse_act is not None
 
   @property
+  def has_routed_io(self) -> bool:
+    return self.gather is not None or self.scatter is not None
+
+  @property
   def size_k(self) -> int:
     return self.x.col_size
 
