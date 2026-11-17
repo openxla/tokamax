@@ -2573,6 +2573,171 @@ class GmmTest(parameterized.TestCase):
       actual = actual * grad_scale
     chex.assert_trees_all_close(actual, expected, atol=2e-1, rtol=5e-2)
 
+  @parameterized.product(
+      dtype=[jnp.bfloat16, jnp.int8, jnp.float8_e4m3fn],
+      has_scale=[False, True],
+      has_bias=[False, True],
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_with_scale_bias_and_fuse_act(
+      self, dtype, has_scale, has_bias, fuse_act
+  ):
+    """Native transpose_rhs matches swapped-axes 2D gmm_v2 across epilogues.
+
+    This test sets maybe_quantize_lhs=False, so lhs must already be in a dtype
+    compatible with rhs (`dtype`) for the TPU MXU.
+    """
+    if dtype == jnp.float8_e4m3fn and pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 5")
+    if dtype == jnp.bfloat16 and has_scale:
+      self.skipTest("rhs_scale only applies to quantized rhs")
+
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1, k2 = jax.random.split(jax.random.key(11), 3)
+    lhs_f = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    lhs_scale = None
+    rhs_scale = None
+    if dtype == jnp.bfloat16:
+      lhs = lhs_f
+      rhs = rhs_f
+    elif dtype == jnp.float8_e4m3fn:
+      lhs = lhs_f.astype(jnp.float8_e4m3fn)
+      if has_scale:
+        rhs, rhs_scale_q = quantize_tensor(
+            rhs_f, jnp.dtype(dtype), axis=1, block_size=256
+        )
+        rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+      else:
+        rhs = rhs_f.astype(jnp.float8_e4m3fn)
+    else:
+      lhs, lhs_scale_q = quantize_tensor(
+          lhs_f.reshape(1, -1),
+          jnp.dtype(dtype),
+          axis=1,
+          block_size=lhs_f.size,
+      )
+      lhs = lhs.reshape(lhs_f.shape)
+      lhs_scale = lhs_scale_q.reshape(1, 1)
+      rhs, rhs_scale_q = quantize_tensor(
+          rhs_f, jnp.dtype(dtype), axis=1, block_size=256
+      )
+      rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2) if has_scale else None
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.uniform(
+          k2, (num_groups, 1, rhs_n), jnp.bfloat16, -1, 1
+      )
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        lhs_scale=lhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      rhs_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_with_lhs_quantization(self, rhs_dtype, fuse_act):
+    """Native transpose_rhs matches 2D gmm_v2 with in-kernel lhs quantization."""
+    if rhs_dtype == jnp.float8_e4m3fn and pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 5")
+
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1 = jax.random.split(jax.random.key(13), 2)
+    lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    rhs, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(rhs_dtype), axis=1, block_size=256
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=True,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_pre_matmul_dequant(self, fuse_act):
+    """Native transpose_rhs matches 2D gmm_v2 for sub-MXU rhs quant blocks."""
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1 = jax.random.split(jax.random.key(15), 2)
+    lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    # block_size=64 < mxu_column_size (128 or 256) triggers pre-matmul dequant.
+    rhs, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(jnp.int8), axis=1, block_size=64
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  def test_transpose_rhs_shape_mismatch_raises(self):
+    """validate_inputs raises ValueError when rhs K disagrees with lhs K."""
+    lhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs_wrong_k = jnp.zeros((4, 128, 512), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([32, 32, 32, 32], dtype=jnp.int32)
+    with self.assertRaisesRegex(ValueError, "rhs shape mismatch"):
+      gmm_v2.gmm_v2(lhs, rhs_wrong_k, group_sizes, transpose_rhs=True)
+    with self.assertRaisesRegex(ValueError, "rhs shape mismatch"):
+      gmm_v2.gmm_v2(lhs, rhs_wrong_k, group_sizes, transpose_rhs=False)
+
 
 _VMEM_LIMIT_BYTES = int(64 * 1024 * 1024 * 0.9)
 
