@@ -20,7 +20,6 @@ from typing import TypeAlias
 import jax
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 
-
 CpMetadata: TypeAlias = (
     tuple[
         jax.Array | bool | None,
@@ -44,9 +43,7 @@ class KdaResiduals:
   g_cumsum: Float[Array, "H B T_ALIGNED GW"] | None
   aqk: Float[Array, "H B T_ALIGNED BT"]
   akk: Float[Array, "H B T_ALIGNED BT"]
-  initial_state: (
-      Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
-  )
+  initial_state: Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
   g_org: Float[Array, "H B T_ALIGNED K"] | None
   a_log: Float[Array, "H"] | None
   delta_time_bias: Float[Array, "H*K"] | None
@@ -70,3 +67,6 @@ class KdaResiduals:
   conv_bias_q: Float[Array, "H_Q K"] | None = None
   conv_bias_k: Float[Array, "H_K K"] | None = None
   conv_bias_v: Float[Array, "H V"] | None = None
+
+  token_order: Int[Array, "B T_ORIG"] | None = None
+  token_unpermute: Int[Array, "B T_ORIG"] | None = None
