@@ -196,7 +196,9 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
     )
 
     def pad_seq_k(x, axis):
-      if x is None or axis is None or x.shape[axis] == 1:
+      if x is None or axis is None:
+        return x
+      if axis == -1 and x.shape[axis] == 1:  # Broadcast along K.
         return x
       block = split_k * config.block_kv
       return shape_lib.pad_to_next_multiple_of(x, block, axis)

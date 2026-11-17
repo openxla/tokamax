@@ -296,6 +296,15 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         expect_supported=self._supports_bias,
     )
 
+  @parameterized.parameters(1, 300)
+  def test_single_key(self, seq_len_q):
+    self._run_test(
+        (2, seq_len_q, 4, 64),
+        kv_shape=(2, 1, 4, 64),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+    )
+
   def test_unaligned_fp16_and_fully_masked_vjp(self):
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
