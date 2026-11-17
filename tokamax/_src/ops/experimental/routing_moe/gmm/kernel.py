@@ -245,9 +245,7 @@ def routing_gmm(
           disable_bounds_checks=True,
           # Remote DMA barriers use the collective barrier semaphore.
           collective_id=0 if remote else None,
-          # NOTE: This is critical to ensure DMA instruction are correctly
-          # scheduled to avoid resource contention.
-          flags={"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True},
+          flags=cfg.llo_flags,
       ),
       name=cfg.kernel_name,
       metadata=cfg.kernel_metadata,
