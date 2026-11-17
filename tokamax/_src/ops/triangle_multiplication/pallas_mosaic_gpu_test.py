@@ -697,6 +697,25 @@ class PallasMosaicGpuTriangleMultiplicationTest(parameterized.TestCase):
             epsilon=1e-6,
         )
 
+    with self.subTest("mismatched_norm_dtype"):
+      params = _get_params(n=128, c=64, h=64, d=64, dtype=jnp.bfloat16)
+      res = (jnp.zeros((64, 128, 128), dtype=jnp.bfloat16),) * 3
+      params["layernorm_in_scale"] = params["layernorm_in_scale"].astype(
+          jnp.float16
+      )
+      with self.assertRaises(NotImplementedError):
+        self._op(**params, triangle_type="outgoing")
+      with self.assertRaises(NotImplementedError):
+        vjp_op(
+            res,
+            params["x"],
+            params["x"],
+            **params,
+            triangle_type="outgoing",
+            precision=default_prec,
+            epsilon=1e-6,
+        )
+
     with self.subTest("mismatched_residual_shape"):
       params = _get_params(n=128, c=64, h=64, d=64, dtype=jnp.bfloat16)
       res = (

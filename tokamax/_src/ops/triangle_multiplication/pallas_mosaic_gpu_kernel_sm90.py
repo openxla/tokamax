@@ -820,8 +820,12 @@ def epilogue_bwd(
         dleft_act_epi,
         grad_sum[:h, :d].astype(dtype),
         grad_sum[h : h + c, :d].astype(dtype),
-        jnp.sum(grad_sum[h + c : h + c + 32, :h], axis=0).astype(dtype),
-        jnp.sum(grad_sum[h + c + 32 : h + c + 64, :h], axis=0).astype(dtype),
+        jnp.sum(grad_sum[h + c : h + c + 32, :h], axis=0).astype(
+            layernorm_out_scale.dtype
+        ),
+        jnp.sum(grad_sum[h + c + 32 : h + c + 64, :h], axis=0).astype(
+            layernorm_out_offset.dtype
+        ),
     )
 
   # 104 KB SMEM + zero-spill register budget at tile_m=64 -> full 2 CTAs/SM on
@@ -1080,8 +1084,12 @@ def epilogue_bwd(
       dleft_act_epi,
       grad_sum[:h, :d].astype(dtype),
       grad_sum[h : h + c, :d].astype(dtype),
-      jnp.sum(grad_sum[h + c : h + c + 32, :h], axis=0).astype(dtype),
-      jnp.sum(grad_sum[h + c + 32 : h + c + 64, :h], axis=0).astype(dtype),
+      jnp.sum(grad_sum[h + c : h + c + 32, :h], axis=0).astype(
+          layernorm_out_scale.dtype
+      ),
+      jnp.sum(grad_sum[h + c + 32 : h + c + 64, :h], axis=0).astype(
+          layernorm_out_offset.dtype
+      ),
   )
 
 
@@ -1378,8 +1386,12 @@ def prologue_bwd(
         dx_flat,
         grad_sum[:c].astype(dtype).reshape(c, 2, h),
         grad_sum[c : 2 * c].astype(dtype).reshape(c, 2, h),
-        jnp.sum(grad_sum[2 * c : 2 * c + 32, :c], axis=0).astype(dtype),
-        jnp.sum(grad_sum[2 * c + 32 : 2 * c + 64, :c], axis=0).astype(dtype),
+        jnp.sum(grad_sum[2 * c : 2 * c + 32, :c], axis=0).astype(
+            layernorm_in_scale.dtype
+        ),
+        jnp.sum(grad_sum[2 * c + 32 : 2 * c + 64, :c], axis=0).astype(
+            layernorm_in_offset.dtype
+        ),
     )
 
   # Fused width-2H (64x128) zero-spill double-buffered path (96 KB SMEM -> FULL
@@ -1652,7 +1664,11 @@ def prologue_bwd(
       dx_flat,
       grad_sum[:c].astype(dtype).reshape(c, 2, h),
       grad_sum[c : 2 * c].astype(dtype).reshape(c, 2, h),
-      jnp.sum(grad_sum[2 * c : 2 * c + 32, :c], axis=0).astype(dtype),
-      jnp.sum(grad_sum[2 * c + 32 : 2 * c + 64, :c], axis=0).astype(dtype),
+      jnp.sum(grad_sum[2 * c : 2 * c + 32, :c], axis=0).astype(
+          layernorm_in_scale.dtype
+      ),
+      jnp.sum(grad_sum[2 * c + 32 : 2 * c + 64, :c], axis=0).astype(
+          layernorm_in_offset.dtype
+      ),
   )
 

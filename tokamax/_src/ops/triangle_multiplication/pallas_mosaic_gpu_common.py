@@ -129,15 +129,24 @@ def validate_fwd_inputs(
       gate_in_weights,
       projection_out_weights,
       gate_out_weights,
+  ):
+    if w.dtype != x.dtype:
+      raise NotImplementedError(
+          f"All weight arrays must match x.dtype={x.dtype}, got {w.dtype}."
+      )
+
+  # The kernels compute the layer norms in float32, like the reference, which
+  # casts their parameters to float32.
+  for p in (
       layernorm_in_scale,
       layernorm_in_offset,
       layernorm_out_scale,
       layernorm_out_offset,
   ):
-    if w.dtype != x.dtype:
+    if p.dtype not in (x.dtype, jnp.float32):
       raise NotImplementedError(
-          f"All weight and norm arrays must match x.dtype={x.dtype}, got"
-          f" {w.dtype}."
+          f"All norm arrays must match x.dtype={x.dtype} or be float32, got"
+          f" {p.dtype}."
       )
 
   n, _, c = x.shape
