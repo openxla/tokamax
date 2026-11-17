@@ -828,7 +828,7 @@ def smem_estimate(
 ) -> dict[str, int]:
   """Estimates SMEM allocation sizes in bytes for routing GMM."""
   allocs = {}
-  allocs["group_cum_sum"] = 4 * (spec.num_global_groups + 1)
+  allocs["group_sizes"] = 4 * spec.num_global_groups
   allocs["group_offset"] = 4
   if plan.live_group_walk and spec.size_row_group:
     allocs["row_group"] = 4 * spec.size_row_group

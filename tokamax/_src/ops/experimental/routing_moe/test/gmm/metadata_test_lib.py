@@ -153,9 +153,8 @@ def fill_metadata(
     routing: helper_inputs.Routing, cfg: config.RoutingGmmConfig
 ) -> np.ndarray:
   """Runs the metadata walk of `cfg` on TPU and returns `[num_gm, 3]` tiles."""
-  group_cum_sum = jnp.cumulative_sum(routing.group_sizes, include_initial=True)
   metadata_in, metadata_scratch = metadata.create_metadata(
-      group_cum_sum.astype(jnp.int32),
+      routing.group_sizes.astype(jnp.int32),
       jnp.array([routing.group_offset], dtype=jnp.int32),
       cfg,
       row_group=routing.row_group if cfg.plan.live_group_walk else None,

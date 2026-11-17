@@ -893,7 +893,12 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     )
     rows = (case.routing.sorted_rows, case.routing.scattered_rows)
     for (x, kwargs), written in zip(calls, rows, strict=True):
-      kwargs = kwargs | case.routing.kernel_kwargs
+      # Pass a 0-D uint32 group_offset to exercise scalar/dtype normalization.
+      kwargs = (
+          kwargs
+          | case.routing.kernel_kwargs
+          | dict(group_offset=jnp.uint32(case.routing.group_offset))
+      )
       expected = kernel.routing_gmm(x, case.w1, **kwargs)
       actual = kernel.routing_gmm(x, case.w1, custom_plan=custom_plan, **kwargs)
       np.testing.assert_array_equal(

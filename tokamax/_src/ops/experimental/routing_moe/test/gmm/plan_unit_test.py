@@ -583,7 +583,7 @@ def _traced_smem_allocations(
     inputs: Any = None,
 ) -> dict[str, int]:
   """Logical bytes of each SMEM allocation."""
-  if jax.typeof(metadata_in.group_cum_sum).memory_space != pltpu.SMEM:
+  if jax.typeof(metadata_in.group_sizes).memory_space != pltpu.SMEM:
     raise ValueError(
         "smem_allocations must be called under jit, where SMEM constraints are"
         " active."
@@ -740,9 +740,9 @@ class SmemBudgetTest(parameterized.TestCase):
     self.assertEqual(allocs["row_group"], 4 * 40960)
     self.assertEqual(
         sum(allocs.values()),
-        # group_cum_sum, group_offset, row_group, tile tables, num_gm, and the
+        # group_sizes, group_offset, row_group, tile tables, num_gm, and the
         # gather and scatter index buffers.
-        4 * 513
+        4 * 512
         + 4
         + 4 * 40960
         + 3 * (4 * cfg.max_num_gm)

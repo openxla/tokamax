@@ -18,6 +18,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.test.gmm import metadata_test_lib
@@ -109,6 +110,72 @@ class MetadataUnitTest(parameterized.TestCase):
         size_n=size_n,
     )
     self.assertEqual(cfg.plan.live_group_walk, rows < num_experts)
+
+  @parameterized.product(
+      shard_spec=[
+          # Non-power-of-two size_out_m=5 with all routed rows before the shard.
+          ([0, 1, 1, 2, 3], 4, 4),
+          # Power-of-two size_out_m=8 with all routed rows before the shard.
+          ([0, 1, 1, 2, 3, 0, 2, 3], 4, 4),
+          # Single routed row before the shard.
+          ([1], 4, 4),
+          # Non-power-of-two size_out_m=5 with all routed rows after the shard.
+          ([8, 9, 11, 12, 15], 4, 4),
+          # Rows straddling both sides of [4, 8) with zero rows inside [4, 8).
+          ([0, 3, 8, 10, 15], 4, 4),
+          # Exact boundary hits at group_start=4 and group_end-1=7 (5 rows).
+          ([1, 4, 4, 7, 12], 4, 4),
+          # Non-power-of-two size_out_m=13 on the final EP shard [12, 16).
+          ([0, 2, 3, 5, 7, 9, 11, 12, 12, 13, 15, 15, 15], 12, 4),
+      ],
+      plan=metadata_test_lib.PLANS,
+  )
+  def test_ep_shard_boundaries_match_numpy(
+      self,
+      shard_spec: tuple[list[int], int, int],
+      plan: gmm_plan.RoutingGmmPlan,
+  ):
+    num_experts = 16
+    experts, group_offset, num_local = shard_spec
+    topk_indices = jnp.asarray(experts, dtype=jnp.int32).reshape(-1, 1)
+    routing = helper_inputs.Routing.make_routing(
+        topk_indices,
+        num_experts,
+        group_offset=group_offset,
+        num_local_experts=num_local,
+    )
+    cfg = metadata_test_lib.make_gmm_config(
+        num_rows=topk_indices.size,
+        num_global_groups=num_experts,
+        num_local_groups=num_local,
+        size_k=512,
+        size_n=512,
+        custom_plan=plan,
+    )
+    actual = metadata_test_lib.fill_metadata(routing, cfg)
+    expected = metadata_test_lib.expected_metadata(routing, cfg.plan.tile_m)
+    np.testing.assert_array_equal(actual, expected)
+
+  def test_empty_routing_falls_back_to_sorted_metadata(self):
+    routing = helper_inputs.Routing.make_routing(
+        jnp.zeros((0, 1), dtype=jnp.int32),
+        16,
+        group_offset=4,
+        num_local_experts=4,
+    )
+    cfg = metadata_test_lib.make_gmm_config(
+        num_rows=0,
+        num_global_groups=16,
+        num_local_groups=4,
+        size_k=512,
+        size_n=512,
+        custom_plan=gmm_plan.RoutingGmmPlan(tile_m=8),
+    )
+    # Fewer routed rows than groups picks the live walk, but an empty row_group
+    # falls back to the sorted walk.
+    self.assertFalse(cfg.plan.live_group_walk)
+    actual = metadata_test_lib.fill_metadata(routing, cfg)
+    self.assertEqual(actual.shape, (0, 3))
 
 
 if __name__ == "__main__":
