@@ -373,6 +373,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/routing_moe/test/common/out_format_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/config_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_block_scaled_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/metadata_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/plan_unit_test.py',
@@ -408,6 +409,8 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-layer-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_block_scaled_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_config_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_plan_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',
         ),
