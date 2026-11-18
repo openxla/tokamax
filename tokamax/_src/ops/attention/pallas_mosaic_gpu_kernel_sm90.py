@@ -229,12 +229,19 @@ def flash_attention_kernel(
   num_q_tiles = pl.cdiv(q_seq_len, block_q * 2)
   early_q_consumed = config.persistent and (bias is None or head_dim < 64)
 
-  if bias is not None and bias.shape[-2] != 1:
-    bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+  if bias is not None:
+    if bias.shape[-2] != 1:
+      bias = shape_lib.pad_to_next_multiple_of(bias, 8, -2)
+    if bias.shape[-1] != 1:
+      bias = shape_lib.pad_to_next_multiple_of(
+          bias, 128 // bias.dtype.itemsize, -1
+      )
 
   if mask is not None:
     if mask.shape[-2] != 1:
       mask = shape_lib.pad_to_next_multiple_of(mask, 8, -2)
+    if mask.shape[-1] != 1:
+      mask = shape_lib.pad_to_next_multiple_of(mask, 128, -1)
     mask = mask.astype(jnp.int8)
 
   as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
