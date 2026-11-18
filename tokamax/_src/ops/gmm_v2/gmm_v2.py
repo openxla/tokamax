@@ -19,12 +19,19 @@ import functools
 import math
 from typing import Any, Protocol, Tuple
 
+from absl import logging
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import config
+
+# Input quantization involves reading all elements in a block to compute scale
+# value. Since this operation is very memory intensive, we use a block size that
+# is small enough to minimize memory overhead but large enough to minimize
+# compute overhead of quantization.
+_LHS_QUANT_BLOCK_SIZE = 512
 
 # Util.
 
@@ -138,6 +145,35 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
 def align_to(x, a):
   return pl.cdiv(x, a) * a
+
+
+def rhs_scale_step_k(
+    lhs_quant_block_size: int,
+    rhs_quant_block_size: int,
+    tile_k: int,
+    size_k: int,
+) -> int:
+  """Returns the K step for applying rhs scales in a quantized lhs block.
+
+  Each step must lie within a single rhs scale block. When one rhs scale covers
+  the whole lhs block, the whole lhs block is a single step; otherwise the lhs
+  block is split into gcd-sized sub-blocks.
+
+  Args:
+    lhs_quant_block_size: Size of one lhs quantization block along K.
+    rhs_quant_block_size: Size of one rhs scale block along K.
+    tile_k: Size of the K tile.
+    size_k: Size of the contracting dimension K.
+  """
+  if (
+      rhs_quant_block_size % lhs_quant_block_size == 0
+      # The kernel loads a single rhs scale per K tile in this case, so
+      # splitting cannot apply a different scale.
+      or rhs_quant_block_size >= tile_k
+      or rhs_quant_block_size >= size_k
+  ):
+    return lhs_quant_block_size
+  return math.gcd(lhs_quant_block_size, rhs_quant_block_size)
 
 
 def get_num_cores(tpu_info: Any) -> int:
@@ -935,11 +971,14 @@ def inner_kernel(
       # result of [tile_m, mxu_size] becomes available at the end of every k
       # inner loop which can be used to pipeline subsequent VPU or VST ops with
       # MXU ops for the next [tile_m, mxu_size].
-      step_k = (
-          math.gcd(q_block_size, rhs_qbs)  # pyrefly: ignore[bad-argument-type]
-          if cfgs.rhs_cfgs.should_dequantize_after_matmul
-          else q_block_size
-      )
+      step_k = q_block_size
+      if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+        step_k = rhs_scale_step_k(
+            q_block_size,  # pyrefly: ignore[bad-argument-type]
+            rhs_qbs,  # pyrefly: ignore[bad-argument-type]
+            cfgs.tiles.tile_k,
+            cfgs.dims.size_k,
+        )
       for start_n in range(0, rhs_tile_n, mxu_size):
         end_n = min(rhs_tile_n, start_n + mxu_size)
         col_size = end_n - start_n
@@ -2020,6 +2059,32 @@ def make_gmm_configs(
         if not is_rhs_float:
           lhs_q_dtype = jnp.int8.dtype
 
+  # Each lhs block is split into gcd-sized sub-blocks, one per rhs scale block
+  # (see `rhs_scale_step_k`). Sub-blocks narrower than a lane are unsupported.
+  needs_sub_blocks = (
+      block_size % _LHS_QUANT_BLOCK_SIZE != 0 and block_size < dims.size_k
+  )
+  if lhs_q_dtype is not None and needs_sub_blocks:
+    sub_block_size = math.gcd(_LHS_QUANT_BLOCK_SIZE, block_size)
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    if sub_block_size % num_lanes != 0:
+      if lhs_quant_dtype is not None or lhs_scale is not None:
+        raise ValueError(
+            "lhs quantization was requested via lhs_quant_dtype or lhs_scale,"
+            f" but rhs {block_size=} (size_k={dims.size_k}) splits lhs quant"
+            f" blocks of {_LHS_QUANT_BLOCK_SIZE} into sub-blocks of"
+            f" {sub_block_size=}, which is not a multiple of {num_lanes=}."
+        )
+      logging.log_first_n(
+          logging.WARNING,
+          "gmm_v2: rhs quant block size %d (size_k=%d) is not compatible with"
+          " lhs quantization; lhs stays unquantized.",
+          1,
+          block_size,
+          dims.size_k,
+      )
+      lhs_q_dtype = None
+
   if lhs_scale is not None and maybe_quantize_lhs:
     assert lhs_q_dtype is not None, (
         "lhs_scale requires lhs quantization to engage, but no lhs quant "
@@ -2030,11 +2095,7 @@ def make_gmm_configs(
 
   lhs_cfgs = InputConfigs(
       quant_dtype=lhs_q_dtype,
-      # Input quantization involves reading all elements in a block to compute
-      # scale value. Since this operation is very memory intensive, we use a
-      # block size that is small enough to minimize memory overhead but large
-      # enough to minimize compute overhead of quantization.
-      quant_block_size=512,
+      quant_block_size=_LHS_QUANT_BLOCK_SIZE,
       dtype=lhs.dtype,
       has_scale=has_lhs_scale,
   )
@@ -2161,7 +2222,10 @@ def gmm_v2(
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
     acc_dtype: Optional jnp.dtype for the accumulator.
-    maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
+    maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized. lhs
+      stays unquantized if the rhs scale block size would split lhs quantization
+      blocks into sub-blocks that are not lane-aligned; with an explicit
+      `lhs_quant_dtype` or `lhs_scale`, this raises a `ValueError`.
     zero_initialize: Whether to initialize unvisited output elements to zero.
     fuse_act: Activation function to fuse with GMM, None if no fusion.
     transpose_rhs: Whether to transpose rhs in-core without HBM transposition.

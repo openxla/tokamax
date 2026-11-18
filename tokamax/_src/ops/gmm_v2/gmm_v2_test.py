@@ -1942,6 +1942,83 @@ class GmmTest(parameterized.TestCase):
     chex.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
   @parameterized.product(
+      weight_dtype=[jnp.float8_e4m3fn],
+      shape=[(1536, 256, 1536), (1536, 768, 1536), (2880, 2880, None)],
+  )
+  @pytest.mark.long
+  def test_gmm_quantized_lhs_applies_each_rhs_block_scale(
+      self, weight_dtype, shape: tuple[int, int, int | None]
+  ) -> None:
+    """Each rhs scale block gets its own scale when gmm_v2 quantizes the lhs.
+
+    Neighboring rhs block scales differ by 8x and K tiles hold several rhs
+    blocks, so a sub-block that straddles rhs blocks applies a wrong scale and
+    shows up as a large error. `shape` is (in_size, block_size, tile_k).
+    """
+    in_size, block_size, tile_k = shape
+    if weight_dtype == jnp.float4_e2m1fn and test_utils.get_tpu_version() < 7:
+      self.skipTest("Expect TPUv7+")
+    batch_size, out_size, num_groups = 128, 256, 4
+    lhs_key, rhs_key = jax.random.split(jax.random.key(0))
+
+    lhs = jax.random.uniform(
+        lhs_key, (batch_size, in_size), jnp.bfloat16, -1, 1
+    )
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.float32, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(
+        rhs, weight_dtype, axis=1, block_size=block_size
+    )
+    num_blocks = in_size // block_size
+    block_factor = jnp.where(jnp.arange(num_blocks) % 2 == 0, 1.0, 8.0)
+    rhs_scale = rhs_scale * block_factor[None, :, None]
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset = jnp.zeros((1,), jnp.int32)
+    if tile_k is None:
+      tile_info = gmm_v2.calculate_tiling_from_request
+    else:
+      tile_info = gmm_v2.TileSizes(
+          tile_m=128, tile_k=tile_k, tile_n=out_size, bucket_base=128
+      )
+
+    cfgs = gmm_v2.make_gmm_configs(
+        lhs,
+        rhs_q,
+        rhs_scale,
+        None,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=tile_info,
+        vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
+    if not cfgs.lhs_cfgs.should_quantize:
+      self.skipTest(f"gmm_v2 does not quantize lhs for {weight_dtype} here.")
+
+    expected = reference_gmm(lhs, rhs_q, group_sizes, rhs_scale=rhs_scale)
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        tile_info=tile_info,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
+
+    actual = actual.astype(jnp.float32)
+    expected = expected.astype(jnp.float32)
+    rel_error = jnp.linalg.norm(actual - expected) / jnp.linalg.norm(expected)
+    self.assertLess(float(rel_error), 0.05)
+
+  @parameterized.product(
       batch_size=[128],
       in_size=[1024],
       out_size=[1024],
@@ -3210,6 +3287,91 @@ class SplitForCoresTest(parameterized.TestCase):
         ),
         expected,
     )
+
+
+class LhsQuantRhsScaleBlocksTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      # rhs blocks that are multiples of the lhs block keep the lhs block.
+      dict(rhs_block=512, tile_k=1536, size_k=3072, expected=512),
+      dict(rhs_block=1024, tile_k=1024, size_k=4096, expected=512),
+      # Several rhs blocks per lhs block need gcd-sized sub-blocks.
+      dict(rhs_block=256, tile_k=1536, size_k=3072, expected=256),
+      dict(rhs_block=768, tile_k=1536, size_k=3072, expected=256),
+      dict(rhs_block=384, tile_k=1536, size_k=3072, expected=128),
+      # One rhs block covers the K tile or all of K.
+      dict(rhs_block=768, tile_k=768, size_k=3072, expected=512),
+      dict(rhs_block=640, tile_k=640, size_k=640, expected=512),
+      # tile_k is lane-aligned, so it can exceed an rhs block that spans K.
+      dict(rhs_block=2880, tile_k=2944, size_k=2880, expected=512),
+  )
+  def test_rhs_scale_step_k(
+      self, rhs_block: int, tile_k: int, size_k: int, expected: int
+  ) -> None:
+    self.assertEqual(
+        gmm_v2.rhs_scale_step_k(512, rhs_block, tile_k, size_k), expected
+    )
+
+  def _make_configs(
+      self,
+      rhs_block: int,
+      size_k: int,
+      lhs_quant_dtype: jnp.dtype | None = None,
+  ) -> gmm_v2.GmmConfigs:
+    num_groups, size_m, size_n = 4, 16, 256
+    return gmm_v2.make_gmm_configs(
+        jnp.zeros((size_m, size_k), jnp.bfloat16),
+        jnp.zeros((num_groups, size_k, size_n), jnp.float8_e4m3fn),
+        jnp.ones((num_groups, size_k // rhs_block, 1, size_n), jnp.float32),
+        None,
+        None,
+        jnp.zeros((num_groups,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
+        tile_info=gmm_v2.TileSizes(
+            tile_m=16, tile_k=size_k, tile_n=size_n, bucket_base=16
+        ),
+        vmem_limit_bytes=None,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=True,
+        zero_initialize=False,
+        lhs_quant_dtype=lhs_quant_dtype,
+    )
+
+  @parameterized.parameters(
+      dict(rhs_block=512, size_k=1536, expected_dtype=jnp.float8_e4m3fn),
+      dict(rhs_block=256, size_k=1536, expected_dtype=jnp.float8_e4m3fn),
+      # gcd(512, 320) = 64 is not lane-aligned.
+      dict(rhs_block=320, size_k=1280, expected_dtype=None),
+      # A single rhs block spanning K needs no sub-blocks.
+      dict(rhs_block=1280, size_k=1280, expected_dtype=jnp.float8_e4m3fn),
+  )
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_make_gmm_configs_lhs_quant_dtype(
+      self,
+      mock_get_tpu_info: mock.MagicMock,
+      rhs_block: int,
+      size_k: int,
+      expected_dtype: type[jnp.generic] | None,
+  ) -> None:
+    mock_get_tpu_info.return_value = pltpu.get_tpu_info_for_chip(
+        pltpu.ChipVersion.TPU_7X, 1
+    )
+    cfgs = self._make_configs(rhs_block, size_k)
+    self.assertEqual(cfgs.lhs_cfgs.quant_dtype, expected_dtype)
+    self.assertEqual(cfgs.lhs_cfgs.quant_block_size, 512)
+
+  @mock.patch.object(gmm_v2.pltpu, "get_tpu_info")
+  def test_make_gmm_configs_explicit_lhs_quant_unaligned_raises(
+      self, mock_get_tpu_info: mock.MagicMock
+  ) -> None:
+    mock_get_tpu_info.return_value = pltpu.get_tpu_info_for_chip(
+        pltpu.ChipVersion.TPU_7X, 1
+    )
+    with self.assertRaisesRegex(ValueError, r"not a multiple of num_lanes=128"):
+      self._make_configs(
+          320, 1280, lhs_quant_dtype=jnp.dtype(jnp.float8_e4m3fn)
+      )
 
 
 class TgmmV2CalculateTilingTest(parameterized.TestCase):
