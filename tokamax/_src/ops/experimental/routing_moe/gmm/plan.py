@@ -24,6 +24,7 @@ carrying `None` unions past planning.
 from collections.abc import Callable
 import dataclasses
 import functools
+import math
 from typing import Self
 
 import jax
@@ -80,6 +81,23 @@ class RoutingGmmPlan:
   max_tile_m: int | None = None
   # Upper bound on the number of buckets (tile_m / bucket_base).
   max_num_buckets: int | None = None
+  # Multiplier on the mean rows per expert group when bounding tile_m, so
+  # moderately skewed groups still fit in one tile.
+  # TODO: The default of 1.5 was chosen empirically from TPUv7x routing
+  # skew sweeps and is not derived. Revisit it based on measured routing skew.
+  skew_headroom: float | None = None
+  # tile_m is kept at or above i_local // dma_floor_divisor, where i_local is
+  # the per-shard intermediate width, so per-tile row gather/scatter stays
+  # small next to the group's weight DMA.
+  # TODO: The default of 16 was chosen empirically from TPUv7x sweeps
+  # and is not derived. Revisit it on other chips and weight dtypes.
+  dma_floor_divisor: int | None = None
+
+  def __post_init__(self) -> None:
+    for name in ("skew_headroom", "dma_floor_divisor"):
+      value = getattr(self, name)
+      if value is not None and value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}.")
 
 
 def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
@@ -131,6 +149,8 @@ def _resolve_smem_indices(
         "max_num_w_buffers",
         "max_tile_m",
         "max_num_buckets",
+        "skew_headroom",
+        "dma_floor_divisor",
     ),
 )
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -388,15 +408,16 @@ def resolve_tiling_and_fusion(
   return tiling, False
 
 
-def _max_group_rows(
+def _token_rows(
     x: tensor_spec.ActivationSpec,
     tpu_info: pltpu.TpuInfo,
 ) -> int:
   """Rows a tile ever needs, rounded up to whole sublane tiles.
 
-  A group gets at most one row per input token, so a tile never needs more
-  rows than there are tokens (e.g. decode). Compact VMEM loads and stores
-  operate on u32 words, so one sublane tile (`num_sublanes` rows) suffices.
+  With gather, a group gets at most one row per input token; without gather,
+  x holds all routed rows so a group gets at most x.row_size. Compact VMEM
+  loads and stores operate on u32 words, so one sublane tile (`num_sublanes`
+  rows) suffices.
 
   Args:
     x: Activation spec.
@@ -407,6 +428,42 @@ def _max_group_rows(
   """
   min_tile_m = tpu_info.num_sublanes
   return min_tile_m * pl.cdiv(x.row_size, min_tile_m)
+
+
+def _max_group_rows(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> int:
+  """Bounds tile_m by expected rows per group and input token count.
+
+  Args:
+    plan: User plan, for `skew_headroom` and `dma_floor_divisor`.
+    spec: Validated input specifications and operator semantics.
+    tpu_info: TPU the kernel runs on.
+
+  Returns:
+    Maximum number of rows a tile needs, rounded up to `num_sublanes`.
+  """
+  min_tile_m = tpu_info.num_sublanes
+  token_cap = max(min_tile_m, _token_rows(spec.x, tpu_info))
+  if spec.size_out_m <= 0 or spec.num_global_groups <= 0:
+    return token_cap
+  if spec.size_k2 is not None:
+    i_local = spec.size_k2
+  elif spec.w.fused_gate_up:
+    i_local = spec.w.out_size // 2
+  elif spec.gather is None and spec.scatter is not None:
+    i_local = spec.size_k
+  else:
+    i_local = min(spec.size_k, spec.w.out_size)
+  dma_floor = max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
+  expected_rows = spec.size_out_m / spec.num_global_groups
+  skew_headroom = plan.skew_headroom or 1.5
+  skew_rows = pl.next_power_of_2(math.ceil(skew_headroom * expected_rows))
+  target_rows = min_tile_m * pl.cdiv(max(dma_floor, skew_rows), min_tile_m)
+  return min(target_rows, token_cap)
 
 
 def _tile_m_limits(plan: RoutingGmmPlan) -> tuple[int, int]:
@@ -764,7 +821,7 @@ def _fused_tiling(
     return None
   tile_k, tile_n = spec.size_k, spec.size_out_n
 
-  max_group_rows = _max_group_rows(x, tpu_info)
+  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
   min_num_w_buffers, max_num_w_buffers = _w_buffer_range(plan)
 
@@ -852,15 +909,24 @@ def _fused_tiling(
   # If fusion requires k2 tiling, the weights can't be reused across m tiles,
   # so we only attempt to do fusion + k2 tiling when remote scatter (to overlap
   # ICI with a larger block of computation) and tile_m is sufficiently large
-  # (for HBM bw and compute overlap).
+  # (for HBM bw and compute overlap). The expected-load bound on tile_m assumes
+  # that reuse, so only the token count bounds tile_m here.
+  token_rows = _token_rows(x, tpu_info)
+  sliced_tile_m = _tile_m_candidates(
+      plan,
+      bucket_base=_resolve_bucket_base(
+          plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=token_rows
+      ),
+      max_group_rows=token_rows,
+  )[0]
   bucket_base = _resolve_bucket_base(
-      dataclasses.replace(plan, tile_m=largest_tile_m),
+      dataclasses.replace(plan, tile_m=sliced_tile_m),
       w=w,
       matmul_dtype=matmul_dtype,
-      max_group_rows=max_group_rows,
+      max_group_rows=token_rows,
   )
   for tile_k2 in tile_k2_candidates:
-    tiling = try_fit(largest_tile_m, tile_k2, bucket_base)
+    tiling = try_fit(sliced_tile_m, tile_k2, bucket_base)
     if tiling is not None:
       return tiling
   return None
@@ -1176,7 +1242,7 @@ def calculate_tiling(
   """
   x, w = spec.x, spec.w
   # Step 1: Set default values.
-  max_group_rows = _max_group_rows(x, tpu_info)
+  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
