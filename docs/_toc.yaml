@@ -19,6 +19,8 @@ toc:
   section:
   - title: Supported Operators
     path: /tokamax/supported_ops
+  - title: Operator Fusion
+    path: /tokamax/op_fusion
   - title: Autotuning
     path: /tokamax/autotuning
   - title: Benchmarking
