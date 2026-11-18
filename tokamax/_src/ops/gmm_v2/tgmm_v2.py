@@ -797,6 +797,12 @@ def tgmm_kernel_main(
     spec_transform_fn: Optional callback transforming BlockSpecs and
       pulled/pushed fusion functions when running under `@op_fusion.fuse`.
   """
+  out_ref = gmm_v2.pad_lanes(out_ref)
+  if rhs_ref.scale is not None:
+    rhs_ref = dataclasses.replace(
+        rhs_ref, scale=gmm_v2.pad_lanes(rhs_ref.scale)
+    )
+
   # With a partial sum, `out_ref` is initialized with it and accumulated into in
   # place, so empty groups already hold their result and must not be zeroed.
   num_groups_to_zero = None
@@ -1028,7 +1034,7 @@ def tgmm_v2(
 
   if rhs_scale is not None:
     rhs_scale = rhs_scale.astype(jnp.float32)
-    pad_n = aligned_n - dims.size_n
+    pad_n = 0 if gmm_v2.HAS_PAD_REF else aligned_n - dims.size_n
     if pad_n > 0:
       rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
 
@@ -1168,10 +1174,8 @@ def tgmm_v2(
         out_fusion_input_values,
     )
   else:
-    # Match the tile-aligned output shape so the partial sum and output blocks
-    # line up exactly. The kernel accumulates into this buffer in place.
     pad_k = aligned_k - dims.size_k
-    pad_n = aligned_n - dims.size_n
+    pad_n = 0 if gmm_v2.HAS_PAD_REF else aligned_n - dims.size_n
     if pad_k or pad_n:
       partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_k), (0, pad_n)))
     out_ref = jax.new_ref(partial_sum)

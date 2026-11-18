@@ -26,6 +26,9 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src import config
 
+# TODO: Remove once minimum JAX >= 0.12.1.
+HAS_PAD_REF: bool = hasattr(pl, "pad_ref")
+
 # Util.
 
 
@@ -138,6 +141,15 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
 def align_to(x, a):
   return pl.cdiv(x, a) * a
+
+
+def pad_lanes(ref: Any) -> Any:
+  """Pads the trailing lane dimension of `ref` to a multiple of `num_lanes`."""
+  aligned_n = align_to(ref.shape[-1], pltpu.get_tpu_info().num_lanes)
+  if ref.shape[-1] == aligned_n:
+    return ref
+  assert HAS_PAD_REF
+  return pl.pad_ref(ref, (*ref.shape[:-1], aligned_n))
 
 
 def get_num_cores(tpu_info: Any) -> int:
@@ -1403,6 +1415,7 @@ def kernel_main(
   """
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
+  out_ref = pad_lanes(out_ref)
 
   if cfgs.rhs_cfgs.should_unpack:
     assert isinstance(rhs_ref, WeightsRef)
@@ -2387,9 +2400,7 @@ def gmm_v2(
         out_fusion_input_values,
     )
   else:
-    # Match the lane-aligned output width so the partial sum and output blocks
-    # line up exactly. The kernel accumulates into this buffer in place.
-    pad_n = aligned_n - partial_sum.shape[1]
+    pad_n = 0 if HAS_PAD_REF else aligned_n - partial_sum.shape[1]
     if pad_n:
       partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_n)))
     out_ref = jax.new_ref(partial_sum)

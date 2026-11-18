@@ -494,42 +494,50 @@ class GmmTest(parameterized.TestCase):
           lhs, rhs, group_sizes, partial_sum=partial_sum.astype(jnp.float32)
       )
 
-  def test_partial_sum_is_accumulated_in_place(self):
+  @parameterized.parameters(500, 512)
+  def test_partial_sum_is_accumulated_in_place(self, n):
     """The partial sum must be aliased to the output rather than copied.
 
     Removing the extra HBM round-trip is the point of the feature. If the
     aliasing silently stops being emitted the numerics still pass, so assert it
     directly.
     """
-    m, k, n, num_groups = 512, 512, 512, 8
+    m, k, num_groups = 512, 512, 8
     k0, k1 = jax.random.split(jax.random.key(0), 2)
     lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
     rhs = jax.random.normal(k1, (num_groups, k, n), dtype=jnp.bfloat16)
     group_sizes = get_group_sizes(m, num_groups)
     partial_sum = jnp.zeros((m, n), jnp.bfloat16)
 
-    fused = jax.jit(lambda l, r, g, p: gmm_v2.gmm_v2(l, r, g, partial_sum=p))
     plain = jax.jit(gmm_v2.gmm_v2)
-
-    fused_text = (
-        fused.lower(lhs, rhs, group_sizes, partial_sum).compile().as_text()
-    )
     plain_text = plain.lower(lhs, rhs, group_sizes).compile().as_text()
     # `as_text` is typed as optional; an empty program would make the control
     # below pass vacuously, so fail loudly instead of defaulting to "".
-    assert fused_text is not None and plain_text is not None
-
+    assert plain_text is not None
     self.assertEqual(
         plain_text.count("output_to_operand_aliasing"),
         0,
         "control failed: a GMM with no partial sum has nothing to alias, so "
         "the counter is not measuring what this test claims",
     )
-    self.assertGreater(
-        fused_text.count("output_to_operand_aliasing"),
-        0,
-        "the partial sum was not aliased to the output",
-    )
+
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        fused = jax.jit(
+            lambda l, r, g, p: gmm_v2.gmm_v2(l, r, g, partial_sum=p)
+        )
+        fused_text = (
+            fused.lower(lhs, rhs, group_sizes, partial_sum).compile().as_text()
+        )
+      assert fused_text is not None
+      self.assertGreater(
+          fused_text.count("output_to_operand_aliasing"),
+          0,
+          "the partial sum was not aliased to the output",
+      )
+      if has_pad_ref:
+        self.assertNotIn("pad(", fused_text)
 
   @parameterized.product(
       batch_size=[128],
@@ -1220,17 +1228,20 @@ class GmmTest(parameterized.TestCase):
         out_dtype=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
     )
     tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
-    actual = tgmm_v2.tgmm_v2(
-        lhs,
-        grad_q,
-        group_sizes,
-        num_groups,
-        rhs_scale=grad_scale,
-        tile_info=tile_info,
-        preferred_element_type=jnp.bfloat16,
-    )
-    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        actual = tgmm_v2.tgmm_v2(
+            lhs,
+            grad_q,
+            group_sizes,
+            num_groups,
+            rhs_scale=grad_scale,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+      self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+      chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
   @parameterized.product(
       batch_size=[128, 512],
@@ -1436,43 +1447,54 @@ class GmmTest(parameterized.TestCase):
           preferred_element_type=jnp.bfloat16,
       )
 
-  def test_tgmm_partial_sum_is_accumulated_in_place(self):
+  @parameterized.parameters(500, 512)
+  def test_tgmm_partial_sum_is_accumulated_in_place(self, n):
     """The partial sum must be aliased to the output rather than copied."""
-    m, k, n, num_groups = 512, 512, 512, 8
+    m, k, num_groups = 512, 512, 8
     k0, k1 = jax.random.split(jax.random.key(0), 2)
     lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
     grad = jax.random.normal(k1, (m, n), dtype=jnp.bfloat16)
     group_sizes = get_group_sizes(m, num_groups)
     partial_sum = jnp.zeros((num_groups, k, n), jnp.bfloat16)
 
-    fused = jax.jit(
-        lambda l, g, gs, p: tgmm_v2.tgmm_v2(
-            l, g, gs, num_groups, partial_sum=p,
-            preferred_element_type=jnp.bfloat16,
-        )
-    )
     plain = jax.jit(
         lambda l, g, gs: tgmm_v2.tgmm_v2(
             l, g, gs, num_groups, preferred_element_type=jnp.bfloat16
         )
     )
-    fused_text = (
-        fused.lower(lhs, grad, group_sizes, partial_sum).compile().as_text()
-    )
     plain_text = plain.lower(lhs, grad, group_sizes).compile().as_text()
-    assert fused_text is not None and plain_text is not None
-
+    assert plain_text is not None
     self.assertEqual(
         plain_text.count("output_to_operand_aliasing"),
         0,
         "control failed: a TGMM with no partial sum has nothing to alias, so "
         "the counter is not measuring what this test claims",
     )
-    self.assertGreater(
-        fused_text.count("output_to_operand_aliasing"),
-        0,
-        "the partial sum was not aliased to the output",
-    )
+
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        fused = jax.jit(
+            lambda l, g, gs, p: tgmm_v2.tgmm_v2(
+                l,
+                g,
+                gs,
+                num_groups,
+                partial_sum=p,
+                preferred_element_type=jnp.bfloat16,
+            )
+        )
+        fused_text = (
+            fused.lower(lhs, grad, group_sizes, partial_sum).compile().as_text()
+        )
+      assert fused_text is not None
+      self.assertGreater(
+          fused_text.count("output_to_operand_aliasing"),
+          0,
+          "the partial sum was not aliased to the output",
+      )
+      if has_pad_ref:
+        self.assertNotIn("pad(", fused_text)
 
   @parameterized.product(
       batch_size=[128],
