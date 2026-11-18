@@ -771,11 +771,13 @@ def _softmax(x: jax.Array, normalize: bool) -> tuple[jax.Array, Residuals]:
   # Always perform reductions in at least f32 precision.
   dtype = jnp.promote_types(x.dtype, jnp.float32)
   x_max = jnp.max(x.astype(dtype), axis=-1, keepdims=True)
-  safe_x_max = jnp.where(jnp.isneginf(x_max), 0.0, x_max)
-  unnormalized = jnp.exp(x - safe_x_max)
+  # Clamp `x_max` and offset `denom` so that fully masked rows (`x_max == -inf`)
+  # get zero weights, not NaN. `jnp.where` guards here break up the XLA GPU
+  # softmax fusion.
+  finfo = jnp.finfo(dtype)
+  unnormalized = jnp.exp(x - jnp.maximum(x_max, finfo.min))
   denom = jnp.sum(unnormalized, axis=-1, keepdims=True)
-  safe_denom = jnp.where(denom == 0.0, 1.0, denom)
-  out = (unnormalized / safe_denom) if normalize else unnormalized
+  out = (unnormalized / (denom + finfo.tiny)) if normalize else unnormalized
   return out, (jnp.squeeze(x_max, -1), jnp.squeeze(denom, -1))
 
 
@@ -785,17 +787,11 @@ def _softmax_jvp(normalize, primals, tangents):
   (x_dot,) = tangents
   y, residual = _softmax(x, normalize)
   if normalize:
-    y_dot = jnp.where(
-        y == 0.0, 0.0, y * (x_dot - (y * x_dot).sum(axis=-1, keepdims=True))
-    )
+    y_dot = y * (x_dot - (y * x_dot).sum(axis=-1, keepdims=True))
   else:
     x_max = residual[0][..., None]
-    x_dot_max_mean = jnp.where(
-        jnp.isneginf(x_max),
-        0.0,
-        jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max)),
-    )
-    y_dot = jnp.where(y == 0.0, 0.0, y * (x_dot - x_dot_max_mean))
+    x_dot_max_mean = jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max))
+    y_dot = y * (x_dot - x_dot_max_mean)
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
 
 
