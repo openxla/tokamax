@@ -74,6 +74,34 @@ def _aligned_vmem_tile_bytes(
   return lead_dim * aligned_rows * aligned_cols * elem_bytes
 
 
+def _get_tpu_vmem_params(
+    *, interpret: bool
+) -> tuple[int, int, int, int | None]:
+  """Queries TPU VMEM geometry and 80% `vmem_limit_bytes` (or host defaults)."""
+  if not interpret:
+    try:
+      tpu_info = pltpu.get_tpu_info()
+    except (ValueError, RuntimeError):
+      pass
+    else:
+      vmem_capacity_bytes = int(tpu_info.vmem_capacity_bytes)
+      # Raise Mosaic's scoped VMEM ceiling from XLA's 16/32 MiB default to 80%
+      # of hardware VMEM (50% double-buffered I/O tiles + 30% scratch headroom).
+      vmem_limit_bytes = int(0.80 * vmem_capacity_bytes)
+      return (
+          vmem_capacity_bytes,
+          int(tpu_info.num_sublanes),
+          int(tpu_info.num_lanes),
+          vmem_limit_bytes,
+      )
+  return (
+      _INTERPRET_DEFAULT_VMEM_BYTES,
+      _INTERPRET_DEFAULT_SUBLANES,
+      _INTERPRET_DEFAULT_LANES,
+      None,
+  )
+
+
 def _select_head_block_size(
     n_heads: int,
     n_groups: int,
@@ -88,18 +116,13 @@ def _select_head_block_size(
   # When `n_groups < n_heads`, `th` divides `n_heads // n_groups` so each grid
   # step loads a single group slice of `B_c` or `C_c`. When `n_groups ==
   # n_heads`, `th` divides `n_heads`.
-  if not interpret:
-    tpu_info = pltpu.get_tpu_info()
-    vmem_capacity_bytes = int(tpu_info.vmem_capacity_bytes)
-    num_sublanes = int(tpu_info.num_sublanes)
-    num_lanes = int(tpu_info.num_lanes)
-  else:
-    vmem_capacity_bytes = _INTERPRET_DEFAULT_VMEM_BYTES
-    num_sublanes = _INTERPRET_DEFAULT_SUBLANES
-    num_lanes = _INTERPRET_DEFAULT_LANES
+  vmem_capacity_bytes, num_sublanes, num_lanes, _ = _get_tpu_vmem_params(
+      interpret=interpret
+  )
 
   # Reserve half of VMEM for double-buffered input/output blocks, leaving the
-  # remainder for compiler scratch and register spills.
+  # remainder within `vmem_limit_bytes` (80% of VMEM) for compiler scratch and
+  # register spills.
   vmem_budget_bytes = vmem_capacity_bytes // 2
 
   bc_single_bytes = 2 * _aligned_vmem_tile_bytes(
@@ -576,6 +599,7 @@ def chunk_state_pallas(
         f"Expected decay_states shape {(C, H, 1, L)}, got {decay_states.shape}."
     )
   resolved_interpret = _resolve_interpret(interpret)
+  _, _, _, vmem_limit_bytes = _get_tpu_vmem_params(interpret=resolved_interpret)
   th = _select_head_block_size(
       H,
       G,
@@ -655,6 +679,7 @@ def chunk_state_pallas(
           compiler_params=pltpu.CompilerParams(
               dimension_semantics=("parallel", "parallel"),
               disable_bounds_checks=True,
+              vmem_limit_bytes=vmem_limit_bytes,
           ),
           interpret=resolved_interpret,
           name="ssd_chunk_state_pallas",
@@ -710,6 +735,7 @@ def chunk_scan_pallas(
     )
   resolved_out_dtype = jnp.dtype(C_c.dtype if out_dtype is None else out_dtype)
   resolved_interpret = _resolve_interpret(interpret)
+  _, _, _, vmem_limit_bytes = _get_tpu_vmem_params(interpret=resolved_interpret)
   th = _select_head_block_size(
       H,
       G,
@@ -780,6 +806,7 @@ def chunk_scan_pallas(
           compiler_params=pltpu.CompilerParams(
               dimension_semantics=("parallel", "parallel"),
               disable_bounds_checks=True,
+              vmem_limit_bytes=vmem_limit_bytes,
           ),
           interpret=resolved_interpret,
           name="ssd_chunk_scan_pallas",
