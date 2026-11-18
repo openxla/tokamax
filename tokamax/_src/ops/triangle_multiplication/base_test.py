@@ -55,7 +55,7 @@ class TriangleMultiplicationTest(parameterized.TestCase):
   @parameterized.product(
       triangle_type=['incoming', 'outgoing'],
       dtype=[jnp.bfloat16, jnp.float32],
-      precision=[jax.lax.Precision.HIGH],
+      precision=[jax.lax.Precision.HIGHEST],
       implementation=[None, 'xla', 'triton', ('triton', 'xla')],
   )
   def test_triangle_multiplication(

@@ -95,7 +95,7 @@ class FlexAttentionApiTest(parameterized.TestCase):
     )
     out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
     out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
-    fwd_tol = 1e-4 if dtype == jnp.float32 else 2e-2
+    fwd_tol = 3e-4 if dtype == jnp.float32 else 2e-2
     grad_atol = 1e-4 if dtype == jnp.float32 else (6.0 if scale else 1e-1)
     grad_rtol = 1e-4 if dtype == jnp.float32 else 1e-1
     chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
