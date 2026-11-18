@@ -283,15 +283,6 @@ class OutSpecAndValidationTest(parameterized.TestCase):
       _make_config(8, custom_plan, out_format=fmt, size_n=1024)
 
   @parameterized.named_parameters(
-      dict(testcase_name="below_tile_m", num_tokens=8, expected=False),
-      dict(testcase_name="at_tile_m", num_tokens=16, expected=False),
-      dict(testcase_name="above_tile_m", num_tokens=17, expected=True),
-  )
-  def test_use_weight_lookahead(self, num_tokens: int, expected: bool):
-    cfg = _make_config(num_tokens, gmm_plan.RoutingGmmPlan(tile_m=16))
-    self.assertEqual(cfg.use_weight_lookahead, expected)
-
-  @parameterized.named_parameters(
       dict(
           testcase_name="untiled_fused",
           fuse_act="silu",

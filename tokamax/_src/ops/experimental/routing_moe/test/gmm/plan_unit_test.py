@@ -1339,5 +1339,69 @@ class VmemEstimateTest(parameterized.TestCase):
     self.assertEqual(estimate(True) - estimate(False), expected)
 
 
+class BufferingAndLookaheadTest(parameterized.TestCase):
+  """Checks weight buffering and lookahead heuristics."""
+
+  def test_large_fused_tile_caps_default_weight_buffers_at_four(self):
+    self.assertEqual(_resolve(32, with_down=True).num_w_buffers, 8)
+    self.assertEqual(_resolve(2048, with_down=True).num_w_buffers, 4)
+    self.assertEqual(_resolve(2048, with_down=False).num_w_buffers, 8)
+    override = gmm_plan.RoutingGmmPlan(max_num_w_buffers=6)
+    self.assertEqual(_resolve(2048, override, with_down=True).num_w_buffers, 6)
+
+  def test_large_expert_weights_cap_buffers_and_keep_lookahead(self):
+    # 2,560 x 5,120 fp8 weights are 12.5 MiB per expert (>= 12 MiB): 3 buffers
+    # fit in VMEM, and fewer than 4 buffers keep lookahead enabled above tile_m.
+    decode = _resolve(8, size_n=5120)
+    prefill = _resolve(4096, size_n=5120)
+    self.assertEqual(decode.num_w_buffers, 3)
+    self.assertFalse(decode.weight_lookahead)
+    self.assertEqual(prefill.num_w_buffers, 3)
+    self.assertTrue(prefill.weight_lookahead)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="decode", num_tokens=8, routed=True, expected=False),
+      dict(
+          testcase_name="prefill_4k_routed",
+          num_tokens=4096,
+          routed=True,
+          expected=False,
+      ),
+      dict(
+          testcase_name="prefill_64k_routed",
+          num_tokens=65536,
+          routed=True,
+          expected=True,
+      ),
+      dict(
+          testcase_name="direct_at_tile_m",
+          num_tokens=64,
+          routed=False,
+          expected=False,
+      ),
+      dict(
+          testcase_name="direct_above_tile_m",
+          num_tokens=512,
+          routed=False,
+          expected=True,
+      ),
+  )
+  def test_weight_lookahead_default(
+      self, num_tokens: int, routed: bool, expected: bool
+  ):
+    self.assertEqual(
+        _resolve(num_tokens, routed=routed).weight_lookahead, expected
+    )
+
+  @parameterized.parameters((8, True), (65536, False))
+  def test_explicit_weight_lookahead_is_kept(
+      self, num_tokens: int, weight_lookahead: bool
+  ):
+    custom_plan = gmm_plan.RoutingGmmPlan(weight_lookahead=weight_lookahead)
+    self.assertEqual(
+        _resolve(num_tokens, custom_plan).weight_lookahead, weight_lookahead
+    )
+
+
 if __name__ == "__main__":
   absltest.main()

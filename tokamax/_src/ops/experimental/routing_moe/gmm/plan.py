@@ -72,6 +72,8 @@ class RoutingGmmPlan:
   live_group_walk: bool | None = None
   # Keep routing gather/scatter indices in SMEM instead of streaming from HBM.
   smem_indices: bool | None = None
+  # Scan ahead in weight BufferedRefs to deduplicate consecutive expert tiles.
+  weight_lookahead: bool | None = None
   # These fields bound the heuristic search and are omitted once resolved.
   vmem_usage_fraction: float | None = None
   # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
@@ -179,6 +181,7 @@ class ResolvedGmmPlan:
   vmem_limit_bytes: int
   live_group_walk: bool
   smem_indices: bool
+  weight_lookahead: bool
 
   @property
   def bucket_rows(self) -> list[int]:
@@ -265,6 +268,12 @@ class ResolvedGmmPlan:
         tile_m=tiling.tile_m,
         tpu_info=tpu_info,
     )
+    weight_lookahead = _resolve_weight_lookahead(
+        plan,
+        spec=spec,
+        tile_m=tiling.tile_m,
+        num_w_buffers=tiling.num_w_buffers,
+    )
     resolved = cls(
         tile_m=tiling.tile_m,
         tile_k=tiling.tile_k,
@@ -283,6 +292,7 @@ class ResolvedGmmPlan:
         vmem_limit_bytes=vmem_limit_bytes,
         live_group_walk=live_group_walk,
         smem_indices=smem_indices,
+        weight_lookahead=weight_lookahead,
     )
     if spec.w2 is None or fuse_up_and_down:
       check_smem(smem_estimate(spec, resolved), tpu_info)
@@ -725,12 +735,28 @@ def _supports_fusion(
   return tile_k == spec.size_k and tile_n == spec.size_out_n
 
 
-def _w_buffer_range(plan: RoutingGmmPlan) -> tuple[int, int]:
+def _w_buffer_range(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    tile_m: int,
+) -> tuple[int, int]:
   """Returns the min and max number of weight buffers to try."""
   min_num_w_buffers = plan.num_w_buffers or 2
   if plan.num_w_buffers is not None:
     return min_num_w_buffers, min_num_w_buffers
-  return min_num_w_buffers, plan.max_num_w_buffers or 8
+  # TODO: On fused two-projection kernels at tile_m >= 64, tile
+  # compute empirically covers weight DMA latency at 4 buffers while avoiding
+  # extra prologue weight prefetches; on large (>= 12 MiB) expert weights, cap
+  # at 3 buffers so prologue weight DMAs do not stall slot 0.
+  large_expert_weight_bytes = 12 * 1024 * 1024
+  if _expert_weight_bytes(spec) >= large_expert_weight_bytes:
+    default_max = 3
+  elif spec.w2 is not None and tile_m >= 64:
+    default_max = 4
+  else:
+    default_max = 8
+  return min_num_w_buffers, plan.max_num_w_buffers or default_max
 
 
 def _max_fitting_w_buffers(
@@ -823,7 +849,6 @@ def _fused_tiling(
 
   max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
-  min_num_w_buffers, max_num_w_buffers = _w_buffer_range(plan)
 
   estimate_vmem = functools.partial(
       _vmem_estimate,
@@ -851,6 +876,9 @@ def _fused_tiling(
         matmul_dtype=matmul_dtype,
         tile_m=tile_m,
         tpu_info=tpu_info,
+    )
+    min_num_w_buffers, max_num_w_buffers = _w_buffer_range(
+        plan, spec=spec, tile_m=tile_m
     )
     num_w_buffers = _max_fitting_w_buffers(
         lambda n: estimate_vmem(
@@ -1187,9 +1215,45 @@ def _resolve_tile_m(
   return tile_m
 
 
+def _expert_weight_bytes(spec: gmm_spec_lib.RoutingGmmSpec) -> int:
+  """Returns HBM bytes of one expert's weight tensor(s)."""
+  w = spec.w
+  total = w.in_size * w.out_size * jax.dtypes.itemsize_bits(w.dtype) // 8
+  if spec.w2 is not None:
+    w2 = spec.w2
+    total += w2.in_size * w2.out_size * jax.dtypes.itemsize_bits(w2.dtype) // 8
+  return total
+
+
+def _resolve_weight_lookahead(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    tile_m: int,
+    num_w_buffers: int,
+) -> bool:
+  """Resolves whether weight BufferedRefs scan ahead across expert tiles."""
+  if plan.weight_lookahead is not None:
+    return plan.weight_lookahead
+  if spec.size_local_groups <= 1 or spec.x.row_size <= tile_m:
+    return False
+  if (
+      (spec.gather is not None or spec.scatter is not None)
+      and spec.num_global_groups > 0
+      and num_w_buffers >= 4
+  ):
+    # TODO: Per-row routed DMAs saturate the scalar ALU when
+    # BufferedRef lookahead scans run on short groups; when fewer than 4 weight
+    # buffers fit, keep lookahead enabled so multi-tile hot groups never starve
+    # next-expert prefetch.
+    return spec.size_out_m > 4 * tile_m * spec.num_global_groups
+  return True
+
+
 def _grow_num_w_buffers(
     plan: RoutingGmmPlan,
     *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
     num_w_buffers: int,
     tile_m: int,
     w_tile_n: int,
@@ -1199,7 +1263,7 @@ def _grow_num_w_buffers(
   """Grows weight buffer count into spare VMEM unless the plan fixes it."""
   if plan.num_w_buffers is not None:
     return num_w_buffers
-  max_num_w_buffers = plan.max_num_w_buffers or 8
+  _, max_num_w_buffers = _w_buffer_range(plan, spec=spec, tile_m=tile_m)
   while num_w_buffers < max_num_w_buffers and (
       estimate_vmem(
           tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
@@ -1308,6 +1372,7 @@ def calculate_tiling(
   # Spend spare VMEM on deeper weight prefetch.
   num_w_buffers = _grow_num_w_buffers(
       plan,
+      spec=spec,
       num_w_buffers=num_w_buffers,
       tile_m=tile_m,
       w_tile_n=w_tile_n,

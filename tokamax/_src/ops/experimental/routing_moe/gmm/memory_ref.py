@@ -1057,7 +1057,7 @@ class PipelineBlockSpecs:
         # after JAX version update.
         pipeline_mode=pl.Buffered(
             buffer_count=self.cfg.plan.num_w_buffers,
-            use_lookahead=self.cfg.use_weight_lookahead,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
@@ -1096,7 +1096,7 @@ class PipelineBlockSpecs:
         # after JAX version update.
         pipeline_mode=pl.Buffered(
             buffer_count=self.cfg.plan.num_w_buffers,
-            use_lookahead=self.cfg.use_weight_lookahead,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
@@ -1121,7 +1121,7 @@ class PipelineBlockSpecs:
         # after JAX version update.
         pipeline_mode=pl.Buffered(
             buffer_count=self.cfg.plan.num_w_buffers,
-            use_lookahead=self.cfg.use_weight_lookahead,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
@@ -1220,14 +1220,14 @@ def _make_weight_bref(
         ),
         dtype_or_type=w_hbm_ref.scale.dtype,
         buffer_count=cfg.plan.num_w_buffers,
-        use_lookahead=cfg.use_weight_lookahead,
+        use_lookahead=cfg.plan.weight_lookahead,
         grid_rank=4,
     )
   weight_bref = pltpu.BufferedRef.input(
       spec=block_specs.get_weight_spec(tile_k, dma_tile_n, is_w2=is_w2),
       dtype_or_type=w_hbm_ref.weight.dtype,
       buffer_count=cfg.plan.num_w_buffers,
-      use_lookahead=cfg.use_weight_lookahead,
+      use_lookahead=cfg.plan.weight_lookahead,
       grid_rank=4,
   )
   bias_bref = None
@@ -1237,7 +1237,7 @@ def _make_weight_bref(
         spec=block_specs.get_bias_spec(w_spec, tile_k, dma_tile_n, is_w2=is_w2),
         dtype_or_type=w_hbm_ref.bias.dtype,
         buffer_count=cfg.plan.num_w_buffers,
-        use_lookahead=cfg.use_weight_lookahead,
+        use_lookahead=cfg.plan.weight_lookahead,
         grid_rank=4,
     )
   if contiguous_fused:
