@@ -264,6 +264,7 @@ class GmmTest(parameterized.TestCase):
           group_sizes,
           num_local_groups,
           group_offset=group_offset,
+          preferred_element_type=jnp.bfloat16,
       )
       return out, drhs
 
