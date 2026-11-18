@@ -256,6 +256,12 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
           prepare_scales=True,
           custom_plan=None,
       ),
+      dict(
+          testcase_name="large_hidden_compact_scales",
+          hidden_size=1536,
+          prepare_scales=False,
+          custom_plan=None,
+      ),
   )
   def test_gather_gmm_gmm_scatter(
       self,

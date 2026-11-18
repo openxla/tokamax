@@ -163,6 +163,24 @@ def _check_lhs_not_narrower(lhs_dtype: jnp.dtype, w_dtype: jnp.dtype) -> None:
     )
 
 
+def _validate_block_scaled_weight(
+    w_spec: tensor_spec.WeightSpec, lhs_dtype: jnp.dtype
+) -> None:
+  """Validates contracting size and scale_rows for a block-scaled weight."""
+  assert isinstance(w_spec.quant, tensor_spec.BlockScaledQuantSpec)
+  block_scaled.check_contracting_size(w_spec.in_size, lhs_dtype)
+  compact_rows = block_scaled.scale_rows(w_spec.in_size, dtype=lhs_dtype)
+  padded_rows = block_scaled.kernel_scale_rows(
+      w_spec.in_size, dtype=lhs_dtype
+  )
+  if w_spec.quant.scale_rows not in (compact_rows, padded_rows):
+    expected = " or ".join(map(str, dict.fromkeys((compact_rows, padded_rows))))
+    raise ValueError(
+        f"Block-scaled weight scale_rows must be {expected} for"
+        f" in_size={w_spec.in_size}. Got {w_spec.quant.scale_rows}."
+    )
+
+
 def _resolve_mode(routing: tensor_spec.RoutingSpec | None) -> RoutingMode:
   """Resolves the DMA routing mode from a routing specification."""
   if routing is None:
@@ -338,6 +356,10 @@ class RoutingGmmConfig:
           "Block-scaled w2_matmul_dtype must be in"
           f" {block_scaled.FP8_DTYPES}. Got {self.plan.w2_matmul_dtype}."
       )
+    _validate_block_scaled_weight(self.spec.w, self.plan.matmul_dtype)
+    if self.spec.w2 is not None:
+      assert self.plan.w2_matmul_dtype is not None
+      _validate_block_scaled_weight(self.spec.w2, self.plan.w2_matmul_dtype)
 
   def _validate_out(self) -> None:
     """Validates output dtype, quantization, and chunk alignment."""

@@ -1080,11 +1080,16 @@ class PipelineBlockSpecs:
         index_map = functools.partial(
             self.index_map_provider.scale_index, is_w2=is_w2
         )
-      case spec_lib.BlockScaledQuantSpec():
+      case spec_lib.BlockScaledQuantSpec(scale_rows=scale_rows):
         block_scaled.check_tile_k(tile_k, w_spec.in_size, w_spec.dtype)
+        if tile_k != w_spec.in_size:
+          raise NotImplementedError(
+              "Block-scaled sub-K tiling is not supported yet. Got"
+              f" tile_k={tile_k}, in_size={w_spec.in_size}."
+          )
         block_shape = (
             None,
-            block_scaled.kernel_scale_rows(tile_k, dtype=w_spec.dtype),
+            scale_rows,
             tile_n,
         )
         index_map = self._weight_index_map(is_w2=is_w2)

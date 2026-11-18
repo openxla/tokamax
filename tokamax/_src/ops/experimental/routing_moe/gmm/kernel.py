@@ -27,7 +27,6 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
@@ -53,17 +52,9 @@ def _weight_ref(
 ) -> memory_ref.SingleWeightRef[jax.Array]:
   """Unwraps a `SingleWeightWrapper` into a `SingleWeightRef`."""
   w_scale = wrapper.scale
-  match wrapper.spec.quant:
-    case None:
-      pass
-    case tensor_spec.SubchannelQuantSpec():
-      assert w_scale is not None
-      w_scale = w_scale.astype(jnp.float32)
-    case tensor_spec.BlockScaledQuantSpec():
-      assert w_scale is not None
-      w_scale = block_scaled.prepare_scales(
-          w_scale, wrapper.spec.in_size, dtype=wrapper.spec.dtype
-      )
+  if isinstance(wrapper.spec.quant, tensor_spec.SubchannelQuantSpec):
+    assert w_scale is not None
+    w_scale = w_scale.astype(jnp.float32)
   return memory_ref.SingleWeightRef(
       weight=wrapper.weight, scale=w_scale, bias=wrapper.bias
   )

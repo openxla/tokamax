@@ -574,6 +574,66 @@ class OutSpecAndValidationTest(parameterized.TestCase):
           tpu_info=tpu_8t,
       )
 
+  def test_block_scaled_config_rejects_invalid_scale_rows(self):
+    gmm_spec, resolved_fmt, plan_8t, tpu_8t = self._block_scaled_fixture()
+    bad_w_spec = dataclasses.replace(
+        gmm_spec,
+        x=dataclasses.replace(gmm_spec.x, col_size=1536),
+        w=dataclasses.replace(
+            gmm_spec.w,
+            in_size=1536,
+            quant=spec.BlockScaledQuantSpec(scale_rows=64),
+        ),
+    )
+    bad_w_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=bad_w_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    with self.assertRaisesRegex(ValueError, "scale_rows must be 96 or 128"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=bad_w_spec,
+          out_format=resolved_fmt,
+          plan=bad_w_plan,
+          tpu_info=tpu_8t,
+      )
+
+    w1 = dataclasses.replace(gmm_spec.w, out_size=3072, fused_gate_up=True)
+    w2 = spec.WeightSpec(
+        group_size=8,
+        in_size=1536,
+        out_size=1024,
+        dtype=jnp.dtype(jnp.float8_e5m2),
+        quant=spec.BlockScaledQuantSpec(scale_rows=64),
+        has_bias=False,
+        fused_gate_up=False,
+    )
+    bad_w2_spec = dataclasses.replace(
+        gmm_spec, w=w1, w2=w2, fuse_act="silu"
+    )
+    bad_w2_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=bad_w2_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    with self.assertRaisesRegex(ValueError, "scale_rows must be 96 or 128"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=bad_w2_spec,
+          out_format=resolved_fmt,
+          plan=bad_w2_plan,
+          tpu_info=tpu_8t,
+      )
+
+    bad_k_spec = dataclasses.replace(
+        gmm_spec,
+        x=dataclasses.replace(gmm_spec.x, col_size=8),
+        w=dataclasses.replace(gmm_spec.w, in_size=8),
+    )
+    bad_k_plan = dataclasses.replace(plan_8t, tile_k=8)
+    with self.assertRaisesRegex(ValueError, "contracting size"):
+      gmm_config.RoutingGmmConfig.create(
+          spec=bad_k_spec,
+          out_format=resolved_fmt,
+          plan=bad_k_plan,
+          tpu_info=tpu_8t,
+      )
+
   def test_subchannel_config_rejects_missing_x_quant_block_size(self):
     cfg = _make_config(8)
     bad_plan = dataclasses.replace(cfg.plan, x_quant_block_size=None)
@@ -628,10 +688,21 @@ class OutSpecAndValidationTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, expected_regex):
       _make_config(num_tokens, custom_plan, routed=routed, top_k=top_k)
 
-  def test_block_scaled_scale_block_spec_uses_kernel_3d_shape(self):
-    in_size = tile_k = 512
+  @parameterized.parameters(
+      (512, 32),
+      (512, 64),
+      (1536, 96),
+      (1536, 128),
+  )
+  def test_block_scaled_scale_block_spec_uses_3d_shape(
+      self, in_size: int, scale_rows: int
+  ):
     gmm_spec, resolved_fmt, _, tpu_8t = self._block_scaled_fixture()
-    w_spec = dataclasses.replace(gmm_spec.w, in_size=in_size)
+    w_spec = dataclasses.replace(
+        gmm_spec.w,
+        in_size=in_size,
+        quant=spec.BlockScaledQuantSpec(scale_rows=scale_rows),
+    )
     x_spec = dataclasses.replace(gmm_spec.x, col_size=in_size)
     cur_spec = dataclasses.replace(gmm_spec, x=x_spec, w=w_spec)
     cur_plan = gmm_plan.ResolvedGmmPlan.create(
@@ -642,23 +713,32 @@ class OutSpecAndValidationTest(parameterized.TestCase):
     )
     index_maps = memory_ref.PipelineIndexMaps(cast(Any, None), cfg)
     block_specs = memory_ref.PipelineBlockSpecs(cfg, index_maps)
-    scale_spec = block_specs.get_scale_spec(w_spec, tile_k=tile_k, tile_n=256)
-    weight_spec = block_specs.get_weight_spec(tile_k=tile_k, tile_n=256)
-    self.assertEqual(
-        scale_spec.block_shape,
-        (None, block_scaled.kernel_scale_rows(tile_k), 256),
-    )
+    scale_spec = block_specs.get_scale_spec(w_spec, tile_k=in_size, tile_n=256)
+    weight_spec = block_specs.get_weight_spec(tile_k=in_size, tile_n=256)
+    self.assertEqual(scale_spec.block_shape, (None, scale_rows, 256))
     self.assertEqual(scale_spec.index_map, weight_spec.index_map)
 
   def test_block_scaled_scale_block_spec_rejects_unsupported_tile_k(self):
-    gmm_spec, resolved_fmt, plan_8t, tpu_8t = self._block_scaled_fixture()
+    gmm_spec, resolved_fmt, _, tpu_8t = self._block_scaled_fixture()
+    w_spec = dataclasses.replace(
+        gmm_spec.w,
+        in_size=1536,
+        quant=spec.BlockScaledQuantSpec(scale_rows=96),
+    )
+    x_spec = dataclasses.replace(gmm_spec.x, col_size=1536)
+    cur_spec = dataclasses.replace(gmm_spec, x=x_spec, w=w_spec)
+    cur_plan = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=cur_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
     cfg = gmm_config.RoutingGmmConfig.create(
-        spec=gmm_spec, out_format=resolved_fmt, plan=plan_8t, tpu_info=tpu_8t
+        spec=cur_spec, out_format=resolved_fmt, plan=cur_plan, tpu_info=tpu_8t
     )
     index_maps = memory_ref.PipelineIndexMaps(cast(Any, None), cfg)
     block_specs = memory_ref.PipelineBlockSpecs(cfg, index_maps)
     with self.assertRaises(ValueError):
-      block_specs.get_scale_spec(gmm_spec.w, tile_k=1, tile_n=256)
+      block_specs.get_scale_spec(w_spec, tile_k=1, tile_n=256)
+    with self.assertRaisesRegex(NotImplementedError, "sub-K tiling"):
+      block_specs.get_scale_spec(w_spec, tile_k=1024, tile_n=256)
 
 
 class IndexWindowTest(parameterized.TestCase):
