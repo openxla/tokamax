@@ -13,10 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 import dataclasses
 import functools
 import math
-from typing import Any, Callable, Tuple
+from typing import Any, Protocol, Tuple
 
 import jax
 from jax import lax
@@ -288,8 +289,35 @@ class FusedWeightsRef(RhsRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class LhsRef:
-  """Dataclass for the lhs value and its optional quantization scale.
+class PrologueWeightsRef[T]:
+  """Prologue-fused RHS weight inputs (or BlockSpecs), scale, and bias."""
+
+  weights: tuple[T, ...]
+  scale: T | None = None
+  bias: T | None = None
+
+  def get_weights(
+      self: "PrologueWeightsRef[jax.Array]",
+  ) -> tuple[jax.Array, ...]:
+    return tuple(w[...] for w in self.weights)
+
+  def get_scale(
+      self: "PrologueWeightsRef[jax.Array]", replicate_size: int | None = None
+  ) -> jax.Array:
+    assert self.scale is not None
+    if replicate_size is not None:
+      return self.scale[:, pl.ds(0, replicate_size, 0), :]
+    return self.scale[...]
+
+  def get_bias(self: "PrologueWeightsRef[jax.Array]") -> jax.Array:
+    assert self.bias is not None
+    return self.bias[...]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class LhsRef[T]:
+  """Unfused lhs operand (or its BlockSpec) and optional quantization scale.
 
   Unlike `rhs`, the lhs is passed to the kernel *unquantized*. When
   `scale` is provided, the kernel uses it to quantize the lhs (i.e.
@@ -298,13 +326,29 @@ class LhsRef:
   per-channel `[M, 1]` and sub-channel `[M, num_blocks]`).
   """
 
-  value: Any
-  scale: Any | None
+  value: T
+  scale: T | None = None
 
-  def get_value(self) -> jax.Array:
+  def get_value(self: "LhsRef[jax.Array]") -> jax.Array:
     return self.value[...]
 
-  def get_scale(self) -> jax.Array:
+  def get_scale(self: "LhsRef[jax.Array]") -> jax.Array:
+    assert self.scale is not None
+    return self.scale[...]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class FusedLhsRef[T]:
+  """Prologue-fused lhs inputs (or their BlockSpecs) and optional lhs scale."""
+
+  values: tuple[T, ...]
+  scale: T | None = None
+
+  def get_values(self: "FusedLhsRef[jax.Array]") -> tuple[jax.Array, ...]:
+    return tuple(v[...] for v in self.values)
+
+  def get_scale(self: "FusedLhsRef[jax.Array]") -> jax.Array:
     assert self.scale is not None
     return self.scale[...]
 
@@ -432,6 +476,86 @@ class TilingRequest:
 
 TileFn = Callable[[TilingRequest], TileSizes]
 
+type PrologueFn = Callable[
+    [tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...]],
+    jax.Array,
+]
+type EpilogueFn = Callable[
+    [
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        jax.Array,
+    ],
+    jax.Array,
+]
+type LhsSpec = LhsRef[pl.BlockSpec]
+type FusedLhsSpec = FusedLhsRef[pl.BlockSpec]
+type PrologueWeightsSpec = PrologueWeightsRef[pl.BlockSpec]
+type OutFusionInputRefs = tuple[jax.Array, ...]
+type OutFusionInputSpecs = tuple[pl.BlockSpec, ...]
+
+
+class GmmSpecTransformFn(Protocol):
+  """Transforms GMM BlockSpecs and extracts pulled/pushed fusion functions."""
+
+  def __call__(
+      self,
+      *,
+      lhs_ref: LhsRef[jax.Array] | FusedLhsRef[jax.Array],
+      out_ref: jax.Array,
+      lhs_spec: LhsSpec,
+      rhs_spec: WeightsRef,
+      out_spec: pl.BlockSpec,
+      cfgs: GmmConfigs,
+  ) -> tuple[
+      LhsRef[jax.Array] | FusedLhsRef[jax.Array],
+      jax.Array,
+      LhsSpec | FusedLhsSpec,
+      WeightsRef | PrologueWeightsSpec,
+      OutFusionInputSpecs,
+      pl.BlockSpec,
+      PrologueFn | None,
+      PrologueFn | None,
+      EpilogueFn | None,
+  ]:
+    ...
+
+
+class GmmFusionSpecProtocol(Protocol):
+  """Protocol for GMM v2 Pallas fuser specifications."""
+
+  @property
+  def is_lhs_fused(self) -> bool:
+    """Returns whether `lhs` carries a fused prologue."""
+    ...
+
+  @property
+  def is_out_fused(self) -> bool:
+    """Returns whether the output carries a fused epilogue."""
+    ...
+
+  def prepare(
+      self,
+      *,
+      lhs: jax.Array,
+      rhs: jax.Array,
+      lhs_scale: jax.Array | None,
+      rhs_scale: jax.Array | None,
+      rhs_bias: jax.Array | None,
+      cfgs: GmmConfigs,
+      raw_out_type: jax.ShapeDtypeStruct,
+  ) -> tuple[
+      LhsRef[jax.Array] | FusedLhsRef[jax.Array],
+      WeightsRef | PrologueWeightsRef[jax.Array],
+      OutFusionInputRefs,
+      jax.ShapeDtypeStruct,
+      pl.MemoryRef,
+      GmmSpecTransformFn,
+  ]:
+    """Prepares fused operands, output type, and BlockSpec transform."""
+    ...
+
 
 class IndexMaps:
   """Index maps for GMM kernel."""
@@ -521,7 +645,7 @@ def generate_block_specs(
     cfgs: GmmConfigs,
     *,
     num_gm: jax.Array,
-) -> Tuple[Tuple[LhsRef, WeightsRef, pl.BlockSpec | None], pl.BlockSpec]:
+) -> Tuple[Tuple[LhsSpec, WeightsRef, pl.BlockSpec | None], pl.BlockSpec]:
   """Generates block specs for the given lhs, rhs, and out refs."""
 
   index_map = IndexMaps(metadata_ref, cfgs, num_gm=num_gm)
@@ -595,12 +719,13 @@ def generate_block_specs(
 def inner_kernel(
     step: pltpu.PipelineStep,
     # In
-    tiled_lhs_ref: LhsRef,
+    tiled_lhs_ref: LhsRef[jax.Array] | FusedLhsRef[jax.Array],
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
-    tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
+    tiled_rhs_ref: RhsRef | PrologueWeightsRef[jax.Array],  # [tile_k, tile_n]
     # Partial Sum
     tiled_partial_sum_ref: jax.Array | None,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
+    tiled_out_fusion_input_refs: OutFusionInputRefs,
     # Out
     tiled_out_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
@@ -610,6 +735,9 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    lhs_fn: PrologueFn | None = None,
+    rhs_fn: PrologueFn | None = None,
+    out_fn: EpilogueFn | None = None,
 ):
   """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -621,19 +749,24 @@ def inner_kernel(
 
   Args:
     step: Current pipeline step.
-    tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
+    tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end] (or
+      prologue-fused LHS VMEM refs).
     tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
       g_id is the group associated with lhs[m_start:m_end, :]
     tiled_partial_sum_ref: Contains value partial_sum[m_start:m_end,
       n_start:n_end], or None if there is no partial sum.
+    tiled_out_fusion_input_refs: Tiled VMEM refs for arrays closed over by the
+      output fusion, or `()` when unfused.
     tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
     partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
       Will be initialized to zero if this is first tile for grid[n_id, :, :].
     acc_ref: Reference to the accumulator.
     metadata_ref: Reference to the metadata.
     cfgs: GmmConfigs.
+    lhs_fn: Optional pulled prologue function for fused lhs inputs.
+    rhs_fn: Optional pulled prologue function for fused rhs inputs.
+    out_fn: Optional pulled epilogue function for fused outputs.
   """
-
   gm_id = step.index[1]
   m_start = metadata_ref.gm_id_to_m_offset[gm_id]
   m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -645,12 +778,32 @@ def inner_kernel(
   def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
     tpu_info = pltpu.get_tpu_info()
     mxu_size = tpu_info.mxu_column_size
+    pids = step.index
 
     # Step 1: Input pre-processing.
-    tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[
-        :bucket_m
-    ]
-    tiled_rhs = tiled_rhs_ref.get_weight(transpose_rhs=cfgs.transpose_rhs)
+    # Unfused `lhs` is reshaped to 3D `(M // sublane, sublane, K)` outside
+    # `emit_pipeline`, so `tiled_lhs_ref.get_value()` reshapes the 3D VMEM tile
+    # back to 2D `(tile_m, tile_k)`. When fused (`FusedLhsRef`),
+    # `pallas.fuser`'s reshape rule rejects `pl.BoundedSlice`, so
+    # `GmmFusionSpec` pulls a 2D `(BoundedSlice(tile_m), tile_k)` spec directly
+    # through the prologue: `tiled_lhs_ref.values` holds the prologue's VMEM
+    # Refs, `lhs_fn(pids, (), lhs_vals)` runs at `pids = step.index` (`() = no
+    # scalar prefetch`) to yield a 2D `(tile_m, tile_k)` tile, and `[:bucket_m]`
+    # trims to the active M-bucket.
+    if isinstance(tiled_lhs_ref, FusedLhsRef):
+      assert lhs_fn is not None
+      tiled_lhs = lhs_fn(pids, (), tiled_lhs_ref.get_values())[:bucket_m]
+    else:
+      tiled_lhs = tiled_lhs_ref.get_value().reshape(-1, cfgs.tiles.tile_k)[
+          :bucket_m
+      ]
+    # Similarly, `rhs_fn` evaluates any fused RHS prologue on the VMEM Refs in
+    # `PrologueWeightsRef.weights` to produce a weight tile.
+    if isinstance(tiled_rhs_ref, PrologueWeightsRef):
+      assert rhs_fn is not None
+      tiled_rhs = rhs_fn(pids, (), tiled_rhs_ref.get_weights())
+    else:
+      tiled_rhs = tiled_rhs_ref.get_weight(transpose_rhs=cfgs.transpose_rhs)
 
     # This should only be taken in the case where we don't requantize
     # the scales and thus we need to dequantize inside VMEM to avoid small
@@ -890,42 +1043,90 @@ def inner_kernel(
         acc += partial_sum_tile.astype(acc.dtype)
 
       acc = apply_act_fn(acc, cfgs.fuse_act)
+      # Evaluate `out_fn` before group-row masking and `partial_out_ref`
+      # sublane accumulation:
+      # 1. `out_fn` and `tiled_out_fusion_input_refs` were pushed/pulled against
+      #    the full 2D `(tile_m, tile_n)` output BlockSpec and `cfgs.out_dtype`,
+      #    while `acc` has dynamic bucket height `bucket_m <= tile_m` (`acc_m`)
+      #    in `acc_dtype` (`f32`). Cast to `cfgs.out_dtype`, zero-pad rows up to
+      #    `tile_m` when `bucket_m < tile_m`, evaluate `out_fn`, and slice back
+      #    to `[:acc_m]`.
+      # 2. Running `out_fn` before `jnp.where(mask, acc, 0)` ensures non-zero
+      #    epilogues (e.g. `+ bias`) leave out-of-group rows strictly 0, so
+      #    adjacent groups sharing an unaligned `size_lhs_sublane` boundary do
+      #    not corrupt neighboring rows or double-count `+ bias` when summed via
+      #    `partial_out_ref`.
+      if out_fn is not None:
+        acc_out = acc.astype(cfgs.out_dtype)
+        if bucket_m < cfgs.tiles.tile_m:
+          acc_out = jnp.pad(
+              acc_out, ((0, cfgs.tiles.tile_m - bucket_m), (0, 0))
+          )
+        out_vals = tuple(r[...] for r in tiled_out_fusion_input_refs)
+        acc = out_fn(pids, (), out_vals, acc_out)[:acc_m]
 
       # Mask out rows that does not belong to the current group.
       iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
       mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
       acc_masked = jnp.where(mask, acc, 0)
 
-      # Write the final output to the output ref.
-      tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
-      tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
-
       # If this is the first tile for grid[n_id, :, :], we initialize the
       # partial out to zeros. Otherwise, partial out from last tile of
       # grid[n_id-1, :, :] can be used and cause numeric issues.
       partial_out_zeros = jnp.zeros_like(partial_out_ref)
-
-      # Accumulate the partial output from the previous step.
-      tiled_out_ref[0] += jnp.where(
+      prev_partial = jnp.where(
           gm_id == 0, partial_out_zeros, partial_out_ref[...]
       )
+      sublane = cfgs.dims.size_lhs_sublane
+      last_row = m_end_local // sublane
 
-      # Consider following case where size_lhs_sublane = 4, number denotes group
-      # id and | denotes boundaries between sublanes:
-      # | 0 0 1 2 | 2 2 2 2 | 3 3 4 4 |
-      #
-      # Assuming group id of current step is 1, current step will not completely
-      # fill size_lhs_sublane rows and will be revisited at the next step. By
-      # storing the partial rows into the partial_out_ref, the next step can
-      # read them and accumulate to them.  Additionally, for group id of 2,
-      # since it completely fills the size_lhs_sublane rows, we need to zero out
-      # partial_out_ref to avoid numeric error for group 3.
-      last_row = m_end_local // cfgs.dims.size_lhs_sublane
-      partial_out_ref[...] = jnp.where(
-          m_end_local % cfgs.dims.size_lhs_sublane == 0,
-          partial_out_zeros,
-          tiled_out_ref[last_row],
-      )
+      if out_fn is not None:
+        # Fused `tiled_out_ref` is 2D `(tile_m, out_tile_n)`. Apply the
+        # `partial_out_ref` sublane boundary carry-over on 2D slices in VREGs
+        # before storing so we avoid 2D->3D `xir.memref_reshape` (unsupported
+        # for bf16 on TPU v6e).
+        acc_out = acc_masked.astype(tiled_out_ref.dtype)
+        first_block = acc_out[:sublane] + prev_partial
+        if acc_m > sublane:
+          acc_out = jnp.concatenate([first_block, acc_out[sublane:]], axis=0)
+        else:
+          acc_out = first_block
+        tiled_out_ref[:acc_m] = acc_out
+        last_block = partial_out_zeros
+        for b in range(acc_m // sublane):
+          block = (
+              first_block
+              if b == 0
+              else acc_out[b * sublane : (b + 1) * sublane]
+          )
+          last_block = jnp.where(last_row == b, block, last_block)
+        partial_out_ref[...] = jnp.where(
+            m_end_local % sublane == 0, partial_out_zeros, last_block
+        )
+      else:
+        # Write the final output to the output ref.
+        tiled_out_2d_ref = tiled_out_ref.reshape(-1, tiled_out_ref.shape[-1])
+        tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
+
+        # Accumulate the partial output from the previous step.
+        tiled_out_ref[0] += prev_partial
+
+        # Consider following case where size_lhs_sublane = 4, number denotes
+        # group id and | denotes boundaries between sublanes:
+        # | 0 0 1 2 | 2 2 2 2 | 3 3 4 4 |
+        #
+        # Assuming group id of current step is 1, current step will not
+        # completely fill size_lhs_sublane rows and will be revisited at the
+        # next step. By storing the partial rows into the partial_out_ref, the
+        # next step can read them and accumulate to them. Additionally, for
+        # group id of 2, since it completely fills the size_lhs_sublane rows,
+        # we need to zero out partial_out_ref to avoid numeric error for
+        # group 3.
+        partial_out_ref[...] = jnp.where(
+            m_end_local % sublane == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
     else:
       acc_ref[:acc_m] = acc
 
@@ -1155,8 +1356,9 @@ def kernel_main(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
     # In
-    lhs_ref: LhsRef,  # value: [size_m, size_k]
-    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    lhs_ref: LhsRef[jax.Array] | FusedLhsRef[jax.Array],
+    rhs_ref: WeightsRef | PrologueWeightsRef[jax.Array],
+    out_fusion_input_refs: OutFusionInputRefs,
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
     # Scratch memory
@@ -1167,6 +1369,7 @@ def kernel_main(
     semaphore_ref: jax.Array | None,  # [1]
     *,
     cfgs: GmmConfigs,
+    spec_transform_fn: GmmSpecTransformFn | None = None,
 ):
   """Entry point for GMM kernel.
 
@@ -1184,8 +1387,10 @@ def kernel_main(
   Args:
     lhs_group_sizes_ref: Reference to the group sizes of lhs.
     group_offset_ref: Reference to the group offset.
-    lhs_ref: Reference to the lhs.
-    rhs_ref: Reference to the rhs.
+    lhs_ref: Reference to the lhs (or prologue-fused lhs refs).
+    rhs_ref: Reference to the rhs (or prologue-fused rhs refs).
+    out_fusion_input_refs: References to HBM arrays closed over by the output
+      fusion, or `()` when unfused.
     out_ref: Reference to the out.
     partial_out_ref: Reference to the partial output.
     acc_ref: Reference to the accumulator.
@@ -1193,11 +1398,14 @@ def kernel_main(
     zero_ref: Scratch memory for storing zero values used in initialization.
     semaphore_ref: Semaphore for zero initialization DMAs.
     cfgs: GmmConfigs.
+    spec_transform_fn: Optional callback transforming BlockSpecs and
+      pulled/pushed fusion functions when running under `@op_fusion.fuse`.
   """
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
   if cfgs.rhs_cfgs.should_unpack:
+    assert isinstance(rhs_ref, WeightsRef)
     rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
     rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
@@ -1222,8 +1430,42 @@ def kernel_main(
   (lhs_spec, rhs_spec, partial_sum_spec), out_spec = generate_block_specs(
       metadata_ref, cfgs, num_gm=num_gm
   )
+  if spec_transform_fn is not None:
+    (
+        lhs_in,
+        out_in,
+        lhs_spec,
+        rhs_spec,
+        out_fusion_input_specs,
+        out_spec,
+        pulled_lhs_fn,
+        pulled_rhs_fn,
+        pulled_out_fn,
+    ) = spec_transform_fn(
+        lhs_ref=lhs_ref,
+        out_ref=out_ref,
+        lhs_spec=lhs_spec,
+        rhs_spec=rhs_spec,
+        out_spec=out_spec,
+        cfgs=cfgs,
+    )
+  else:
+    assert isinstance(lhs_ref, LhsRef)
+    pulled_lhs_fn = pulled_rhs_fn = pulled_out_fn = None
+    out_fusion_input_specs: OutFusionInputSpecs = ()
+    # Bounded slice requires second last dim to be aligned to the sublane size.
+    # rhs_ref uses static tiling thus reshape is not needed. The lhs quant scale
+    # (when present) is small and statically tiled, so it is passed through
+    # as-is.
+    lhs_value_in = lhs_ref.value.reshape(
+        -1, cfgs.dims.size_lhs_sublane, lhs_ref.value.shape[-1]
+    )
+    lhs_in = LhsRef(value=lhs_value_in, scale=lhs_ref.scale)
+    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
 
   if cfgs.fuse_act is not None:
+    assert isinstance(rhs_ref, WeightsRef)
+    assert isinstance(rhs_spec, WeightsRef)
     rhs_up_weight = (
         rhs_ref.weight.at[:, cfgs.out_size_n :, :]
         if cfgs.transpose_rhs
@@ -1261,28 +1503,33 @@ def kernel_main(
       else (pltpu.PARALLEL, pltpu.ARBITRARY, pltpu.ARBITRARY)
   )
   pipeline_fn = pltpu.emit_pipeline(
-      functools.partial(inner_kernel, cfgs=cfgs),
+      functools.partial(
+          inner_kernel,
+          cfgs=cfgs,
+          lhs_fn=pulled_lhs_fn,
+          rhs_fn=pulled_rhs_fn,
+          out_fn=pulled_out_fn,
+      ),
       grid=(num_n, num_gm, num_k),
-      in_specs=(lhs_spec, rhs_spec, partial_sum_spec),
+      in_specs=(lhs_spec, rhs_spec, partial_sum_spec, out_fusion_input_specs),
       out_specs=out_spec,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
       _explicit_indices=True,
   )
 
-  # Bounded slice requires second last dim to be aligned to the sublane size.
-  # rhs_ref uses static tiling thus reshape is not needed. The lhs quant scale
-  # (when present) is small and statically tiled, so it is passed through as-is.
-  lhs_value_in = lhs_ref.value.reshape(
-      -1, cfgs.dims.size_lhs_sublane, lhs_ref.value.shape[-1]
-  )
-  lhs_in = LhsRef(value=lhs_value_in, scale=lhs_ref.scale)
-  out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
   # With a partial sum, `out_ref` is initialized with it and accumulated into in
   # place.
   partial_sum_in = out_in if cfgs.has_partial_sum else None
   scratches = [partial_out_ref, acc_ref, metadata_ref]
-  pipeline_fn(lhs_in, rhs_ref, partial_sum_in, out_in, scratches=scratches)
+  pipeline_fn(
+      lhs_in,
+      rhs_ref,
+      partial_sum_in,
+      out_fusion_input_refs,
+      out_in,
+      scratches=scratches,
+  )
 
   if cfgs.zero_init:
     zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)  # pyrefly: ignore[bad-argument-type, unbound-name]
@@ -1536,7 +1783,7 @@ def validate_inputs(
   """Validates the inputs for the GMM kernel."""
 
   size_m, size_k = lhs.shape
-  if rhs.ndim != 3:
+  if len(rhs.shape) != 3:
     raise ValueError(f"rhs must be 3D, got shape {rhs.shape}.")
   size_group = rhs.shape[0]
   size_n = rhs.shape[1] if transpose_rhs else rhs.shape[2]
@@ -1880,6 +2127,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     transpose_rhs: bool = False,
+    fusion_spec: GmmFusionSpecProtocol | None = None,
 ) -> jax.Array:
   """GMM kernel implemented with emit_pipeline.
 
@@ -1917,6 +2165,8 @@ def gmm_v2(
     zero_initialize: Whether to initialize unvisited output elements to zero.
     fuse_act: Activation function to fuse with GMM, None if no fusion.
     transpose_rhs: Whether to transpose rhs in-core without HBM transposition.
+    fusion_spec: Optional `GmmFusionSpec` describing fused prologue/epilogue
+      functions when invoked via `@op.fuse`.
 
   Returns:
     Output of shape [size_m, size_n].
@@ -1931,6 +2181,13 @@ def gmm_v2(
   size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
   padded_size_m = align_to(size_m, size_lhs_sublane)
   if padded_size_m != size_m:
+    if fusion_spec is not None and (
+        fusion_spec.is_lhs_fused or fusion_spec.is_out_fused
+    ):
+      raise NotImplementedError(
+          f"Fused lhs/out in gmm_v2 requires size_m ({size_m}) to be aligned"
+          f" to size_lhs_sublane ({size_lhs_sublane})."
+      )
     lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
     if partial_sum is not None:
       partial_sum = jnp.pad(
@@ -1981,12 +2238,45 @@ def gmm_v2(
   if rhs_bias is not None:
     rhs_bias = rhs_bias.astype(jnp.float32)
 
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  aligned_n = align_to(cfgs.out_size_n, num_lanes)
+  raw_out_type = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+  # `out_fusion_input_values` holds external arrays closed over by an output
+  # fusion (e.g. epilogue bias or residual), passed as HBM kernel inputs so
+  # `emit_pipeline` prefetches their tiles into VMEM for `out_fn`.
+  if fusion_spec is not None:
+    (
+        lhs_in,
+        rhs_weights,
+        out_fusion_input_values,
+        out_init,
+        partial_out_shape,
+        spec_transform_fn,
+    ) = fusion_spec.prepare(
+        lhs=lhs,
+        rhs=rhs,
+        lhs_scale=lhs_scale,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        cfgs=cfgs,
+        raw_out_type=raw_out_type,
+    )
+  else:
+    lhs_in = LhsRef(value=lhs, scale=lhs_scale)
+    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    out_fusion_input_values: OutFusionInputRefs = ()
+    out_init = raw_out_type
+    partial_out_shape = pltpu.VMEM(
+        (dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype
+    )
+    spec_transform_fn = None
+
   # Initialize scratch shapes.
   max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
   acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
   scratch_shapes = [
       # partial_out_ref
-      pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+      partial_out_shape,
       # acc_ref
       pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
       # metadata_ref
@@ -1996,7 +2286,6 @@ def gmm_v2(
       ),
   ]
 
-  num_lanes = pltpu.get_tpu_info().num_lanes
   if cfgs.zero_init:
     # TODO: Create better heuristics for determining this value.
     target_zero_ref_bytes = 2 * 1024 * 1024
@@ -2011,21 +2300,20 @@ def gmm_v2(
     # (which is smallest allowed column size for DMA) and reuse the buffer by
     # size_n//num_lanes times in a single tile, we can significantly increase
     # tile_zero_m without triggering OOM.
-    out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
+    out_bytes = jnp.dtype(out_init.dtype).itemsize
     tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
     tile_zero_m = min(tile_zero_m, dims.size_m)
 
     scratch_shapes += [
-        pltpu.VMEM((tile_zero_m, num_lanes), cfgs.out_dtype),
+        pltpu.VMEM((tile_zero_m, num_lanes), out_init.dtype),
         pltpu.SemaphoreType.DMA((1,)),
     ]
   else:
     scratch_shapes += [None, None]
 
-  aligned_n = align_to(cfgs.out_size_n, num_lanes)
-  out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
-  lhs_in = LhsRef(value=lhs, scale=lhs_scale)
-  rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+  kernel_fn = functools.partial(
+      kernel_main, cfgs=cfgs, spec_transform_fn=spec_transform_fn
+  )
 
   if partial_sum is not None and config.disable_multi_core_mode.value:
     raise NotImplementedError(
@@ -2036,31 +2324,16 @@ def gmm_v2(
   # DO NOT EDIT THIS BLOCK: This path is a temporary fallback to unblock
   # until Tokamax updates its JAX version.
   if config.disable_multi_core_mode.value:
-    lhs_scale_spec = None
-    if cfgs.lhs_cfgs.has_scale:
-      lhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-
-    rhs_scale_spec = rhs_bias_spec = None
-    if rhs_scale is not None:
-      rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-    if rhs_bias is not None:
-      rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-
-    return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    out = pl.pallas_call(
+        kernel_fn,
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
-                LhsRef(
-                    value=pl.BlockSpec(memory_space=pltpu.HBM),
-                    scale=lhs_scale_spec,
-                ),
-                WeightsRef(
-                    weight=pl.BlockSpec(memory_space=pltpu.HBM),
-                    scale=rhs_scale_spec,
-                    bias=rhs_bias_spec,
-                ),
+                jax.tree.map(lambda _: hbm_spec, lhs_in),
+                jax.tree.map(lambda _: hbm_spec, rhs_weights),
+                jax.tree.map(lambda _: hbm_spec, out_fusion_input_values),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             # pyrefly: ignore[bad-argument-type]
@@ -2073,9 +2346,19 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),  # pyrefly: ignore[bad-argument-type]
-    )(group_sizes, group_offset, lhs_in, rhs_weights)[
-        :size_m, : cfgs.out_size_n
-    ]
+    )(
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_weights,
+        out_fusion_input_values,
+    )
+    # When output is fused, the epilogue already ran inside the kernel on
+    # aligned (size_m, out_size_n) tiles (so there is no padding to trim) and
+    # may have changed `out`'s column width from `cfgs.out_size_n`.
+    if fusion_spec is not None and fusion_spec.is_out_fused:
+      return out
+    return out[:size_m, : cfgs.out_size_n]
 
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
@@ -2083,7 +2366,7 @@ def gmm_v2(
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
   gmm_kernel = functools.partial(
       pl.kernel,
-      functools.partial(kernel_main, cfgs=cfgs),
+      kernel_fn,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       scratch_types=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
       compiler_params=pltpu.CompilerParams(
@@ -2097,7 +2380,11 @@ def gmm_v2(
 
   if partial_sum is None:
     out = gmm_kernel(out_type=out_init)(
-        group_sizes, group_offset, lhs_in, rhs_weights
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_weights,
+        out_fusion_input_values,
     )
   else:
     # Match the lane-aligned output width so the partial sum and output blocks
@@ -2107,7 +2394,17 @@ def gmm_v2(
       partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_n)))
     out_ref = jax.new_ref(partial_sum)
     gmm_kernel(out_type=())(
-        group_sizes, group_offset, lhs_in, rhs_weights, out_ref
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_weights,
+        out_fusion_input_values,
+        out_ref,
     )
     out = jax.freeze(out_ref)
+  # When output is fused, the epilogue already ran inside the kernel on
+  # aligned (size_m, out_size_n) tiles (so there is no padding to trim) and
+  # may have changed `out`'s column width from `cfgs.out_size_n`.
+  if fusion_spec is not None and fusion_spec.is_out_fused:
+    return out
   return out[:size_m, : cfgs.out_size_n]

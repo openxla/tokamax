@@ -27,7 +27,19 @@ from tokamax._src import quantization
 from tokamax._src.ops.gmm_v2 import gmm_v2 as gmm_backend
 from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.gmm_v2 import util as gmm_util
+from tokamax._src.ops.ragged_dot import api as ragged_dot_api
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
+from tokamax.ops import op_fusion
+
+
+def _rms_norm(
+    x: jax.Array, weight: jax.Array, eps: float = 1e-6
+) -> jax.Array:
+  """Applies RMS normalization along the last dimension."""
+  ms = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+  return (x.astype(jnp.float32) * jax.lax.rsqrt(ms + eps)).astype(
+      x.dtype
+  ) * weight
 
 
 class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
@@ -647,6 +659,230 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     self.assertTrue(all(c.tile_k % 128 == 0 for c in drhs_configs))
     self.assertTrue(all(c.lhs_buffer_count is None for c in drhs_configs))
 
+  def test_gmm_fused_rms_norm(self):
+    """Tests fusing RMS norm before ragged_dot inside @op_fusion.fuse."""
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rms_weight = jax.random.normal(k1, (1, k), jnp.bfloat16)
+    rhs = jax.random.normal(k2, (num_groups, k, n), jnp.bfloat16)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm(x, w, rhs, gs):
+      x_norm = _rms_norm(x, w)
+      return op(x_norm, rhs, group_sizes=gs, zero_initialize=True)
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_api_ragged_dot(x, w, rhs, gs):
+      x_norm = _rms_norm(x, w)
+      return ragged_dot_api.ragged_dot(
+          x_norm, rhs, group_sizes=gs, implementation="mosaic_tpu_v2"
+      )
+
+    out_fused = fused_gmm(lhs, rms_weight, rhs, group_sizes)
+    out_api_fused = fused_api_ragged_dot(lhs, rms_weight, rhs, group_sizes)
+    out_ref = gmm_backend.gmm_v2(
+        _rms_norm(lhs, rms_weight), rhs, group_sizes, zero_initialize=True
+    )
+    chex.assert_trees_all_close(out_fused, out_ref, atol=2e-2, rtol=2e-2)
+    chex.assert_trees_all_close(out_api_fused, out_ref, atol=2e-2, rtol=2e-2)
+
+  def test_gmm_fused_rms_norm_and_epilogue(self):
+    """Tests fusing RMS norm prologue and bias/scale epilogue in gmm_v2."""
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2, k3 = jax.random.split(jax.random.key(1), 4)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rms_weight = jax.random.normal(k1, (1, k), jnp.bfloat16)
+    rhs = jax.random.normal(k2, (num_groups, k, n), jnp.bfloat16)
+    out_bias = jax.random.normal(k3, (1, n), jnp.bfloat16)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm_epilogue(x, w, rhs, b, gs):
+      x_norm = _rms_norm(x, w)
+      out = op(x_norm, rhs, group_sizes=gs, zero_initialize=True)
+      return jax.nn.silu(out + b)
+
+    for gs in (
+        group_sizes,
+        jnp.array([3, 2, 17, m - 22], dtype=jnp.int32),
+    ):
+      out_fused = fused_gmm_epilogue(lhs, rms_weight, rhs, out_bias, gs)
+      out_ref = jax.nn.silu(
+          gmm_backend.gmm_v2(
+              _rms_norm(lhs, rms_weight), rhs, gs, zero_initialize=True
+          )
+          + out_bias
+      )
+      chex.assert_trees_all_close(out_fused, out_ref, atol=2e-2, rtol=2e-2)
+
+  def test_gmm_fused_output_rms_norm(self):
+    """Tests fusing RMS norm on the output of ragged_dot (gmm_v2)."""
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    rms_weight = jax.random.normal(k2, (1, n), jnp.bfloat16)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm_output_rms_norm(x, rhs, w, gs):
+      out = op(x, rhs, group_sizes=gs, zero_initialize=True)
+      return _rms_norm(out, w)
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_api_output_rms_norm(x, rhs, w, gs):
+      out = ragged_dot_api.ragged_dot(
+          x, rhs, group_sizes=gs, implementation="mosaic_tpu_v2"
+      )
+      return _rms_norm(out, w)
+
+    out_fused = fused_gmm_output_rms_norm(lhs, rhs, rms_weight, group_sizes)
+    out_api_fused = fused_api_output_rms_norm(
+        lhs, rhs, rms_weight, group_sizes
+    )
+    out_ref = _rms_norm(
+        gmm_backend.gmm_v2(lhs, rhs, group_sizes, zero_initialize=True),
+        rms_weight,
+    )
+    chex.assert_trees_all_close(out_fused, out_ref, atol=2e-2, rtol=2e-2)
+    chex.assert_trees_all_close(out_api_fused, out_ref, atol=2e-2, rtol=2e-2)
+
+  def test_tgmm_drhs_fused_rms_norm(self):
+    """Tests fusing RMS norm before tgmm_v2 (drhs) inside @op_fusion.fuse."""
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(2), 3)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rms_weight = jax.random.normal(k1, (1, k), jnp.bfloat16)
+    grad = jax.random.normal(k2, (m, n), jnp.bfloat16)
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(
+        num_actual_groups=num_groups
+    )
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_tgmm(x, w, dy, gs):
+      x_norm = _rms_norm(x, w)
+      return op(
+          x_norm,
+          dy,
+          group_sizes=gs,
+          ragged_dot_dimension_numbers=(
+              pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS
+          ),
+          preferred_element_type=jnp.bfloat16,
+      )
+
+    out_fused = fused_tgmm(lhs, rms_weight, grad, group_sizes)
+    out_ref = tgmm_backend.tgmm_v2(
+        _rms_norm(lhs, rms_weight),
+        grad,
+        group_sizes=group_sizes,
+        num_actual_groups=num_groups,
+        preferred_element_type=jnp.bfloat16,
+    )
+    chex.assert_trees_all_close(out_fused, out_ref, atol=2e-2, rtol=2e-2)
+
+  def test_gmm_op_fuse_with_explicit_custom_vjp(self):
+    """Tests `@op_fusion.fuse` inside an explicit `@jax.custom_vjp`."""
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2, k3 = jax.random.split(jax.random.key(3), 4)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rms_weight = jax.random.normal(k1, (1, k), jnp.bfloat16)
+    rhs = jax.random.normal(k2, (num_groups, k, n), jnp.bfloat16) / jnp.sqrt(
+        jnp.array(k, jnp.bfloat16)
+    )
+    dout = jax.random.normal(k3, (m, n), jnp.bfloat16) / jnp.sqrt(
+        jnp.array(n, jnp.bfloat16)
+    )
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+    drhs_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(
+        num_actual_groups=num_groups
+    )
+
+    @op_fusion.fuse
+    def fused_fwd_kernel(x, w, r):
+      return op(
+          _rms_norm(x, w), r, group_sizes=group_sizes, zero_initialize=True
+      )
+
+    @op_fusion.fuse
+    def fused_drhs_kernel(x, w, dy):
+      return drhs_op(
+          _rms_norm(x, w),
+          dy,
+          group_sizes=group_sizes,
+          ragged_dot_dimension_numbers=(
+              pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS
+          ),
+          preferred_element_type=rhs.dtype,
+      )
+
+    @jax.custom_vjp
+    def fused_gmm(x, w, r):
+      return fused_fwd_kernel(x, w, r)
+
+    def fused_gmm_fwd(x, w, r):
+      return fused_fwd_kernel(x, w, r), (x, w, r)
+
+    def fused_gmm_bwd(residuals, dy):
+      x, w, r = residuals
+      dr = fused_drhs_kernel(x, w, dy)
+      dx_norm = op(
+          dy,
+          r,
+          group_sizes=group_sizes,
+          ragged_dot_dimension_numbers=(
+              pallas_mosaic_tpu_v2.DLHS_RAGGED_DOT_DIM_NUMS
+          ),
+          zero_initialize=True,
+      )
+      _, rms_vjp = jax.vjp(_rms_norm, x, w)
+      dx, dw = rms_vjp(dx_norm)
+      return dx, dw, dr
+
+    fused_gmm.defvjp(fused_gmm_fwd, fused_gmm_bwd)
+
+    def loss_fused(x, w, r):
+      return jnp.sum((fused_gmm(x, w, r) * dout).astype(jnp.float32))
+
+    def loss_ref(x, w, r):
+      ref_out = op(
+          _rms_norm(x, w), r, group_sizes=group_sizes, zero_initialize=True
+      )
+      return jnp.sum((ref_out * dout).astype(jnp.float32))
+
+    val_fused, grads_fused = jax.jit(
+        jax.value_and_grad(loss_fused, argnums=(0, 1, 2))
+    )(lhs, rms_weight, rhs)
+    val_ref, grads_ref = jax.jit(
+        jax.value_and_grad(loss_ref, argnums=(0, 1, 2))
+    )(lhs, rms_weight, rhs)
+
+    chex.assert_trees_all_close(val_fused, val_ref, atol=2e-2, rtol=2e-2)
+    chex.assert_trees_all_close(grads_fused, grads_ref, atol=2e-2, rtol=2e-2)
+
 
 class PallasMosaicTpuV2VjpConfigTest(parameterized.TestCase):
   """Verifies which tiling the dlhs sub-op of the custom vjp uses."""
@@ -739,6 +975,37 @@ class PallasMosaicTpuV2VjpConfigTest(parameterized.TestCase):
             )
         ],
     )
+
+  def test_vjp_zero_initialize_unvisited_rows(self) -> None:
+    m, k, n, num_groups = 256, 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(5), 3)
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    dout = jax.random.normal(k2, (m, n), jnp.bfloat16)
+    group_sizes = jnp.array([32, 0, 64, 32], dtype=jnp.int32)
+    op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
+
+    def loss(x, w):
+      out = op(x, w, group_sizes=group_sizes, zero_initialize=True)
+      return jnp.sum((out * dout).astype(jnp.float32))
+
+    dlhs, drhs = jax.jit(jax.grad(loss, argnums=(0, 1)))(lhs, rhs)
+    expected_dlhs = gmm_backend.gmm_v2(
+        dout,
+        rhs.swapaxes(1, 2),
+        group_sizes=group_sizes,
+        zero_initialize=True,
+    )
+    expected_drhs = tgmm_backend.tgmm_v2(
+        lhs,
+        dout,
+        group_sizes=group_sizes,
+        num_actual_groups=num_groups,
+        preferred_element_type=rhs.dtype,
+    )
+    chex.assert_trees_all_close(dlhs, expected_dlhs, atol=2e-2, rtol=2e-2)
+    chex.assert_trees_all_close(drhs, expected_drhs, atol=2e-2, rtol=2e-2)
+    chex.assert_trees_all_equal(dlhs[128:], jnp.zeros_like(dlhs[128:]))
 
 
 if __name__ == "__main__":

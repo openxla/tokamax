@@ -253,6 +253,11 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     # -- gmm ---------------------------------------------------------------
+    'gmm-v2-fuser': Spec(
+        paths=('tokamax/_src/ops/gmm_v2/gmm_fuser_test.py',),
+        minutes=1,
+        compat_minutes=1,
+    ),
     'gmm-v2-kernel': Spec(
         paths=('tokamax/_src/ops/gmm_v2/gmm_v2_test.py',),
         minutes=4,

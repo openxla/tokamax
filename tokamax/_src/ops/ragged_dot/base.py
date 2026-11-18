@@ -360,24 +360,20 @@ def vjp(
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     # `manual_axis_type` is not used, but is expected by vjp.
     manual_axis_type: jax.sharding.ManualAxisType | None = None,
+    zero_initialize: bool = False,
     # The following are forward-only features (forwarded here by the op
     # framework because they are part of `bind`). The backward path does not
     # support quantized/biased/fused gradients, so they must be at defaults and
     # are not propagated to the `dlhs`/`drhs` sub-calls.
     group_offset: jax.Array | None = None,
-    zero_initialize: bool = False,
     fuse_gateup_activation: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Ragged dot VJP."""
   del out  # Unused.
 
-  if (
-      group_offset is not None
-      or zero_initialize
-      or fuse_gateup_activation is not None
-  ):
+  if group_offset is not None or fuse_gateup_activation is not None:
     raise NotImplementedError(
-        "group_offset, zero_initialize, fuse_gateup_activation"
+        "group_offset and fuse_gateup_activation"
         " are not supported on the ragged_dot backward path for now."
     )
 
@@ -415,6 +411,7 @@ def vjp(
       precision=precision,
       preferred_element_type=lhs.dtype,
       manual_axis_type=jax.typeof(lhs).manual_axis_type.to_ct_mat(),
+      zero_initialize=zero_initialize,
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
