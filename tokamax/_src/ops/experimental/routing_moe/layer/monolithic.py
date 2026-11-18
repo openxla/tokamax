@@ -79,8 +79,11 @@ def gated_routing_moe(
     gating_output: routing information of tokens [num_tokens, num_experts]
     w1: first moe weights [num_experts, hidden_size, intermediate_size * 2]
     w2: second moe weights [num_experts, intermediate_size, hidden_size]
-    w1_scale: w1 scale [num_experts, num_blocks, 1, intermediate_size * 2]
-    w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
+    w1_scale: optional w1 scale, `[num_experts, num_blocks, 1,
+      intermediate_size * 2]` or block-scaled `[num_experts, scale_rows,
+      intermediate_size * 2]`.
+    w2_scale: optional w2 scale, `[num_experts, num_blocks, 1, hidden_size]` or
+      block-scaled `[num_experts, scale_rows, hidden_size]`.
     w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
     w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
     topk: number of experts to choose per token.

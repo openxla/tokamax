@@ -67,6 +67,11 @@ def check_gmm_supported(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"
         " multiple of 256 even when up & down can be fused."
     )
+  if case.shape.w_block_scaled:
+    if not block_scaled.is_available():
+      raise absltest.SkipTest("Block-scaled matmul is not available in OSS.")
+    if not gmm_plan.is_block_scaled_tpu(pltpu.get_tpu_info()):
+      raise absltest.SkipTest("Block-scaled matmul requires TPU_8T or newer.")
 
 
 def check_moe_supported(

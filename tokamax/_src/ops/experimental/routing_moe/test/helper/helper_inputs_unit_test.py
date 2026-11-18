@@ -23,6 +23,7 @@ from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
+from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 
 
 def _rows_per_expert(gating: jax.Array, topk: int) -> np.ndarray:
@@ -174,6 +175,59 @@ class HelperReferenceBlockScaledTest(absltest.TestCase):
         rtol=0.0,
         atol=0.06 * float(np.abs(out_unquant).max()),
     )
+
+  def test_block_scaled_quantize_per_k_shard_validates_each_shard(self):
+    w = jax.random.normal(jax.random.key(2), (2, 768, 512), dtype=jnp.bfloat16)
+    w_q, w_scale = helper_inputs.block_scaled_quantize(
+        w, jnp.float8_e4m3fn, k_shards=2
+    )
+    self.assertEqual(w_q.shape, (2, 768, 512))
+    self.assertEqual(w_scale.dtype, jnp.float8_e8m0fnu)
+    for q_part, s_part in zip(
+        jnp.split(w_q, 2, axis=1), jnp.split(w_scale, 2, axis=1), strict=True
+    ):
+      wrapped = arg.SingleWeightWrapper.create(q_part, s_part)
+      assert wrapped.scale is not None
+      self.assertEqual(q_part.shape, (2, 384, 512))
+      self.assertEqual(
+          wrapped.scale.shape, (2, block_scaled.scale_rows(384), 512)
+      )
+
+  def test_moe_inputs_quantize_block_scaled_and_validation(self):
+    shape = helper_shapes.MoEShape(
+        "bs",
+        num_experts=4,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=512,
+        w_dtype=jnp.dtype(jnp.float8_e4m3fn),
+        w_block_scaled=True,
+        has_shared_expert=True,
+    )
+    inputs = helper_inputs.MoEInputs.generate(shape, 8)
+    with self.assertRaisesRegex(ValueError, "block_size cannot be set"):
+      inputs.quantize(
+          jnp.dtype(jnp.float8_e4m3fn), block_size=256, block_scaled=True
+      )
+    with self.assertRaisesRegex(ValueError, "k_shards=3"):
+      helper_inputs.block_scaled_quantize(
+          inputs.w2, jnp.float8_e4m3fn, k_shards=3
+      )
+    quantized = inputs.quantize(
+        jnp.dtype(jnp.float8_e4m3fn),
+        block_scaled=True,
+        w2_k_shards=2,
+        shared_w2_k_shards=2,
+    )
+    assert quantized.w1_scale is not None and quantized.w2_scale is not None
+    assert quantized.w1_shared_scale is not None
+    assert quantized.w2_shared_scale is not None
+    rows_512 = block_scaled.scale_rows(512)
+    rows_256 = block_scaled.scale_rows(256)
+    self.assertEqual(quantized.w1_scale.shape, (4, rows_512, 1024))
+    self.assertEqual(quantized.w2_scale.shape, (4, 2 * rows_256, 512))
+    self.assertEqual(quantized.w1_shared_scale.shape, (1, rows_512, 1024))
+    self.assertEqual(quantized.w2_shared_scale.shape, (1, 2 * rows_256, 512))
 
 
 if __name__ == "__main__":

@@ -217,8 +217,11 @@ def routing_moe(
     topk_indices: expert indices of selected experts [num_tokens, topk]
     w1: first moe weights [num_experts, hidden_size, intermediate_size * 2]
     w2: second moe weights [num_experts, intermediate_size, hidden_size]
-    w1_scale: w1 scale [num_experts, num_blocks, 1, intermediate_size * 2]
-    w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
+    w1_scale: optional w1 scale, `[num_experts, num_blocks, 1,
+      intermediate_size * 2]` or block-scaled `[num_experts, scale_rows,
+      intermediate_size * 2]`.
+    w2_scale: optional w2 scale, `[num_experts, num_blocks, 1, hidden_size]` or
+      block-scaled `[num_experts, scale_rows, hidden_size]`.
     w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
     w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
     mesh: mesh to perform moe.
@@ -249,21 +252,11 @@ def routing_moe(
       activation=activation,
       plan=resolved_plan,
       mesh=mesh,
+      w1_scale_shape=None if w1_scale is None else w1_scale.shape,
+      w2_scale_shape=None if w2_scale is None else w2_scale.shape,
   )
 
-  w2_block_axis = None
-  if w2_scale is not None and w2_scale.shape[1] > 1:
-    w2_block_axis = tp_axis
-
   # PartitionSpec leaves match None inputs because None has no PyTree leaves.
-  w1_spec = sharding.PartitionSpec(ep_axis, None, tp_axis)
-  w2_spec = sharding.PartitionSpec(ep_axis, tp_axis, None)
-  w1_scale_spec = sharding.PartitionSpec(ep_axis, None, None, tp_axis)
-  w2_scale_spec = sharding.PartitionSpec(ep_axis, w2_block_axis, None, None)
-  w1_bias_spec = sharding.PartitionSpec(ep_axis, None, tp_axis)
-  w2_bias_spec = sharding.PartitionSpec(ep_axis, None, None)
-  ep_shard_idx_spec = sharding.PartitionSpec(ep_axis)
-
   return jax.shard_map(
       functools.partial(
           _routing_moe_local,
@@ -275,13 +268,13 @@ def routing_moe(
           cfg.act_pspec,
           cfg.act_pspec,
           cfg.act_pspec,
-          w1_spec,
-          w2_spec,
-          w1_scale_spec,
-          w2_scale_spec,
-          w1_bias_spec,
-          w2_bias_spec,
-          ep_shard_idx_spec,
+          cfg.w1_pspec,
+          cfg.w2_pspec,
+          cfg.w1_scale_pspec,
+          cfg.w2_scale_pspec,
+          cfg.w1_bias_pspec,
+          cfg.w2_bias_pspec,
+          cfg.ep_shard_idx_pspec,
       ),
       out_specs=cfg.out_pspec,
       check_vma=False,

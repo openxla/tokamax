@@ -24,6 +24,7 @@ from jax import sharding
 import jax.numpy as jnp
 from tokamax._src import test_utils
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
+from tokamax._src.ops.experimental.routing_moe.layer import config as layer_config
 from tokamax._src.ops.experimental.routing_moe.layer import modular
 from tokamax._src.ops.experimental.routing_moe.layer import monolithic
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
@@ -66,14 +67,12 @@ def _interleave_gate_up(w: jax.Array, n_shards: int) -> jax.Array:
   return interleaved.reshape(w.shape)
 
 
-def _scale_block_axis(scale: jax.Array | None, axis: AxisSpec) -> AxisSpec:
-  """Returns `axis` when `scale` has multiple intermediate blocks, else None."""
-  # Because w2 is sharded along its contracting dimension while per-channel
-  # quantization has a single scale across all TP shards, the scale is
-  # replicated unless sub-channel blocks are present.
-  if scale is None or scale.shape[1] == 1:
-    return None
-  return axis
+def _maybe_interleave(w: jax.Array | None, n_shards: int) -> jax.Array | None:
+  return None if w is None else _interleave_gate_up(w, n_shards)
+
+
+def _scale_shape(scale: jax.Array | None) -> tuple[int, ...] | None:
+  return None if scale is None else scale.shape
 
 
 def _split_scale_blocks(
@@ -100,7 +99,7 @@ def _split_scale_blocks(
     ValueError: If `w`'s contracting dimension is not divisible by the refined
       block count.
   """
-  if scale is None or w is None:
+  if scale is None or w is None or scale.ndim != 4:
     return scale
   num_blocks = scale.shape[1]
   if num_blocks == 1 or num_blocks % num_shards == 0:
@@ -124,15 +123,17 @@ def _shard_inputs(
     moe_in = dataclasses.replace(
         moe_in,
         w1=_interleave_gate_up(moe_in.w1, sharding_spec.tp),
-        w1_bias=None
-        if moe_in.w1_bias is None
-        else _interleave_gate_up(moe_in.w1_bias, sharding_spec.tp),
+        w1_scale=_maybe_interleave(moe_in.w1_scale, sharding_spec.tp),
+        w1_bias=_maybe_interleave(moe_in.w1_bias, sharding_spec.tp),
     )
   if moe_in.w1_shared is not None and sharding_spec.num_cores > 1:
     moe_in = dataclasses.replace(
         moe_in,
         w1_shared=_interleave_gate_up(
             moe_in.w1_shared, sharding_spec.num_cores
+        ),
+        w1_shared_scale=_maybe_interleave(
+            moe_in.w1_shared_scale, sharding_spec.num_cores
         ),
         w2_shared_scale=_split_scale_blocks(
             moe_in.w2_shared_scale,
@@ -141,62 +142,94 @@ def _shard_inputs(
         ),
     )
 
-  def _maybe_put[T](x: T, spec: tuple[AxisSpec, ...]) -> T:
+  def _maybe_put[T](x: T, pspec: sharding.PartitionSpec) -> T:
     return jax.tree.map(
-        lambda v: jax.device_put(v, NamedSharding(mesh, P(*spec))), x
+        lambda v: jax.device_put(v, NamedSharding(mesh, pspec)), x
     )
 
   ep = layout.sharding.ep_axis
   tp = layout.sharding.tp_axis
   red = layout.sharding.reduction_axis
-  act = (red, None) if layout.use_sp else (None, None)
-  w2_block = _scale_block_axis(moe_in.w2_scale, tp)
-  w2_shared_block = _scale_block_axis(moe_in.w2_shared_scale, red)
+  act = P(red, None) if layout.use_sp else P(None, None)
 
   return helper_inputs.MoEInputs(
       hidden_states=_maybe_put(moe_in.hidden_states, act),
       gating_output=_maybe_put(moe_in.gating_output, act),
-      w1=_maybe_put(moe_in.w1, (ep, None, tp)),
-      w2=_maybe_put(moe_in.w2, (ep, tp, None)),
-      w1_scale=_maybe_put(moe_in.w1_scale, (ep, None, None, tp)),
-      w2_scale=_maybe_put(moe_in.w2_scale, (ep, w2_block, None, None)),
-      w1_bias=_maybe_put(moe_in.w1_bias, (ep, None, tp)),
-      w2_bias=_maybe_put(moe_in.w2_bias, (ep, None, None)),
-      w1_shared=_maybe_put(moe_in.w1_shared, (None, None, red)),
-      w2_shared=_maybe_put(moe_in.w2_shared, (None, red, None)),
+      w1=_maybe_put(moe_in.w1, P(ep, None, tp)),
+      w2=_maybe_put(moe_in.w2, P(ep, tp, None)),
+      w1_scale=_maybe_put(
+          moe_in.w1_scale,
+          layer_config.w1_scale_pspec(
+              _scale_shape(moe_in.w1_scale), ep_axis=ep, tp_axis=tp
+          ),
+      ),
+      w2_scale=_maybe_put(
+          moe_in.w2_scale,
+          layer_config.w2_scale_pspec(
+              _scale_shape(moe_in.w2_scale), ep_axis=ep, tp_axis=tp
+          ),
+      ),
+      w1_bias=_maybe_put(moe_in.w1_bias, P(ep, None, tp)),
+      w2_bias=_maybe_put(moe_in.w2_bias, P(ep, None, None)),
+      w1_shared=_maybe_put(moe_in.w1_shared, P(None, None, red)),
+      w2_shared=_maybe_put(moe_in.w2_shared, P(None, red, None)),
       w1_shared_scale=_maybe_put(
-          moe_in.w1_shared_scale, (None, None, None, red)
+          moe_in.w1_shared_scale,
+          layer_config.w1_scale_pspec(
+              _scale_shape(moe_in.w1_shared_scale), ep_axis=None, tp_axis=red
+          ),
       ),
       w2_shared_scale=_maybe_put(
-          moe_in.w2_shared_scale, (None, w2_shared_block, None, None)
+          moe_in.w2_shared_scale,
+          layer_config.w2_scale_pspec(
+              _scale_shape(moe_in.w2_shared_scale), ep_axis=None, tp_axis=red
+          ),
       ),
-      w_shared_gate=_maybe_put(moe_in.w_shared_gate, (None, None)),
+      w_shared_gate=_maybe_put(moe_in.w_shared_gate, P(None, None)),
   )
 
 
-def _make_raw_inputs(
+def _make_case_inputs(
     shape: helper_shapes.MoEShape,
     num_tokens: int,
     layout: WeightLayout,
     *,
     seed: int,
     max_to_mean_load: float = 1.0,
-) -> helper_inputs.MoEInputs:
-  """Generates, folds, and quantizes the unsharded inputs of one layer call."""
+) -> tuple[helper_inputs.MoEInputs, helper_inputs.MoEInputs]:
+  """Generates `(raw, for_shard)` layer inputs for `shape` and `layout`."""
   if layout.fold_shared_expert and (
       not shape.has_shared_expert or layout.sharding.ep > 1
   ):
     raise ValueError(
         "fold_shared_expert requires has_shared_expert and sharding.ep == 1."
     )
-  moe = helper_inputs.MoEInputs.generate(
+  base = helper_inputs.MoEInputs.generate(
       shape, num_tokens, seed=seed, max_to_mean_load=max_to_mean_load
   )
   if layout.fold_shared_expert:
-    moe = moe.fold_shared_expert()
-  if shape.w_dtype is not None:
-    moe = moe.quantize(shape.w_dtype, shape.w_quant_block_size)
-  return moe
+    base = base.fold_shared_expert()
+  if shape.w_dtype is None:
+    return base, base
+  if not shape.w_block_scaled:
+    quantized = base.quantize(shape.w_dtype, shape.w_quant_block_size)
+    return quantized, quantized
+
+  raw = base.quantize(shape.w_dtype, block_scaled=True)
+  # Each TP shard of w2 quantizes and pads its K-dimension scale rows locally.
+  w2_shards = layout.sharding.tp
+  shared_shards = (
+      layout.sharding.num_cores if base.w2_shared is not None else 1
+  )
+  if w2_shards == 1 and shared_shards == 1:
+    return raw, raw
+  for_shard = base.quantize(
+      shape.w_dtype,
+      block_scaled=True,
+      w2_k_shards=w2_shards,
+      shared_w2_k_shards=shared_shards,
+  )
+  return raw, for_shard
 
 
 def _shared_expert_local(
@@ -246,13 +279,16 @@ def _shared_expert(
   else:
     out_spec = P(axis, None)
 
-  w1_scale_spec = (
-      None if moe.w1_shared_scale is None else P(None, None, None, axis)
-  )
+  w1_scale_spec = None
+  if moe.w1_shared_scale is not None:
+    w1_scale_spec = layer_config.w1_scale_pspec(
+        moe.w1_shared_scale.shape, ep_axis=None, tp_axis=axis
+    )
   w2_scale_spec = None
   if moe.w2_shared_scale is not None:
-    block_axis = _scale_block_axis(moe.w2_shared_scale, axis)
-    w2_scale_spec = P(None, block_axis, None, None)
+    w2_scale_spec = layer_config.w2_scale_pspec(
+        moe.w2_shared_scale.shape, ep_axis=None, tp_axis=axis
+    )
 
   return jax.shard_map(
       functools.partial(
@@ -429,7 +465,16 @@ class MoECase:
         and moe_plan.scatter_format.quant is not None
     )
     is_quant = self.shape.w_dtype is not None or is_scatter_quant
-    rtol = 5e-2 if is_quant else 2e-2
+    if self.shape.w_block_scaled and self.shape.w_dtype == jnp.dtype(
+        jnp.float8_e5m2
+    ):
+      rtol = 1.2e-1
+    elif self.shape.w_block_scaled:
+      rtol = 8e-2
+    elif is_quant:
+      rtol = 5e-2
+    else:
+      rtol = 2e-2
     atol = rtol * float(jnp.abs(expected).max())
     test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
 
@@ -454,14 +499,14 @@ class MoECase:
         intermediate_size=case.local_intermediate_size * layout.sharding.tp,
     )
     mesh = helper_inputs.make_mesh(layout.sharding)
-    raw = _make_raw_inputs(
+    raw, for_shard = _make_case_inputs(
         aligned,
         case.num_tokens,
         layout,
         seed=seed,
         max_to_mean_load=case.max_to_mean_load,
     )
-    sharded = jax.block_until_ready(_shard_inputs(raw, mesh, layout))
+    sharded = jax.block_until_ready(_shard_inputs(for_shard, mesh, layout))
     return cls(
         raw=raw, sharded=sharded, shape=aligned, layout=layout, mesh=mesh
     )

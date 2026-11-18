@@ -25,6 +25,45 @@ from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.layer import plan as plan_lib
 
 
+type AxisSpec = str | tuple[str, ...] | None
+
+
+def w1_scale_pspec(
+    scale_shape: tuple[int, ...] | None,
+    *,
+    ep_axis: AxisSpec,
+    tp_axis: AxisSpec,
+) -> sharding.PartitionSpec:
+  """Returns the `w1` scale `PartitionSpec` for 3D or 4D scales."""
+  if scale_shape is not None and len(scale_shape) not in (3, 4):
+    raise ValueError(
+        f"Expected w1_scale to have rank 3 or 4, got {scale_shape}."
+    )
+  if scale_shape is not None and len(scale_shape) == 3:
+    return sharding.PartitionSpec(ep_axis, None, tp_axis)
+  return sharding.PartitionSpec(ep_axis, None, None, tp_axis)
+
+
+def w2_scale_pspec(
+    scale_shape: tuple[int, ...] | None,
+    *,
+    ep_axis: AxisSpec,
+    tp_axis: AxisSpec,
+) -> sharding.PartitionSpec:
+  """Returns the `w2` scale `PartitionSpec` for 3D or 4D scales."""
+  if scale_shape is not None and len(scale_shape) not in (3, 4):
+    raise ValueError(
+        f"Expected w2_scale to have rank 3 or 4, got {scale_shape}."
+    )
+  if scale_shape is not None and len(scale_shape) == 3:
+    return sharding.PartitionSpec(ep_axis, tp_axis, None)
+  # Per-channel 4D scales have a single block shared across TP shards.
+  block_axis = (
+      tp_axis if scale_shape is not None and scale_shape[1] > 1 else None
+  )
+  return sharding.PartitionSpec(ep_axis, block_axis, None, None)
+
+
 class OutputCollective(enum.StrEnum):
   """Cross-device collective applied to unpacked MoE outputs."""
 
@@ -45,6 +84,8 @@ class RoutingMoEConfig:
   reduce_output: bool
   activation: str
   plan: plan_lib.ResolvedMoEPlan
+  w1_scale_shape: tuple[int, ...] | None
+  w2_scale_shape: tuple[int, ...] | None
 
   @classmethod
   def create(
@@ -56,7 +97,9 @@ class RoutingMoEConfig:
       reduce_output: bool,
       activation: str,
       plan: plan_lib.ResolvedMoEPlan,
-      mesh: sharding.Mesh,
+      mesh: sharding.Mesh | sharding.AbstractMesh,
+      w1_scale_shape: tuple[int, ...] | None = None,
+      w2_scale_shape: tuple[int, ...] | None = None,
   ) -> Self:
     """Assembles the config and validates the plan against layer parameters."""
 
@@ -92,14 +135,19 @@ class RoutingMoEConfig:
             f" tp_axis. Currently {ep_axis_idx=} and {tp_axis_idx=}"
         )
 
-    return cls(
+    cfg = cls(
         tp_axis=tp_axis,
         ep_axis=ep_axis,
         use_sp=use_sp,
         reduce_output=reduce_output,
         activation=activation,
         plan=plan,
+        w1_scale_shape=w1_scale_shape,
+        w2_scale_shape=w2_scale_shape,
     )
+    _ = cfg.w1_scale_pspec
+    _ = cfg.w2_scale_pspec
+    return cfg
 
   @property
   def reduction_axis(self) -> tuple[str, ...]:
@@ -112,6 +160,45 @@ class RoutingMoEConfig:
     if self.use_sp:
       return sharding.PartitionSpec(self.reduction_axis)
     return sharding.PartitionSpec(None)
+
+  @property
+  def w1_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w1`."""
+    return sharding.PartitionSpec(self.ep_axis, None, self.tp_axis)
+
+  @property
+  def w2_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w2`."""
+    return sharding.PartitionSpec(self.ep_axis, self.tp_axis, None)
+
+  @property
+  def w1_scale_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w1_scale`."""
+    return w1_scale_pspec(
+        self.w1_scale_shape, ep_axis=self.ep_axis, tp_axis=self.tp_axis
+    )
+
+  @property
+  def w2_scale_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w2_scale`."""
+    return w2_scale_pspec(
+        self.w2_scale_shape, ep_axis=self.ep_axis, tp_axis=self.tp_axis
+    )
+
+  @property
+  def w1_bias_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w1_bias`."""
+    return sharding.PartitionSpec(self.ep_axis, None, self.tp_axis)
+
+  @property
+  def w2_bias_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `w2_bias`."""
+    return sharding.PartitionSpec(self.ep_axis, None, None)
+
+  @property
+  def ep_shard_idx_pspec(self) -> sharding.PartitionSpec:
+    """The PartitionSpec of `ep_shard_idx`."""
+    return sharding.PartitionSpec(self.ep_axis)
 
   @property
   def gmm_in_format(self) -> out_format.ResolvedActivationFormat:
