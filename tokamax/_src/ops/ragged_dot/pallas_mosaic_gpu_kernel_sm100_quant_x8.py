@@ -639,10 +639,21 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
       def _deq_wg():
         kernel_config.set_max_registers(kernel_config.deq_wg_regs)
 
-        @pl.loop(wg, num_k_iters, step=_DEQ_WG)
+        tile_offset = local_index * num_k_iters
+        # Barrier phases are tracked per thread, so each barrier slot must
+        # always be waited on by the same warpgroup. Warpgroup `wg` takes the
+        # iterations with global_ki % _DEQ_WG == wg.
+        ki_start = wg
+        if num_k_iters % _DEQ_WG:
+          # (wg - tile_offset) mod _DEQ_WG, written with non-negative operands.
+          ki_start = lax.rem(
+              wg + (-num_k_iters % _DEQ_WG) * local_index, _DEQ_WG
+          )
+
+        @pl.loop(ki_start, num_k_iters, step=_DEQ_WG)
         def _dequantize(ki):
           with jax.named_scope("indices"):
-            global_ki = ki + local_index * num_k_iters
+            global_ki = ki + tile_offset
             data_slot = lax.rem(global_ki, data_stages)
             w_slot = lax.rem(global_ki, deq_stages)
           with jax.named_scope("wait_w_tma"):
