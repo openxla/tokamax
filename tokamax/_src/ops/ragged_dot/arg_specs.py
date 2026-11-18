@@ -315,11 +315,10 @@ ARG_SPECS = (
     )
     + tuple(_make_spec(name, *args) for name, args in SPEC_SHAPES.items())
     + (
-        # Use smaller input shapes to avoid XLA implementation from OOMing.
         _make_maxtext_gmm_v2_spec(
-            'gmm_v2_maxtext_8192x7168_64x7168x1024',
-            num_groups=64,
-            m=8192,
+            'gmm_v2_maxtext_262144x7168_256x7168x1024',
+            num_groups=256,
+            m=262144,
             n=1024,
             k=7168,
             block_size=256,
