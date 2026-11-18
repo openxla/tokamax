@@ -681,6 +681,44 @@ def _apply_mask_and_soft_cap(
   return qk
 
 
+def _store_residuals(
+    residuals: list[tuple[Any, jax.Array]], sublane_residuals: bool
+) -> None:
+  """Stores the forward's per-row softmax residuals.
+
+  Args:
+    residuals: `(ref, value)` pairs. Each value is (heads, bq, NUM_LANES), one
+      value per q row broadcast over the lanes.
+    sublane_residuals: If true, each ref is (heads, NUM_SUBLANES, bq) and gets
+      the value transposed into rows, so the wrapper reads a 16x smaller array.
+      Otherwise each ref has the value's shape.
+  """
+  if not (sublane_residuals and residuals):
+    for ref, x in residuals:
+      assert ref.shape == x.shape
+      ref[...] = x.astype(ref.dtype)
+    return
+  # Residual r takes lanes [8r, 8r + 8) of one packed array, so a single
+  # transpose serves all.
+  packed = residuals[0][1]
+  num_heads, bq, num_lanes = packed.shape
+  assert num_lanes == NUM_LANES and bq % NUM_LANES == 0
+  assert len(residuals) * NUM_SUBLANES <= NUM_LANES
+  lane_group = (
+      lax.broadcasted_iota(jnp.int32, packed.shape, packed.ndim - 1)
+      // NUM_SUBLANES
+  )
+  for r, (_, x) in enumerate(residuals[1:], start=1):
+    packed = jnp.where(lane_group == r, x, packed)
+  for head in range(num_heads):
+    rows = packed[head].T
+    for r, (ref, _) in enumerate(residuals):
+      assert ref.shape == (num_heads, NUM_SUBLANES, bq)
+      ref[head] = rows[r * NUM_SUBLANES : (r + 1) * NUM_SUBLANES].astype(
+          ref.dtype
+      )
+
+
 def flash_attention_kernel(
     # Prefetched inputs
     active_rows_ref,
@@ -721,6 +759,7 @@ def flash_attention_kernel(
     mask_function: MaskFunctionType | None,
     fuse_reciprocal: bool,  # config.fuse_reciprocal or not save_residuals
     config: SplashConfig,
+    sublane_residuals: bool = False,
 ):
   del mask_next_ref
   float32 = jnp.float32
@@ -1146,17 +1185,15 @@ def flash_attention_kernel(
       o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
     else:
       o_ref[...] = o_scratch_ref[...].astype(o_ref.dtype)
+    residuals = []
     if logsumexp_ref is not None:
-      assert logsumexp_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
       log = jnp.log2 if config.use_base2_exp else jnp.log
-      logsumexp = m + log(l)
-      logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)
+      residuals.append((logsumexp_ref, m + log(l)))
     if l_linear_ref is not None:
-      assert l_linear_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
-      l_linear_ref[...] = l.astype(l_linear_ref.dtype)
+      residuals.append((l_linear_ref, l))
     if max_logits_ref is not None:
-      assert max_logits_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
-      max_logits_ref[...] = m.astype(max_logits_ref.dtype)
+      residuals.append((max_logits_ref, m))
+    _store_residuals(residuals, sublane_residuals)
 
 
 def _div(dividend: int, divisor: int):
@@ -1606,29 +1643,32 @@ def _splash_attention_forward(
   out_specs = [
       pl.BlockSpec((num_stacked_q_heads, bq, head_dim_v), out_index_map),
   ]
+  # Per-row residuals are written as (heads, NUM_SUBLANES, q_seq_len) rows
+  # rather than lane-broadcast (heads, q_seq_len, NUM_LANES) columns when the q
+  # block fills whole lane tiles: the slice below then reads 8 values per q row
+  # instead of 128. The values are the same.
+  sublane_residuals = save_residuals and bq % NUM_LANES == 0
   if save_residuals:
-    logsumexp_index_map = unravel(lambda h_block, i, j, *_: (h_block, i, 0))
+    if sublane_residuals:
+      residual_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
+      residual_block = (num_stacked_q_heads, NUM_SUBLANES, bq)
+      residual_index_map = unravel(lambda h_block, i, j: (h_block, 0, i))
+    else:
+      residual_shape = (num_q_heads, q_seq_len, NUM_LANES)
+      residual_block = (num_stacked_q_heads, bq, NUM_LANES)
+      residual_index_map = unravel(lambda h_block, i, j: (h_block, i, 0))
+    residual_out = jax.ShapeDtypeStruct(residual_shape, jnp.float32)
+    residual_spec = pl.BlockSpec(residual_block, residual_index_map)
 
     out_shapes += [
-        # logsumexp
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
-        if fuse_reciprocal
-        else None,
-        # l_linear
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
-        if not fuse_reciprocal
-        else None,
-        # max_logits
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32),
+        residual_out if fuse_reciprocal else None,  # logsumexp
+        residual_out if not fuse_reciprocal else None,  # l_linear
+        residual_out,  # max_logits
     ]
     out_specs += [
-        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map)
-        if fuse_reciprocal
-        else None,
-        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map)
-        if not fuse_reciprocal
-        else None,
-        pl.BlockSpec((num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map),
+        residual_spec if fuse_reciprocal else None,
+        residual_spec if not fuse_reciprocal else None,
+        residual_spec,
     ]
   else:
     out_shapes += [None, None, None]
@@ -1714,6 +1754,7 @@ def _splash_attention_forward(
             fuse_reciprocal=fuse_reciprocal,
             config=config,
             mask_function=mask_function,
+            sublane_residuals=sublane_residuals,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=7,
@@ -1776,18 +1817,21 @@ def _splash_attention_forward(
 
   out = init_if_empty(out, 0.0)
 
+  def residual_rows(x: jax.Array) -> jax.Array:
+    return x[..., 0, :] if sublane_residuals else x[..., 0]
+
   if save_residuals:
     assert max_logits is not None
-    max_logits = init_if_empty(max_logits[..., 0], mask_value)
+    max_logits = init_if_empty(residual_rows(max_logits), mask_value)
 
     if fuse_reciprocal:
       assert logsumexp is not None
-      logsumexp = init_if_empty(logsumexp[..., 0], mask_value)
+      logsumexp = init_if_empty(residual_rows(logsumexp), mask_value)
     else:
       assert l_linear is not None
       log = jnp.log2 if config.use_base2_exp else jnp.log
 
-      l = l_linear[..., 0]
+      l = init_if_empty(residual_rows(l_linear), 1.0)
       logsumexp = max_logits + log(l)
       out = (out / l[..., None]).astype(out.dtype)
   else:
