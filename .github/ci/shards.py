@@ -452,6 +452,7 @@ SHARDS: ShardMap = {
     ),
     'experimental-mla': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/mla/api_test.py',
             'tokamax/_src/ops/experimental/mla/base_test.py',
             'tokamax/_src/ops/experimental/mla/kernel/transpose_test.py',
             'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',
