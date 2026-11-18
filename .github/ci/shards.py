@@ -96,7 +96,7 @@ EXCLUDED_TESTS = ()
 
 # JAX versions tested in CI: `latest_jax()` for the shard jobs, `older_jaxs()`
 # for compat-tests. The oldest must match the floor in pyproject.toml.
-JAX_VERSIONS = ('0.12.0', '0.11.2')
+JAX_VERSIONS = ('0.12.1', '0.12.0')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
