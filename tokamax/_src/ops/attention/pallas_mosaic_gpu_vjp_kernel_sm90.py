@@ -71,8 +71,9 @@ def _estimate_dq_smem_bytes(
 
   # 32-bit floats are downcast to 16-bit before the kernel call.
   dtype_bits = jnp.finfo(jnp.bfloat16).bits
-  block_d = pl.cdiv(q.shape[-1], 64) * 64
-  block_d_out = pl.cdiv(v.shape[-1], 64) * 64
+  min_head_dim = 8 * common.MIN_SWIZZLE // dtype_bits
+  block_d = pl.cdiv(q.shape[-1], min_head_dim) * min_head_dim
+  block_d_out = pl.cdiv(v.shape[-1], min_head_dim) * min_head_dim
   bytes_per_stage = block_kv * (block_d + block_d_out) * dtype_bits // 8  # k,v
   if bias is None:
     ds_bytes = 0
@@ -102,8 +103,9 @@ def _estimate_dkv_smem_bytes(ba, block_q, block_kv, num_stages, compute_wgs=2):
 
   # 32-bit floats are downcast to 16-bit before the kernel call.
   dtype_bits = jnp.finfo(jnp.bfloat16).bits
-  block_d = pl.cdiv(q.shape[-1], 64) * 64
-  block_d_out = pl.cdiv(v.shape[-1], 64) * 64
+  min_head_dim = 8 * common.MIN_SWIZZLE // dtype_bits
+  block_d = pl.cdiv(q.shape[-1], min_head_dim) * min_head_dim
+  block_d_out = pl.cdiv(v.shape[-1], min_head_dim) * min_head_dim
   bytes_per_stage = block_q * (block_d + block_d_out) * dtype_bits // 8  # q, do
   bytes_per_stage += 3 * block_q * _F32_BYTES  # m, l, delta
   if bias is not None:
@@ -200,7 +202,12 @@ def flash_attention_vjp_kernel(
 ]:
   orig_q_seq_len, _, orig_head_dim = q.shape
   orig_kv_seq_len, _, orig_head_dim_out = v.shape
-  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
+  # As in the forward kernel. All five share the padded size, from the 16-bit q:
+  # `out` can still be 32-bit.
+  min_head_dim = 8 * common.MIN_SWIZZLE // mgpu_lib.num_bits(q.dtype)
+  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(
+      x, min_head_dim, -1
+  )
   q, k, v, out, dout = map(pad_head_dim, (q, k, v, out, dout))
   m, l = residuals
 
