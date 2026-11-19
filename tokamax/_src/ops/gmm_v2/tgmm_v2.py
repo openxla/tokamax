@@ -71,6 +71,7 @@ class TgmmTilingRequest:
   acc_dtype: jnp.dtype
   target_zero_ref_bytes: int
   has_partial_sum: bool = False
+  is_out_fused: bool = False
 
 
 TileTgmmFn = Callable[[TgmmTilingRequest], gmm_v2.TileSizes]
@@ -171,6 +172,7 @@ def calculate_tgmm_tiling_from_request(
       req.acc_dtype,
       req.target_zero_ref_bytes,
       req.has_partial_sum,
+      req.is_out_fused,
   )
 
 
@@ -183,6 +185,7 @@ def calculate_tgmm_tiling(
     acc_dtype: jnp.dtype,
     target_zero_ref_bytes: int,
     has_partial_sum: bool = False,
+    is_out_fused: bool = False,
 ) -> gmm_v2.TileSizes:
   """Calculate optimal tile sizes for TGMM kernel."""
   # In tgmm, we calculate lhs.T @ dout which doesn't require quantization.
@@ -279,22 +282,59 @@ def calculate_tgmm_tiling(
   # `tgmm_kernel_main`), and the grid is split across TensorCores along the
   # first of them whose tile count is a multiple of `num_cores`. If neither is,
   # split the larger of k and n, so that each core re-reads only the operand of
-  # the smaller one. Splitting only shrinks tiles, so VMEM usage stays in limit.
+  # the smaller one. Exact splits are preferred over padded splits (e.g. when
+  # both k and n are odd multiples of `num_lanes`), which fused outputs don't
+  # support. Splitting only shrinks tiles, so VMEM usage stays in limit.
   num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
   if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
     tile_k_lower_bound = min(
         pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
     )
     split_k = gmm_v2.split_for_cores(
-        dims.size_k, num_k_tiles, num_cores, num_lanes, tile_k_lower_bound
+        dims.size_k,
+        num_k_tiles,
+        num_cores,
+        num_lanes,
+        tile_k_lower_bound,
+        allow_padding=False,
     )
     split_n = gmm_v2.split_for_cores(
-        dims.size_n, num_n_tiles, num_cores, num_lanes, tile_n_lower_bound
+        dims.size_n,
+        num_n_tiles,
+        num_cores,
+        num_lanes,
+        tile_n_lower_bound,
+        allow_padding=False,
     )
     if split_k is not None and (dims.size_k >= dims.size_n or split_n is None):
       num_k_tiles, tile_k = split_k
     elif split_n is not None:
       num_n_tiles, tile_n = split_n
+    elif not is_out_fused:
+      # Prefer a padded n split: the output is padded along k to a multiple of
+      # `tile_k`, so a padded k split forces an extra HBM slice copy of the
+      # output, while n is only padded to `num_lanes`.
+      split_n = gmm_v2.split_for_cores(
+          dims.size_n,
+          num_n_tiles,
+          num_cores,
+          num_lanes,
+          tile_n_lower_bound,
+          allow_padding=True,
+      )
+      if split_n is not None:
+        num_n_tiles, tile_n = split_n
+      else:
+        split_k = gmm_v2.split_for_cores(
+            dims.size_k,
+            num_k_tiles,
+            num_cores,
+            num_lanes,
+            tile_k_lower_bound,
+            allow_padding=True,
+        )
+        if split_k is not None:
+          num_k_tiles, tile_k = split_k
 
   # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
   # full-tile int32 masks alongside the accumulator in VREGs, causing severe
@@ -330,6 +370,7 @@ def make_tgmm_configs(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype | None,
     target_zero_ref_bytes: int,
+    is_out_fused: bool = False,
 ):
   """Fills the GMM config for the TGMM kernel."""
   assert out_dtype, "out_dtype cannot be None"
@@ -415,6 +456,7 @@ def make_tgmm_configs(
             acc_dtype=acc_dtype,
             target_zero_ref_bytes=target_zero_ref_bytes,
             has_partial_sum=partial_sum is not None,
+            is_out_fused=is_out_fused,
         )
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
@@ -1021,6 +1063,7 @@ def tgmm_v2(
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
+      is_out_fused=fusion_spec is not None and fusion_spec.is_out_fused,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles

@@ -169,9 +169,20 @@ def get_num_cores(tpu_info: Any) -> int:
 
 
 def split_for_cores(
-    size: int, num_tiles: int, num_cores: int, num_lanes: int, min_tile: int
+    size: int,
+    num_tiles: int,
+    num_cores: int,
+    num_lanes: int,
+    min_tile: int,
+    *,
+    allow_padding: bool = True,
 ) -> tuple[int, int] | None:
   """Splits `size` into a multiple of `num_cores` equal, lane-aligned tiles.
+
+  Prefers the fewest tiles that exactly cover `align_to(size, num_lanes)`. When
+  no exact split exists (e.g. `align_to(size, num_lanes) // num_lanes` is odd
+  for `num_cores == 2`) and `allow_padding` is True, falls back to the fewest
+  lane-aligned tiles whose `cdiv(size, tile)` still equals the tile count.
 
   Args:
     size: The size of the dimension to split.
@@ -179,21 +190,29 @@ def split_for_cores(
     num_cores: The number of TensorCores the tiles are partitioned across.
     num_lanes: The number of lanes that each tile must be aligned to.
     min_tile: The smallest allowed tile size.
+    allow_padding: Whether to allow padded splits (`tile * cand > aligned_size`)
+      when no exact split exists.
 
   Returns:
-    `(num_tiles, tile)` for the fewest tiles that are a multiple of `num_cores`,
-    are at least `min_tile` and exactly cover `size` (rounded up to
-    `num_lanes`), or `None` if no such split exists.
+    `(num_tiles, tile)` for the chosen split, or `None` if no valid split
+    exists.
   """
   aligned_size = align_to(size, num_lanes)
   start = align_to(max(num_tiles, 1), num_cores)
+  padded_fallback: tuple[int, int] | None = None
   for cand in range(start, aligned_size // num_lanes + 1, num_cores):
     tile = align_to(size, cand * num_lanes) // cand
     if tile < min_tile:
       break
     if tile * cand == aligned_size:
       return cand, tile
-  return None
+    if (
+        allow_padding
+        and padded_fallback is None
+        and pl.cdiv(size, tile) == cand
+    ):
+      padded_fallback = (cand, tile)
+  return padded_fallback
 
 
 def _get_lhs_sublane_size(dtype: jnp.dtype, size_m: int) -> int:
@@ -484,6 +503,7 @@ class TilingRequest:
   vmem_limit_bytes: int
   fuse_act: str | None = None
   has_partial_sum: bool = False
+  is_out_fused: bool = False
 
 
 TileFn = Callable[[TilingRequest], TileSizes]
@@ -1557,6 +1577,7 @@ def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
       req.vmem_limit_bytes,
       req.fuse_act,
       req.has_partial_sum,
+      req.is_out_fused,
   )
 
 
@@ -1567,6 +1588,7 @@ def calculate_tiling(
     vmem_limit_bytes: int,
     fuse_act: str | None = None,
     has_partial_sum: bool = False,
+    is_out_fused: bool = False,
 ) -> TileSizes:
   """Calculate optimal tile sizes for GMM kernel."""
 
@@ -1679,12 +1701,16 @@ def calculate_tiling(
 
   # In MegaCore mode only the n grid dimension is split across TensorCores (see
   # `kernel_main`), so use a multiple of `num_cores` n tiles to keep every core
-  # busy. Keep the current tiling if `size_n_per_rhs` cannot be split evenly
-  # into tiles of at least `tile_n_limit`.
+  # busy. Fused outputs require exact `tile_n` divisibility (see `gmm_fuser`).
   num_cores = get_num_cores(tpu_info)
   if num_cores > 1 and num_n_tiles % num_cores:
     split = split_for_cores(
-        size_n_per_rhs, num_n_tiles, num_cores, num_lanes, tile_n_limit
+        size_n_per_rhs,
+        num_n_tiles,
+        num_cores,
+        num_lanes,
+        tile_n_limit,
+        allow_padding=not is_out_fused,
     )
     if split is not None:
       num_n_tiles, tile_n = split
@@ -1960,6 +1986,7 @@ def make_gmm_configs(
     transpose_rhs: bool = False,
     lhs_quant_dtype: jnp.dtype | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    is_out_fused: bool = False,
 ):
   """Fills the GMM config for the GMM kernel."""
   packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
@@ -2076,6 +2103,7 @@ def make_gmm_configs(
             vmem_limit_bytes=vmem_limit_bytes,
             fuse_act=fuse_act,
             has_partial_sum=partial_sum is not None,
+            is_out_fused=is_out_fused,
         )
     )
 
@@ -2235,6 +2263,7 @@ def gmm_v2(
       transpose_rhs=transpose_rhs,
       lhs_quant_dtype=lhs_quant_dtype,
       rhs_quant_dtype=rhs_quant_dtype,
+      is_out_fused=fusion_spec is not None and fusion_spec.is_out_fused,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles

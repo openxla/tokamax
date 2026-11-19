@@ -551,8 +551,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     else:
       raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
 
-    k_ = ((k + 128 - 1) // 128) * 128
-    n_ = ((n + 128 - 1) // 128) * 128
+    def _tile_candidates(dim: int) -> set[int]:
+      aligned = ((dim + 128 - 1) // 128) * 128
+      num_lanes = aligned // 128
+      return (
+          {128 * (2**i) for i in range(8) if 128 * (2**i) <= aligned}
+          | {((num_lanes + (2**i) - 1) // (2**i)) * 128 for i in range(6)}
+          | {aligned}
+      )
 
     try:
       tpu_gen = getattr(pltpu.get_tpu_info(), "generation", 0)
@@ -564,24 +570,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         for i in range(8)
         if 128 * (2**i) <= m and 128 * (2**i) <= max_tile_m
     ]
-    tile_k_range = (
-        {128 * (2**i) for i in range(8) if 128 * (2**i) <= k_}
-        | {
-            k_ // (2**i)
-            for i in range(6)
-            if k_ // (2**i) >= 128 and (k_ // (2**i)) % 128 == 0
-        }
-        | {k_}
-    )
-    tile_n_range = (
-        {128 * (2**i) for i in range(8) if 128 * (2**i) <= n_}
-        | {
-            n_ // (2**i)
-            for i in range(6)
-            if n_ // (2**i) >= 128 and (n_ // (2**i)) % 128 == 0
-        }
-        | {n_}
-    )
+    tile_k_range = _tile_candidates(k)
+    tile_n_range = _tile_candidates(n)
     lhs_buffer_count_range = (
         [None]
         if dims == DRHS_RAGGED_DOT_DIM_NUMS

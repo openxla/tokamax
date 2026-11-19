@@ -665,6 +665,17 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
     self.assertTrue(all(c.tile_k % 128 == 0 for c in drhs_configs))
     self.assertTrue(all(c.lhs_buffer_count is None for c in drhs_configs))
 
+    # Odd multiples of 128 lanes (e.g. 1408 = 11*128, 1664 = 13*128) must
+    # include the tightest lane-aligned 2-way splits (768 and 896) so MegaCore
+    # autotuning can partition across 2 TensorCores with minimal padding.
+    odd_lane_configs = op.bind(
+        jax.ShapeDtypeStruct((128, 1408), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4, 1408, 1664), jnp.bfloat16),
+        group_sizes=group_sizes,
+    ).autotuning_configs - {pallas_mosaic_tpu_v2.Config()}
+    self.assertIn(768, {c.tile_k for c in odd_lane_configs})
+    self.assertIn(896, {c.tile_n for c in odd_lane_configs})
+
   def test_gmm_fused_rms_norm(self):
     """Tests fusing RMS norm before ragged_dot inside @op_fusion.fuse."""
     m, k, n, num_groups = 256, 256, 256, 4

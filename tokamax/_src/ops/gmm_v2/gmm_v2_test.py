@@ -3034,6 +3034,22 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           fuse_act=None,
           expected_tile_n=1024,
       ),
+      dict(
+          testcase_name="odd_lane_multiple_fwd",
+          size_k=1408,
+          size_n=1664,
+          is_transposed=False,
+          fuse_act=None,
+          expected_tile_n=896,
+      ),
+      dict(
+          testcase_name="odd_lane_multiple_dlhs",
+          size_k=1664,
+          size_n=1408,
+          is_transposed=True,
+          fuse_act=None,
+          expected_tile_n=768,
+      ),
   )
   def test_calculate_tiling_megacore_splits_n(
       self,
@@ -3075,16 +3091,19 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           )
         self.assertEqual(tiles.tile_n, want_tile_n)
         self.assertEqual(tiles.tile_k, size_k)
-        self.assertEqual(size_n_per_rhs % tiles.tile_n, 0)
+        self.assertEqual(tiles.tile_n % 128, 0)
+        if num_cores > 1 and not disable_multi_core_mode:
+          self.assertEqual(pl.cdiv(size_n_per_rhs, tiles.tile_n) % num_cores, 0)
 
   @parameterized.named_parameters(
-      # A split into 2 tiles of 256 would not cover 384 exactly.
-      dict(testcase_name="indivisible", size_n=384),
       # Tiles of 128 would be below the MXU-stall floor of 256.
-      dict(testcase_name="below_tile_n_floor", size_n=256),
+      dict(testcase_name="below_tile_n_floor", size_n=256, is_out_fused=False),
+      # Fused outputs require exact tile_n divisibility, so odd lane multiples
+      # cannot use a padded MegaCore split.
+      dict(testcase_name="fused_output_odd_lanes", size_n=384, is_out_fused=True),
   )
   def test_calculate_tiling_megacore_keeps_unsplittable_n(
-      self, size_n: int
+      self, size_n: int, is_out_fused: bool
   ) -> None:
     dims = _make_dims(size_m=4096, size_k=1024, size_n=size_n)
     with (
@@ -3098,6 +3117,7 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           lhs_cfgs=_bf16_input_configs(),
           rhs_cfgs=_bf16_input_configs(is_transposed=False),
           vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+          is_out_fused=is_out_fused,
       )
     self.assertEqual(tiles.tile_n, size_n)
 
@@ -3207,28 +3227,42 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
 class SplitForCoresTest(parameterized.TestCase):
 
   @parameterized.parameters(
-      dict(size=1280, num_tiles=1, min_tile=256, expected=(2, 640)),
-      dict(size=2048, num_tiles=1, min_tile=256, expected=(2, 1024)),
-      dict(size=4096, num_tiles=3, min_tile=256, expected=(4, 1024)),
+      dict(size=1280, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 640)),
+      dict(size=2048, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 1024)),
+      dict(size=4096, num_tiles=3, min_tile=256, allow_padding=True, expected=(4, 1024)),
       # 1536 / 2 = 768 is lane-aligned.
-      dict(size=1536, num_tiles=1, min_tile=256, expected=(2, 768)),
-      # 640 is 5 lanes, which cannot be split into an even number of equal
-      # lane-aligned tiles.
-      dict(size=640, num_tiles=1, min_tile=256, expected=None),
-      dict(size=640, num_tiles=1, min_tile=128, expected=None),
-      dict(size=384, num_tiles=1, min_tile=128, expected=None),
-      dict(size=100, num_tiles=1, min_tile=100, expected=None),
+      dict(size=1536, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 768)),
+      # Odd multiples of 128 lanes fall back to the fewest padded lane-aligned
+      # tiles when allow_padding=True, and return None when allow_padding=False.
+      dict(size=1408, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 768)),
+      dict(size=1664, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 896)),
+      dict(size=640, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 384)),
+      dict(size=384, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 256)),
+      dict(size=1408, num_tiles=1, min_tile=256, allow_padding=False, expected=None),
+      dict(size=640, num_tiles=1, min_tile=256, allow_padding=False, expected=None),
+      dict(size=640, num_tiles=1, min_tile=128, allow_padding=False, expected=None),
+      dict(size=384, num_tiles=1, min_tile=128, allow_padding=False, expected=None),
+      # Guard against cand where cdiv(size, tile) != cand (640 / 256 -> 3 != 4).
+      dict(size=640, num_tiles=3, min_tile=256, allow_padding=True, expected=None),
+      dict(size=256, num_tiles=1, min_tile=256, allow_padding=True, expected=None),
+      dict(size=100, num_tiles=1, min_tile=100, allow_padding=True, expected=None),
   )
   def test_split_for_cores(
       self,
       size: int,
       num_tiles: int,
       min_tile: int,
+      allow_padding: bool,
       expected: tuple[int, int] | None,
   ) -> None:
     self.assertEqual(
         gmm_v2.split_for_cores(
-            size, num_tiles, num_cores=2, num_lanes=128, min_tile=min_tile
+            size,
+            num_tiles,
+            num_cores=2,
+            num_lanes=128,
+            min_tile=min_tile,
+            allow_padding=allow_padding,
         ),
         expected,
     )
@@ -3237,7 +3271,12 @@ class SplitForCoresTest(parameterized.TestCase):
 class TgmmV2CalculateTilingTest(parameterized.TestCase):
 
   def _calculate_tgmm_tiling(
-      self, size_k: int, size_n: int, num_cores: int, size_m: int = 98304
+      self,
+      size_k: int,
+      size_n: int,
+      num_cores: int,
+      size_m: int = 98304,
+      is_out_fused: bool = False,
   ) -> gmm_v2.TileSizes:
     dims = _make_dims(size_m=size_m, size_k=size_k, size_n=size_n)
     with (
@@ -3256,6 +3295,7 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
           out_dtype=jnp.dtype(jnp.bfloat16),
           acc_dtype=jnp.dtype(jnp.float32),
           target_zero_ref_bytes=2 * 1024 * 1024,
+          is_out_fused=is_out_fused,
       )
 
   @parameterized.named_parameters(
@@ -3275,13 +3315,37 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
           expected_tile_k=1280,
           expected_tile_n=1024,
       ),
-      # 640 cannot be split into lane-aligned halves, so split n instead.
+      # 640 cannot be split evenly, so prefer the exact split on n (512 -> 256).
       dict(
           testcase_name="split_n_when_k_is_unsplittable",
           size_k=640,
           size_n=512,
           expected_tile_k=640,
           expected_tile_n=256,
+      ),
+      # When both dims are odd multiples of 128, fall back to a padded split on
+      # n, which avoids padding the output along k.
+      dict(
+          testcase_name="padded_split_n_odd_lanes",
+          size_k=1408,
+          size_n=1664,
+          expected_tile_k=1408,
+          expected_tile_n=896,
+      ),
+      dict(
+          testcase_name="padded_split_n_odd_lanes_larger_k",
+          size_k=1664,
+          size_n=1408,
+          expected_tile_k=1664,
+          expected_tile_n=768,
+      ),
+      # n is too small to split, so fall back to a padded split on k.
+      dict(
+          testcase_name="padded_split_k_when_n_is_unsplittable",
+          size_k=1408,
+          size_n=128,
+          expected_tile_k=768,
+          expected_tile_n=128,
       ),
   )
   def test_calculate_tgmm_tiling_megacore(
@@ -3298,13 +3362,33 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
     tiles = self._calculate_tgmm_tiling(size_k, size_n, 2)
     self.assertEqual(tiles.tile_k, expected_tile_k)
     self.assertEqual(tiles.tile_n, expected_tile_n)
-    num_parallel_tiles = (size_k // tiles.tile_k) * (size_n // tiles.tile_n)
+    num_parallel_tiles = pl.cdiv(size_k, tiles.tile_k) * pl.cdiv(
+        size_n, tiles.tile_n
+    )
     self.assertEqual(num_parallel_tiles % 2, 0)
 
-  def test_calculate_tgmm_tiling_megacore_keeps_unsplittable(self) -> None:
-    tiles = self._calculate_tgmm_tiling(256, 256, 2)
-    self.assertEqual(tiles.tile_k, 256)
-    self.assertEqual(tiles.tile_n, 256)
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="below_floor",
+          size_k=256,
+          size_n=256,
+          is_out_fused=False,
+      ),
+      dict(
+          testcase_name="fused_output_odd_lanes",
+          size_k=1408,
+          size_n=1664,
+          is_out_fused=True,
+      ),
+  )
+  def test_calculate_tgmm_tiling_megacore_keeps_unsplittable(
+      self, size_k: int, size_n: int, is_out_fused: bool
+  ) -> None:
+    tiles = self._calculate_tgmm_tiling(
+        size_k, size_n, 2, is_out_fused=is_out_fused
+    )
+    self.assertEqual(tiles.tile_k, size_k)
+    self.assertEqual(tiles.tile_n, size_n)
 
   @parameterized.named_parameters(
       dict(testcase_name="avg_32_clamped_to_base", size_m=4096, want_tile_m=256),
@@ -3547,6 +3631,168 @@ class GmmV2VmapTest(parameterized.TestCase):
         for i in range(vmap_size)
     ])
     assert_arrays_all_close(actual, expected)
+
+
+class GmmV2OddLaneMultipleMegaCoreTest(parameterized.TestCase):
+  """Hardware tests for odd-lane-multiple dimensions under MegaCore splitting."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 5:
+      self.skipTest("Only supported on TPU gen 5+.")
+    super().setUp()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="fwd_1408x1664_f32_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=False,
+          rhs_dtype=jnp.float32,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="fwd_1664x1408_f32_rhs",
+          in_size=1664,
+          out_size=1408,
+          transpose_rhs=False,
+          rhs_dtype=jnp.float32,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="dlhs_1664x1408_f32_rhs",
+          in_size=1664,
+          out_size=1408,
+          transpose_rhs=True,
+          rhs_dtype=jnp.float32,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="dlhs_1408x1664_f32_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=True,
+          rhs_dtype=jnp.float32,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="fwd_1408x1664_bf16_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=False,
+          rhs_dtype=jnp.bfloat16,
+          tile_n=896,
+      ),
+  )
+  def test_gmm_odd_lane_multiple_padded_tile_n(
+      self,
+      in_size: int,
+      out_size: int,
+      transpose_rhs: bool,
+      rhs_dtype: jnp.dtype,
+      tile_n: int,
+  ):
+    batch_size = 512
+    num_groups = 8
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs_shape = (
+        (num_groups, out_size, in_size)
+        if transpose_rhs
+        else (num_groups, in_size, out_size)
+    )
+    rhs = jax.random.normal(k1, rhs_shape, dtype=rhs_dtype)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    rhs_ref = rhs.swapaxes(1, 2) if transpose_rhs else rhs
+    expected = reference_gmm(lhs, rhs_ref, group_sizes)
+
+    # Test both explicit padded tile_n and the default MegaCore heuristic.
+    for tile_info in (
+        gmm_v2.TileSizes(
+            tile_m=256, tile_k=in_size, tile_n=tile_n, bucket_base=128
+        ),
+        gmm_v2.calculate_tiling_from_request,
+    ):
+      with self.subTest(tile_info=tile_info):
+        actual = gmm_v2.gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            transpose_rhs=transpose_rhs,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+        self.assertEqual(actual.shape, (batch_size, out_size))
+        assert_arrays_all_close(actual, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="split_n_1408x1664",
+          in_size=1408,
+          out_size=1664,
+          tile_k=1408,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="split_k_1408x1664",
+          in_size=1408,
+          out_size=1664,
+          tile_k=768,
+          tile_n=1664,
+      ),
+      dict(
+          testcase_name="split_k_1664x1408",
+          in_size=1664,
+          out_size=1408,
+          tile_k=896,
+          tile_n=1408,
+      ),
+      dict(
+          testcase_name="split_n_1664x1408",
+          in_size=1664,
+          out_size=1408,
+          tile_k=1664,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="split_k_1408x128",
+          in_size=1408,
+          out_size=128,
+          tile_k=768,
+          tile_n=128,
+      ),
+  )
+  def test_tgmm_odd_lane_multiple_padded_tiles(
+      self, in_size: int, out_size: int, tile_k: int, tile_n: int
+  ):
+    batch_size = 512
+    num_groups = 8
+    k0, k1 = jax.random.split(jax.random.key(1), 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(lhs.swapaxes(0, 1), rhs, group_sizes, num_groups)
+
+    for tile_info in (
+        gmm_v2.TileSizes(
+            tile_m=256, tile_k=tile_k, tile_n=tile_n, bucket_base=256
+        ),
+        tgmm_v2.calculate_tgmm_tiling_from_request,
+    ):
+      with self.subTest(tile_info=tile_info):
+        actual = tgmm_v2.tgmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            num_actual_groups=num_groups,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+        self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+        assert_arrays_all_close(actual, expected)
 
 
 if __name__ == "__main__":
