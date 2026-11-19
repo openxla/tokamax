@@ -53,7 +53,9 @@ For PRs modifying existing code, follow these guidelines:
 
 ### Introducing new operators
 
-If your PR introduces a new op, follow these guidelines:
+If your PR introduces a new op, follow these guidelines.
+[Adding an Op](https://openxla.org/tokamax/adding_an_op) walks through the
+files and registration steps.
 
 *   Provide an explanation (preferably in separate markdown documentation) of
     the origins of the operator (e.g., a published paper), what the operator
