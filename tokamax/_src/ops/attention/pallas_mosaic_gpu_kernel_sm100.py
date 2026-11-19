@@ -381,7 +381,7 @@ def flash_attention_kernel(
     if mask.shape[-2] == 1 or mask.shape[-1] == 1:
       mask = mask.astype(jnp.int8)
     else:
-      mask = common.pack_mask(mask)
+      mask = common.pack_mask(mask, config.block_kv)
 
   block_q = config.block_q
   block_kv = config.block_kv
@@ -623,7 +623,7 @@ def flash_attention_kernel(
                 if mask_smem is not None:
                   assert mask_produced is not None and mask_consumed is not None
                   hi_ = 0 if mask_gmem.shape[-3] == 1 else hi
-                  ks = pl.ds(ki * mask_block_kv, mask_block_size)
+                  ks = pl.ds(ki * mask_block_size, mask_block_size)
                   plgpu.barrier_wait(mask_consumed)
                   mgpu_lib.fence_async_shared_cta()
                   plgpu.copy_gmem_to_smem(

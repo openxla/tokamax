@@ -325,10 +325,27 @@ MASK_PACKED_BITS = mgpu_lib.num_bits(MASK_PACK_DTYPE)
 MIN_MASK_COLS = 128 // MASK_PACKED_BITS
 
 
-def pack_mask(mask: jax.Array) -> jax.Array:
-  """Packs a boolean mask into bits."""
+def pack_mask(mask: jax.Array, block_kv: int | None = None) -> jax.Array:
+  """Packs a boolean mask into bits.
+
+  Args:
+    mask: The boolean mask.
+    block_kv: If given, each block of `block_kv` columns narrower than
+      `MIN_MASK_COLS * MASK_PACKED_BITS` is padded to `MIN_MASK_COLS` bytes so
+      that TMA can load any block. Must be a positive multiple of
+      `MASK_PACKED_BITS`.
+
+  Returns:
+    The packed mask.
+  """
   mask = jnp.packbits(mask, axis=-1, bitorder="little").view(MASK_PACK_DTYPE)
-  return shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+  if block_kv is None or block_kv >= MIN_MASK_COLS * MASK_PACKED_BITS:
+    return shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+  block_cols = block_kv // MASK_PACKED_BITS
+  mask = shape_lib.pad_to_next_multiple_of(mask, m=block_cols, axis=-1)
+  mask = mask.reshape(*mask.shape[:-1], -1, block_cols)
+  mask = shape_lib.pad_to_next_multiple_of(mask, m=MIN_MASK_COLS, axis=-1)
+  return mask.reshape(*mask.shape[:-2], -1)
 
 
 def unpack_bool_bits_tmem_native(a):

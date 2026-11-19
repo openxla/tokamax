@@ -352,6 +352,24 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         atol=0.02,
     )
 
+  @parameterized.parameters(256, 128)
+  def test_sm100_block_kv_64_mask(self, kv_seq_len):
+    if not gpu_utils.is_sm100() or not isinstance(
+        self._attention_fn, fa.PallasMosaicGpuFlashAttention
+    ):
+      self.skipTest("SM100-specific test.")
+    config = fa.ConfigSM100(block_q=256, block_kv=64, collective=True)
+    impl = fa.PallasMosaicGpuFlashAttention(config=config)
+    self._run_test(
+        (2, 256, 4, 128),
+        kv_shape=(2, kv_seq_len, 4, 128),
+        mask_shape=(2, 1, 256, kv_seq_len),
+        dtype=jnp.bfloat16,
+        impl=impl,
+        atol=0.02,
+        test_vjp=False,
+    )
+
   def test_unaligned_fp16_and_fully_masked_vjp(self):
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
