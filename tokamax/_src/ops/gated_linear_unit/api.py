@@ -19,21 +19,24 @@ from typing import Any, Final, Literal
 
 import immutabledict
 import jax
+from jax.extend import backend
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src.ops.gated_linear_unit import base
 from tokamax._src.ops.gated_linear_unit.base import FusedWeights, UnfusedWeights  # pylint: disable=g-importing-member,g-multiple-import
 
-type Implementation = Literal['cutedsl', 'mosaic', 'triton', 'xla']
+type Implementation = Literal[
+    'cutedsl', 'mosaic', 'mosaic_gpu', 'mosaic_tpu', 'triton', 'xla'
+]
 
 _IMPLEMENTATIONS = dict(xla=base.GatedLinearUnit())
-_DEFAULT_IMPLEMENTATIONS = ('xla',)
+_default_implementations = ('xla',)
 
 
 try:
   from tokamax._src.ops.gated_linear_unit import triton  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
   _IMPLEMENTATIONS['triton'] = triton.TritonGatedLinearUnit()
-  _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
+  _default_implementations = ('triton',) + _default_implementations
 except ImportError:
   pass
 
@@ -41,8 +44,20 @@ except ImportError:
 try:
   from tokamax._src.ops.gated_linear_unit import pallas_mosaic_gpu as pallas_mgpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 
-  _IMPLEMENTATIONS['mosaic'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
-  _DEFAULT_IMPLEMENTATIONS = ('mosaic',) + _DEFAULT_IMPLEMENTATIONS
+  _IMPLEMENTATIONS['mosaic_gpu'] = pallas_mgpu.PallasMosaicGpuGatedLinearUnit()
+  _default_implementations = ('mosaic',) + _default_implementations
+except ImportError:
+  pass
+
+
+try:
+  from tokamax._src.ops.gated_linear_unit import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS['mosaic_tpu'] = (
+      pallas_mosaic_tpu.PallasMosaicTpuGatedLinearUnit()
+  )
+  if 'mosaic' not in _default_implementations:
+    _default_implementations = ('mosaic',) + _default_implementations
 except ImportError:
   pass
 
@@ -103,8 +118,9 @@ def gated_linear_unit(
     The output array.
   """
 
-  if implementation is None:
-    implementation = _DEFAULT_IMPLEMENTATIONS
+  is_default = implementation is None
+  if is_default:
+    implementation = _default_implementations
   elif isinstance(implementation, str):
     implementation = (implementation,)
   elif not implementation:
@@ -114,7 +130,15 @@ def gated_linear_unit(
   fn = base.GatedLinearUnit()
   for impl in implementation:
     if isinstance(impl, str):
+      if impl == 'mosaic':
+        impl = (
+            'mosaic_gpu'
+            if 'NVIDIA' in backend.get_default_device().device_kind
+            else 'mosaic_tpu'
+        )
       if impl not in IMPLEMENTATIONS:
+        if is_default:
+          continue
         raise ValueError(f'Unknown implementation: {impl}')
       fn = IMPLEMENTATIONS[impl]
 
