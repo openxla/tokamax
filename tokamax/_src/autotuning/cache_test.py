@@ -26,6 +26,7 @@ from tokamax._src import config as config_lib
 from tokamax._src.autotuning import cache
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import base as attention_base
+from tokamax._src.ops.causal_conv1d_gated_delta_rule import pallas_mosaic_tpu as gdn_pallas_mosaic_tpu
 from tokamax._src.ops.normalization import base as normalization_base
 
 try:
@@ -58,6 +59,12 @@ class CacheTest(parameterized.TestCase):
 
   @parameterized.parameters(
       ("TPU7x", attention_base.DotProductAttention),
+      # Binds every stored GDN key against the current `_fwd` signature, so a
+      # renamed or newly added kwarg cannot silently break cache loading.
+      (
+          "TPU7x",
+          gdn_pallas_mosaic_tpu.PallasMosaicTpuCausalConv1dGatedDeltaRule,
+      ),
       *(
           ()
           if triton is None
