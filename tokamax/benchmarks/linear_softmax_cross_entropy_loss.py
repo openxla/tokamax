@@ -49,7 +49,7 @@ class LinearSoftmaxCrossEntropyLossBenchmark(parameterized.TestCase):
   """Benchmarks for different linear softmax cross-entropy loss implementations."""
 
   @parameterized.product(
-      implementation=(None, 'xla', 'mosaic_tpu', 'chunked_xla'),
+      implementation=(None, 'xla', 'mosaic_tpu'),
       benchmark_mode=('forward', 'forward_and_vjp'),
       args_spec_name=tuple(EXAMPLES.keys()),
   )

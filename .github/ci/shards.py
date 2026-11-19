@@ -273,7 +273,6 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/api_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/base_test.py',
-            'tokamax/_src/ops/linear_softmax_cross_entropy_loss/chunked_xla_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/pallas_mosaic_tpu_kernel_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/linear_softmax_cross_entropy_loss/reference_test.py',

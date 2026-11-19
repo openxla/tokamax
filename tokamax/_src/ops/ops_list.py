@@ -649,13 +649,6 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/linear_softmax_cross_entropy_loss/base.py",
             ),
             Impl(
-                name="chunked_xla",
-                backend=XLA,
-                module=(
-                    "_src/ops/linear_softmax_cross_entropy_loss/chunked_xla.py"
-                ),
-            ),
-            Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module=(
