@@ -16,7 +16,7 @@
 
 import abc
 import collections
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Collection, Hashable, Mapping
 import contextlib
 import contextvars
 import dataclasses
@@ -220,11 +220,15 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     bind = cast(Callable[P, Any], self.bind)  # Work around pytype bug.
     ba = bind(*args, **kwargs)
 
+    target_devices = _resolve_target_devices(ba)
     bypass = self.bypass_device_check or config_lib.cross_compile.value
     if not bypass:
-      for device in infer_devices(ba) or {backend.get_default_device()}:
-        if not self.supported_on(device):
-          raise NotImplementedError(f"Not supported on {device.device_kind}.")
+      with abstract_device_context(target_devices):
+        for device in target_devices:
+          if not self.supported_on(cast(jax.Device, device)):
+            raise NotImplementedError(
+                f"Not supported on {device.device_kind}."
+            )
 
     if fuser_adapter.in_op_fusion_context():
       if type(self)._fusible_fwd is Op._fusible_fwd:
@@ -233,7 +237,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
             " (@op_fusion.fuse)."
         )
       return fuser_adapter.call_fusible_op(
-          self, ba, return_residuals=return_residuals
+          self,
+          ba,
+          return_residuals=return_residuals,
+          device_ctx=lambda: abstract_device_context(target_devices),
       )
 
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
@@ -242,47 +249,48 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
 
     @self._capture_batched_args
     def fwd(*arrays, batched_args, fwd_res=True):
-      args, kwargs = args_tree.unflatten(merge(arrays, other))
-      kwargs["return_residuals"] = fwd_res or return_residuals
-      ba = self.bind(*args, **kwargs)
-      if batched_args is not None:
-        bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
-        bkwargs["return_residuals"] = fwd_res or return_residuals
-        arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
-        ba = BoundArguments(self, arguments)
+      with abstract_device_context(target_devices):
+        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        kwargs["return_residuals"] = fwd_res or return_residuals
+        ba = self.bind(*args, **kwargs)
+        if batched_args is not None:
+          bargs, bkwargs = args_tree.unflatten(merge(batched_args.args, other))
+          bkwargs["return_residuals"] = fwd_res or return_residuals
+          arguments = self._fwd_signature.bind(*bargs, **bkwargs).arguments
+          ba = BoundArguments(self, arguments)
 
-      config = ba.default_config
+        config = ba.default_config
 
-      # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      with ba._tokamax_metadata(config):  # pylint: disable=protected-access
-        if fwd_res and self.vjp is None and batched_args is not None:
+        # Serialize args into the HLO to allow for, e.g., offline autotuning.
+        with ba._tokamax_metadata(config):  # pylint: disable=protected-access
+          if fwd_res and self.vjp is None and batched_args is not None:
 
-          def fwd_flat(*arrays):
-            args, kwargs = args_tree.unflatten(merge(arrays, other))
-            kwargs["return_residuals"] = return_residuals
-            return self._fwd(*args, config=config, **kwargs)
+            def fwd_flat(*arrays):
+              args, kwargs = args_tree.unflatten(merge(arrays, other))
+              kwargs["return_residuals"] = return_residuals
+              return self._fwd(*args, config=config, **kwargs)
 
-          try:
-            out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
-            f_vjp.fun = _AlwaysEqual(f_vjp.fun)  # type: ignore
-          except Exception as e:  # pylint: disable=broad-except
-            out, residuals = fwd_flat(*arrays)
+            try:
+              out, f_vjp, residuals = jax.vjp(fwd_flat, *arrays, has_aux=True)
+              f_vjp.fun = _AlwaysEqual(f_vjp.fun)  # type: ignore
+            except Exception as e:  # pylint: disable=broad-except
+              out, residuals = fwd_flat(*arrays)
 
-            def f_vjp(_, e=e):
-              raise NotImplementedError("vjp not implemented") from e
+              def f_vjp(_, e=e):
+                raise NotImplementedError("vjp not implemented") from e
 
-            f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp))
+              f_vjp = jax.tree_util.Partial(_AlwaysEqual(f_vjp))
 
-          ret = (out, residuals) if return_residuals else out
-          return ret, f_vjp
+            ret = (out, residuals) if return_residuals else out
+            return ret, f_vjp
 
-        out, residuals = self._fwd(*args, config=config, **kwargs)
+          out, residuals = self._fwd(*args, config=config, **kwargs)
 
-      ret = (out, residuals) if return_residuals else out
-      if self.vjp is None:
-        full_residuals = Residuals(args, kwargs, out, residuals)
-        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
-      return ret, (out, residuals)
+        ret = (out, residuals) if return_residuals else out
+        if self.vjp is None:
+          full_residuals = Residuals(args, kwargs, out, residuals)
+          return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+        return ret, (out, residuals)
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
@@ -299,7 +307,8 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       @self._capture_batched_args
       def bwd(f_vjp, dout, batched_args):
         del batched_args  # Unused.
-        return f_vjp(dout[0] if return_residuals else dout)
+        with abstract_device_context(target_devices):
+          return f_vjp(dout[0] if return_residuals else dout)
     else:
 
       def fwd_vjp(*arrays):
@@ -310,42 +319,45 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined
-        residuals = residuals.tree.unflatten(residuals.values)
-        args = residuals.args
-        kwargs = residuals.kwargs
-        kwargs.pop("return_residuals")
-        out = residuals.out
-        residuals = residuals.residuals
-        dout = dout[0] if return_residuals else dout
-        assert self.vjp is not None
-        if self.autotuning_cache_miss_fallback is not None:
-          with config_lib.autotuning_cache_miss_fallback(
-              self.autotuning_cache_miss_fallback
-          ):
-            grads = self.vjp(residuals, out, dout, *args, **kwargs)
-        else:
-          grads = self.vjp(residuals, out, dout, *args, **kwargs)
-
-        if isinstance(grads, dict):
-          grads_ba = ba.signature.bind_partial(**grads)
-          in_args = ba.signature.bind_partial(*args, **kwargs).arguments
-        else:
-          grads_ba = ba.signature.bind_partial(*grads)
-          in_args = kwargs
-
-        for k, v in in_args.items():
-          if (dv := grads_ba.arguments.get(k)) is None:
-            # Set any missing grads to zeros.
-            zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
-            grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
+        with abstract_device_context(target_devices):
+          residuals = residuals.tree.unflatten(residuals.values)
+          args = residuals.args
+          kwargs = residuals.kwargs
+          kwargs.pop("return_residuals")
+          out = residuals.out
+          residuals = residuals.residuals
+          dout = dout[0] if return_residuals else dout
+          assert self.vjp is not None
+          if self.autotuning_cache_miss_fallback is not None:
+            with config_lib.autotuning_cache_miss_fallback(
+                self.autotuning_cache_miss_fallback
+            ):
+              grads = self.vjp(residuals, out, dout, *args, **kwargs)
           else:
-            # Check that grads is tree with same structure as arg/kwarg value.
-            grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+            grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
-        # Check that grads is tree with same structure as args.
-        dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
+          if isinstance(grads, dict):
+            grads_ba = ba.signature.bind_partial(**grads)
+            in_args = ba.signature.bind_partial(*args, **kwargs).arguments
+          else:
+            grads_ba = ba.signature.bind_partial(*grads)
+            in_args = kwargs
 
-        return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
+          for k, v in in_args.items():
+            if (dv := grads_ba.arguments.get(k)) is None:
+              # Set any missing grads to zeros.
+              zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
+              grads_ba.arguments[k] = jax.tree.map(zeros_like, v)
+            else:
+              # Check that grads is tree with same structure as arg/kwarg value.
+              grads_ba.arguments[k] = jax.tree.map(lambda _, g: g, v, dv)
+
+          # Check that grads is tree with same structure as args.
+          dargs = jax.tree.map(lambda _, g: g, args, grads_ba.args)
+
+          return list(
+              filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs)))
+          )
 
     f = jax.custom_vjp(f)
     f.defvjp(fwd_vjp, bwd, optimize_remat=True)
@@ -806,10 +818,87 @@ def _get_arg_spec_adapter(op: Op) -> pydantic_lib.TypeAdapter[dict[str, Any]]:
 BOUND_ARGS_ADAPTER = pydantic.TypeAdapter(BoundArguments)
 
 
-def infer_devices(ba: BoundArguments) -> set[jax.Device]:
-  """Infers the devices from bound array arguments."""
-  devices = set()
-  for x in jax.tree.leaves(dict(ba.arguments)):
+def _extract_sharding(x: Any) -> jax.sharding.Sharding | None:
+  """Returns the JAX sharding attached to `x`, if any."""
+  if isinstance(x, jax.sharding.Sharding):
+    return x
+  try:
+    sharding = getattr(x, "sharding", None)
+  except TypeError:
+    sharding = None
+  if sharding is None and isinstance(x, jax.Array):
+    try:
+      sharding = getattr(jax.typeof(x), "sharding", None)
+    except Exception:  # pylint: disable=broad-exception-caught
+      sharding = None
+  return sharding if isinstance(sharding, jax.sharding.Sharding) else None
+
+
+def _infer_active_mesh_devices() -> set[jax.Device]:
+  """Returns devices from the active `jax.set_mesh` or `with mesh:` context."""
+  try:
+    mesh = jax.sharding.get_mesh()
+  except ValueError:
+    mesh = None
+  if isinstance(mesh, jax.sharding.Mesh) and not mesh.empty:
+    return set(mesh.devices.flat)
+  mesh_stack = getattr(jax._src.config, "mesh_context_manager", None)  # pylint: disable=protected-access
+  if mesh_stack is not None and mesh_stack.value:
+    mesh = mesh_stack.value[-1]
+    if isinstance(mesh, jax.sharding.Mesh) and not mesh.empty:
+      return set(mesh.devices.flat)
+  return set()
+
+
+def _infer_pytree_device_signals(pytree: Any) -> tuple[
+    set[jax.Device],
+    bool,
+    set[jax.Device],
+    set[jax.sharding.AbstractDevice],
+]:
+  """Collects concrete devices, abstract flags, and explicit leaf shardings."""
+  concrete_devices: set[jax.Device] = set()
+  has_abstract_or_sharding = False
+  explicit_mesh_devices: set[jax.Device] = set()
+  explicit_abstract_devices: set[jax.sharding.AbstractDevice] = set()
+
+  for x in jax.tree.leaves(pytree):
+    if isinstance(x, jax.Array):
+      try:
+        concrete_devices |= x.devices()
+        continue
+      except jax.errors.ConcretizationTypeError:
+        has_abstract_or_sharding = True
+    elif isinstance(x, (jax.ShapeDtypeStruct, jax.sharding.Sharding)):
+      has_abstract_or_sharding = True
+
+    sharding = _extract_sharding(x)
+    if sharding is None:
+      continue
+    mesh = getattr(sharding, "mesh", None)
+    abstract_device = getattr(mesh, "abstract_device", None)
+    if isinstance(abstract_device, jax.sharding.AbstractDevice):
+      explicit_abstract_devices.add(abstract_device)
+    try:
+      explicit_mesh_devices |= set(sharding.device_set)
+      continue
+    except (AttributeError, TypeError, ValueError):
+      pass
+    if isinstance(mesh, jax.sharding.Mesh) and not mesh.empty:
+      explicit_mesh_devices.update(mesh.devices.flat)
+
+  return (
+      concrete_devices,
+      has_abstract_or_sharding,
+      explicit_mesh_devices,
+      explicit_abstract_devices,
+  )
+
+
+def _infer_concrete_devices_from_pytree(pytree: Any) -> set[jax.Device]:
+  """Returns concrete array devices from `pytree` leaves."""
+  devices: set[jax.Device] = set()
+  for x in jax.tree.leaves(pytree):
     if isinstance(x, jax.Array):
       try:
         devices |= x.devices()
@@ -818,18 +907,147 @@ def infer_devices(ba: BoundArguments) -> set[jax.Device]:
   return devices
 
 
-def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
-  """Infers the device kind from bound array arguments."""
-  device_kinds = {d.device_kind for d in infer_devices(ba)}
+def _resolve_devices_from_pytree(
+    pytree: Any,
+) -> set[jax.Device | jax.sharding.AbstractDevice]:
+  """Resolves target concrete, virtual, or abstract devices from args/meshes."""
+  (
+      concrete_devices,
+      has_abstract_or_sharding,
+      explicit_mesh_devices,
+      explicit_abstract_devices,
+  ) = _infer_pytree_device_signals(pytree)
+
+  # Explicit leaf shardings take precedence over ambient mesh context managers.
+  if explicit_mesh_devices or explicit_abstract_devices:
+    mesh_or_abstract_targets: set[jax.Device | jax.sharding.AbstractDevice] = (
+        set(explicit_mesh_devices) | set(explicit_abstract_devices)
+    )
+  else:
+    mesh_or_abstract_targets = set(_infer_active_mesh_devices())
+    if not mesh_or_abstract_targets:
+      abstract_device = jax.sharding.get_abstract_mesh().abstract_device
+      if isinstance(abstract_device, jax.sharding.AbstractDevice):
+        mesh_or_abstract_targets.add(abstract_device)
+
+  if concrete_devices:
+    # Closed-over host-CPU constants must not shadow non-CPU mesh/abstract
+    # targets when tracing or sharding onto a virtual TPU/GPU mesh.
+    if (
+        (
+            has_abstract_or_sharding
+            or explicit_mesh_devices
+            or explicit_abstract_devices
+        )
+        and all(d.platform == "cpu" for d in concrete_devices)
+        and any(d.platform != "cpu" for d in mesh_or_abstract_targets)
+    ):
+      return mesh_or_abstract_targets
+    return set(concrete_devices)
+
+  return mesh_or_abstract_targets
+
+
+@contextlib.contextmanager
+def abstract_device_context(devices: Collection[Any]):
+  """Sets an abstract TPU device context when lowering for virtual TPUs."""
+  specs = {
+      (d.platform, d.device_kind, getattr(d, "num_cores", None))
+      for d in devices
+  }
+  if len(specs) != 1:
+    yield
+    return
+  platform, device_kind, num_cores = next(iter(specs))
+  if platform != "tpu":
+    yield
+    return
+  cur_mesh = jax.sharding.get_abstract_mesh()
+  cur_dev = cur_mesh.abstract_device
+  default_dev = backend.get_default_device()
+  default_cores = getattr(default_dev, "num_cores", None)
+  if (
+      cur_dev is not None
+      and cur_dev.platform == "tpu"
+      and cur_dev.device_kind == device_kind
+      and isinstance(cur_dev.num_cores, int)
+      and (num_cores is None or cur_dev.num_cores == num_cores)
+  ) or (
+      cur_dev is None
+      and default_dev.platform == "tpu"
+      and default_dev.device_kind == device_kind
+      and isinstance(default_cores, int)
+      and (num_cores is None or default_cores == num_cores)
+  ):
+    yield
+    return
+  abstract_device = jax.sharding.AbstractDevice(
+      device_kind=device_kind,
+      num_cores=num_cores if isinstance(num_cores, int) else 1,
+      platform="tpu",
+  )
+  with jax.sharding.use_abstract_mesh(
+      cur_mesh.update(abstract_device=abstract_device)
+  ):
+    yield
+
+
+def _resolve_target_devices(
+    ba: BoundArguments[Any, Any],
+) -> Collection[jax.Device | jax.sharding.AbstractDevice]:
+  """Resolves target concrete, virtual, or abstract devices for an op call."""
+  devices = _resolve_devices_from_pytree(dict(ba.arguments))
+  if not devices:
+    return {backend.get_default_device()}
+
+  if all(isinstance(d, jax.sharding.AbstractDevice) for d in devices):
+    default_device = backend.get_default_device()
+    default_cores = getattr(
+        default_device,
+        "core_count" if default_device.platform == "gpu" else "num_cores",
+        None,
+    )
+    if len(devices) == 1:
+      abs_device = next(iter(devices))
+      if (
+          default_device.platform == abs_device.platform
+          and default_device.device_kind == abs_device.device_kind
+          and (
+              abs_device.num_cores is None
+              or abs_device.num_cores == default_cores
+          )
+      ):
+        return {default_device}
+  return devices
+
+
+def infer_devices(
+    ba: BoundArguments[Any, Any], *, include_mesh: bool = False
+) -> set[jax.Device]:
+  """Infers devices from bound array arguments (and meshes when opted in)."""
+  if not include_mesh:
+    return _infer_concrete_devices_from_pytree(dict(ba.arguments))
+  return {
+      d
+      for d in _resolve_devices_from_pytree(dict(ba.arguments))
+      if isinstance(d, jax.Device)
+  }
+
+
+def infer_device_kind_from_args(pytree: Any) -> DeviceKind | None:
+  """Infers the target device kind from arguments or active mesh context."""
+  devices = _resolve_devices_from_pytree(pytree)
+  device_kinds = {d.device_kind for d in devices}
   if not device_kinds:
-    # Fall back to active abstract mesh during export or cross-compilation.
-    abstract_mesh = jax.sharding.get_abstract_mesh()
-    if abstract_mesh.abstract_device is not None:
-      return abstract_mesh.abstract_device.device_kind
     return None
   if len(device_kinds) == 1:
     return device_kinds.pop()
   raise ValueError(f"Multiple device kinds found: {device_kinds}")
+
+
+def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
+  """Infers the device kind from bound array arguments."""
+  return infer_device_kind_from_args(dict(ba.arguments))
 
 
 def _abstractify(pytree):

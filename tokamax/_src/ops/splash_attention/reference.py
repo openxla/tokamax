@@ -208,6 +208,7 @@ def _attention_reference_impl(
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
     dropout_mask: jax.Array | None,
+    max_logit_value: jax.Array | None,
     mask_value: float,
     save_residuals: bool,
     attn_logits_soft_cap: float | None,
@@ -228,12 +229,18 @@ def _attention_reference_impl(
     assert sinks.shape == ()  # should already be vmapped
 
   logits = jnp.where(mask, logits, mask_value)
-  m = logits.max(axis=-1)
   sinks = None if sinks is None else sinks.astype(logits.dtype)
-  m = m if sinks is None else jnp.maximum(m, sinks)
+  if max_logit_value is None:
+    m = logits.max(axis=-1)
+    m = m if sinks is None else jnp.maximum(m, sinks)
+  else:
+    m = jnp.broadcast_to(
+        jnp.asarray(max_logit_value, dtype=logits.dtype), logits.shape[:-1]
+    )
   s = jnp.exp(logits - m[..., None])
   l = s.sum(axis=-1) + (0 if sinks is None else jnp.exp(sinks - m))
-  p = s / l[..., None]
+  l_safe = jnp.where(l == 0.0, 1.0, l)
+  p = jnp.where(l[..., None] == 0.0, 0.0, s / l_safe[..., None])
 
   if dropout_mask is not None:
     # Applied *after* normalization: the denominator is
@@ -244,7 +251,7 @@ def _attention_reference_impl(
   o = jnp.einsum("st,td->sd", p, v.astype(jnp.float32))
 
   if save_residuals:
-    logsumexp = m + jnp.log(l)
+    logsumexp = jnp.where(l == 0.0, -jnp.inf, m + jnp.log(l_safe))
     return o, {"logsumexp": logsumexp, "max_logits": m}
   return o
 
@@ -285,7 +292,11 @@ def _attention_reference_custom_bwd(
     )
   logits = jnp.where(mask, logits, mask_value)
 
-  p = jnp.exp(logits - logsumexp[..., None])
+  lse_is_neg_inf = jnp.isneginf(logsumexp)
+  safe_lse = jnp.where(lse_is_neg_inf, 0.0, logsumexp)
+  p = jnp.where(
+      lse_is_neg_inf[..., None], 0.0, jnp.exp(logits - safe_lse[..., None])
+  )
   do_dp = do_dp.astype(jnp.float32)
   do_dv = do_dv.astype(jnp.float32)
   # `pr` is the dropped-and-rescaled weight, `p` the undropped one. dv and dp
@@ -321,9 +332,13 @@ def _attention_reference_custom_bwd(
   dq = jnp.einsum("st,td->sd", ds, k_dq.astype(jnp.float32)).astype(q.dtype)
   dsinks = None
   if sinks is not None:
-    sinks_exp = -jnp.exp(
-        sinks[..., None, None].astype(jnp.float32)
-        - logsumexp[..., None].astype(jnp.float32)
+    sinks_exp = jnp.where(
+        lse_is_neg_inf[..., None],
+        0.0,
+        -jnp.exp(
+            sinks[..., None, None].astype(jnp.float32)
+            - safe_lse[..., None].astype(jnp.float32)
+        ),
     )
     dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do_dp, axis=(-1, -2))
   return dq, dk, dv, None, None, dsinks
@@ -352,6 +367,7 @@ def attention_reference(
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     attn_logits_soft_cap: float | None = None,
+    max_logit_value: float | jax.Array | None = None,
     dropout_rate: float = 0.0,
 ):
   """A JIT-compiled reference implementation of attention, handles MQA and MHA.
@@ -361,6 +377,10 @@ def attention_reference(
   reference stays independent of the kernel's block sizes: the kernel builds the
   equivalent mask one tile at a time from a key and the tile coordinates.
   """
+  if max_logit_value is not None:
+    max_logit_value = jnp.broadcast_to(
+        jnp.asarray(max_logit_value, dtype=jnp.float32), (q.shape[0],)
+    )
   attn_impl = functools.partial(
       _attention_reference_impl,
       mask_value=mask_value,
@@ -370,7 +390,7 @@ def attention_reference(
   )
 
   if is_mqa:
-    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, None, None, None, None, 0, 0, 0))
   else:
     # In grouped attention (1 < num_kv_heads && num_kv_heads < num_q_heads).
     # We interleave the KV heads across the Q heads.
@@ -389,9 +409,9 @@ def attention_reference(
       k = jnp.repeat(k, repeats=q_heads_per_kv, axis=0)
       v = jnp.repeat(v, repeats=q_heads_per_kv, axis=0)
 
-    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0, 0))
+    func = jax.vmap(attn_impl, in_axes=(0, 0, 0, None, None, 0, 0, 0))
 
-  out = func(q, k, v, mask, segment_ids, sinks, dropout_mask)
+  out = func(q, k, v, mask, segment_ids, sinks, dropout_mask, max_logit_value)
   return out
 
 

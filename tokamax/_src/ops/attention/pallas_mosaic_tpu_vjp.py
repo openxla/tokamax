@@ -20,11 +20,11 @@ from typing import Annotated, Any, ClassVar, override
 
 import immutabledict
 import jax
-import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
@@ -48,6 +48,9 @@ class Config:
   block_kv_dkv_compute: Annotated[
       int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
   ]
+  q_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  k_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  v_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
   use_base2_exp: bool = True
 
   def __post_init__(self):
@@ -67,6 +70,10 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  q_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  k_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  v_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  use_base2_exp: bool = True
 
   @jaxtyping.jaxtyped
   @override
@@ -84,6 +91,9 @@ class PallasMosaicTpuFlashAttentionVjp(
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: base.Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -94,6 +104,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       return_residuals: bool,
       config: Config,
   ) -> tuple[base.DotProductAttentionGrads, None]:
+    del max_logit_value
     if not normalize_output:
       raise NotImplementedError("`normalize_output=False` not supported.")
     if return_residuals:
@@ -109,6 +120,8 @@ class PallasMosaicTpuFlashAttentionVjp(
         dropout_rate=dropout_rate,
         paging_info=paging_info,
         mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
     )
 
     q *= logits_scale
@@ -211,12 +224,15 @@ class PallasMosaicTpuFlashAttentionVjp(
         block_q_dkv=block_q_dkv,
         block_kv_dkv=block_kv_dkv,
         block_kv_dkv_compute=min(block_kv_dkv, max_tile // 2),
-        use_base2_exp=True,
+        q_layout=self.q_layout,
+        k_layout=self.k_layout,
+        v_layout=self.v_layout,
+        use_base2_exp=self.use_base2_exp,
     )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k = ba.arguments['q'], ba.arguments['k']
+    q, k = ba.arguments["q"], ba.arguments["k"]
     q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
     # TODO: Add 256, 8192 once autotuning bugs are fixed.
     tiles = [512, 1024, 2048, 4096]
@@ -244,10 +260,33 @@ class PallasMosaicTpuFlashAttentionVjp(
                 block_q_dkv=bq,
                 block_kv_dkv=bkv,
                 block_kv_dkv_compute=bkv_c,
+                q_layout=self.q_layout,
+                k_layout=self.k_layout,
+                v_layout=self.v_layout,
+                use_base2_exp=self.use_base2_exp,
             )
         )
+    if not configs:
+      configs.add(self._get_heuristics_config(ba))
     return configs
+
+  def _matches_config(self, cfg: Config) -> bool:
+    return (
+        cfg.q_layout == self.q_layout
+        and cfg.k_layout == self.k_layout
+        and cfg.v_layout == self.v_layout
+        and cfg.use_base2_exp == self.use_base2_exp
+    )
+
+  @override
+  def get_autotuning_cache(
+      self, device_kind: op.DeviceKind | None = None
+  ) -> dict[Any, op.AutotuningData[Config]]:
+    return common.sp_vjp.filter_autotuning_cache(
+        base.DotProductAttentionVjp.get_autotuning_cache(self, device_kind),
+        self._matches_config,
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

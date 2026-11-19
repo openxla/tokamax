@@ -16,6 +16,7 @@
 
 import functools
 import typing
+import warnings
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -59,7 +60,11 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         is_mqa=is_mqa,
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
-    vjp = sp_vjp.PallasMosaicTpuSplashAttentionVjp(config=vjp_config)
+    vjp = (
+        None
+        if vjp_config is None
+        else sp_vjp.PallasMosaicTpuSplashAttentionVjp(config=vjp_config)
+    )
     attention_impl = PallasTpuSplash(config=config, vjp=vjp)
     reference_impl = ReferenceSplash()
 
@@ -180,7 +185,9 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
       (0, False),
       (16, False),
       (128, False),
+      (256, False),
       (16, True),
+      (256, True),
   )
   def test_causal_mask_offset(self, offset, use_base_mask):
     head_dim = 64
@@ -568,6 +575,218 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     chex.assert_trees_all_close(dq, dq_base, atol=1e-3)
     chex.assert_trees_all_close(dk, dk_base, atol=1e-3)
     chex.assert_trees_all_close(dv, dv_base, atol=1e-4)
+
+  @parameterized.parameters(64, 128)
+  def test_seq_minor_layouts_with_default_vjp(self, head_dim):
+    num_q_heads, num_kv_heads, seq_len = 4, 2, 256
+    q_s = jax.ShapeDtypeStruct((num_q_heads, seq_len, head_dim), jnp.bfloat16)
+    k_s = jax.ShapeDtypeStruct((num_kv_heads, seq_len, head_dim), jnp.bfloat16)
+    q, k, v, do = numerics.random_initialize((q_s, k_s, k_s, q_s), seed=51)
+    seq_minor = pallas_mosaic_tpu.QKVLayout.SEQ_MINOR
+    config = pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_experimental_scheduler=True,
+    )
+    op_seq = PallasTpuSplash(config=config)
+    assert isinstance(op_seq.vjp, sp_vjp.PallasMosaicTpuSplashAttentionVjp)
+    self.assertEqual(op_seq.vjp.q_layout, seq_minor)
+    self.assertEqual(op_seq.vjp.k_layout, seq_minor)
+    self.assertEqual(op_seq.vjp.v_layout, seq_minor)
+    self._test_attention(q, k, v, do, config=config)
+
+  @parameterized.parameters("scalar", "1d", "batched_2d", "const")
+  def test_max_logit_and_config_options(self, mode):
+    batch_shape = (2,) if mode == "batched_2d" else ()
+    num_q_heads, num_kv_heads, seq_len, head_dim = 4, 2, 256, 64
+    q_s = jax.ShapeDtypeStruct(
+        (*batch_shape, num_q_heads, seq_len, head_dim), jnp.float32
+    )
+    k_s = jax.ShapeDtypeStruct(
+        (*batch_shape, num_kv_heads, seq_len, head_dim), jnp.float32
+    )
+    q, k, v, do = numerics.random_initialize((q_s, k_s, k_s, q_s), seed=63)
+    q = q * (head_dim**-0.5)
+
+    max_logit_const = 10.0 if mode == "const" else None
+    if mode == "scalar":
+      max_logit_value = 10.0
+    elif mode == "1d":
+      max_logit_value = jnp.array([8.0, 9.0, 10.0, 11.0], dtype=jnp.float32)
+    elif mode == "batched_2d":
+      max_logit_value = jnp.array(
+          [[8.0, 9.0, 10.0, 11.0], [8.5, 9.5, 10.5, 11.5]], dtype=jnp.float32
+      )
+    else:
+      max_logit_value = None
+
+    config = pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+        max_logit_const=max_logit_const,
+        fuse_reciprocal=False,
+        residual_checkpoint_name="context",
+    )
+    op_pallas = PallasTpuSplash(config=config)
+    op_ref = ReferenceSplash()
+
+    out_fwd_only = op_pallas(
+        q, k, v, mask=base.CAUSAL_MASK, max_logit_value=max_logit_value
+    )
+    _, res_default = PallasTpuSplash()(
+        q, k, v, mask=base.CAUSAL_MASK, return_residuals=True
+    )
+    out_res, res_fixed = op_pallas(
+        q,
+        k,
+        v,
+        mask=base.CAUSAL_MASK,
+        max_logit_value=max_logit_value,
+        return_residuals=True,
+    )
+    expected_val = 10.0 if max_logit_const is not None else max_logit_value
+    expected_max = jnp.broadcast_to(
+        jnp.asarray(expected_val, dtype=jnp.float32)[..., None],
+        (*batch_shape, num_q_heads, seq_len),
+    )
+    chex.assert_trees_all_close(res_fixed[0], expected_max, atol=1e-4)
+    self.assertFalse(jnp.allclose(res_default[0], res_fixed[0], atol=1e-2))
+
+    out, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: op_pallas(
+            q_, k_, v_, mask=base.CAUSAL_MASK, max_logit_value=max_logit_value
+        ),
+        q,
+        k,
+        v,
+    )
+    out_base, vjp_base = jax.vjp(
+        lambda q_, k_, v_: op_ref(q_, k_, v_, mask=base.CAUSAL_MASK), q, k, v
+    )
+    dq, dk, dv = vjp_fn(do)
+    dq_base, dk_base, dv_base = vjp_base(do)
+
+    chex.assert_trees_all_close(out_fwd_only, out_base, atol=0.05)
+    chex.assert_trees_all_close(out_res, out_base, atol=0.05)
+    chex.assert_trees_all_close(out, out_base, atol=0.05)
+    chex.assert_trees_all_close(dq, dq_base, atol=0.2, rtol=0.02)
+    chex.assert_trees_all_close(dk, dk_base, atol=0.2, rtol=0.02)
+    chex.assert_trees_all_close(dv, dv_base, atol=0.1, rtol=0.02)
+
+    if mode == "scalar":
+      cfg_both = pallas_mosaic_tpu.Config(
+          block_q=128,
+          block_kv=128,
+          block_kv_compute=128,
+          q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+          k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+          v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+          use_experimental_scheduler=True,
+          max_logit_const=10.0,
+      )
+      with self.assertRaisesRegex(ValueError, "max_logit_const"):
+        PallasTpuSplash(config=cfg_both)(
+            q, k, v, mask=base.CAUSAL_MASK, max_logit_value=10.0
+        )
+
+  def test_full_covering_local_mask(self):
+    s = jax.ShapeDtypeStruct((2, 128, 64), jnp.float32)
+    q, k, v, do = numerics.random_initialize((s, s, s, s), seed=73)
+    local_full = mask_lib.LocalMask(
+        shape=(128, 128), window_size=(255, 255), offset=0
+    )
+    self._test_attention(q, k, v, do, mask=local_full)
+
+  @parameterized.product(
+      fuse_reciprocal=[True, False],
+      use_base2_exp=[True, False],
+  )
+  def test_max_logit_zero_denom_and_underflow(
+      self, fuse_reciprocal, use_base2_exp
+  ):
+    s = jax.ShapeDtypeStruct((4, 128, 64), jnp.float32)
+    q, k, v, do = numerics.random_initialize((s, s, s, s), seed=79)
+    q = q * 0.125
+    head_minor = pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR
+    cfg = pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=head_minor,
+        k_layout=head_minor,
+        v_layout=head_minor,
+        use_experimental_scheduler=True,
+        use_base2_exp=use_base2_exp,
+        fuse_reciprocal=fuse_reciprocal,
+    )
+    op_pallas = PallasTpuSplash(config=cfg)
+    op_ref = ReferenceSplash()
+
+    row0_mask = jnp.ones((128, 128), dtype=jnp.bool_).at[0, :].set(False)
+    with warnings.catch_warnings():
+      warnings.simplefilter("error", UserWarning)
+      out_res, (_, lse) = op_pallas(
+          q, k, v, mask=row0_mask, max_logit_value=10, return_residuals=True
+      )
+      out, vjp_fn = jax.vjp(
+          lambda q_, k_, v_: op_pallas(
+              q_, k_, v_, mask=row0_mask, max_logit_value=10
+          ),
+          q,
+          k,
+          v,
+      )
+    dq, dk, dv = vjp_fn(do)
+    self.assertTrue(bool(jnp.all(jnp.isneginf(lse[:, 0]))))
+    chex.assert_tree_all_finite((out_res, out, dq, dk, dv))
+    chex.assert_trees_all_close(out[:, 0, :], 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dq[:, 0, :], 0.0, atol=1e-7)
+
+    out_base, vjp_base = jax.vjp(
+        lambda q_, k_, v_: op_ref(
+            q_, k_, v_, mask=row0_mask, max_logit_value=10.0
+        ),
+        q,
+        k,
+        v,
+    )
+    dq_base, dk_base, dv_base = vjp_base(do)
+    chex.assert_trees_all_close(out, out_base, atol=0.05)
+    chex.assert_trees_all_close(dq, dq_base, atol=0.2, rtol=0.02)
+    chex.assert_trees_all_close(dk, dk_base, atol=0.2, rtol=0.02)
+    chex.assert_trees_all_close(dv, dv_base, atol=0.1, rtol=0.02)
+
+    sinks = jnp.full((4,), -200.0, dtype=jnp.float32)
+    out_uf, vjp_uf = jax.vjp(
+        lambda q_, k_, v_, s_: op_pallas(
+            q_,
+            k_,
+            v_,
+            mask=base.FULL_MASK,
+            sinks=s_,
+            max_logit_value=120.0,
+        ),
+        q,
+        k,
+        v,
+        sinks,
+    )
+    dq_uf, dk_uf, dv_uf, dsinks_uf = vjp_uf(do)
+    chex.assert_tree_all_finite((out_uf, dq_uf, dk_uf, dv_uf, dsinks_uf))
+    chex.assert_trees_all_close(out_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dq_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dk_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dv_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dsinks_uf, 0.0, atol=1e-7)
 
 
 if __name__ == "__main__":

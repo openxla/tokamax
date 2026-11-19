@@ -14,24 +14,131 @@
 # ==============================================================================
 """Pallas/Mosaic kernel wrapper for Splash Attention VJP."""
 
+from collections.abc import Callable, Mapping
 import dataclasses
 import itertools
-from typing import Annotated, ClassVar, Final, override
+from typing import Annotated, Any, ClassVar, Final, override
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
-from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import splash_attention_kernel
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 
 NUM_LANES: Final[int] = 128
 LOG2E = splash_attention_kernel.LOG2E
+QKVLayout = splash_attention_kernel.QKVLayout
+_MISSING = object()
+
+
+class _FilteredAutotuningCache[_ConfigT](
+    dict[Any, op.AutotuningData[_ConfigT]]
+):
+  """Dict view of an autotuning cache filtering entries by a config predicate."""
+
+  def __init__(
+      self,
+      raw_cache: dict[Any, op.AutotuningData[_ConfigT]],
+      predicate: Callable[[_ConfigT], bool],
+  ):
+    filtered_items = []
+    for k, data in raw_cache.items():
+      matching = op.AutotuningData(
+          {cfg: ev for cfg, ev in data.items() if predicate(cfg)}
+      )
+      if matching:
+        filtered_items.append((k, matching))
+    super().__init__(filtered_items)
+    self._raw = raw_cache
+    self._predicate = predicate
+
+  def _update_raw_entry(
+      self, key: Any, matching: Mapping[_ConfigT, Any]
+  ) -> None:
+    """Merges `matching` entries into `self._raw` without clobbering others."""
+    if key in self._raw:
+      preserved = {
+          cfg: ev
+          for cfg, ev in self._raw[key].items()
+          if not self._predicate(cfg)
+      }
+    else:
+      preserved = {}
+    merged = {**preserved, **matching}
+    if merged:
+      self._raw[key] = op.AutotuningData(merged)
+    elif key in self._raw:
+      del self._raw[key]
+
+  @override
+  def __setitem__(self, key: Any, value: op.AutotuningData[_ConfigT]) -> None:
+    matching_dict = {
+        cfg: ev for cfg, ev in value.items() if self._predicate(cfg)
+    }
+    self._update_raw_entry(key, matching_dict)
+    if matching_dict:
+      super().__setitem__(key, op.AutotuningData(matching_dict))
+    elif key in self:
+      super().__delitem__(key)
+
+  @override
+  def __delitem__(self, key: Any) -> None:
+    super().__delitem__(key)
+    self._update_raw_entry(key, {})
+
+  @override
+  def pop(self, key: Any, default: Any = _MISSING) -> Any:
+    if key in self:
+      val = super().pop(key)
+      self._update_raw_entry(key, {})
+      return val
+    if default is _MISSING:
+      raise KeyError(key)
+    return default
+
+  @override
+  def setdefault(
+      self, key: Any, default: op.AutotuningData[_ConfigT] | None = None
+  ) -> Any:
+    if key in self:
+      return self[key]
+    if default is None:
+      return None
+    self[key] = default
+    if key in self:
+      return self[key]
+    return default
+
+  @override
+  def update(self, other: Any = (), /, **kwargs: Any) -> None:
+    items = other.items() if isinstance(other, Mapping) else other
+    for k, v in items:
+      self[k] = v
+    for k, v in kwargs.items():
+      self[k] = v
+
+  @override
+  def clear(self) -> None:
+    for k in list(self):
+      del self[k]
+
+  def __ior__(self, other: Any):
+    self.update(other)
+    return self
+
+
+def filter_autotuning_cache[_ConfigT](
+    raw_cache: dict[Any, op.AutotuningData[_ConfigT]],
+    predicate: Callable[[_ConfigT], bool],
+) -> dict[Any, op.AutotuningData[_ConfigT]]:
+  """Returns a view of `raw_cache` keeping only configs matching `predicate`."""
+  return _FilteredAutotuningCache(raw_cache, predicate)
 
 
 def slice_mask_info(
@@ -77,6 +184,9 @@ class Config:
   dropout_block_kv: (
       Annotated[int, pydantic.Field(multiple_of=NUM_LANES, gt=0)] | None
   ) = None
+  q_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  v_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
   use_base2_exp: bool = True
   dq_reduction_steps: int | None = None
   qk_diag_skip: bool = False
@@ -143,6 +253,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  q_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  v_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  use_base2_exp: bool = True
 
   @jaxtyping.jaxtyped
   @override
@@ -161,11 +275,15 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       is_mqa: bool = False,
       mask_value: float = base.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[base.SplashAttentionGrads, None]:
+    del max_logit_value
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
 
@@ -379,7 +497,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         block_kv_dkv_compute=block_kv_dkv_compute,
         dropout_block_q=dropout_block_q,
         dropout_block_kv=dropout_block_kv,
-        use_base2_exp=True,
+        q_layout=self.q_layout,
+        k_layout=self.k_layout,
+        v_layout=self.v_layout,
+        use_base2_exp=self.use_base2_exp,
         dq_reduction_steps=dq_reduction_steps,
     )
 
@@ -462,6 +583,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                 block_kv_dkv_compute=bkv_c,
                 dropout_block_q=dbq,
                 dropout_block_kv=dbkv,
+                q_layout=self.q_layout,
+                k_layout=self.k_layout,
+                v_layout=self.v_layout,
+                use_base2_exp=self.use_base2_exp,
                 dq_reduction_steps=dq_reduction_steps,
             )
         )
@@ -479,6 +604,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
                     dq_reduction_steps=dq_reduction_steps,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -495,6 +624,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
                     dq_reduction_steps=dq_reduction_steps,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -512,6 +645,10 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
                     dq_reduction_steps=1,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -522,6 +659,23 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       configs.add(self._get_heuristics_config(ba))
     return configs
 
+  def _matches_config(self, cfg: Config) -> bool:
+    return (
+        cfg.q_layout == self.q_layout
+        and cfg.k_layout == self.k_layout
+        and cfg.v_layout == self.v_layout
+        and cfg.use_base2_exp == self.use_base2_exp
+    )
+
+  @override
+  def get_autotuning_cache(
+      self, device_kind: op.DeviceKind | None = None
+  ) -> dict[Any, op.AutotuningData[Config]]:
+    return filter_autotuning_cache(
+        base.SplashAttentionVjp.get_autotuning_cache(self, device_kind),
+        self._matches_config,
+    )
+
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

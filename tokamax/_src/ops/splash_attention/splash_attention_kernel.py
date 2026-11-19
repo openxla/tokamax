@@ -1832,8 +1832,11 @@ def _splash_attention_forward(
       log = jnp.log2 if config.use_base2_exp else jnp.log
 
       l = init_if_empty(residual_rows(l_linear), 1.0)
-      logsumexp = max_logits + log(l)
-      out = (out / l[..., None]).astype(out.dtype)
+      l_safe = jnp.where(l == 0.0, 1.0, l)
+      logsumexp = jnp.where(l == 0.0, -jnp.inf, max_logits + log(l_safe))
+      out = jnp.where(l[..., None] == 0.0, 0.0, out / l_safe[..., None]).astype(
+          out.dtype
+      )
   else:
     # If we're not saving residuals, then we can't fuse the reciprocal
     # out of the kernel.
@@ -3161,6 +3164,7 @@ def _splash_attention_bwd(
       config.block_kv_dkv_compute,
   )
   q, k, v, segment_ids, sinks, o, logsumexp, dkv_mask_info, prng_key = res
+  logsumexp = jnp.where(jnp.isneginf(logsumexp), 1e30, logsumexp)
 
   # di: [num_heads, q_seq_len]
   di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))  # pyrefly: ignore[missing-attribute]

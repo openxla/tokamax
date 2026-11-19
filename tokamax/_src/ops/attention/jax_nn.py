@@ -54,6 +54,9 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -72,6 +75,8 @@ class JaxNnDotProductAttention(base.DotProductAttention[op.NullConfig, None]):
       raise NotImplementedError("`logits_dtype` must be `jnp.float32`.")
     if logits_soft_cap is not None:
       raise NotImplementedError("`logits_soft_cap` not supported.")
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
     if dropout_mask is not None or dropout_rate != 0.0:
       raise NotImplementedError("dropout not supported.")
     if not normalize_output:
