@@ -17,6 +17,7 @@
 import contextvars
 import dataclasses
 import functools
+import math
 from unittest import mock
 
 from absl.testing import parameterized
@@ -30,7 +31,6 @@ from tokamax._src import numerics
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import arg_specs
 from tokamax._src.ops.ragged_dot import base
-
 ARG_SPECS = arg_specs.ARG_SPECS
 
 
@@ -47,6 +47,61 @@ def _dot_fn_f32(dot_fn):
 
 
 _jax_ragged_dot_f32 = _dot_fn_f32(jax.lax.ragged_dot)
+_jit_jax_ragged_dot_f32 = jax.jit(_jax_ragged_dot_f32)
+
+
+def _leaf_nbytes(x: jax.ShapeDtypeStruct) -> int:
+  return (math.prod(x.shape) * jax.dtypes.itemsize_bits(x.dtype) + 7) // 8
+
+
+def _spec_nbytes(tree) -> int:
+  return sum(
+      _leaf_nbytes(x)
+      for x in jax.tree.leaves(tree)
+      if isinstance(x, jax.ShapeDtypeStruct)
+  )
+
+
+def _exceeds_gpu_memory_limit(spec) -> bool:
+  """Returns True if `ref(**spec)` provably exceeds the GPU allocator limit."""
+  if jax.default_backend() != "gpu":
+    return False
+  stats = jax.devices()[0].memory_stats()
+  if not stats or "bytes_limit" not in stats:
+    return False
+  bytes_limit = stats["bytes_limit"]
+  if _spec_nbytes(spec) > bytes_limit:
+    return True
+
+  def _prepare_ref_inputs(lhs, rhs, group_sizes):
+    lhs, rhs = map(quantization.as_array, (lhs, rhs))
+    if lhs.dtype != rhs.dtype:
+      input_dtype = jnp.result_type(lhs.dtype, rhs.dtype)
+      lhs, rhs = lhs.astype(input_dtype), rhs.astype(input_dtype)
+    return lhs, rhs, jnp.asarray(group_sizes)
+
+  lhs_abs, rhs_abs, gs_abs = jax.eval_shape(
+      _prepare_ref_inputs, spec["lhs"], spec["rhs"], spec["group_sizes"]
+  )
+  pinned_extra = 0
+  for orig, deq in ((spec["lhs"], lhs_abs), (spec["rhs"], rhs_abs)):
+    if type(orig) is not jax.ShapeDtypeStruct or orig.dtype != deq.dtype:  # pylint: disable=unidiomatic-typecheck
+      pinned_extra += _spec_nbytes(orig)
+
+  ma = (
+      _jit_jax_ragged_dot_f32.lower(lhs_abs, rhs_abs, gs_abs)
+      .compile()
+      .memory_analysis()
+  )
+  if ma is None:
+    return False
+  exe_live = (
+      ma.argument_size_in_bytes
+      + ma.output_size_in_bytes
+      + ma.temp_size_in_bytes
+      - ma.alias_size_in_bytes
+  )
+  return pinned_extra + exe_live > bytes_limit
 
 
 def ref(lhs, rhs, group_sizes, activation=None):
@@ -330,7 +385,6 @@ class RaggedDotTestBase(parameterized.TestCase):
     self._test_bench(spec.args)
 
   def _test_bench(self, spec):
-    kwargs = numerics.random_initialize(spec)
     # Skip the test if the reference implementation fails,
     # e.g out-of-memory.
     try:
@@ -341,6 +395,9 @@ class RaggedDotTestBase(parameterized.TestCase):
           self.skipTest("lower precision lhs not supported on TPUs.")
       else:
         atol, rtol = 0.01, 0.005
+      if _exceeds_gpu_memory_limit(spec):
+        self.skipTest("Out of memory")
+      kwargs = numerics.random_initialize(spec)
       expected = ref(**kwargs)
       actual = self._dot_fn(**kwargs)
       count = sum(spec["group_sizes"].representative_value)

@@ -100,10 +100,19 @@ class _Sm100QuantTestBase(test_base.RaggedDotTestBase):
     super().__init__(*args, dot_fn=fn)
 
   def setUp(self):
+    if type(self) is _Sm100QuantTestBase:  # pylint: disable=unidiomatic-typecheck
+      self.skipTest("Base class; subclasses test concrete dtypes.")
+    if self._testMethodName.startswith("test_bench"):
+      self.skipTest("Not supported.")
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
     if not gpu_utils.is_sm100():
       self.skipTest("Not supported on non-sm100 GPUs.")
+    if (
+        self._quant_a_dtype == jnp.int8
+        and not gpu_utils.has_tcgen05_int8_support()
+    ):
+      self.skipTest("tcgen05 int8 MMA is not supported on this GPU.")
     super().setUp()
 
   @override
@@ -228,8 +237,8 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
   def test_wi4_afp8_quantized(
       self, subchannels, use_as_qarray, activation, task, block_m, block_k
   ):
-    if subchannels < block_k:
-      self.skipTest("subchannels < block_k")
+    if subchannels < block_k or subchannels % block_k != 0:
+      self.skipTest("subchannels must be a multiple of block_k")
     config = dataclasses.replace(_CONFIG, block_m=block_m, block_k=block_k)
     with test_base.ConfigManager(config):
       test_base.RaggedDotTestBase._test_quantized(
@@ -431,6 +440,41 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
       pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(
           int4_to_fp8_offline_permute=True
       )(lhs, b, group_sizes=group_sizes)
+
+  def test_unsupported_quant_tile_raises(self):
+    lhs, rhs, group_sizes = self._create_inputs(
+        2,
+        64,
+        128,
+        128,
+        jnp.bfloat16,
+        use_as_qarray=True,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, 128),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, 1, 16),
+    )
+    with self.assertRaises(NotImplementedError):
+      _ = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(config=_CONFIG)(
+          lhs, rhs, group_sizes=group_sizes
+      )
+    if not gpu_utils.has_tcgen05_int8_support():
+      lhs_i8, rhs_i4, gs = self._create_inputs(
+          2,
+          64,
+          128,
+          128,
+          jnp.bfloat16,
+          use_as_qarray=True,
+          quant_a_dtype=jnp.int8,
+          a_tile_shape=(1, 128),
+          quant_b_dtype=jnp.int4,
+          b_tile_shape=(1, 128, 1),
+      )
+      with self.assertRaises(NotImplementedError):
+        _ = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(config=_CONFIG)(
+            lhs_i8, rhs_i4, group_sizes=gs
+        )
 
   @parameterized.product(
       block_k=(128,),

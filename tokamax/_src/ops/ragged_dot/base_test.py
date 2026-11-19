@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import functools
-from typing import override
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -43,13 +42,28 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Disabled for now due to numeric issues.")
+    if not self._testMethodName.startswith("test_vjp"):
+      self.skipTest("Forward-only path is identical to RaggedDotTest.")
     super().setUp()
 
-  @override
-  def _test_bench(self, spec):
-    if "128_m16384" in self._testMethodName and jax.default_backend() == "gpu":
-      self.skipTest("OOMs on MiG slice.")
-    super()._test_bench(spec)
+  def test_vjp_explicit_vs_implicit(self):
+    lhs, rhs, group_sizes = self._create_inputs(4, 64, 64, 128, jnp.bfloat16)
+    implicit_op = base.RaggedDot()
+    explicit_op = self._dot_fn
+    kw = dict(group_sizes=group_sizes, fuse_gateup_activation="silu")
+    self.assertTrue(
+        bool(
+            jnp.array_equal(
+                implicit_op(lhs, rhs, **kw), explicit_op(lhs, rhs, **kw)
+            )
+        )
+    )
+    _, implicit_bwd = jax.vjp(lambda x, w: implicit_op(x, w, **kw), lhs, rhs)
+    out, explicit_bwd = jax.vjp(lambda x, w: explicit_op(x, w, **kw), lhs, rhs)
+    implicit_dlhs, _ = implicit_bwd(jnp.ones_like(out))
+    self.assertEqual(implicit_dlhs.shape, lhs.shape)
+    with self.assertRaisesRegex(NotImplementedError, "fuse_gateup_activation"):
+      explicit_bwd(jnp.ones_like(out))
 
   @parameterized.product(
       rhs_dtype=(jnp.bfloat16, jnp.float32),
