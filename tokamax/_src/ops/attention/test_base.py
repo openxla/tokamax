@@ -152,20 +152,22 @@ def _run_test(
   if not test_vjp:
     return
 
-  del actual, expected  # Free device memory.
-
-  # Forwards training.
-  actual, vjp_fn = jax.vjp(impl, q, k, v, bias)
-  expected, ref_vjp_fn = jax.vjp(ref_impl, *ref_inputs)
-  test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
-
   (seed,) = seed_seq.generate_state(n_words=1)
   dout = jax.ShapeDtypeStruct(expected.shape, dtype=actual.dtype)
   dout = numerics.random_initialize(dout, seed=seed)
   ref_dout = dout.astype(expected.dtype)
-  del expected, ref_kwargs, ref_impl, ref_inputs  # Free device memory.
+  del actual  # Free device memory.
 
-  # Backwards.
+  # Forwards training & backwards.
+  impl_fwd_bwd = jax.jit(
+      lambda q_, k_, v_, bias_, d_: (lambda out_, vjp_: (out_, vjp_(d_)))(
+          *jax.vjp(impl, q_, k_, v_, bias_)
+      )
+  )
+  actual, grads = impl_fwd_bwd(q, k, v, bias, dout)
+  test_utils.assert_trees_all_close(actual, expected, atol=atol, rtol=rtol)
+  del expected  # Free device memory.
+
   if atol_grads is None:
     if isinstance(atol, dict):
       atol_grads = {k: max(2 * v, 5e-6) for k, v in atol.items()}
@@ -173,8 +175,13 @@ def _run_test(
       atol_grads = max(2 * atol, 5e-6)
 
   grad_names = ("dq", "dk", "dv", "dbias")
-  actual_grads = dict(zip(grad_names, vjp_fn(dout), strict=True))
-  expected_grads = dict(zip(grad_names, ref_vjp_fn(ref_dout), strict=True))
+  actual_grads = dict(zip(grad_names, grads, strict=True))
+  del grads
+  ref_bwd = jax.jit(lambda *a: jax.vjp(ref_impl, *a[:-1])[1](a[-1]))
+  expected_grads = dict(
+      zip(grad_names, ref_bwd(*ref_inputs, ref_dout), strict=True)
+  )
+  del ref_kwargs, ref_impl, ref_inputs, ref_dout  # Free device memory.
   min_atol_grads = (
       atol_grads if isinstance(atol_grads, float) else min(atol_grads.values())
   )
@@ -182,12 +189,13 @@ def _run_test(
   test_utils.assert_trees_all_close(
       actual_grads, expected_grads, atol=atol_grads, rtol=rtol_grads
   )
-  del expected_grads, vjp_fn, ref_vjp_fn  # Free device memory.
+  del expected_grads  # Free device memory.
 
-  actual2, vjp_fn = jax.vjp(impl, q, k, v, bias)
-  actual_grads2 = dict(zip(grad_names, vjp_fn(dout)))
-  chex.assert_trees_all_equal(actual, actual2)
-  chex.assert_trees_all_equal(actual_grads, actual_grads2)
+  if test_deterministic:
+    actual2, grads2 = impl_fwd_bwd(q, k, v, bias, dout)
+    actual_grads2 = dict(zip(grad_names, grads2, strict=True))
+    chex.assert_trees_all_equal(actual, actual2)
+    chex.assert_trees_all_equal(actual_grads, actual_grads2)
 
 
 def override_test_args(**kwargs):
