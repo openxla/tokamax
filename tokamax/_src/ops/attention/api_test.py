@@ -14,12 +14,14 @@
 # ==============================================================================
 import functools
 import os
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
 from jax import export
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import gpu_utils
@@ -28,6 +30,11 @@ from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import api
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  pallas_mosaic_tpu = None
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
@@ -602,6 +609,175 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):
   IMPL = 'xla_chunked'
+
+
+class DotProductAttentionVirtualTpuTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if pallas_mosaic_tpu is None or 'mosaic_tpu' not in api.IMPLEMENTATIONS:
+      self.skipTest('mosaic_tpu backend is not linked in this build.')
+
+  @parameterized.parameters('mosaic', 'mosaic_tpu', None, 'callable')
+  def test_virtual_tpu_lowering_on_cpu(self, impl_mode):
+    assert pallas_mosaic_tpu is not None
+    implementation = (
+        pallas_mosaic_tpu.PallasMosaicTpuFlashAttention()
+        if impl_mode == 'callable'
+        else impl_mode
+    )
+    cpu_device = jax.devices('cpu')[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind='TPU7x', num_cores=1, platform='tpu'
+    )
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7,
+    )
+    sharding = jax.sharding.NamedSharding(
+        abstract_mesh, jax.sharding.PartitionSpec('x', None, None, None)
+    )
+    q_sds = jax.ShapeDtypeStruct(
+        (2, 256, 4, 128), jnp.bfloat16, sharding=sharding
+    )
+    kv_sds = jax.ShapeDtypeStruct(
+        (2, 256, 2, 128), jnp.bfloat16, sharding=sharding
+    )
+
+    def loss_fn(q, k, v):
+      return jnp.sum(
+          api.dot_product_attention(
+              q,
+              k,
+              v,
+              is_causal=True,
+              implementation=implementation,
+              q_sharding=sharding,
+          )
+      )
+
+    with mock.patch.object(
+        backend, 'get_default_device', return_value=cpu_device
+    ):
+      lowered = (
+          jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1, 2)))
+          .trace(q_sds, kv_sds, kv_sds)
+          .lower(lowering_platforms=('tpu',))
+      )
+      self.assertIn('tpu_custom_call', lowered.as_text())
+
+  def test_virtual_tpu_abstract_mesh_num_cores_none_and_v4_fallback(self):
+    cpu_device = jax.devices('cpu')[0]
+    tpu_v7_none_cores = jax.sharding.AbstractDevice(
+        device_kind='TPU7x', num_cores=None, platform='tpu'
+    )
+    mesh_v7 = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7_none_cores,
+    )
+    tpu_v4 = jax.sharding.AbstractDevice(
+        device_kind='TPU v4', num_cores=2, platform='tpu'
+    )
+    mesh_v4 = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v4,
+    )
+    q_sds = jax.ShapeDtypeStruct((2, 256, 4, 128), jnp.bfloat16)
+    kv_sds = jax.ShapeDtypeStruct((2, 256, 2, 128), jnp.bfloat16)
+
+    with mock.patch.object(
+        backend, 'get_default_device', return_value=cpu_device
+    ):
+      with jax.sharding.use_abstract_mesh(mesh_v7):
+        lowered_v7 = (
+            jax.jit(
+                jax.value_and_grad(
+                    lambda q, k, v: jnp.sum(
+                        api.dot_product_attention(
+                            q, k, v, is_causal=True, implementation='mosaic'
+                        )
+                    ),
+                    argnums=(0, 1, 2),
+                )
+            )
+            .trace(q_sds, kv_sds, kv_sds)
+            .lower(lowering_platforms=('tpu',))
+        )
+        self.assertIn('tpu_custom_call', lowered_v7.as_text())
+
+      with jax.sharding.use_abstract_mesh(mesh_v4):
+        with self.assertRaisesRegex(
+            NotImplementedError, 'Not supported on TPU v4'
+        ):
+          jax.jit(
+              lambda q, k, v: api.dot_product_attention(
+                  q, k, v, is_causal=True, implementation='mosaic'
+              )
+          ).trace(q_sds, kv_sds, kv_sds)
+
+        lowered_default = (
+            jax.jit(
+                lambda q, k, v: api.dot_product_attention(
+                    q, k, v, is_causal=True, implementation=None
+                )
+            )
+            .trace(q_sds, kv_sds, kv_sds)
+            .lower(lowering_platforms=('tpu',))
+        )
+        self.assertNotIn('tpu_custom_call', lowered_default.as_text())
+
+  def test_mosaic_missing_backend_falls_back_on_default_or_sequence(self):
+    cpu_device = jax.devices('cpu')[0]
+    with jax.default_device(cpu_device):
+      q_arr = jnp.ones((1, 16, 2, 32), jnp.bfloat16)
+    self.assertEqual(q_arr.devices(), {cpu_device})
+    impls_without_tpu = {
+        k: v for k, v in api.IMPLEMENTATIONS.items() if k != 'mosaic_tpu'
+    }
+    with (
+        mock.patch.object(
+            backend, 'get_default_device', return_value=cpu_device
+        ),
+        mock.patch.object(api, 'IMPLEMENTATIONS', impls_without_tpu),
+    ):
+      out_default = api.dot_product_attention(
+          q_arr, q_arr, q_arr, implementation=None
+      )
+      self.assertEqual(out_default.shape, q_arr.shape)
+      out_seq = api.dot_product_attention(
+          q_arr, q_arr, q_arr, implementation=('mosaic', 'xla')
+      )
+      self.assertEqual(out_seq.shape, q_arr.shape)
+      with self.assertRaises(ValueError):
+        api.dot_product_attention(q_arr, q_arr, q_arr, implementation='mosaic')
+
+    gpu_abs = jax.sharding.AbstractDevice(
+        device_kind='NVIDIA H100 80GB HBM3', num_cores=None, platform='gpu'
+    )
+    gpu_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=gpu_abs,
+    )
+    q_sds = jax.ShapeDtypeStruct((1, 16, 2, 32), jnp.bfloat16)
+    impls_without_gpu = {
+        k: v for k, v in api.IMPLEMENTATIONS.items() if k != 'mosaic_gpu'
+    }
+    with mock.patch.object(api, 'IMPLEMENTATIONS', impls_without_gpu):
+      with jax.sharding.use_abstract_mesh(gpu_mesh):
+        lowered = jax.jit(
+            lambda q, k, v: api.dot_product_attention(
+                q, k, v, implementation=None
+            )
+        ).trace(q_sds, q_sds, q_sds)
+        self.assertIsNotNone(lowered)
 
 
 if __name__ == '__main__':

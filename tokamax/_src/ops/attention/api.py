@@ -22,12 +22,21 @@ from jax.extend import backend
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import qwix
 from tokamax._src import jaxtyping
+from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import jax_nn
 from tokamax._src.ops.attention import xla_chunked
 
 QArray = qwix.QArray
-type Implementation = Literal["mosaic", "triton", "cudnn", "xla", "xla_chunked"]
+type Implementation = Literal[
+    "mosaic",
+    "mosaic_tpu",
+    "mosaic_gpu",
+    "triton",
+    "cudnn",
+    "xla",
+    "xla_chunked",
+]
 
 # TODO: Investigate if `_XLA_CHUNK_SIZE` should be larger on TPU.
 _XLA_CHUNK_SIZE: Final[tuple[int, int]] = (512, 1024)
@@ -93,7 +102,12 @@ def dot_product_attention(
     local_window_size: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
-    implementation: Implementation | Sequence[Implementation] | None = None,
+    implementation: (
+        Implementation
+        | Callable[..., Any]
+        | Sequence[Implementation | Callable[..., Any]]
+        | None
+    ) = None,
     q_sharding: jax.sharding.NamedSharding | None = None,
 ) -> Float[Array, "*B T N h"]:  # pylint: disable=g-doc-args
   """Scaled dot product attention function.
@@ -131,9 +145,10 @@ def dot_product_attention(
     ExceptionGroup: If multiple implementations are provided and all of them
       raise `NotImplementedError`.
   """
-  if implementation is None:
+  is_default = implementation is None
+  if is_default:
     implementation = _DEFAULT_IMPLEMENTATIONS
-  elif isinstance(implementation, str):
+  elif isinstance(implementation, str) or callable(implementation):
     implementation = (implementation,)
   elif not implementation:
     raise ValueError("`implementation` must not be an empty sequence.")
@@ -160,13 +175,19 @@ def dot_product_attention(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
+      orig_impl = impl
       if impl == "mosaic":
-        impl = (
-            "mosaic_gpu"
-            if "NVIDIA" in backend.get_default_device().device_kind
-            else "mosaic_tpu"
+        device_kind = (
+            op.infer_device_kind_from_args((query, key, value, q_sharding))
+            or backend.get_default_device().device_kind
         )
+        impl = "mosaic_gpu" if "NVIDIA" in device_kind else "mosaic_tpu"
       if impl not in IMPLEMENTATIONS:
+        if is_default or (orig_impl == "mosaic" and len(implementation) > 1):
+          errors.append(
+              NotImplementedError(f"Implementation '{impl}' is not registered.")
+          )
+          continue
         raise ValueError(f"Unknown implementation: {impl}")
       impl = IMPLEMENTATIONS[impl]
 

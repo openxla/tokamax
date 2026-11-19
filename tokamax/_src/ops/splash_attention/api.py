@@ -14,7 +14,7 @@
 # ==============================================================================
 """Splash Attention Op API."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal
 import immutabledict
 import jax
@@ -23,7 +23,7 @@ from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
-type Implementation = Literal["mosaic_tpu", "base"]
+type Implementation = Literal["mosaic_tpu", "base"] | Callable[..., Any]
 
 _IMPLEMENTATIONS = dict(
     base=base.SplashAttention(),

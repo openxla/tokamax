@@ -15,10 +15,12 @@
 """Comprehensive tests for Splash Attention API and argument specifications."""
 
 import functools
+from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import hlo_utils
 from tokamax._src import numerics
@@ -26,6 +28,13 @@ from tokamax._src.ops.splash_attention import api
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+
+try:
+  from tokamax._src import mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax._src.ops.splash_attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  mosaic_tpu = None
+  pallas_mosaic_tpu = None
 
 
 class SplashAttentionApiTest(parameterized.TestCase):
@@ -477,6 +486,142 @@ class SplashAttentionApiTest(parameterized.TestCase):
         q_sharding=sharding,
     )
     chex.assert_trees_all_close(out, ref_out, atol=1e-4, rtol=1e-4)
+
+
+class SplashAttentionVirtualTpuTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if pallas_mosaic_tpu is None or "mosaic_tpu" not in api.IMPLEMENTATIONS:
+      self.skipTest("mosaic_tpu backend is not linked in this build.")
+
+  def test_has_mosaic_tpu_support(self):
+    assert mosaic_tpu is not None
+    cpu_device = jax.devices("cpu")[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    tpu_v5 = jax.sharding.AbstractDevice(
+        device_kind="TPU v5 lite", num_cores=1, platform="tpu"
+    )
+    tpu_v4 = jax.sharding.AbstractDevice(
+        device_kind="TPU v4", num_cores=2, platform="tpu"
+    )
+    with mock.patch.object(
+        backend, "get_default_device", return_value=cpu_device
+    ):
+      self.assertFalse(mosaic_tpu.has_mosaic_tpu_support(cpu_device))
+      self.assertFalse(mosaic_tpu.has_mosaic_tpu_support(None))
+      self.assertTrue(mosaic_tpu.has_mosaic_tpu_support(tpu_v7))
+      self.assertTrue(mosaic_tpu.has_mosaic_tpu_support(tpu_v5))
+      self.assertFalse(mosaic_tpu.has_mosaic_tpu_support(tpu_v4))
+
+      tpu_v7_none_cores = jax.sharding.AbstractDevice(
+          device_kind="TPU7x", num_cores=None, platform="tpu"
+      )
+      mesh_v7_none_cores = jax.sharding.AbstractMesh(
+          (2,),
+          ("x",),
+          axis_types=(jax.sharding.AxisType.Auto,),
+          abstract_device=tpu_v7_none_cores,
+      )
+      with jax.sharding.use_abstract_mesh(mesh_v7_none_cores):
+        self.assertTrue(mosaic_tpu.has_mosaic_tpu_support(tpu_v7_none_cores))
+        q_sds = jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16)
+        lowered = (
+            jax.jit(
+                lambda q, k, v: api.splash_attention(
+                    q, k, v, is_causal=True, implementation="mosaic_tpu"
+                )
+            )
+            .trace(q_sds, q_sds, q_sds)
+            .lower(lowering_platforms=("tpu",))
+        )
+        self.assertIn("tpu_custom_call", lowered.as_text())
+
+  @parameterized.parameters("mosaic_tpu", None, "callable")
+  def test_virtual_tpu_lowering_on_cpu(self, impl_mode):
+    assert pallas_mosaic_tpu is not None
+    implementation = (
+        pallas_mosaic_tpu.PallasMosaicTpuSplashAttention()
+        if impl_mode == "callable"
+        else impl_mode
+    )
+    cpu_device = jax.devices("cpu")[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ("x",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7,
+    )
+    sharding = jax.sharding.NamedSharding(
+        abstract_mesh, jax.sharding.PartitionSpec("x", None, None)
+    )
+    q_sds = jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16, sharding=sharding)
+    k_sds = jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16, sharding=sharding)
+    v_sds = jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16, sharding=sharding)
+
+    def loss_fn(q, k, v):
+      return jnp.sum(
+          api.splash_attention(
+              q,
+              k,
+              v,
+              is_causal=True,
+              implementation=implementation,
+              q_sharding=sharding,
+          )
+      )
+
+    with mock.patch.object(
+        backend, "get_default_device", return_value=cpu_device
+    ):
+      lowered = (
+          jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1, 2)))
+          .trace(q_sds, k_sds, v_sds)
+          .lower(lowering_platforms=("tpu",))
+      )
+      self.assertIn("tpu_custom_call", lowered.as_text())
+
+  def test_virtual_tpu_v4_rejection_and_fallback(self):
+    cpu_device = jax.devices("cpu")[0]
+    tpu_v4 = jax.sharding.AbstractDevice(
+        device_kind="TPU v4", num_cores=2, platform="tpu"
+    )
+    mesh_v4 = jax.sharding.AbstractMesh(
+        (2,),
+        ("x",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v4,
+    )
+    q_sds = jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16)
+
+    with mock.patch.object(
+        backend, "get_default_device", return_value=cpu_device
+    ):
+      with jax.sharding.use_abstract_mesh(mesh_v4):
+        with self.assertRaisesRegex(
+            NotImplementedError, "Not supported on TPU v4"
+        ):
+          jax.jit(
+              lambda q, k, v: api.splash_attention(
+                  q, k, v, is_causal=True, implementation="mosaic_tpu"
+              )
+          ).trace(q_sds, q_sds, q_sds)
+
+        lowered_default = (
+            jax.jit(
+                lambda q, k, v: api.splash_attention(
+                    q, k, v, is_causal=True, implementation=None
+                )
+            )
+            .trace(q_sds, q_sds, q_sds)
+            .lower(lowering_platforms=("tpu",))
+        )
+        self.assertNotIn("tpu_custom_call", lowered_default.as_text())
 
 
 if __name__ == "__main__":

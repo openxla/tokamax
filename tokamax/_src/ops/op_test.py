@@ -16,6 +16,7 @@
 import dataclasses
 from typing import Any, ClassVar
 from unittest import mock
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,6 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import backend
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import hlo_utils
@@ -116,6 +118,82 @@ class _DeviceRestrictedOp(_FakeOp):
   def supported_on(self, device: jax.Device) -> bool:
     del device
     return False
+
+
+class _TpuGen5Vjp(
+    op_lib.Op[Any, tuple[jax.Array, jax.Array], None, _FakeOpConfig, Any]
+):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+
+  def _fwd(
+      self,
+      residuals: jax.Array,
+      out: jax.Array,
+      dout: jax.Array,
+      x: jax.Array,
+      y: jax.Array,
+      *,
+      return_residuals: bool,
+      config,
+  ):
+    del residuals, out, x, y, return_residuals, config
+    abstract_device = jax.sharding.get_abstract_mesh().abstract_device
+    assert abstract_device is not None
+    assert abstract_device.device_kind == "TPU7x"
+    assert isinstance(abstract_device.num_cores, int)
+    return (dout, dout), None
+
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+    del ba
+    return _HEURISTICS_CONFIG
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and device.device_kind == "TPU7x"
+
+
+class _TpuGen5Op(op_lib.Op[Any, jax.Array, jax.Array, _FakeOpConfig, Any]):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+  fusible_argnames: ClassVar[tuple[str, ...]] = ("x",)
+
+  def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
+    del config
+    abstract_device = jax.sharding.get_abstract_mesh().abstract_device
+    assert abstract_device is not None
+    assert abstract_device.device_kind == "TPU7x"
+    assert isinstance(abstract_device.num_cores, int)
+    out = x + y
+    return out, (out if return_residuals else None)
+
+  def _fusible_fwd(self, x_f, y, *, out_fusions=None, config):
+    assert config == _HEURISTICS_CONFIG
+    abstract_device = jax.sharding.get_abstract_mesh().abstract_device
+    assert abstract_device is not None
+    assert abstract_device.device_kind == "TPU7x"
+    assert isinstance(abstract_device.num_cores, int)
+    out = x_f() + y
+    return out if out_fusions is None else out_fusions(out)
+
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+    del ba
+    return _HEURISTICS_CONFIG
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and device.device_kind == "TPU7x"
+
+
+class _GpuSm100Op(_FakeOp):
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return (
+        device.platform == "gpu"
+        and getattr(device, "compute_capability", None) == "10.0"
+    )
+
+
+class _CpuMeshOnlyOp(_FakeOp):
+
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "cpu"
 
 
 class NonFusibleOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
@@ -757,6 +835,191 @@ class BoundArgumentsTest(parameterized.TestCase):
 
     with config_lib.ignore_autotuning_cache(False):
       self.assertIsNotNone(ba.cached_autotuning_data)
+
+  @parameterized.parameters(False, True)
+  def test_virtual_tpu_abstract_device_lowering(self, custom_vjp_op):
+    op = _TpuGen5Op(vjp=_TpuGen5Vjp() if custom_vjp_op else None)
+    cpu_device = jax.devices("cpu")[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ("x",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7,
+    )
+    sharding = jax.sharding.NamedSharding(
+        abstract_mesh, jax.sharding.PartitionSpec("x", None)
+    )
+    x_sds = jax.ShapeDtypeStruct((4, 4), jnp.float32, sharding=sharding)
+    y_sds = jax.ShapeDtypeStruct((4, 4), jnp.float32, sharding=sharding)
+
+    loss_fn = lambda x, y: jnp.sum(op(x, y))
+
+    with mock.patch.object(
+        backend, "get_default_device", return_value=cpu_device
+    ):
+      # Lowering via sharded ShapeDtypeStruct without an active mesh context.
+      lowered = (
+          jax.jit(jax.value_and_grad(loss_fn))
+          .trace(x_sds, y_sds)
+          .lower(lowering_platforms=("tpu",))
+      )
+      self.assertIn("add", lowered.as_text())
+
+      # Fused `@op_fusion.fuse` lowering without an active mesh context.
+      @op_fusion.fuse
+      def fused_fn(x, y):
+        return op(x * 2.0, y) - 1.0
+
+      lowered_fused = (
+          jax.jit(fused_fn)
+          .trace(x_sds, y_sds)
+          .lower(lowering_platforms=("tpu",))
+      )
+      self.assertIn("subtract", lowered_fused.as_text())
+
+      # Lowering via active `use_abstract_mesh` with unsharded ShapeDtypeStruct,
+      # including when `num_cores=None` on `AbstractDevice`.
+      unsharded = jax.ShapeDtypeStruct((4, 4), jnp.float32)
+      tpu_v7_none_cores = jax.sharding.AbstractDevice(
+          device_kind="TPU7x", num_cores=None, platform="tpu"
+      )
+      mesh_none_cores = jax.sharding.AbstractMesh(
+          (2,),
+          ("x",),
+          axis_types=(jax.sharding.AxisType.Auto,),
+          abstract_device=tpu_v7_none_cores,
+      )
+      for mesh_ctx in (abstract_mesh, mesh_none_cores):
+        with jax.sharding.use_abstract_mesh(mesh_ctx):
+          lowered_ctx = (
+              jax.jit(jax.value_and_grad(loss_fn))
+              .trace(unsharded, unsharded)
+              .lower(lowering_platforms=("tpu",))
+          )
+          self.assertIn("add", lowered_ctx.as_text())
+          lowered_fused_ctx = (
+              jax.jit(fused_fn)
+              .trace(unsharded, unsharded)
+              .lower(lowering_platforms=("tpu",))
+          )
+          self.assertIn("subtract", lowered_fused_ctx.as_text())
+
+      # Negative control: bare CPU host without virtual TPU target fails closed.
+      with self.assertRaisesRegex(NotImplementedError, "Not supported on"):
+        jax.jit(loss_fn).lower(unsharded, unsharded)
+
+      # Negative control: TPU v4 (< generation 5) is rejected.
+      tpu_v4 = jax.sharding.AbstractDevice(
+          device_kind="TPU v4", num_cores=2, platform="tpu"
+      )
+      mesh_v4 = jax.sharding.AbstractMesh(
+          (2,),
+          ("x",),
+          axis_types=(jax.sharding.AxisType.Auto,),
+          abstract_device=tpu_v4,
+      )
+      with jax.sharding.use_abstract_mesh(mesh_v4):
+        with self.assertRaisesRegex(
+            NotImplementedError, "Not supported on TPU v4"
+        ):
+          jax.jit(loss_fn).trace(unsharded, unsharded)
+
+    # `with mesh:` context manager inference with unsharded ShapeDtypeStruct.
+    fake_gpu = mock.Mock(
+        spec=jax.Device,
+        platform="gpu",
+        device_kind="NVIDIA H100",
+        num_cores=None,
+    )
+    cpu_mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("x",))
+    cpu_op = _CpuMeshOnlyOp()
+    with mock.patch.object(
+        backend, "get_default_device", return_value=fake_gpu
+    ):
+      with self.assertRaisesRegex(
+          NotImplementedError, "Not supported on NVIDIA H100"
+      ):
+        jax.jit(cpu_op).lower(unsharded, unsharded)
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        with cpu_mesh:
+          lowered_mesh = jax.jit(cpu_op).lower(unsharded, unsharded)
+      self.assertIn("add", lowered_mesh.as_text())
+
+    # AbstractDevice matching backend.get_default_device() preserves concrete
+    # device attributes (such as compute_capability inside shard_map).
+    # Real JAX GPU devices expose `.core_count` rather than `.num_cores`.
+    @dataclasses.dataclass(frozen=True)
+    class _FakeGpuDevice:
+      platform: str = "gpu"
+      device_kind: str = "NVIDIA B200"
+      core_count: int = 148
+      compute_capability: str = "10.0"
+
+    b200_dev = _FakeGpuDevice()
+    b200_abs = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA B200", num_cores=148, platform="gpu"
+    )
+    b200_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ("x",),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=b200_abs,
+    )
+    sm100_op = _GpuSm100Op()
+    with mock.patch.object(
+        backend, "get_default_device", return_value=b200_dev
+    ):
+      with jax.sharding.use_abstract_mesh(b200_mesh):
+        lowered_gpu = (
+            jax.jit(sm100_op)
+            .trace(unsharded, unsharded)
+            .lower(lowering_platforms=("cpu",))
+        )
+      self.assertIn("add", lowered_gpu.as_text())
+
+    # `infer_devices` stays concrete-only by default (`include_mesh=False`) and
+    # opts into mesh devices when `include_mesh=True`.
+    with warnings.catch_warnings():
+      warnings.simplefilter("ignore", DeprecationWarning)
+      with cpu_mesh:
+        traced_ba = _FakeOp().bind(unsharded, unsharded)
+        self.assertEmpty(op_lib.infer_devices(traced_ba))
+        self.assertEqual(
+            op_lib.infer_devices(traced_ba, include_mesh=True),
+            set(cpu_mesh.devices.flat),
+        )
+
+    # Closed-over host-CPU constants must not shadow virtual/abstract TPU mesh.
+    with jax.default_device(cpu_device):
+      host_const = jnp.ones((4, 4), jnp.float32)
+    self.assertEqual(host_const.devices(), {cpu_device})
+
+    def mixed_fn(x):
+      return op(x, host_const)
+
+    with mock.patch.object(
+        backend, "get_default_device", return_value=cpu_device
+    ):
+      lowered_sharded_mixed = (
+          jax.jit(mixed_fn).trace(x_sds).lower(lowering_platforms=("tpu",))
+      )
+      self.assertIn("add", lowered_sharded_mixed.as_text())
+      with jax.sharding.use_abstract_mesh(abstract_mesh):
+        lowered_mixed = (
+            jax.jit(mixed_fn)
+            .trace(unsharded)
+            .lower(lowering_platforms=("tpu",))
+        )
+        self.assertIn("add", lowered_mixed.as_text())
+      # Outside jit with no abstract/traced args, concrete CPU constants still
+      # report CPU and fail closed.
+      with jax.sharding.use_abstract_mesh(abstract_mesh):
+        with self.assertRaisesRegex(NotImplementedError, "Not supported on"):
+          op(host_const, host_const)
 
 
 if __name__ == "__main__":
