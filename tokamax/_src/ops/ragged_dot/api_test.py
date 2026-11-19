@@ -513,7 +513,7 @@ class RaggedDotMosaicTpuV2Test(RaggedDotImplementationTest):
       )
 
   @override
-  def _test_vjp(self, num_groups, m, k, n, activation=None):
+  def _test_vjp(self, num_groups, m, k, n, activation=None, group_sizes=None):
     # There is a Mosaic compile error most likely comes from the f32 dout /
     # f32 output combination. Since we mainly use bf16 for inputs and outputs,
     # this test is skipped. The bf16 path is tested in `RaggedDotTest`.

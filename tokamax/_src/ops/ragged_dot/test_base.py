@@ -272,8 +272,14 @@ class RaggedDotTestBase(parameterized.TestCase):
   def test_vjp(self, num_groups, m, k, n, activation=None):
     return self._test_vjp(num_groups, m, k, n, activation)
 
-  def _test_vjp(self, num_groups, m, k, n, activation=None):
-    a, b, group_sizes = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+  def _test_vjp(self, num_groups, m, k, n, activation=None, group_sizes=None):
+    a, b, default_group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16
+    )
+    if group_sizes is None:
+      group_sizes = default_group_sizes
+    else:
+      group_sizes = jnp.array(group_sizes, jnp.int32)
     a_ref = a.astype(jnp.float32)
     b_ref = b.astype(jnp.float32)
     f = functools.partial(

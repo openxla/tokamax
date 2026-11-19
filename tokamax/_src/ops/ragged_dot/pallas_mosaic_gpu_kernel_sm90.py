@@ -202,7 +202,9 @@ def _ragged_contracting_dim_dot_kernel_body(
 
       # TODO: Only mask out the 1st and last iteration.
       plgpu.wgmma(acc, lhs_smem[...] * mask, rhs_smem)
-      plgpu.wgmma_wait(1)
+      # The A operand is in registers (the masked `lhs_smem`), and the next
+      # step overwrites them, so this wgmma must complete before it starts.
+      plgpu.wgmma_wait(0)
 
     spec = functools.partial(_tiled_swizzled_block_spec, delay_release=1)
     lhs_spec = spec(
