@@ -157,7 +157,7 @@ def ragged_dot_quantized_kernel(
               plgpu.barrier_wait(w_barrier.at[0])
 
             def k_loop_body(ki, w_scales):
-              si = lax.rem(ki, num_stages)
+              si = mgpu_lib.urem(ki, num_stages)
               with jax.named_scope("dequant"):
                 w_scale_bits = mgpu_lib.num_bits(w_scales.dtype)
                 match w_scale_bits // mgpu_lib.num_bits(w_smem.dtype):
@@ -177,7 +177,7 @@ def ragged_dot_quantized_kernel(
                 plgpu.wgmma(acc, w, x_smem.at[si].T)
 
               def load_scales():
-                si = lax.rem(ki + 1, num_stages)
+                si = mgpu_lib.urem(ki + 1, num_stages)
                 with jax.named_scope("wait W"):
                   plgpu.barrier_wait(w_barrier.at[si])
                 return plgpu.load(w_scales_smem.at[si, ns], layout=_WGMMA_ROW)
@@ -216,7 +216,7 @@ def ragged_dot_quantized_kernel(
               @pl.loop(0, k_iters)
               def k_loop(ki):
                 ks = pl.ds(ki * block_k, block_k)
-                si = lax.rem(ki, num_stages)
+                si = mgpu_lib.urem(ki, num_stages)
 
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def wait_w_consumed():
@@ -226,7 +226,7 @@ def ragged_dot_quantized_kernel(
                 plgpu.copy_gmem_to_smem(  # e,n,k
                     w_gmem.at[gi, ns, ks], w_smem.at[si], w_barrier.at[si]
                 )
-                ki_ = lax.div(ki, w_scales_tile_k // block_k)
+                ki_ = mgpu_lib.udiv(ki, w_scales_tile_k // block_k)
                 plgpu.copy_gmem_to_smem(  # e,k//t,n
                     w_scales_gmem.at[gi, ki_, ns],
                     w_scales_smem.at[si],
@@ -239,7 +239,7 @@ def ragged_dot_quantized_kernel(
               @pl.loop(0, k_iters)
               def k_loop(ki):
                 ks = pl.ds(ki * block_k, block_k)
-                si = lax.rem(ki, num_stages)
+                si = mgpu_lib.urem(ki, num_stages)
 
                 @pl.when((ki >= num_stages) | (carry > 0))
                 def wait_x_consumed():

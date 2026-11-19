@@ -119,6 +119,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
     raise NotImplementedError(
         f"{tile_k=} must be greater than or equal to {block_k=}."
     )
+  if tile_k % block_k != 0:
+    raise NotImplementedError(f"{tile_k=} must be a multiple of {block_k=}.")
   if k_w != k_x:
     raise ValueError(
         f"Contraction dim mismatch: weights.shape[1]={k_w}, x.shape[-1]={k_x}"
@@ -221,7 +223,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           @pl.when(warp_id == _W_TMA_WARP)
           def w_tma_warp():
             def _iter_w(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -236,7 +238,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
                 plgpu.copy_gmem_to_smem(
                     w_scales_gmem.at[
                         group_id,
-                        lax.div((ki * block_k), tile_k),
+                        mgpu_lib.udiv(ki * block_k, tile_k),
                         slice_n,
                     ],
                     ws_smem.at[slot],
@@ -248,7 +250,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
           @pl.when(warp_id == _X_TMA_WARP)
           def x_tma_warp():
             def _iter_x(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
 
               @pl.when((ki >= num_stages) | (carry > 0))
               def _():
@@ -275,7 +277,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
                 plgpu.barrier_wait(acc_consumed_barrier)
 
             def do_mma(ki, _):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
               if post_scale:
 
                 @pl.when((ki >= num_stages) | (carry > 0))
@@ -312,7 +314,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         @pl.when(wg == deq_wg)
         def _():
           def _deq(ki, _):
-            slot = lax.rem(ki, num_stages)
+            slot = mgpu_lib.urem(ki, num_stages)
             plgpu.barrier_wait(w_tma_barrier.at[slot])
             w = plgpu.load(w_smem.at[slot], layout=_TMEM(8), optimized=False)
             w_deq = plgpu.layout_cast(
@@ -343,12 +345,10 @@ def ragged_dot_gpu_quant_blackwell_kernel(
             )
 
             def _loop_body(ki, acc):
-              slot = lax.rem(ki, num_stages)
+              slot = mgpu_lib.urem(ki, num_stages)
               scale = plgpu.load(
                   w_scales_gmem.at[
-                      group_id,
-                      lax.div((ki * block_k), tile_k),
-                      slice_n,
+                      group_id, mgpu_lib.udiv(ki * block_k, tile_k), slice_n
                   ],
                   layout=_TCGEN05_ROW,
                   optimized=False,
