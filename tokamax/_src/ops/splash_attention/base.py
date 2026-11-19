@@ -19,7 +19,7 @@ from collections.abc import Callable
 import dataclasses
 import functools
 import math
-from typing import Any, Final, Literal, NotRequired, TypeAlias, TypeVar, TypedDict, cast, overload, override
+from typing import Any, ClassVar, Final, Literal, NotRequired, TypeAlias, TypeVar, TypedDict, cast, overload, override
 import jax
 from jax.experimental import shard_map
 import jax.numpy as jnp
@@ -78,24 +78,29 @@ class Mask:
   Attributes:
     bool_mask: An optional explicit 2D boolean mask.
     is_causal: Whether causal masking should be applied.
-    offset: Offset of q start with respect to kv. Only meaningful when
-      is_causal=True. Semantics match splash_attention_mask.CausalMask.offset
-      (q_idx + offset >= kv_idx). A positive offset allows queries to attend to
-      more key/value tokens (shifts triangle upward); a negative offset allows
-      fewer key/value tokens (shifts triangle downward).
+    offset: Offset of q start with respect to kv. Meaningful when
+      `is_causal=True` or `window_size` is set. Semantics match
+      splash_attention_mask.CausalMask.offset (q_idx + offset >= kv_idx).
+    window_size: Optional `(left, right)` local attention window bounds.
   """
 
   bool_mask: Bool[jax.Array, "*#B T t"] | None = None
   _: dataclasses.KW_ONLY
   is_causal: bool = dataclasses.field(default=False, metadata=dict(static=True))
   offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+  window_size: tuple[int | None, int | None] | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
   q_seq_axis: str | tuple[str, ...] | None = dataclasses.field(
       default=None, metadata=dict(static=True)
   )
 
   def __post_init__(self):
-    if self.offset != 0 and not self.is_causal:
-      raise ValueError("`offset` can only be non-zero when `is_causal=True`.")
+    if self.offset != 0 and not self.is_causal and self.window_size is None:
+      raise ValueError(
+          "`offset` can only be non-zero when `is_causal=True` or"
+          " `window_size` is set."
+      )
 
   def get_q_seq_shard_info(self) -> tuple[int, int | jax.Array]:
     """Returns (q_seq_shards, q_shard_idx) when inside a jax shard_map."""
@@ -119,37 +124,55 @@ class Mask:
     q_idx = (q_shard_idx * q_seq_len + jnp.arange(q_seq_len))[:, None]
     kv_idx = jnp.arange(kv_seq_len)[None, :]
 
-    if self.bool_mask is not None and self.is_causal:
-      return jnp.logical_and(
-          jnp.asarray(self.bool_mask), q_idx + self.offset >= kv_idx
-      )
-
-    if self.bool_mask is not None:
-      return jnp.asarray(self.bool_mask)
-
+    mask = jnp.ones((q_seq_len, kv_seq_len), dtype=jnp.bool_)
+    if self.window_size is not None:
+      left, right = self.window_size
+      if left is not None:
+        mask = jnp.logical_and(mask, q_idx + self.offset - left <= kv_idx)
+      if right is not None:
+        mask = jnp.logical_and(mask, q_idx + self.offset + right >= kv_idx)
     if self.is_causal:
-      return q_idx + self.offset >= kv_idx
-
-    return jnp.ones((q_seq_len, kv_seq_len), dtype=jnp.bool_)
+      mask = jnp.logical_and(mask, q_idx + self.offset >= kv_idx)
+    if self.bool_mask is not None:
+      mask = jnp.logical_and(jnp.asarray(self.bool_mask), mask)
+    return mask
 
   def __bool__(self) -> bool:
-    return self.bool_mask is not None or self.is_causal
+    return (
+        self.bool_mask is not None
+        or self.is_causal
+        or self.window_size is not None
+    )
 
 
 CAUSAL_MASK: Final[Mask] = Mask(is_causal=True)
 FULL_MASK: Final[Mask] = Mask()
 
 
+def _has_default_q_sequence(mask: mask_lib._ComputableMask) -> bool:  # pylint: disable=protected-access
+  return mask.q_sequence is not None and np.array_equal(
+      mask.q_sequence, np.arange(mask.shape[0], dtype=mask.q_sequence.dtype)
+  )
+
+
 def _canonicalize_mask(
     mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None,
+    *,
+    preserve_local_mask: bool = False,
 ) -> Mask:
   """Canonicalizes a mask argument."""
   if mask is None:
     return Mask()
   if isinstance(mask, (jax.Array, np.ndarray)):
     return Mask(bool_mask=mask)
-  if isinstance(mask, mask_lib.CausalMask):
+  if isinstance(mask, mask_lib.CausalMask) and _has_default_q_sequence(mask):
     return Mask(is_causal=True, offset=mask.offset)
+  if (
+      preserve_local_mask
+      and isinstance(mask, mask_lib.LocalMask)
+      and _has_default_q_sequence(mask)
+  ):
+    return Mask(window_size=mask.window_size, offset=mask.offset)
   if isinstance(mask, mask_lib.FullMask):
     return Mask()
   if isinstance(mask, mask_lib.Mask):
@@ -157,6 +180,23 @@ def _canonicalize_mask(
   if isinstance(mask, Mask):
     return mask
   raise TypeError(f"Unsupported mask type: {type(mask)}")
+
+
+def _resolve_bound_mask(
+    mask: Bool[Array, "*#B T t"] | Mask | mask_lib.Mask | None,
+    *,
+    is_causal: bool,
+    q_seq_len: int,
+    kv_seq_len: int,
+    preserve_local_mask: bool,
+) -> Mask:
+  """Canonicalizes `mask` and materializes unsupported sliding windows."""
+  if is_causal:
+    return CAUSAL_MASK
+  resolved = _canonicalize_mask(mask, preserve_local_mask=preserve_local_mask)
+  if not preserve_local_mask and resolved.window_size is not None:
+    return Mask(bool_mask=resolved.as_array(q_seq_len, kv_seq_len))
+  return resolved
 
 
 def _canonicalize_segment_ids(
@@ -196,11 +236,29 @@ def _canonicalize_segment_ids(
   raise TypeError(f"Unsupported segment ids type: {type(segment_ids)}")
 
 
+def _max_logit_value_kwarg(
+    op_self: op.Op[Any, Any, Any, Any, Any],
+    max_logit_value: Any,
+) -> dict[str, Any]:
+  """Returns `{"max_logit_value": ...}` only when supported by `_fwd`."""
+  if isinstance(
+      max_logit_value, (int, float, np.integer, np.floating)
+  ) and not isinstance(max_logit_value, bool):
+    max_logit_value = float(max_logit_value)
+  if "max_logit_value" in op_self._fwd_signature.parameters:  # pylint: disable=protected-access
+    return {"max_logit_value": max_logit_value}
+  if max_logit_value is not None:
+    raise NotImplementedError("`max_logit_value` is not supported.")
+  return {}
+
+
 @dataclasses.dataclass(frozen=True)
 class SplashAttention[_Config](
     op.Op[Any, Float[Array, "*B H T d"], Residuals, _Config, Any]
 ):
   """Tokamax operator template for Splash Attention."""
+
+  supports_analytic_local_mask: ClassVar[bool] = False
 
   def __post_init__(self):
     if self.vjp is None:
@@ -229,6 +287,9 @@ class SplashAttention[_Config](
       is_causal: bool = ...,
       mask_value: float = ...,
       attn_logits_soft_cap: float | None = ...,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = ...,
       dropout_rate: float = ...,
       prng_key: jax.Array | None = ...,
       q_sharding: jax.sharding.NamedSharding | None = ...,
@@ -256,6 +317,9 @@ class SplashAttention[_Config](
       is_causal: bool = ...,
       mask_value: float = ...,
       attn_logits_soft_cap: float | None = ...,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = ...,
       dropout_rate: float = ...,
       prng_key: jax.Array | None = ...,
       q_sharding: jax.sharding.NamedSharding | None = ...,
@@ -282,6 +346,9 @@ class SplashAttention[_Config](
       is_causal: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       q_sharding: jax.sharding.NamedSharding | None = None,
@@ -296,8 +363,9 @@ class SplashAttention[_Config](
     bound_args = self.bind(**params)
     mask = cast(Mask, bound_args.kwargs["mask"])
     segment_ids = cast(SegmentIds | None, bound_args.kwargs["segment_ids"])
+    max_logit_value = bound_args.kwargs.get("max_logit_value", max_logit_value)
 
-    def fwd_closed(q, k, v, mask, segment_ids, sinks):
+    def fwd_closed(q, k, v, mask, segment_ids, sinks, max_logit_value):
       return op.Op.__call__(
           self,
           q,
@@ -312,10 +380,15 @@ class SplashAttention[_Config](
           dropout_rate=dropout_rate,
           prng_key=prng_key,
           return_residuals=return_residuals,
+          **_max_logit_value_kwarg(self, max_logit_value),
       )
 
     if q_sharding is None:
-      return fwd_closed(q, k, v, mask, segment_ids, sinks)
+      if k_sharding is not None:
+        raise ValueError(
+            "q_sharding must be specified if k_sharding is specified."
+        )
+      return fwd_closed(q, k, v, mask, segment_ids, sinks, max_logit_value)
 
     mesh, q_spec = q_sharding.mesh, q_sharding.spec
 
@@ -331,6 +404,7 @@ class SplashAttention[_Config](
       k_batch_axes = batch_axes
       k_heads_axis = heads_axis
       seq_k_axis = None
+      k_head_dim_axis = head_dim_axis
     else:
       if q_sharding.mesh != k_sharding.mesh:
         raise ValueError("q_sharding and k_sharding must have the same mesh.")
@@ -362,10 +436,10 @@ class SplashAttention[_Config](
       return axes_spec
 
     k_axes_spec = _create_spec(
-        k_batch_axes, k_heads_axis, seq_k_axis, head_dim_axis
+        k_batch_axes, k_heads_axis, seq_k_axis, k_head_dim_axis
     )
     v_axes_spec = _create_spec(
-        k_batch_axes, k_heads_axis, seq_k_axis, head_dim_axis
+        k_batch_axes, k_heads_axis, seq_k_axis, k_head_dim_axis
     )
 
     in_axes = (
@@ -375,11 +449,19 @@ class SplashAttention[_Config](
         dataclasses.replace(mask, bool_mask=[*batch_axes, seq_q_axis, seq_k_axis]),  # pyrefly: ignore[bad-argument-type]
         SegmentIds(q=[*batch_axes, seq_q_axis], kv=[*batch_axes, seq_k_axis]),  # pyrefly: ignore[bad-argument-type]
         [*batch_axes, heads_axis],
+        [*batch_axes, heads_axis],
     )
     P = jax.sharding.PartitionSpec  # pylint: disable=invalid-name
     residual_spec = P(*batch_axes, heads_axis, seq_q_axis)
     out_specs = (P(*q_axes), residual_spec) if return_residuals else P(*q_axes)
-    is_array = lambda x: isinstance(x, jax.Array)
+    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
+
+    def bcast(x, axes):
+      return (
+          jax.lax.broadcast_to_rank(jnp.asarray(x), len(axes))
+          if is_array(x)
+          else x
+      )
 
     def spec(x, axes):
       if not is_array(x):
@@ -389,12 +471,13 @@ class SplashAttention[_Config](
 
     def fwd_sharded(*args):
       is_leaf = lambda x: x is None
+      args = jax.tree.map(bcast, args, in_axes, is_leaf=is_leaf)
       in_specs = jax.tree.map(spec, args, in_axes, is_leaf=is_leaf)
       return shard_map.shard_map(
           fwd_closed, mesh, in_specs, out_specs, check_rep=False
       )(*args)
 
-    return fwd_sharded(q, k, v, mask, segment_ids, sinks)
+    return fwd_sharded(q, k, v, mask, segment_ids, sinks, max_logit_value)
 
   def bind(
       self,
@@ -414,6 +497,9 @@ class SplashAttention[_Config](
       mask_value: float = DEFAULT_MASK_VALUE,
       is_causal: bool = False,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       q_sharding: jax.sharding.NamedSharding | None = None,
@@ -453,13 +539,17 @@ class SplashAttention[_Config](
             f" ({k.shape[-3]})."
         )
 
-    if is_causal:
-      mask = CAUSAL_MASK
-    else:
-      mask = _canonicalize_mask(mask)
+    mask = _resolve_bound_mask(
+        mask,
+        is_causal=is_causal,
+        q_seq_len=q.shape[-2],
+        kv_seq_len=k.shape[-2],
+        preserve_local_mask=self.supports_analytic_local_mask,
+    )
     segment_ids = _canonicalize_segment_ids(segment_ids)
 
-    return super().bind(
+    return op.Op.bind(
+        self,
         q,
         k,
         v,
@@ -472,6 +562,7 @@ class SplashAttention[_Config](
         dropout_rate=dropout_rate,
         prng_key=prng_key,
         return_residuals=return_residuals,
+        **_max_logit_value_kwarg(self, max_logit_value),
     )
 
   @override
@@ -488,6 +579,9 @@ class SplashAttention[_Config](
       is_mqa: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
@@ -530,8 +624,15 @@ class SplashAttention[_Config](
           else segment_ids.kv,
       )
     sinks = broadcast_to_rank(sinks, q.ndim - 2)
+    max_logit_val = None
+    if max_logit_value is not None:
+      max_logit_val = jnp.broadcast_to(
+          jnp.asarray(max_logit_value, dtype=jnp.float32), q.shape[:-2]
+      )
 
-    def single_fwd(q, k, v, mask, segment_ids, sinks, dropout_mask):
+    def single_fwd(
+        q, k, v, mask, segment_ids, sinks, dropout_mask, max_logit_val
+    ):
       return reference.attention_reference(
           q=q,
           k=k,
@@ -544,11 +645,19 @@ class SplashAttention[_Config](
           mask_value=mask_value,
           save_residuals=return_residuals,
           attn_logits_soft_cap=attn_logits_soft_cap,
+          max_logit_value=max_logit_val,
           dropout_rate=dropout_rate,
       )
 
     out = vmap_batch_dims(single_fwd)(
-        q, k_in, v_in, mask_array, segment_ids, sinks, dropout_mask
+        q,
+        k_in,
+        v_in,
+        mask_array,
+        segment_ids,
+        sinks,
+        dropout_mask,
+        max_logit_val,
     )
     if return_residuals:
       out, stats = out
@@ -569,6 +678,8 @@ class SplashAttentionVjp[_Config](
     op.Op[Any, SplashAttentionGrads, None, _Config, Any]
 ):
   """Splash attention VJP."""
+
+  supports_analytic_local_mask: ClassVar[bool] = False
 
   def bind(
       self,
@@ -591,6 +702,9 @@ class SplashAttentionVjp[_Config](
       mask_value: float = DEFAULT_MASK_VALUE,
       is_causal: bool = False,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
@@ -625,13 +739,17 @@ class SplashAttentionVjp[_Config](
             f" ({k.shape[-3]})."
         )
 
-    if is_causal:
-      mask = CAUSAL_MASK
-    else:
-      mask = _canonicalize_mask(mask)
+    mask = _resolve_bound_mask(
+        mask,
+        is_causal=is_causal,
+        q_seq_len=q.shape[-2],
+        kv_seq_len=k.shape[-2],
+        preserve_local_mask=self.supports_analytic_local_mask,
+    )
     segment_ids = _canonicalize_segment_ids(segment_ids)
 
-    return super().bind(
+    return op.Op.bind(
+        self,
         residuals,
         out,
         dout,
@@ -647,6 +765,7 @@ class SplashAttentionVjp[_Config](
         dropout_rate=dropout_rate,
         prng_key=prng_key,
         return_residuals=return_residuals,
+        **_max_logit_value_kwarg(self, max_logit_value),
     )
 
   @jaxtyping.jaxtyped
@@ -666,13 +785,16 @@ class SplashAttentionVjp[_Config](
       is_mqa: bool = False,
       mask_value: float = DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: _Config,
   ) -> tuple[SplashAttentionGrads, None]:
     """Computes attention VJP."""
-    del config
+    del config, max_logit_value
 
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported in VJP.")

@@ -20,11 +20,11 @@ from typing import Annotated, Any, ClassVar, override
 
 import immutabledict
 import jax
-import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src import quantization
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
@@ -51,6 +51,10 @@ class Config:
   v_layout: splash.QKVLayout
   use_experimental_scheduler: bool
   use_base2_exp: bool = True
+  max_logit_const: float | None = None
+  fuse_reciprocal: bool = True
+  residual_checkpoint_name: str | None = None
+  fold_q_seq_heads: bool = False
 
   def __post_init__(self):
     if self.block_kv % self.block_kv_compute:
@@ -66,13 +70,32 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
 
+  def _default_vjp(
+      self,
+  ) -> pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp:
+    if self.config is None:
+      return pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp()
+    return pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp(
+        q_layout=self.config.q_layout,
+        k_layout=self.config.k_layout,
+        v_layout=self.config.v_layout,
+        use_base2_exp=self.config.use_base2_exp,
+        fold_q_seq_heads=self.config.fold_q_seq_heads,
+    )
+
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(
-          self,
-          "vjp",
-          pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp(),
-      )
+      object.__setattr__(self, "vjp", self._default_vjp())
+
+  @override
+  def replace(self, **kwargs):
+    if (
+        "config" in kwargs
+        and "vjp" not in kwargs
+        and self.vjp == self._default_vjp()
+    ):
+      return dataclasses.replace(self, **kwargs, vjp=None)
+    return base.DotProductAttention.replace(self, **kwargs)
 
   @jaxtyping.jaxtyped
   @override
@@ -87,6 +110,9 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: base.Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -98,6 +124,12 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
       config: Config,
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     """Performs attention, optionally returning softmax residuals."""
+    if not normalize_output:
+      raise NotImplementedError("`normalize_output=False` not supported.")
+    if config.max_logit_const is not None and max_logit_value is not None:
+      raise ValueError(
+          "Cannot set both `config.max_logit_const` and `max_logit_value`."
+      )
     common.check_inputs_support(
         q,
         k,
@@ -108,6 +140,8 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         dropout_rate=dropout_rate,
         paging_info=paging_info,
         mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
     )
 
     q = quantization.as_array(q)
@@ -128,10 +162,15 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
+    config_dict = dataclasses.asdict(config)
+    fold_q_seq_heads = config_dict.pop("fold_q_seq_heads")
+    if fold_q_seq_heads:
+      common.sp_vjp.check_fold_q_seq_heads(num_q_heads, num_kv_heads, is_mqa)
+      q = common.sp_vjp.fold_q_heads(q)
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
-        **dataclasses.asdict(config),
+        **config_dict,
     )
     splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
@@ -140,22 +179,47 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
         kv_seq_len=kv_seq_len,
         is_mqa=is_mqa,
         save_residuals=return_residuals,
+        fold_q_seq_heads=fold_q_seq_heads,
     )
     if is_mqa:
       k = jnp.squeeze(k, axis=1)
       v = jnp.squeeze(v, axis=1)
 
-    def splash_fn(q, k, v, mask):
-      return splash_maker(mask=mask)(q, k, v)
+    if max_logit_value is None:
+      max_logit_val = None
+      max_logit_in_axis = None
+    else:
+      max_logit_arr = jnp.asarray(max_logit_value, dtype=jnp.float32)
+      if (
+          fold_q_seq_heads
+          and max_logit_arr.ndim > 0
+          and max_logit_arr.shape[-1] != 1
+      ):
+        raise NotImplementedError(
+            "`fold_q_seq_heads` requires `max_logit_value` to be scalar or"
+            " broadcastable along heads."
+        )
+      max_logit_val = jnp.broadcast_to(
+          max_logit_arr, (*orig_q_shape[:-3], q.shape[1])
+      ).reshape(q.shape[0], q.shape[1])
+      max_logit_in_axis = 0
+
+    def splash_fn(q, k, v, mask, max_logit_val):
+      return splash_maker(mask=mask)(q, k, v, max_logit_value=max_logit_val)
 
     mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
-    splash_output = jax.vmap(splash_fn, in_axes=(0, 0, 0, mask_in_axes))(
-        q, k, v, splash_mask
-    )
+    splash_output = jax.vmap(
+        splash_fn, in_axes=(0, 0, 0, mask_in_axes, max_logit_in_axis)
+    )(q, k, v, splash_mask, max_logit_val)
 
     if return_residuals:
       out, stats = splash_output
-      residuals = (stats["max_logits"], stats["logsumexp"])
+      max_logits = stats["max_logits"]
+      logsumexp = stats["logsumexp"]
+      if fold_q_seq_heads:
+        max_logits = common.sp_vjp.unfold_q_residuals(max_logits)
+        logsumexp = common.sp_vjp.unfold_q_residuals(logsumexp)
+      residuals = (max_logits, logsumexp)
       # Restore the original batch dimensions (*B) and head/sequence structure
       # (H, T).
       # Input q is [*B, T, H, D]. Target residuals are [*B, H, T].
@@ -169,6 +233,8 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
     else:
       out = splash_output
       residuals = None
+    if fold_q_seq_heads:
+      out = common.sp_vjp.unfold_q_heads(out)
     out = jnp.swapaxes(out, 1, 2)
     # Reshape back to original shape.
     out = out.reshape(*orig_q_shape[:-1], out.shape[-1])[..., :head_dim_out]
@@ -237,4 +303,4 @@ class PallasMosaicTpuFlashAttention(base.DotProductAttention[Config, Key]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

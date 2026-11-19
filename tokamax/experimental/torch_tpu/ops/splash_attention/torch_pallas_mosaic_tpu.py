@@ -16,6 +16,7 @@
 
 from collections.abc import Sequence
 import dataclasses
+import struct
 from typing import Any
 import jax
 from tokamax._src.ops.splash_attention import base as jax_base
@@ -31,6 +32,21 @@ QKVLayout = jax_pallas_mosaic_tpu.QKVLayout
 PallasMosaicTpuSplashAttentionVjp = (
     torch_pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp
 )
+_EXPECTED_FWD_CONFIG_FIELDS = 18
+_FWD_CONFIG_PREFIX_LEN = 19
+
+
+def _encode_optional_float(value: float | None) -> tuple[int, int]:
+  if value is None:
+    return (0, 0)
+  bits = struct.unpack("<q", struct.pack("<d", float(value)))[0]
+  return (1, bits)
+
+
+def _decode_optional_float(has_value: int, bits: int) -> float | None:
+  if not has_value:
+    return None
+  return struct.unpack("<d", struct.pack("<q", int(bits)))[0]
 
 
 class _PallasMosaicTpuSplashAttention(
@@ -52,10 +68,14 @@ class _PallasMosaicTpuSplashAttention(
   ) -> tuple[int, ...] | None:
     if config is None:
       return None
-    assert len(dataclasses.fields(config)) == 14, (
-        "Expected 14 fields in fwd config, got"
+    assert len(dataclasses.fields(config)) == _EXPECTED_FWD_CONFIG_FIELDS, (
+        f"Expected {_EXPECTED_FWD_CONFIG_FIELDS} fields in fwd config, got"
         f" {len(dataclasses.fields(config))}."
     )
+    has_mlc, mlc_bits = _encode_optional_float(config.max_logit_const)
+    name = config.residual_checkpoint_name
+    has_name = 0 if name is None else 1
+    name_bytes = () if name is None else tuple(name.encode("utf-8"))
     return (
         config.block_q,
         config.block_kv,
@@ -71,14 +91,32 @@ class _PallasMosaicTpuSplashAttention(
         config.qk_diag_grid,
         int(config.sv_diag_skip),
         int(config.diag_band_skip),
+        has_mlc,
+        mlc_bits,
+        int(config.fuse_reciprocal),
+        int(config.fold_q_seq_heads),
+        has_name,
+        *name_bytes,
     )
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
     config = config_parts[0]
     assert config is not None, "Forward config not set."
-    assert len(config) == 14, (
-        f"Expected 14 elements in fwd config, got {len(config)}."
+    assert len(config) >= _FWD_CONFIG_PREFIX_LEN, (
+        f"Expected at least {_FWD_CONFIG_PREFIX_LEN} elements in fwd config,"
+        f" got {len(config)}."
+    )
+    has_name = bool(config[18])
+    if not has_name:
+      assert len(config) == _FWD_CONFIG_PREFIX_LEN, (
+          f"Expected {_FWD_CONFIG_PREFIX_LEN} elements in fwd config when"
+          f" residual_checkpoint_name is None, got {len(config)}."
+      )
+    residual_checkpoint_name = (
+        bytes(int(b) for b in config[_FWD_CONFIG_PREFIX_LEN:]).decode("utf-8")
+        if has_name
+        else None
     )
     return Config(
         block_q=int(config[0]),
@@ -95,6 +133,12 @@ class _PallasMosaicTpuSplashAttention(
         qk_diag_grid=int(config[11]),
         sv_diag_skip=bool(config[12]),
         diag_band_skip=bool(config[13]),
+        max_logit_const=_decode_optional_float(
+            int(config[14]), int(config[15])
+        ),
+        fuse_reciprocal=bool(config[16]),
+        fold_q_seq_heads=bool(config[17]),
+        residual_checkpoint_name=residual_checkpoint_name,
     )
 
   @override

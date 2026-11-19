@@ -53,6 +53,9 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -67,6 +70,8 @@ class WrappedFlexAttention(attn_base.DotProductAttention[op.NullConfig, None]):
 
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
 
     def score_mod(logits):
       logits = logits.astype(logits_dtype) * logits_scale

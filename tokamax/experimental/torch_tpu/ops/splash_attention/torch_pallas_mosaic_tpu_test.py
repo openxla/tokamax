@@ -363,6 +363,189 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         v_torch.grad, v_expected.grad, rtol=1e-4, atol=1e-4
     )
 
+  def test_config_roundtrip_and_seq_minor_options(self):
+    op_splash = torch_pallas_mosaic_tpu.PallasMosaicTpuSplashAttention
+    seq_minor = torch_pallas_mosaic_tpu.QKVLayout.SEQ_MINOR
+    fwd_cfg = torch_pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_experimental_scheduler=True,
+        use_base2_exp=False,
+        max_logit_const=12.5,
+        fuse_reciprocal=False,
+        residual_checkpoint_name="splash_res",
+    )
+    bwd_cfg = torch_pallas_mosaic_tpu.VjpConfig(
+        block_q_dkv=128,
+        block_kv_dkv=128,
+        block_kv_dkv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_base2_exp=False,
+    )
+    self.assertEqual(
+        op_splash.reconstruct_config(op_splash.deconstruct_config(fwd_cfg)),
+        fwd_cfg,
+    )
+    default_mlc_cfg = torch_pallas_mosaic_tpu.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_experimental_scheduler=True,
+    )
+    self.assertEqual(
+        op_splash.reconstruct_config(
+            op_splash.deconstruct_config(default_mlc_cfg)
+        ),
+        default_mlc_cfg,
+    )
+
+    device = "tpu"
+    q_torch = (
+        torch.randn((4, 128, 64), dtype=torch.float32, device=device) * 0.25
+    ).requires_grad_(True)
+    k_torch = (
+        torch.randn((4, 128, 64), dtype=torch.float32, device=device) * 0.25
+    ).requires_grad_(True)
+    v_torch = torch.randn(
+        (4, 128, 64), dtype=torch.float32, device=device, requires_grad=True
+    )
+    do_torch = torch.randn((4, 128, 64), dtype=torch.float32, device=device)
+
+    out_torch = op_splash(
+        q_torch,
+        k_torch,
+        v_torch,
+        mask=torch_base.CAUSAL_MASK,
+        configs=(fwd_cfg, bwd_cfg),
+    )
+    out_torch.backward(do_torch)
+
+    jax_op = jax_pallas_mosaic_tpu.PallasMosaicTpuSplashAttention(
+        config=fwd_cfg
+    )
+    q_jax = jnp.array(q_torch.detach().cpu().numpy(), dtype=jnp.float32)
+    k_jax = jnp.array(k_torch.detach().cpu().numpy(), dtype=jnp.float32)
+    v_jax = jnp.array(v_torch.detach().cpu().numpy(), dtype=jnp.float32)
+    do_jax = jnp.array(do_torch.detach().cpu().numpy(), dtype=jnp.float32)
+    out_jax, vjp_fn = jax.vjp(
+        functools.partial(jax_op, mask=jax_base.CAUSAL_MASK),
+        q_jax,
+        k_jax,
+        v_jax,
+    )
+    dq_jax, dk_jax, dv_jax = vjp_fn(do_jax)
+    torch.testing.assert_close(
+        out_torch,
+        torch.as_tensor(np.asarray(out_jax), device=device),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    torch.testing.assert_close(
+        q_torch.grad,
+        torch.as_tensor(np.asarray(dq_jax), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    torch.testing.assert_close(
+        k_torch.grad,
+        torch.as_tensor(np.asarray(dk_jax), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    torch.testing.assert_close(
+        v_torch.grad,
+        torch.as_tensor(np.asarray(dv_jax), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+    folded_fwd = torch_pallas_mosaic_tpu.Config(
+        block_q=256,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_experimental_scheduler=True,
+        fold_q_seq_heads=True,
+    )
+    folded_bwd = torch_pallas_mosaic_tpu.VjpConfig(
+        block_q_dkv=256,
+        block_kv_dkv=128,
+        block_kv_dkv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        fold_q_seq_heads=True,
+    )
+    self.assertEqual(
+        op_splash.reconstruct_config(op_splash.deconstruct_config(folded_fwd)),
+        folded_fwd,
+    )
+    q_gqa = torch.randn(
+        (4, 128, 64), dtype=torch.float32, device=device, requires_grad=True
+    )
+    k_gqa = torch.randn(
+        (2, 128, 64), dtype=torch.float32, device=device, requires_grad=True
+    )
+    v_gqa = torch.randn(
+        (2, 128, 64), dtype=torch.float32, device=device, requires_grad=True
+    )
+    do_gqa = torch.randn((4, 128, 64), dtype=torch.float32, device=device)
+    out_folded = op_splash(
+        q_gqa,
+        k_gqa,
+        v_gqa,
+        mask=torch_base.CAUSAL_MASK,
+        configs=(folded_fwd, folded_bwd),
+    )
+    out_folded.backward(do_gqa)
+    jax_folded = jax_pallas_mosaic_tpu.PallasMosaicTpuSplashAttention(
+        config=folded_fwd
+    )
+    out_jax_f, vjp_jax_f = jax.vjp(
+        functools.partial(jax_folded, mask=jax_base.CAUSAL_MASK),
+        jnp.array(q_gqa.detach().cpu().numpy(), dtype=jnp.float32),
+        jnp.array(k_gqa.detach().cpu().numpy(), dtype=jnp.float32),
+        jnp.array(v_gqa.detach().cpu().numpy(), dtype=jnp.float32),
+    )
+    dq_f, dk_f, dv_f = vjp_jax_f(
+        jnp.array(do_gqa.detach().cpu().numpy(), dtype=jnp.float32)
+    )
+    torch.testing.assert_close(
+        out_folded,
+        torch.as_tensor(np.asarray(out_jax_f), device=device),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    torch.testing.assert_close(
+        q_gqa.grad,
+        torch.as_tensor(np.asarray(dq_f), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    torch.testing.assert_close(
+        k_gqa.grad,
+        torch.as_tensor(np.asarray(dk_f), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    torch.testing.assert_close(
+        v_gqa.grad,
+        torch.as_tensor(np.asarray(dv_f), device=device),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

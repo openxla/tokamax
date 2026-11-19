@@ -293,6 +293,22 @@ class PallasMosaicTpuSplashAttentionVjpTest(parameterized.TestCase):
     self.assertEqual(dv.shape, (4, 128, 64))
     self.assertIsNone(dsinks)
 
+  def test_bwd_config_roundtrip_preserves_layouts(self):
+    vjp_op = torch_pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp
+    cfg = torch_pallas_mosaic_tpu_vjp.Config(
+        block_q_dkv=128,
+        block_kv_dkv=128,
+        block_kv_dkv_compute=128,
+        q_layout=torch_pallas_mosaic_tpu_vjp.QKVLayout.SEQ_MINOR,
+        k_layout=torch_pallas_mosaic_tpu_vjp.QKVLayout.SEQ_MINOR,
+        v_layout=torch_pallas_mosaic_tpu_vjp.QKVLayout.HEAD_DIM_MINOR,
+        use_base2_exp=False,
+        dq_reduction_steps=3,
+        fold_q_seq_heads=True,
+    )
+    deconstructed = vjp_op.deconstruct_config(cfg)
+    self.assertEqual(vjp_op.reconstruct_config(deconstructed), cfg)
+
 
 if __name__ == "__main__":
   absltest.main()
