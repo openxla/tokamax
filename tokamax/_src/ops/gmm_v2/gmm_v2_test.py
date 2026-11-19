@@ -2547,8 +2547,8 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
     self.assertEqual(tiles_tight.tile_k, tiles_large.tile_k)
 
 
-class GmmV2GroupOffsetCpuTest(parameterized.TestCase):
-  """CPU tests for group_offset normalization in gmm_v2 and tgmm_v2."""
+class GmmV2GroupOffsetNormalizationTest(parameterized.TestCase):
+  """Tests for group_offset normalization in gmm_v2 and tgmm_v2."""
 
   def test_validate_tgmm_inputs(self):
     group_sizes = jnp.array([32, 32, 32], dtype=jnp.int32)
@@ -2568,59 +2568,11 @@ class GmmV2GroupOffsetCpuTest(parameterized.TestCase):
       (jnp.int32(1), 1),
       (jnp.array([1], dtype=jnp.int32), 1),
   )
-  def test_kernel_entries_normalize_group_offset(self, offset, expected):
-    lhs = jnp.zeros((128, 128), dtype=jnp.bfloat16)
-    rhs = jnp.zeros((2, 128, 128), dtype=jnp.bfloat16)
-    out_grad = jnp.zeros((128, 128), dtype=jnp.bfloat16)
-    group_sizes = jnp.array([64, 32, 32], dtype=jnp.int32)
-    tiles = gmm_v2.TileSizes(
-        tile_m=128, tile_k=128, tile_n=128, bucket_base=128
-    )
-    seen = []
-
-    tpu_info = mock.MagicMock(
-        num_lanes=128, mxu_column_size=128, vmem_capacity_bytes=16 * 1024 * 1024
-    )
-    tpu_info.get_sublane_tiling.return_value = 8
-
-    def fake_kernel(*args, out_type, **kwargs):
-      del args, kwargs
-
-      def runner(gs, group_offset, *_):
-        del gs
-        seen.append(group_offset)
-        return jnp.zeros(out_type.shape, dtype=out_type.dtype)
-
-      return runner
-
-    with (
-        mock.patch.object(gmm_v2.pltpu, "get_tpu_info", return_value=tpu_info),
-        mock.patch.object(
-            gmm_v2.pltpu,
-            "with_memory_space_constraint",
-            side_effect=lambda x, _: x,
-        ),
-        mock.patch.object(gmm_v2.pltpu, "TensorCoreMesh"),
-        mock.patch.object(gmm_v2.pl, "kernel", side_effect=fake_kernel),
-    ):
-      gmm_v2.gmm_v2.__wrapped__(
-          lhs, rhs, group_sizes, group_offset=offset, tile_info=tiles
-      )
-      tgmm_v2.tgmm_v2.__wrapped__(
-          lhs,
-          out_grad,
-          group_sizes,
-          2,
-          group_offset=offset,
-          tile_info=tiles,
-          preferred_element_type=jnp.bfloat16,
-      )
-
-    self.assertLen(seen, 2)
-    for actual in seen:
-      self.assertEqual(actual.shape, (1,))
-      self.assertEqual(actual.dtype, jnp.int32)
-      self.assertEqual(int(actual[0]), expected)
+  def test_normalize_group_offset(self, offset, expected):
+    actual = gmm_v2.normalize_group_offset(offset)
+    self.assertEqual(actual.shape, (1,))
+    self.assertEqual(actual.dtype, jnp.int32)
+    self.assertEqual(int(actual[0]), expected)
 
 
 class GmmV2VmemStressTest(parameterized.TestCase):

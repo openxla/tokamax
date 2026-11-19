@@ -742,10 +742,7 @@ def validate_tgmm_inputs(
     num_actual_groups: The number of actual groups.
     group_offset: An optional offset for the group indices.
   """
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  elif jnp.isscalar(group_offset):
-    group_offset = jnp.asarray(group_offset, dtype=jnp.int32).reshape((1,))
+  group_offset = gmm_v2.normalize_group_offset(group_offset)
   if group_sizes.size < group_offset[0] + num_actual_groups:
     raise ValueError(
         f"group_sizes.size ({group_sizes.size}) must be >= group_offset"
@@ -811,12 +808,7 @@ def tgmm_v2(
     [num_actual_groups, size_k, size_n].
   """
   del precision
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  elif jnp.isscalar(group_offset):
-    # Also accept a Python int or 0-d array (e.g. under `jax.disable_jit()`,
-    # where it is not traced).
-    group_offset = jnp.asarray(group_offset, dtype=jnp.int32).reshape((1,))
+  group_offset = gmm_v2.normalize_group_offset(group_offset)
   if vmem_limit_bytes is None:
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
