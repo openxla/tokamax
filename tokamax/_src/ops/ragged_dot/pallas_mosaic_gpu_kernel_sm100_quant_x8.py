@@ -267,7 +267,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
   m, k_x = lhs.shape
   tile_k = k_w // w_scales.shape[1]
 
-  use_prefill_config = m >= 8192
+  use_prefill_config = cluster_block_m >= 64 and m >= 8192
   if use_prefill_config:
     logging.info("Using prefill config for m = %d", m)
     kernel_config = PREFILL_CONFIG
@@ -363,6 +363,25 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
       out_dtype=out_dtype,
       deq_wg=_DEQ_WG,
   )
+  if not use_prefill_config and (data_stages == 0 or deq_stages == 0):
+    kernel_config = PREFILL_CONFIG
+    _DEQ_WG = kernel_config.deq_wg  # pylint: disable=invalid-name
+    _MAIN_WG = _DEQ_WG  # pylint: disable=invalid-name
+    _STORE_WG = _MAIN_WG + 1  # pylint: disable=invalid-name
+    data_stages, scale_stages, deq_stages, acc_stages = _compute_stages(
+        block_m,
+        block_n,
+        2 if collective else 1,
+        block_k,
+        x_dtype=lhs.qtype,
+        w_dtype=rhs.qtype,
+        ws_dtype=rhs.scale.dtype,
+        xs_dtype=lhs.scale.dtype,
+        xsum_dtype=jnp.float32 if is_fp8 else None,
+        acc_dtype=acc_tmem_dtype,
+        out_dtype=out_dtype,
+        deq_wg=_DEQ_WG,
+    )
 
   # data_stages, scale_stages, deq_stages, acc_stages = 4, 4, 2, 2
   logging.info(
@@ -417,6 +436,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
     raise NotImplementedError(
         f"tile_xk must be a multiple of block_k, got: {tile_xk=} {block_k=}."
     )
+  k_iters_per_subchannel = tile_xk // block_k
 
   n_iters = pl.cdiv(n, cluster_block_n)
   align_tile = 8
@@ -475,6 +495,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
     linear_grid = m_iters * n_iters
     m, k = x_gmem.shape
     num_k_iters = pl.cdiv(k, block_k)
+    num_subchannels = num_k_iters // k_iters_per_subchannel
     cluster_idx = lax.axis_index("x")
     is_lead_block = cluster_idx == 0
 
@@ -553,21 +574,21 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
           @pl.when(warp_id == _SCALE_TMA_WARP)
           def ws_tma_warp():
 
-            def do_tma_ws(ki, slot):
+            def do_tma_ws(si, slot):
               plgpu.copy_gmem_to_smem(
                   w_scales_gmem.at[
                       group_id,
-                      mgpu_lib.udiv(ki, tile_k // block_k),
+                      mgpu_lib.udiv(si, tile_k // tile_xk),
                       slice_n,
                   ],
                   ws_smem.at[slot],
                   xws_barrier.at[slot],
               )
 
-            def do_tma_xs(ki, slot):
+            def do_tma_xs(si, slot):
               plgpu.copy_gmem_to_smem(
                   x_scales_gmem.at[
-                      mgpu_lib.udiv(ki, tile_xk // block_k),
+                      si,
                       pl.ds(block_start, max(cluster_block_m, 64)),
                   ],
                   xs_smem.at[slot],
@@ -576,24 +597,24 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
               if is_fp8:
                 plgpu.copy_gmem_to_smem(
                     x_sum_gmem.at[
-                        mgpu_lib.udiv(ki, tile_xk // block_k),
+                        si,
                         pl.ds(block_start, max(cluster_block_m, 64)),
                     ],
                     x_sum_smem.at[slot],
                     xws_barrier.at[slot],
                 )
 
-            @pl.loop(0, num_k_iters)
-            def _tma_ws_loop(ki):
-              global_ki = ki + local_index * num_k_iters
-              slot = mgpu_lib.urem(global_ki, scale_stages)
+            @pl.loop(0, num_subchannels)
+            def _tma_ws_loop(si):
+              global_si = si + local_index * num_subchannels
+              slot = mgpu_lib.urem(global_si, scale_stages)
 
-              @pl.when(global_ki >= scale_stages)
+              @pl.when(global_si >= scale_stages)
               def _():
                 plgpu.barrier_wait(xws_consumed_barrier.at[slot])
 
-              do_tma_ws(ki, slot)
-              do_tma_xs(ki, slot)
+              do_tma_ws(si, slot)
+              do_tma_xs(si, slot)
 
           @pl.when((warp_id == _MMA_WARP) & is_lead_block)
           def mma_warp():
@@ -603,9 +624,24 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
               global_ki = ki + local_index * num_k_iters
               x_slot = mgpu_lib.urem(global_ki, data_stages)
               w_slot = mgpu_lib.urem(global_ki, deq_stages)
-              acc_slot = mgpu_lib.urem(global_ki, acc_stages)
+              si = (
+                  ki
+                  if k_iters_per_subchannel == 1
+                  else mgpu_lib.udiv(ki, k_iters_per_subchannel)
+              )
+              sub_step = (
+                  0
+                  if k_iters_per_subchannel == 1
+                  else mgpu_lib.urem(ki, k_iters_per_subchannel)
+              )
+              global_si = si + local_index * num_subchannels
+              acc_slot = mgpu_lib.urem(global_si, acc_stages)
 
-              @pl.when(global_ki >= acc_stages)
+              @pl.when(
+                  global_si >= acc_stages
+                  if k_iters_per_subchannel == 1
+                  else (sub_step == 0) & (global_si >= acc_stages)
+              )
               def _():
                 with jax.named_scope("wait_acc_consumed"):
                   plgpu.barrier_wait(acc_consumed_barrier.at[acc_slot])
@@ -622,12 +658,19 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
                   w_tmem.at[:, pl.ds(w_slot * block_k, block_k)],
                   x_smem.at[x_slot].T,
                   w_tmem_consumed_barrier.at[w_slot],
-                  accumulate=False,
+                  accumulate=(
+                      False if k_iters_per_subchannel == 1 else (sub_step > 0)
+                  ),
                   collective_axis="x" if collective else None,
               )
               plgpu.tcgen05_commit_arrive(
                   acc_ready_barrier.at[acc_slot],
                   collective_axis="x" if collective else None,
+                  predicate=(
+                      None
+                      if k_iters_per_subchannel == 1
+                      else (sub_step == k_iters_per_subchannel - 1)
+                  ),
               )
 
               plgpu.tcgen05_commit_arrive(
@@ -703,10 +746,10 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             _TCGEN05,
         )
 
-        def _loop_body(ki, acc_carry):
-          global_ki = ki + local_index * num_k_iters
-          scale_slot = mgpu_lib.urem(global_ki, scale_stages)
-          acc_slot = mgpu_lib.urem(global_ki, acc_stages)
+        def _loop_body(si, acc_carry):
+          global_si = si + local_index * num_subchannels
+          scale_slot = mgpu_lib.urem(global_si, scale_stages)
+          acc_slot = mgpu_lib.urem(global_si, acc_stages)
 
           with jax.named_scope("wait_scales"):
             plgpu.barrier_wait(xws_barrier.at[scale_slot])
@@ -737,14 +780,8 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
           with jax.named_scope("rescale_acc"):
             if is_fp8:
               assert x_sum is not None
-              k_iters_per_subchannel = tile_xk // block_k
-              apply_bias = mgpu_lib.urem(ki, k_iters_per_subchannel) == 0
-              apply_bias_coef = lax.broadcast_in_dim(
-                  apply_bias.astype(x_sum.dtype), x_sum.shape, ()
-              )
-              bias_val = -8 * x_sum * apply_bias_coef
               int_bias = plgpu.layout_cast(
-                  lax.broadcast_in_dim(bias_val, acc.shape, [1]),
+                  lax.broadcast_in_dim(-8 * x_sum, acc.shape, [1]),
                   _TCGEN05,
               )
               acc = acc * 512 + int_bias
@@ -756,7 +793,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             )
             return acc_carry + acc.astype(acc_dtype) * (ws * x_scale)
 
-        acc_carry = lax.fori_loop(0, num_k_iters, _loop_body, acc_carry)
+        acc_carry = lax.fori_loop(0, num_subchannels, _loop_body, acc_carry)
         if activation is not None:
           acc_carry = activation(acc_carry)
 
