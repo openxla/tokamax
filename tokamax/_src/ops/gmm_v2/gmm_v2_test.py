@@ -150,7 +150,7 @@ def reference_tgmm(
       if rhs_scale is None:
         out.append(lhs[:, start:end] @ rhs[start:end, :])
       else:
-        # rhs_scale.shape==(1, 1, N).
+        # rhs_scale.shape is (1, 1, N) (pooled) or (num_actual_groups, 1, N).
         partial = jax.lax.dot_general(
             lhs[:, start:end].astype(jnp.float32),
             rhs[start:end, :].astype(jnp.float32),
@@ -158,7 +158,8 @@ def reference_tgmm(
             preferred_element_type=jnp.float32,
             precision=jax.lax.Precision.HIGHEST,
         )
-        partial *= rhs_scale[0]  # rhs_scale[0]: shape [1, N]
+        scale_idx = 0 if rhs_scale.shape[0] == 1 else group
+        partial *= rhs_scale[scale_idx]  # shape [1, N]
         output_dtype = out_dtype if out_dtype is not None else lhs.dtype
         out.append(partial.astype(output_dtype))
     start = end
@@ -1242,6 +1243,134 @@ class GmmTest(parameterized.TestCase):
         )
       self.assertEqual(actual.shape, (num_groups, in_size, out_size))
       chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+
+  @parameterized.product(
+      batch_size=[128, 512],
+      in_size=[256],
+      out_size=[256],
+      num_groups=[16],
+      group_offset=[0, 2],
+      dtype_pair=[
+          (jnp.float8_e4m3fn, jnp.float8_e5m2),
+          (jnp.float8_e4m3fn, jnp.float8_e4m3fn),
+      ],
+  )
+  def test_tgmm_with_per_group_rhs_scale(
+      self, batch_size, in_size, out_size, num_groups, group_offset, dtype_pair
+  ):
+    lhs_dtype, rhs_quant_dtype = dtype_pair
+    num_local_groups = num_groups - group_offset
+
+    key1, key2, key3 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(
+        key1, (batch_size, in_size), dtype=jnp.bfloat16
+    ).astype(lhs_dtype)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
+    grad_q, base_scale = quantize_tensor(
+        grad,
+        rhs_quant_dtype,
+        axis=0,
+        block_size=batch_size,
+    )
+    grad_scale = base_scale[None, :, :] * jax.random.uniform(
+        key3, (num_local_groups, 1, out_size), dtype=jnp.float32, minval=0.5, maxval=1.5
+    )
+
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    # Ensure at least one empty local group when num_local_groups > 1.
+    if num_local_groups > 1:
+      moved = group_sizes[group_offset]
+      group_sizes = group_sizes.at[group_offset].set(0)
+      group_sizes = group_sizes.at[group_offset + 1].add(moved)
+    group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad_q,
+        group_sizes,
+        num_local_groups,
+        rhs_scale=grad_scale,
+        group_offset=group_offset_arr,
+        out_dtype=jnp.dtype(jnp.bfloat16),
+    )
+    tgmm_v2.validate_tgmm_inputs(
+        group_sizes, num_local_groups, group_offset_arr
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad_q,
+        group_sizes,
+        num_local_groups,
+        rhs_scale=grad_scale,
+        group_offset=group_offset_arr,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
+    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+
+  def test_tgmm_with_per_group_rhs_scale_n_padding(self):
+    batch_size, in_size, out_size = 128, 256, 300
+    num_groups = 4
+    key1, key2, key3 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(
+        key1, (batch_size, in_size), dtype=jnp.bfloat16
+    ).astype(jnp.float8_e4m3fn)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.float32)
+    grad_q, base_scale = quantize_tensor(
+        grad, jnp.dtype(jnp.float8_e5m2), axis=0, block_size=batch_size
+    )
+    grad_scale = base_scale[None, :, :] * jax.random.uniform(
+        key3, (num_groups, 1, out_size), dtype=jnp.float32, minval=0.5, maxval=1.5
+    )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+    expected = reference_tgmm(
+        lhs.swapaxes(0, 1),
+        grad_q,
+        group_sizes,
+        num_groups,
+        rhs_scale=grad_scale,
+        out_dtype=jnp.dtype(jnp.bfloat16),
+    )
+    tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        actual = tgmm_v2.tgmm_v2(
+            lhs,
+            grad_q,
+            group_sizes,
+            num_groups,
+            rhs_scale=grad_scale,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+      self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+      chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+
+  @parameterized.parameters(
+      (5, 1, 256),  # mismatched leading dim (num_groups=4)
+      (4, 2, 256),  # non-unit middle dim
+      (4, 1, 255),  # mismatched size_n
+      (1, 256),     # wrong ndim
+  )
+  def test_tgmm_with_invalid_rhs_scale_shape(self, *scale_shape):
+    batch_size, in_size, out_size, num_groups = 128, 256, 256, 4
+    lhs = jnp.ones((batch_size, in_size), dtype=jnp.float8_e4m3fn)
+    rhs = jnp.ones((batch_size, out_size), dtype=jnp.float8_e5m2)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    rhs_scale = jnp.ones(scale_shape, dtype=jnp.float32)
+    with self.assertRaises((ValueError, NotImplementedError)):
+      tgmm_v2.tgmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          num_groups,
+          rhs_scale=rhs_scale,
+          preferred_element_type=jnp.bfloat16,
+      )
 
   @parameterized.product(
       batch_size=[128, 512],

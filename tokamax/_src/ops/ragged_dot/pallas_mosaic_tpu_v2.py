@@ -486,7 +486,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         rhs_val = rhs.qvalue
         rhs_scale = rhs.scale
         if rhs_scale is not None:
-          rhs_scale = rhs_scale.reshape(1, 1, -1)
+          _, size_n = rhs_val.shape
+          if rhs_scale.shape in ((1, 1, size_n), (1, size_n), (size_n,)):
+            rhs_scale = rhs_scale.reshape(1, 1, size_n)
+          elif rhs_scale.shape != (num_actual_groups, 1, size_n):
+            raise NotImplementedError(
+                f"Unsupported rhs_scale shape {rhs.scale.shape} for rhs shape"
+                f" {rhs.shape} and num_actual_groups={num_actual_groups}."
+            )
       else:
         rhs_val = rhs
         rhs_scale = None
