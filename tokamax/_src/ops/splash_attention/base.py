@@ -34,9 +34,11 @@ from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 _Config = TypeVar("_Config")
 
 DEFAULT_MASK_VALUE = reference.DEFAULT_MASK_VALUE
+QuantizationStrategy = reference.QuantizationStrategy
 SegmentIds = reference.SegmentIds
 SplashCustomReturnType = reference.SplashCustomReturnType
 SplashResidualsType = reference.SplashResidualsType
+apply_quantization = reference.apply_quantization
 attention_reference = reference.attention_reference
 attention_reference_vjp = reference.attention_reference_vjp
 

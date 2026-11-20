@@ -37,6 +37,7 @@ from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask
 
 P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
+QuantizationStrategy = base.QuantizationStrategy
 partial = functools.partial
 NUM_LANES = 128
 NUM_SUBLANES = 8
