@@ -26,6 +26,7 @@ from tokamax._src import precision as precision_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.gated_linear_unit import api as glu_api
 from tokamax._src.ops.normalization import api as norm_api
+from tokamax._src.ops.normalization import base as norm_base
 
 type AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 type Implementation = Literal["xla", "triton"]
@@ -35,6 +36,8 @@ type Residuals = tuple[
     Float[Array, "N N H"] | Float[Array, "H N N"],
 ]
 CanonicalPrecision = precision_lib.CanonicalPrecision
+
+_XLA_LAYER_NORM = norm_base.Normalization(vjp=norm_base.NormalizationVjp())
 
 
 class Grads(TypedDict):
@@ -147,17 +150,24 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
     glu_impl = "xla" if implementation is None else implementation
 
     h_dim = layernorm_out_scale.shape[0]
-
-    left_act = norm_api.layer_norm(
-        x,
-        scale=layernorm_in_scale,
-        offset=layernorm_in_offset,
-        epsilon=epsilon,
-        axis=-1,
-        implementation=norm_impl,
-    )
-
     channel_dim = len(gate_in_weights)
+
+    def _layer_norm(arr, scale, offset):
+      if norm_impl == "xla":
+        return _XLA_LAYER_NORM(
+            arr, scale=scale, offset=offset, epsilon=epsilon, axis=-1
+        )
+      return norm_api.layer_norm(
+          arr,
+          scale=scale,
+          offset=offset,
+          epsilon=epsilon,
+          axis=-1,
+          implementation=norm_impl,
+      )
+
+    left_act = _layer_norm(x, layernorm_in_scale, layernorm_in_offset)
+
     gate_weights = jnp.reshape(gate_in_weights, (channel_dim, -1))  # (C, 2 * H)
     projection_weights = jnp.reshape(projection_in_weights, (channel_dim, -1))
     proj_act = glu_api.gated_linear_unit(
@@ -167,34 +177,24 @@ class TriangleMultiplication[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         precision=precision,
         implementation=glu_impl,
     )
-    proj_act = proj_act.reshape(proj_act.shape[0], proj_act.shape[1], 2, h_dim)
-    proj_act = jnp.transpose(proj_act, (2, 3, 0, 1))  # 2 C N N
-    proj_act = mask * proj_act
-    left_proj_act, right_proj_act = jnp.split(proj_act, 2, axis=0)
-    left_proj_act = jnp.squeeze(left_proj_act, axis=0)
-    right_proj_act = jnp.squeeze(right_proj_act, axis=0)
+    proj_act = mask[..., None] * proj_act
+    left_proj_act = jnp.transpose(proj_act[..., :h_dim], (2, 0, 1))
+    right_proj_act = jnp.transpose(proj_act[..., h_dim:], (2, 0, 1))
 
     equation = "cik,cjk->ijc" if triangle_type == "outgoing" else "ckj,cki->ijc"
     act = jnp.einsum(
         equation, left_proj_act, right_proj_act, precision=precision
     )
-    residuals = (left_proj_act, right_proj_act, act)
-
-    act = norm_api.layer_norm(
-        act,
-        scale=layernorm_out_scale,
-        offset=layernorm_out_offset,
-        epsilon=epsilon,
-        axis=-1,
-        implementation=norm_impl,
+    residuals = (
+        (left_proj_act, right_proj_act, act) if return_residuals else None
     )
 
+    act = _layer_norm(act, layernorm_out_scale, layernorm_out_offset)
     act = jnp.dot(act, projection_out_weights, precision=precision)
-
     gate_values = jnp.dot(left_act, gate_out_weights, precision=precision)
     act *= jax.nn.sigmoid(gate_values)
 
-    return act, (residuals if return_residuals else None)
+    return act, residuals
 
 
 class TriangleMultiplicationVjp[C, K: Hashable](op.Op[Any, Grads, None, C, K]):
