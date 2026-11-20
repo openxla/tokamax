@@ -367,9 +367,10 @@ class SplashConfig:
   # - Forward (when block_q == block_kv == block_kv_compute): splits into
   #   qk_diag_grid query row-bands, each attending only to its visible kv
   #   prefix.
-  # - Backward dkv: splits into qk_diag_grid_dkv kv row-bands, each over only
-  #   the queries it attends to. Accumulates dq in VMEM scratch when present
-  #   (dq_reduction_steps=1), or per query band in f32 registers otherwise.
+  # - Backward dkv: splits into qk_diag_grid_dkv kv row-bands (square or not),
+  #   each over only the queries it attends to. Accumulates dq in VMEM scratch
+  #   when present (dq_reduction_steps=1), or per query band in f32 registers
+  #   otherwise.
   diag_band_skip: bool = False
   # Attention dropout probability, applied to the softmax weights. The mask is
   # generated inside the kernel per (head, q block, kv block) tile from a
@@ -2272,7 +2273,6 @@ def _flash_attention_dkv_kernel(
     if (
         config.qk_diag_skip
         and config.diag_band_skip
-        and gq == gk
         and has_partial_mask
         and not dropout_rate
         and (
@@ -2286,8 +2286,9 @@ def _flash_attention_dkv_kernel(
         and sq % NUM_LANES == 0
     ):
       # Row-band diagonal skip: on an aligned causal diagonal block, kv band ki
-      # only attends to queries [ki * sq, bq), so run the backward for each band
-      # on that contiguous query suffix instead of the full tile.
+      # only attends to queries from q band q_start[ki] (the first not strictly
+      # above the diagonal) to bq, so run the backward for each band on that
+      # contiguous query suffix instead of the full tile.
       exp = jnp.exp2 if config.use_base2_exp else jnp.exp
       dk_dims = (
           NN_DIM_NUMBERS
@@ -2295,9 +2296,13 @@ def _flash_attention_dkv_kernel(
           else NT_DIM_NUMBERS
       )
       q_view = lambda ref, s: None if ref is None else ref.at[:, s]
+      q_start = [
+          next(qj for qj in range(gq) if not _above_diag(qj, sq, ki, sk))
+          for ki in range(gk)
+      ] + [gq]
       dq_acc: dict[int, jax.Array] = {}
       for ki in range(gk):
-        q0, k0 = ki * sq, ki * sk
+        q0, k0 = q_start[ki] * sq, ki * sk
         qs = pl.ds(q0, bq - q0)
         if config.q_layout == HEAD_DIM_MINOR:
           q_b, scaled_q_b = q[q0:, :], scaled_q[q0:, :]
@@ -2359,21 +2364,23 @@ def _flash_attention_dkv_kernel(
           if dq_scratch_ref is not None:
             dq_scratch_ref[q0:, :] += dq_b
           elif dq_ref is not None:
-            # Square dkv tiles imply num_iters == 1 (i == 0), and query band ki
-            # only attends to kv bands 0..ki, so dq_acc.pop(ki) is this block's
-            # complete dq contribution for q_band once iteration ki finishes.
-            for qb in range(ki, gk):
-              part = dq_b[(qb - ki) * sq : (qb - ki + 1) * sq]
+            # Square dkv tiles imply num_iters == 1 (i == 0). Later kv bands
+            # start at q band q_start[ki + 1] or after, so q bands before it
+            # hold this block's complete dq contribution once iteration ki
+            # finishes.
+            for qb in range(q_start[ki], gq):
+              part = dq_b[(qb - q_start[ki]) * sq : (qb - q_start[ki] + 1) * sq]
               prev = dq_acc.get(qb)
               dq_acc[qb] = part if prev is None else prev + part
-            dq_band = dq_acc.pop(ki)
-            q_band = pl.ds(q0, sq)
-            if dq_alias is not None:
-              dq_ref[q_band, :] = (
-                  dq_alias[q_band, :].astype(jnp.float32) + dq_band
-              ).astype(dq_ref.dtype)
-            else:
-              dq_ref[q_band, :] = dq_band.astype(dq_ref.dtype)
+            for qb in range(q_start[ki], q_start[ki + 1]):
+              dq_band = dq_acc.pop(qb)
+              q_band = pl.ds(qb * sq, sq)
+              if dq_alias is not None:
+                dq_ref[q_band, :] = (
+                    dq_alias[q_band, :].astype(jnp.float32) + dq_band
+                ).astype(dq_ref.dtype)
+              else:
+                dq_ref[q_band, :] = dq_band.astype(dq_ref.dtype)
       return
 
     if (

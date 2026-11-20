@@ -1873,6 +1873,49 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
       np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
 
   @parameterized.product(
+      qk_diag_grid=((2, 4), (4, 2)), dq_reduction_steps=(None, 1, 3)
+  )
+  def test_diag_band_skip_non_square_grid_matches_stock_bwd(
+      self, qk_diag_grid, dq_reduction_steps
+  ):
+    """`diag_band_skip` on a non-square grid matches the stock bwd."""
+    seq_len, num_heads, block = 2048, 2, 512
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = random.normal(k1, (num_heads, seq_len, 128), jnp.bfloat16)
+    k = random.normal(k2, (num_heads, seq_len, 128), jnp.bfloat16)
+    v = random.normal(k3, (num_heads, seq_len, 128), jnp.bfloat16)
+    do = random.normal(k4, (num_heads, seq_len, 128), jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def grads(diag_band_skip):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          residual_checkpoint_name="context",
+          interpret=self.INTERPRET,
+          qk_diag_skip=True,
+          qk_diag_grid=qk_diag_grid,
+          dq_reduction_steps=dq_reduction_steps,
+          diag_band_skip=diag_band_skip,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(attn, q, k, v)
+        return vjp(do)
+
+      return jax.jit(bwd)(q, k, v, do)
+
+    for name, r, g in zip(("dq", "dk", "dv"), grads(False), grads(True)):
+      with self.subTest(name):
+        self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
+  @parameterized.product(
       mask_kind=("causal", "local", "full"),
       is_mqa=(False, True),
       bkv_compute_div=(1, 2),
