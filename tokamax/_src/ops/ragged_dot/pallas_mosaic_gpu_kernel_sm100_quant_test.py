@@ -680,7 +680,13 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
 
     def epi_qtype(lhs, rhs, pet):
       ba = pallas_mosaic_gpu.op.BoundArguments(
-          op, {"lhs": lhs, "rhs": rhs, "preferred_element_type": pet}
+          op,
+          {
+              "lhs": lhs,
+              "rhs": rhs,
+              "preferred_element_type": pet,
+              "ragged_dot_dimension_numbers": base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+          },
       )
       return op._get_heuristics_config(ba).epilogue_quant_qtype
 
@@ -695,7 +701,13 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
 
     def epi_qtype_disabled(lhs, rhs, pet):
       ba = pallas_mosaic_gpu.op.BoundArguments(
-          op_disabled, {"lhs": lhs, "rhs": rhs, "preferred_element_type": pet}
+          op_disabled,
+          {
+              "lhs": lhs,
+              "rhs": rhs,
+              "preferred_element_type": pet,
+              "ragged_dot_dimension_numbers": base.DEFAULT_RAGGED_DOT_DIM_NUMS,
+          },
       )
       return op_disabled._get_heuristics_config(ba).epilogue_quant_qtype
 
