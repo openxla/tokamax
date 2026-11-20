@@ -41,6 +41,7 @@ from tokamax._src.ops.kda.cp_utils import (
     cp_canonicalize_packed_segment_ids,
     cp_shift_right,
 )
+from tokamax._src.ops.kda.pallas_mosaic_tpu_output import compact_output
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import GdnResiduals
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import KdaResiduals
 from tokamax._src.ops.kda.utils import (
@@ -478,6 +479,138 @@ def _prepare_cp_initial_state(
 # =============================================================================
 
 
+def _solve_unit_lower_triangular_batched(A, b):
+  """Solve (I + A) x = b exactly for batched inputs.
+
+  Uses block forward substitution with block size 16 for TPU MXU
+  utilization.
+
+  Args:
+      A: (MB, N, N) strictly lower triangular matrix (float32).
+      b: (MB, N, D) right-hand side matrix (float32).
+
+  Returns:
+      x: (MB, N, D) exact solution matrix.
+  """
+  MB, N, D = b.shape
+  BS = 16
+  num_blocks = N // BS
+  A = A.astype(jnp.float32)
+  b = b.astype(jnp.float32)
+
+  blocks = [b[:, i * BS : (i + 1) * BS, :] for i in range(num_blocks)]
+
+  for i in range(num_blocks):
+    start = i * BS
+    end = (i + 1) * BS
+
+    A_ii = A[:, start:end, start:end]  # [MB, BS, BS]
+    x_block = blocks[i]  # [MB, BS, D]
+
+    rows = [x_block[:, r, :] for r in range(BS)]  # list of [MB, D]
+    for j in range(BS):
+      if j > 0:
+        vec = A_ii[:, j, :j]  # [MB, j]
+        mat = jnp.stack(rows[:j], axis=1)  # [MB, j, D]
+        # [MB, 1, j] @ [MB, j, D] → [MB, 1, D] → squeeze
+        correction = jnp.matmul(vec[:, None, :], mat).squeeze(1)
+        rows[j] = rows[j] - correction
+
+    x_block = jnp.stack(rows, axis=1)  # [MB, BS, D]
+    blocks[i] = x_block
+
+    if i < num_blocks - 1:
+      x_rest = jnp.concatenate(blocks[i + 1 :], axis=1)  # [MB, rest, D]
+      A_rest = A[:, (i + 1) * BS :, start:end]  # [MB, rest, BS]
+
+      update = jnp.matmul(
+          A_rest,
+          x_block,
+          preferred_element_type=jnp.float32,
+      )
+      x_rest = x_rest - update
+
+      remaining = num_blocks - 1 - i
+      for idx in range(remaining):
+        blocks[i + 1 + idx] = x_rest[:, idx * BS : (idx + 1) * BS, :]
+
+  return jnp.concatenate(blocks, axis=1)
+
+
+def _solve_unit_lower_triangular_neumann_batched(A, b):
+  """Solve (I + A) x = b with a blocked finite Neumann series.
+
+  The strictly lower triangular system is split into 8-token diagonal blocks.
+  Each diagonal block is inverted with a finite Neumann series, then the
+  block-off-diagonal system is inverted with Horner doubling.
+
+  Args:
+      A: (MB, N, N) strictly lower triangular matrix.
+      b: (MB, N, D) right-hand side matrix.
+
+  Returns:
+      A pair containing the solution with shape (MB, N, D) and the inverse of
+      (I + A) with shape (MB, N, N), both in float32.
+  """
+  N = A.shape[-1]
+  block_size = 8
+  num_blocks = N // block_size
+  inv_dtype = jnp.float32
+  identity = jnp.eye(N, dtype=inv_dtype)
+
+  # Batched dot: [MB, M, K] @ [MB, K, N] -> [MB, M, N].
+  def dot_batch(lhs, rhs):
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        (((2,), (1,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+
+  A = A.astype(inv_dtype)
+  block_ids = jnp.arange(N, dtype=jnp.int32) // block_size
+  same_block = (block_ids[:, None] == block_ids[None, :]).astype(inv_dtype)
+  A_diag = A * same_block[None]
+  A_off_diag = A - A_diag
+
+  neg_A_diag = -A_diag
+  diag_inverse = identity[None] + neg_A_diag
+  power = neg_A_diag
+  num_diag_steps = {4: 1, 8: 2, 16: 3, 32: 4, 64: 5}[block_size]
+  for _ in range(num_diag_steps):
+    power = dot_batch(power, power)
+    diag_inverse = dot_batch(diag_inverse, identity[None] + power)
+
+  if num_blocks == 1:
+    return dot_batch(diag_inverse, b.astype(inv_dtype)), diag_inverse
+
+  # Fuse P @ [F | b] to share a matmul, where P is the block-diagonal
+  # inverse and F is the block-off-diagonal part of A.
+  off_diag_and_rhs = jnp.concatenate([A_off_diag, b.astype(inv_dtype)], axis=-1)
+  merged = dot_batch(diag_inverse, off_diag_and_rhs)
+  transformed_off_diag = merged[:, :, :N]
+  transformed_rhs = merged[:, :, N:]
+
+  # (I + G)^-1 = sum(k=0..num_blocks-1) (-G)^k. The block-strictly-lower
+  # matrix G is nilpotent, so Horner doubling evaluates this finite series.
+  neg_transformed_off_diag = -transformed_off_diag
+  off_diag_inverse = identity[None] + neg_transformed_off_diag
+  power = neg_transformed_off_diag
+  log2_num_blocks = {2: 1, 4: 2, 8: 3, 16: 4, 32: 5}[num_blocks]
+  for _ in range(log2_num_blocks - 1):
+    power = dot_batch(power, power)
+    off_diag_inverse = off_diag_inverse + dot_batch(off_diag_inverse, power)
+
+  result = dot_batch(off_diag_inverse, transformed_rhs)
+  inverse = dot_batch(off_diag_inverse, diag_inverse)
+  return result, inverse
+
+
+# =============================================================================
+# Fused gate cumsum and intra-chunk solve
+# =============================================================================
+
+
 def _scalar_gate_intra(
     q_f32,
     k_f32,
@@ -743,7 +876,7 @@ def _fused_gate_intra_kernel(
     g = g_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
   else:
     g = g_ref[:, 0, 0]  # [MB, BT, K]
-  beta = beta_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
+  beta = beta_ref[:, 0, 0].reshape(MB, BT, 1)
 
   if use_conv1d_in_kernel:
     assert (
@@ -1910,8 +2043,12 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   i_c = pl.program_id(2)
   seq_idx = chunk_to_seq_ref[i_b, i_c]
 
-  bos = seqlens_ref[i_b, seq_idx]
-  eos = seqlens_ref[i_b, seq_idx + 1]
+  if seqlens_ref.ndim == 1:
+    offset = 2 * (i_b * chunk_to_seq_ref.shape[1] + i_c)
+    bos, eos = seqlens_ref[offset], seqlens_ref[offset + 1]
+  else:
+    bos = seqlens_ref[i_b, seq_idx]
+    eos = seqlens_ref[i_b, seq_idx + 1]
   t0 = i_c * BT
 
   K = w_ref.shape[-1]
@@ -2623,6 +2760,441 @@ def compute_local_cp_fwd_summary(
   return s_pad[..., :K, :V], m_pad[..., :K, :K]
 
 
+def _fused_forward_kernel(
+    seqlens_ref,
+    chunk_to_seq_ref,
+    q_ref,
+    k_ref,
+    g_ref,
+    beta_ref,
+    v_ref,
+    a_log_ref,
+    bias_ref,
+    h0_ref,
+    o_ref,
+    ht_ref,
+    h_ref,
+    aqk_out_ref,
+    akk_out_ref,
+    gate_out_ref,
+    v_new_out_ref,
+    state_ref,
+    u_ref,
+    w_ref,
+    kg_ref,
+    aqk_ref,
+    akk_ref,
+    gate_ref,
+    *,
+    chunk_size,
+    key_dim,
+    value_dim,
+    scale,
+    safe_gate,
+    use_gate_in_kernel,
+    lower_bound,
+    mini_batch,
+    store_h,
+    store_residuals,
+    store_gate,
+    output_precision,
+):
+  """Runs both forward stages with the bridge tensors in VMEM.
+
+  The sequential chunk grid preserves `state_ref` across chunks. The other
+  scratch refs are overwritten on each iteration. Their dtypes preserve the
+  rounding at the staged implementation's HBM boundary.
+  """
+  _fused_gate_intra_kernel(
+      q_ref,
+      k_ref,
+      g_ref,
+      beta_ref,
+      v_ref,
+      a_log_ref,
+      bias_ref,
+      u_ref,
+      w_ref,
+      kg_ref,
+      aqk_ref,
+      akk_ref,
+      gate_ref,
+      chunk_size=chunk_size,
+      head_dim=key_dim,
+      value_dim=value_dim,
+      scale=scale,
+      cumsum_scale=RCP_LN2,
+      fuse_cumsum=True,
+      disable_recompute=False,
+      safe_gate=safe_gate,
+      per_channel_gate=True,
+      use_gate_in_kernel=use_gate_in_kernel,
+      lower_bound=lower_bound,
+      mini_batch=mini_batch,
+  )
+  _chunk_kda_fwd_h_o_varlen_kernel(
+      seqlens_ref,
+      chunk_to_seq_ref,
+      w_ref.at[:, 0],
+      u_ref.at[:, 0],
+      kg_ref.at[:, 0],
+      gate_ref.at[:, 0],
+      q_ref.at[:, 0],
+      aqk_ref.at[:, 0],
+      h0_ref,
+      o_ref.at[:, 0],
+      ht_ref,
+      h_ref,
+      v_new_out_ref.at[:, 0] if v_new_out_ref is not None else None,
+      state_ref,
+      BT=chunk_size,
+      scale=scale,
+      USE_INITIAL_STATE=h0_ref is not None,
+      STORE_FINAL_STATE=ht_ref is not None,
+      STORE_H=store_h,
+      STORE_V_NEW=store_h,
+      MB=mini_batch,
+      OUTPUT_PRECISION=output_precision,
+      GQA_REPEATS=1,
+      NATIVE_OUT_LAYOUT=False,
+  )
+  if store_residuals:
+    aqk_out_ref[...] = aqk_ref[...]
+    akk_out_ref[...] = akk_ref[...]
+  if store_gate:
+    gate_out_ref[...] = gate_ref[...]
+
+
+def _packed_fused_forward_kernel(
+    seqlens_ref, mapping_ref, packed_seqlens_ref, *refs, **kwargs
+):
+  """Load an 8-row-aligned packed window, then mask the sequence tail."""
+  chunk_size = kwargs["chunk_size"]
+  batch, chunk = pl.program_id(1), pl.program_id(2)
+  seq = mapping_ref[batch, chunk]
+  offset = 2 * (batch * mapping_ref.shape[1] + chunk)
+  if seqlens_ref.ndim == 1:
+    aligned_start = seqlens_ref[offset]
+  else:
+    aligned_start = seqlens_ref[batch, seq]
+  block = chunk - aligned_start // chunk_size
+  if packed_seqlens_ref.ndim == 1:
+    start = packed_seqlens_ref[offset] + block * chunk_size
+    end = packed_seqlens_ref[offset + 1]
+  else:
+    start = packed_seqlens_ref[batch, seq] + block * chunk_size
+    end = packed_seqlens_ref[batch, seq + 1]
+  active = (block >= 0) & (start < end)
+  start = jnp.where(active, start, 0)
+  offset = start % 8
+  # Separate static slices keep the TPU sublane shift bounded to 0..7.
+  branches = tuple(
+      (lambda x, i=i: x[:, :, i : i + chunk_size, :]) for i in range(8)
+  )
+  for index, (window, tile) in enumerate(zip(refs[:5], refs[-5:], strict=True)):
+    values = jax.lax.switch(offset, branches, window[...])
+    fill = -1e4 if index == 2 and kwargs["use_gate_in_kernel"] else 0
+    # Build the mask directly at the tile rank.  Adding singleton dimensions
+    # to a [BT] predicate creates an unsupported Mosaic shape cast for MB=1.
+    token = jax.lax.broadcasted_iota(jnp.int32, values.shape, dimension=2)
+    values = jnp.where(active & (start + token < end), values, fill)
+    tile[...] = values.reshape(tile.shape)
+  _fused_forward_kernel(
+      seqlens_ref, mapping_ref, *refs[-5:], *refs[5:-5], **kwargs
+  )
+
+
+def _bounded_chunk_boundaries(boundaries, mapping):
+  """Avoid scalar-prefetching an entire large sequence-capacity table."""
+  if boundaries.size <= 8193:
+    return boundaries.astype(jnp.int32)
+  starts = jnp.take_along_axis(boundaries[:, :-1], mapping, axis=1)
+  ends = jnp.take_along_axis(boundaries[:, 1:], mapping, axis=1)
+  return jnp.stack((starts, ends), axis=-1).reshape(-1).astype(jnp.int32)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "scale",
+        "chunk_size",
+        "safe_gate",
+        "use_gate_in_kernel",
+        "lower_bound",
+        "store_h",
+        "store_residuals",
+        "store_gate",
+        "output_final_state",
+    ),
+)
+@jaxtyping.jaxtyped
+def chunk_kda_fwd_fused(
+    q: Float[Array, "H B T K"],
+    k: Float[Array, "H B T K"],
+    v: Float[Array, "H B T V"],
+    g: Float[Array, "H B T K"],
+    beta: Float[Array, "H B T"],
+    cu_seqlens: Int[Array, "B N_CU"],
+    chunk_indices: Int[Array, "B NT 2"],
+    initial_state: Float[Array, "B N H K V"] | None,
+    a_log: Float[Array, "H"] | None,
+    delta_time_bias: Float[Array, "H*K"] | None,
+    *,
+    packed_inputs: tuple[jax.Array, ...] | None = None,
+    packed_cu_seqlens: jax.Array | None = None,
+    scale: float,
+    chunk_size: int,
+    safe_gate: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: float | None,
+    store_h: bool,
+    store_residuals: bool,
+    store_gate: bool,
+    output_final_state: bool,
+) -> tuple[
+    Float[Array, "H B T V"],
+    Float[Array, "B N H K V"] | None,
+    Float[Array, "H B NT K V"] | None,
+    Float[Array, "H B T BT"] | None,
+    Float[Array, "H B T BT"] | None,
+    Float[Array, "H B T K"] | None,
+    Float[Array, "H B T V"] | None,
+]:
+  """Fuses aligned, non-CP KDA forward while retaining backward residuals.
+
+  H/B/T/K/V denote heads, batch, aligned tokens, key width and value width.
+  Each segment occupies complete chunks; `cu_seqlens` and `chunk_indices`
+  describe those chunks. K and V must be multiples of 128. Returns output
+  [H,B,T,V], optional final state [B,N,H,K,V], optional chunk-start states
+  [H,B,NT,K,V], and optional Aqk/Akk [H,B,T,BT] and gate [H,B,T,K].
+  """
+  heads, batch, tokens, key_dim = q.shape
+  value_dim = v.shape[-1]
+  chunks = tokens // chunk_size
+  segments = cu_seqlens.shape[-1] - 1
+  if chunk_size != 64 or tokens % chunk_size:
+    raise ValueError("Fused forward requires complete 64-token chunks.")
+  if key_dim % 128 or value_dim % 128:
+    raise ValueError("Fused forward requires K and V to be multiples of 128.")
+  if chunk_indices.shape[1] != chunks:
+    raise ValueError("Chunk metadata must cover the aligned token extent.")
+
+  # Include persistent state, bridge buffers, double-buffered I/O and
+  # intra-chunk solve temporaries. Retain compiler headroom rather than
+  # inheriting the smaller staged kernels' independent VMEM estimates.
+  packed = packed_inputs is not None
+  per_head = 4 * (
+      key_dim * value_dim
+      + 16 * chunk_size * (key_dim + value_dim)
+      + 12 * chunk_size * chunk_size
+  )
+  if packed:
+    # Additional packed input windows and aligned VMEM staging refs.
+    per_head += 4 * (3 * key_dim + value_dim + 1) * (3 * chunk_size + 16)
+  mini_batch = estimate_mini_batch(
+      per_head, heads, max_mb=16 if packed else 32
+  )
+  token_shape = lambda width: (heads, batch, chunks, chunk_size, width)
+  tile_shape = lambda width: (mini_batch, 1, 1, chunk_size, width)
+
+  def token_spec(width):
+    return pl.BlockSpec(
+        tile_shape(width),
+        lambda h, b, c, *_: (h, b, c, 0, 0),
+    )
+
+  scalar_inputs = [
+      _bounded_chunk_boundaries(cu_seqlens, chunk_indices[..., 0]),
+      chunk_indices[..., 0].astype(jnp.int32),
+  ]
+  input_values = [
+      q.reshape(token_shape(key_dim)),
+      k.reshape(token_shape(key_dim)),
+      g.reshape(token_shape(key_dim)),
+      beta.reshape(token_shape(1)),
+      v.reshape(token_shape(value_dim)),
+  ]
+  input_specs = [
+      token_spec(width) for width in (key_dim, key_dim, key_dim, 1, value_dim)
+  ]
+  if packed:
+    if packed_cu_seqlens is None:
+      raise ValueError("Packed inputs require original sequence boundaries.")
+    scalar_inputs.append(
+        _bounded_chunk_boundaries(packed_cu_seqlens, chunk_indices[..., 0])
+    )
+    pq, pk, pv, pg, pb = packed_inputs
+    # Round the allocation to eight rows and append a full guard window.
+    input_values = [
+        jnp.pad(
+            x, ((0, 0), (0, 0), (0, (-x.shape[2]) % 8 + chunk_size + 8), (0, 0))
+        )
+        for x in (pq, pk, pg, pb[..., None], pv)
+    ]
+
+    def packed_index(h, b, c, aligned, mapping, original):
+      seq = mapping[b, c]
+      offset = 2 * (b * mapping.shape[1] + c)
+      aligned_start = aligned[offset] if aligned.ndim == 1 else aligned[b, seq]
+      block = c - aligned_start // chunk_size
+      original_start = (
+          original[offset] if original.ndim == 1 else original[b, seq]
+      )
+      end = original[offset + 1] if original.ndim == 1 else original[b, seq + 1]
+      start = original_start + block * chunk_size
+      active = (block >= 0) & (start < end)
+      start = jnp.where(active, start, 0)
+      return h * mini_batch, b, pl.multiple_of(start - start % 8, 8), 0
+
+    input_specs = [
+        pl.BlockSpec(
+            tuple(
+                pl.Element(d) for d in (mini_batch, 1, chunk_size + 8, width)
+            ),
+            packed_index,
+        )
+        for width in (key_dim, key_dim, key_dim, 1, value_dim)
+    ]
+
+  def parameter_spec(width):
+    return pl.BlockSpec(
+        (mini_batch, 1, 1, 1, width),
+        lambda h, b, c, *_: (h, 0, 0, 0, 0),
+    )
+
+  state_shape = (batch, segments, heads, key_dim, value_dim)
+  state_spec = pl.BlockSpec(
+      (1, 1, mini_batch, key_dim, value_dim),
+      lambda h, b, c, seqlens, mapping, *_: (b, mapping[b, c], h, 0, 0),
+  )
+  saved_state_shape = (heads, batch, chunks, key_dim, value_dim)
+  saved_state_spec = pl.BlockSpec(
+      (mini_batch, 1, 1, key_dim, value_dim),
+      lambda h, b, c, *_: (h, b, c, 0, 0),
+  )
+  if a_log is None:
+    a_log = jnp.zeros((heads,), jnp.float32)
+  if delta_time_bias is None:
+    delta_time_bias = jnp.zeros((heads * key_dim,), jnp.float32)
+
+  out_shapes = [
+      jax.ShapeDtypeStruct(token_shape(value_dim), jnp.float32),
+      jax.ShapeDtypeStruct(state_shape, jnp.float32)
+      if output_final_state
+      else None,
+      jax.ShapeDtypeStruct(saved_state_shape, k.dtype) if store_h else None,
+      jax.ShapeDtypeStruct(token_shape(chunk_size), k.dtype)
+      if store_residuals
+      else None,
+      jax.ShapeDtypeStruct(token_shape(chunk_size), k.dtype)
+      if store_residuals
+      else None,
+      jax.ShapeDtypeStruct(token_shape(key_dim), jnp.float32)
+      if store_gate
+      else None,
+      jax.ShapeDtypeStruct(token_shape(value_dim), v.dtype)
+      if store_h
+      else None,
+  ]
+  results = pl.pallas_call(
+      functools.partial(
+          _packed_fused_forward_kernel if packed else _fused_forward_kernel,
+          chunk_size=chunk_size,
+          key_dim=key_dim,
+          value_dim=value_dim,
+          scale=scale,
+          safe_gate=safe_gate,
+          use_gate_in_kernel=use_gate_in_kernel,
+          lower_bound=lower_bound,
+          mini_batch=mini_batch,
+          store_h=store_h,
+          store_residuals=store_residuals,
+          store_gate=store_gate,
+          output_precision=(
+              jax.lax.Precision.DEFAULT
+              if q.dtype == jnp.bfloat16
+              else jax.lax.Precision.HIGHEST
+          ),
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=len(scalar_inputs),
+          grid=(heads // mini_batch, batch, chunks),
+          in_specs=[
+              *input_specs,
+              parameter_spec(1),
+              parameter_spec(key_dim),
+              state_spec if initial_state is not None else None,
+          ],
+          out_specs=[
+              token_spec(value_dim),
+              state_spec if output_final_state else None,
+              saved_state_spec if store_h else None,
+              token_spec(chunk_size) if store_residuals else None,
+              token_spec(chunk_size) if store_residuals else None,
+              token_spec(key_dim) if store_gate else None,
+              token_spec(value_dim) if store_h else None,
+          ],
+          scratch_shapes=[
+              pltpu.VMEM((mini_batch, key_dim, value_dim), jnp.float32),
+              *[
+                  pltpu.VMEM(tile_shape(width), k.dtype)
+                  for width in (
+                      value_dim,
+                      key_dim,
+                      key_dim,
+                      chunk_size,
+                      chunk_size,
+                  )
+              ],
+              pltpu.VMEM(tile_shape(key_dim), jnp.float32),
+              *(
+                  [
+                      pltpu.VMEM(tile_shape(x.shape[-1]), x.dtype)
+                      for x in input_values
+                  ]
+                  if packed
+                  else []
+              ),
+          ],
+      ),
+      out_shape=out_shapes,
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "arbitrary"),
+      ),
+      interpret=get_interpret(),
+  )(
+      *scalar_inputs,
+      *input_values,
+      a_log.astype(jnp.float32).reshape(heads, 1, 1, 1, 1),
+      delta_time_bias.astype(jnp.float32).reshape(heads, 1, 1, 1, key_dim),
+      initial_state,
+  )
+  output, final_state, h, aqk, akk, gate, v_new = results
+  if final_state is not None:
+    empty = jnp.diff(cu_seqlens, axis=-1) == 0
+    fill = (
+        initial_state
+        if initial_state is not None
+        else jnp.zeros_like(final_state)
+    )
+    final_state = jnp.where(empty[:, :, None, None, None], fill, final_state)
+
+  def flatten(x):
+    return (
+        x.reshape(heads, batch, tokens, x.shape[-1]) if x is not None else None
+    )
+
+  return (
+      flatten(output).astype(q.dtype),
+      final_state,
+      h,
+      flatten(aqk),
+      flatten(akk),
+      flatten(gate),
+      flatten(v_new),
+  )
+
+
 @jaxtyping.jaxtyped
 def chunk_kda_fwd_custom(
     q: Float[Array, "H B T_ALIGNED K"],
@@ -2661,6 +3233,11 @@ def chunk_kda_fwd_custom(
     use_conv1d_in_kernel: bool = False,
     use_qk_l2norm: bool = False,
     mini_batch: int | None = None,
+    fuse_forward: bool = False,
+    packed_output: bool = False,
+    packed_inputs: tuple[jax.Array, ...] | None = None,
+    token_unpermute: jax.Array | None = None,
+    padding_guard: bool = False,
     two_pass_bf16: bool = False,
     cp_checkpoint_name: str | None = None,
 ) -> tuple[
@@ -2759,191 +3336,253 @@ def chunk_kda_fwd_custom(
   # ------------------------------------------------------------------
   # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
   # ------------------------------------------------------------------
-  q_raw_in, k_raw_in, v_raw_in = q, k, v
   rank_halo_q = rank_halo_k = rank_halo_v = None
-  if _inplace_cp and use_conv1d_in_kernel and halo_len_raw > 0:
-    assert context_parallel_metadata is not None
-    axis_name = context_parallel_metadata.axis_name
-    cp_size = context_parallel_metadata.cp_size
-    rank_halo_q = cp_shift_right(q[:, :, -_CONV_HALO:, :], axis_name, cp_size)
-    rank_halo_k = cp_shift_right(k[:, :, -_CONV_HALO:, :], axis_name, cp_size)
-    rank_halo_v = cp_shift_right(v[:, :, -_CONV_HALO:, :], axis_name, cp_size)
-    if cp_ckpt is not None:
-      rank_halo_q = ad_checkpoint.checkpoint_name(rank_halo_q, name=cp_ckpt)
-      rank_halo_k = ad_checkpoint.checkpoint_name(rank_halo_k, name=cp_ckpt)
-      rank_halo_v = ad_checkpoint.checkpoint_name(rank_halo_v, name=cp_ckpt)
-    q_raw_in = jnp.concatenate(
-        [rank_halo_q[:, :, -halo_len_raw:, :], q], axis=2
-    )
-    k_raw_in = jnp.concatenate(
-        [rank_halo_k[:, :, -halo_len_raw:, :], k], axis=2
-    )
-    v_raw_in = jnp.concatenate(
-        [rank_halo_v[:, :, -halo_len_raw:, :], v], axis=2
-    )
-
-  scale_val = 1.0 / math.sqrt(K) if scale is None else scale
-  (
-      w,
-      u,
-      kg,
-      Aqk,
-      Akk,
-      g_cumsum,
-      q_norm,
-      k_norm,
-      v_silu,
-      q_rstd_conv,
-      k_rstd_conv,
-  ) = kda_fwd_intra_fused(
-      q=q,
-      k=k,
-      v=v,
-      g=g,
-      beta=beta,
-      scale=scale_val,
-      cu_seqlens=cu_seqlens,
-      chunk_size=BT,
-      chunk_indices=chunk_indices,
-      safe_gate=safe_gate,
-      per_channel_gate=per_channel_gate,
-      disable_recompute=save_for_backward,
-      cumsum_scale=RCP_LN2,
-      a_log=a_log,
-      delta_time_bias=delta_time_bias,
-      use_gate_in_kernel=use_gate_in_kernel,
-      lower_bound=lower_bound,
-      conv_weight_q=conv_weight_q,
-      conv_weight_k=conv_weight_k,
-      conv_weight_v=conv_weight_v,
-      conv_bias_q=conv_bias_q,
-      conv_bias_k=conv_bias_k,
-      conv_bias_v=conv_bias_v,
-      use_conv1d_in_kernel=use_conv1d_in_kernel,
-      use_qk_l2norm=(use_qk_l2norm and use_conv1d_in_kernel),
-      return_conv_intermediates=(use_conv1d_in_kernel and return_residuals),
-      aligned_segment_ids=aligned_segment_ids,
-      mini_batch=mini_batch,
-      store_akk=return_residuals,
-      two_pass_bf16=two_pass_bf16,
-      packed_tok_meta=packed_tok_meta,
-      rank_halo_q=rank_halo_q,
-      rank_halo_k=rank_halo_k,
-      rank_halo_v=rank_halo_v,
+  use_fused_forward = (
+      fuse_forward
+      and not two_pass_bf16
+      and packed_tok_meta is None
+      and not _cp_active
+      and per_channel_gate
+      and not use_conv1d_in_kernel
+      and BT == 64
+      and mini_batch is None
+      and K % 128 == 0
+      and V % 128 == 0
   )
-  if use_conv1d_in_kernel:
-    assert q_norm is not None
-    q_stage34 = q_norm
-    if return_residuals:
-      assert k_norm is not None and v_silu is not None
-      q_res, k_res, v_res = q_norm, k_norm, v_silu
-      q_rstd_res, k_rstd_res = q_rstd_conv, k_rstd_conv
-      q_raw_res, k_raw_res, v_raw_res = q_raw_in, k_raw_in, v_raw_in
+  if use_fused_forward:
+    if _is_varlen:
+      stage34_cu_seqlens = cu_seqlens
+      stage34_chunk_indices = chunk_indices
+      stage34_initial_state = initial_state
     else:
-      q_res = k_res = v_res = q_rstd_res = k_rstd_res = None
-      q_raw_res = k_raw_res = v_raw_res = None
-  else:
-    q_stage34 = q
+      stage34_cu_seqlens = jnp.broadcast_to(
+          jnp.asarray([0, T], dtype=jnp.int32), (B, 2)
+      )
+      block_ids = jnp.arange(T // BT, dtype=jnp.int32)
+      fixed_chunk_indices = jnp.stack(
+          [jnp.zeros_like(block_ids), block_ids], axis=-1
+      )
+      stage34_chunk_indices = jnp.broadcast_to(
+          fixed_chunk_indices[None, :, :], (B, T // BT, 2)
+      )
+      stage34_initial_state = (
+          initial_state[:, None, ...] if initial_state is not None else None
+      )
+
+    o, final_state, h, Aqk, Akk, g_cumsum, v_new = chunk_kda_fwd_fused(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        stage34_cu_seqlens,
+        stage34_chunk_indices,
+        stage34_initial_state,
+        a_log,
+        delta_time_bias,
+        packed_inputs=packed_inputs,
+        packed_cu_seqlens=original_cu_seqlens,
+        scale=1.0 / math.sqrt(K) if scale is None else scale,
+        chunk_size=BT,
+        safe_gate=safe_gate,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        store_h=save_for_backward,
+        store_residuals=return_residuals,
+        store_gate=return_residuals
+        and (save_for_backward or not use_gate_in_kernel),
+        output_final_state=output_final_state,
+    )
+    w = u = kg = None
     q_res, k_res, v_res = q, k, v
     q_rstd_res, k_rstd_res = q_rstd, k_rstd
     q_raw_res = k_raw_res = v_raw_res = None
+  else:
+    q_raw_in, k_raw_in, v_raw_in = q, k, v
+    rank_halo_q = rank_halo_k = rank_halo_v = None
+    if _inplace_cp and use_conv1d_in_kernel and halo_len_raw > 0:
+      assert context_parallel_metadata is not None
+      axis_name = context_parallel_metadata.axis_name
+      cp_size = context_parallel_metadata.cp_size
+      rank_halo_q = cp_shift_right(q[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+      rank_halo_k = cp_shift_right(k[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+      rank_halo_v = cp_shift_right(v[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+      if cp_ckpt is not None:
+        rank_halo_q = ad_checkpoint.checkpoint_name(rank_halo_q, name=cp_ckpt)
+        rank_halo_k = ad_checkpoint.checkpoint_name(rank_halo_k, name=cp_ckpt)
+        rank_halo_v = ad_checkpoint.checkpoint_name(rank_halo_v, name=cp_ckpt)
+      q_raw_in = jnp.concatenate(
+          [rank_halo_q[:, :, -halo_len_raw:, :], q], axis=2
+      )
+      k_raw_in = jnp.concatenate(
+          [rank_halo_k[:, :, -halo_len_raw:, :], k], axis=2
+      )
+      v_raw_in = jnp.concatenate(
+          [rank_halo_v[:, :, -halo_len_raw:, :], v], axis=2
+      )
 
-  if _inplace_cp:
-    assert context_parallel_metadata is not None
-    s_local, m_local = compute_local_cp_fwd_summary(
-        kg=kg,
+    scale_val = 1.0 / math.sqrt(K) if scale is None else scale
+    (
+        w,
+        u,
+        kg,
+        Aqk,
+        Akk,
+        g_cumsum,
+        q_norm,
+        k_norm,
+        v_silu,
+        q_rstd_conv,
+        k_rstd_conv,
+    ) = kda_fwd_intra_fused(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale_val,
+        cu_seqlens=cu_seqlens,
+        chunk_size=BT,
+        chunk_indices=chunk_indices,
+        safe_gate=safe_gate,
+        per_channel_gate=per_channel_gate,
+        disable_recompute=save_for_backward,
+        cumsum_scale=RCP_LN2,
+        a_log=a_log,
+        delta_time_bias=delta_time_bias,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        conv_weight_q=conv_weight_q,
+        conv_weight_k=conv_weight_k,
+        conv_weight_v=conv_weight_v,
+        conv_bias_q=conv_bias_q,
+        conv_bias_k=conv_bias_k,
+        conv_bias_v=conv_bias_v,
+        use_conv1d_in_kernel=use_conv1d_in_kernel,
+        use_qk_l2norm=(use_qk_l2norm and use_conv1d_in_kernel),
+        return_conv_intermediates=(use_conv1d_in_kernel and return_residuals),
+        aligned_segment_ids=aligned_segment_ids,
+        mini_batch=mini_batch,
+        store_akk=return_residuals,
+        two_pass_bf16=two_pass_bf16,
+        packed_tok_meta=packed_tok_meta,
+        rank_halo_q=rank_halo_q,
+        rank_halo_k=rank_halo_k,
+        rank_halo_v=rank_halo_v,
+    )
+    if use_conv1d_in_kernel:
+      assert q_norm is not None
+      q_stage34 = q_norm
+      if return_residuals:
+        assert k_norm is not None and v_silu is not None
+        q_res, k_res, v_res = q_norm, k_norm, v_silu
+        q_rstd_res, k_rstd_res = q_rstd_conv, k_rstd_conv
+        q_raw_res, k_raw_res, v_raw_res = q_raw_in, k_raw_in, v_raw_in
+      else:
+        q_res = k_res = v_res = q_rstd_res = k_rstd_res = None
+        q_raw_res = k_raw_res = v_raw_res = None
+    else:
+      q_stage34 = q
+      q_res, k_res, v_res = q, k, v
+      q_rstd_res, k_rstd_res = q_rstd, k_rstd
+      q_raw_res = k_raw_res = v_raw_res = None
+
+    if _inplace_cp:
+      assert context_parallel_metadata is not None
+      s_local, m_local = compute_local_cp_fwd_summary(
+          kg=kg,
+          w=w,
+          u=u,
+          gk=g_cumsum,
+          chunk_size=BT,
+          packed_chunk_keep=packed_chunk_keep,
+      )
+      initial_state = cp_associative_scan_fwd(
+          s_local,
+          m_local,
+          axis_name=context_parallel_metadata.axis_name,
+          cp_size=context_parallel_metadata.cp_size,
+      )
+      if cp_ckpt is not None:
+        initial_state = ad_checkpoint.checkpoint_name(
+            initial_state, name=cp_ckpt
+        )
+    elif _cp_active:
+      assert (
+          cu_seqlens is not None
+          and chunk_indices is not None
+          and context_parallel_metadata is not None
+      )
+      initial_state = _prepare_cp_initial_state(
+          kg=kg,
+          w=w,
+          u=u,
+          gk=g_cumsum,
+          cu_seqlens=cu_seqlens,
+          chunk_indices=chunk_indices,
+          context_parallel_metadata=context_parallel_metadata,
+          chunk_size=BT,
+      )
+
+    # ------------------------------------------------------------------
+    # Step 3 + Step 4: Inter-chunk state + Output (gather/scatter for varlen)
+    #
+    # The inter-chunk kernel and output kernel require BT-aligned
+    # cu_seqlens (they index blocks via bos // BT).  For non-aligned
+    # varlen sequences we reuse the existing _align_seqs / _unalign_output
+    # utilities to gather inputs into a chunk-aligned layout, run Stages
+    # 3 & 4, then scatter the output back.
+    #
+    # Padding semantics (relied on for correctness):
+    #   - k/w/u/q/Aqk at padded tail positions = 0 (from _align_seqs's
+    #     jnp.pad with default fill value 0). With zero k/w/u/q the state
+    #     update reduces to h_pad = h_{t-1} * exp(g_pad) + 0, and the
+    #     output reduces to q_pad * exp(...) @ h = 0 * ... = 0.
+    #   - g_cumsum at padded tail positions = 0 ⇒ exp(g_pad) = 1, so the
+    #     hidden state is carried through padded positions unchanged.
+    # ------------------------------------------------------------------
+    # Stage 1/2 already operate in BT-aligned layout; derived tensors inherit
+    # that layout. Use the fused Stage 3+4 kernel for both varlen and fixed
+    # inputs. A fixed batch is represented as one sequence [0, T] per batch.
+    if _is_varlen:
+      stage34_cu_seqlens = cu_seqlens
+      stage34_chunk_indices = chunk_indices
+      stage34_initial_state = initial_state
+    else:
+      stage34_cu_seqlens = jnp.broadcast_to(
+        jnp.asarray([0, T], dtype=jnp.int32), (B, 2)
+      )
+      block_ids = jnp.arange(T // BT, dtype=jnp.int32)
+      fixed_chunk_indices = jnp.stack(
+        [jnp.zeros_like(block_ids), block_ids], axis=-1
+      )
+      stage34_chunk_indices = jnp.broadcast_to(
+        fixed_chunk_indices[None, :, :], (B, T // BT, 2)
+      )
+      stage34_initial_state = (
+        initial_state[:, None, ...] if initial_state is not None else None
+      )
+
+    o, final_state, h, v_new = chunk_kda_fwd_h_o_varlen(
         w=w,
         u=u,
+        kg=kg,
         gk=g_cumsum,
+        q=q_stage34,
+        A=Aqk,
+        cu_seqlens=stage34_cu_seqlens,
+        chunk_indices=stage34_chunk_indices,
+        initial_state=stage34_initial_state,
+        output_final_state=output_final_state,
+        scale=scale_val,
         chunk_size=BT,
+        store_h=disable_recompute,
+        store_v_new=disable_recompute,
+        mini_batch=mini_batch,
+        two_pass_bf16=two_pass_bf16,
+        packed_tok_meta=packed_tok_meta,
         packed_chunk_keep=packed_chunk_keep,
     )
-    initial_state = cp_associative_scan_fwd(
-        s_local,
-        m_local,
-        axis_name=context_parallel_metadata.axis_name,
-        cp_size=context_parallel_metadata.cp_size,
-    )
-    if cp_ckpt is not None:
-      initial_state = ad_checkpoint.checkpoint_name(
-          initial_state, name=cp_ckpt
-      )
-  elif _cp_active:
-    assert (
-        cu_seqlens is not None
-        and chunk_indices is not None
-        and context_parallel_metadata is not None
-    )
-    initial_state = _prepare_cp_initial_state(
-        kg=kg,
-        w=w,
-        u=u,
-        gk=g_cumsum,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        context_parallel_metadata=context_parallel_metadata,
-        chunk_size=BT,
-    )
-
-  # ------------------------------------------------------------------
-  # Step 3 + Step 4: Inter-chunk state + Output (gather/scatter for varlen)
-  #
-  # The inter-chunk kernel and output kernel require BT-aligned
-  # cu_seqlens (they index blocks via bos // BT).  For non-aligned
-  # varlen sequences we reuse the existing _align_seqs / _unalign_output
-  # utilities to gather inputs into a chunk-aligned layout, run Stages
-  # 3 & 4, then scatter the output back.
-  #
-  # Padding semantics (relied on for correctness):
-  #   - k/w/u/q/Aqk at padded tail positions = 0 (from _align_seqs's
-  #     jnp.pad with default fill value 0). With zero k/w/u/q the state
-  #     update reduces to h_pad = h_{t-1} * exp(g_pad) + 0, and the
-  #     output reduces to q_pad * exp(...) @ h = 0 * ... = 0.
-  #   - g_cumsum at padded tail positions = 0 ⇒ exp(g_pad) = 1, so the
-  #     hidden state is carried through padded positions unchanged.
-  # ------------------------------------------------------------------
-  # Stage 1/2 already operate in BT-aligned layout; derived tensors inherit
-  # that layout. Use the fused Stage 3+4 kernel for both varlen and fixed
-  # inputs. A fixed batch is represented as one sequence [0, T] per batch.
-  if _is_varlen:
-    stage34_cu_seqlens = cu_seqlens
-    stage34_chunk_indices = chunk_indices
-    stage34_initial_state = initial_state
-  else:
-    stage34_cu_seqlens = jnp.broadcast_to(
-      jnp.asarray([0, T], dtype=jnp.int32), (B, 2)
-    )
-    block_ids = jnp.arange(T // BT, dtype=jnp.int32)
-    fixed_chunk_indices = jnp.stack(
-      [jnp.zeros_like(block_ids), block_ids], axis=-1
-    )
-    stage34_chunk_indices = jnp.broadcast_to(
-      fixed_chunk_indices[None, :, :], (B, T // BT, 2)
-    )
-    stage34_initial_state = (
-      initial_state[:, None, ...] if initial_state is not None else None
-    )
-
-  o, final_state, h, v_new = chunk_kda_fwd_h_o_varlen(
-      w=w,
-      u=u,
-      kg=kg,
-      gk=g_cumsum,
-      q=q_stage34,
-      A=Aqk,
-      cu_seqlens=stage34_cu_seqlens,
-      chunk_indices=stage34_chunk_indices,
-      initial_state=stage34_initial_state,
-      output_final_state=output_final_state,
-      scale=scale_val,
-      chunk_size=BT,
-      store_h=disable_recompute,
-      store_v_new=disable_recompute,
-      mini_batch=mini_batch,
-      two_pass_bf16=two_pass_bf16,
-      packed_tok_meta=packed_tok_meta,
-      packed_chunk_keep=packed_chunk_keep,
-  )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]
 
@@ -2962,12 +3601,26 @@ def chunk_kda_fwd_custom(
   if aligned_cu_seqlens is not None:
     if segment_ids is None:
       raise ValueError("Aligned varlen metadata requires `segment_ids`.")
-    output = _unalign_output(
-        output,
-        cu_seqlens,
-        aligned_cu_seqlens,
-        segment_ids.shape[1],
+    unalign = (
+        functools.partial(
+            compact_output, chunk_size=chunk_size, zero_guard=padding_guard
+        )
+        if packed_output and not _cp_active
+        else functools.partial(_unalign_output, zero_guard=padding_guard)
     )
+    if token_unpermute is not None:
+      output = _unalign_output(
+          output,
+          cu_seqlens,
+          aligned_cu_seqlens,
+          segment_ids.shape[1],
+          token_order=token_unpermute,
+          zero_guard=padding_guard,
+      )
+    else:
+      output = unalign(
+          output, cu_seqlens, aligned_cu_seqlens, segment_ids.shape[1]
+      )
 
   output = (output.astype(q.dtype), final_state)
   if not return_residuals:
@@ -2979,6 +3632,7 @@ def chunk_kda_fwd_custom(
   # arguments, but these copies may be varlen-aligned and L2-normalized.
   assert q_res is not None and k_res is not None and v_res is not None
   residuals = KdaResiduals(
+      padding_guard=padding_guard,
       q=q_res,
       k=k_res,
       v=v_res,

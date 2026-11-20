@@ -356,6 +356,21 @@ SHARDS: ShardMap = {
         minutes=16,
         compat_minutes=1,
     ),
+    'experimental-kda-megakernel-forward': Spec(
+        paths=(
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_fwd_fused_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_compact_forward_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_packed_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_output_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_resource_test.py',
+            'tokamax/_src/ops/kda/native_padding_carry_test.py',
+            'tokamax/_src/ops/kda/packing_single_call_test.py',
+            'tokamax/_src/ops/kda/packing_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_padding_test.py',
+            'tokamax/_src/ops/kda/training_packing_regression_test.py',
+        ),
+        minutes=10,
+    ),
     'experimental-routing-moe': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',

@@ -361,13 +361,18 @@ def derive_context_parallel_metadata(
     max_num_segments: int | None,
 ) -> tuple[ContextParallelMetadata | None, jax.Array | None]:
   cu_seqlens = None
-  if context_parallel_metadata is None or not context_parallel_metadata.is_cp_enabled:
+  if (
+      context_parallel_metadata is None
+      or not context_parallel_metadata.is_cp_enabled
+  ):
     return context_parallel_metadata, cu_seqlens
 
   if initial_state is not None:
     raise ValueError("`initial_state` is not supported when CP is enabled.")
   if output_final_state:
-    raise ValueError("`output_final_state` is not supported when CP is enabled.")
+    raise ValueError(
+        "`output_final_state` is not supported when CP is enabled."
+    )
   if segment_ids is None:
     raise ValueError("CP requires rank-local `segment_ids` with shape [B, T].")
 
@@ -385,7 +390,9 @@ def derive_context_parallel_metadata(
     cu_locals.append(cu_b)
     chain_metas.append(meta_b)
   cu_seqlens = jnp.stack(cu_locals, axis=0)
-  chain_meta = {k: jnp.stack([m[k] for m in chain_metas]) for k in chain_metas[0]}
+  chain_meta = {
+      k: jnp.stack([m[k] for m in chain_metas]) for k in chain_metas[0]
+  }
   context_parallel_metadata = dataclasses.replace(
       context_parallel_metadata,
       is_first_rank=chain_meta["is_first_rank"],
@@ -421,7 +428,9 @@ def align_up(x, align: int):
   return cdiv(x, align) * align
 
 
-def pad_to_multiple(x: jax.Array, multiple: int | list[int], axis: int | list[int], val):
+def pad_to_multiple(
+    x: jax.Array, multiple: int | list[int], axis: int | list[int], val
+):
   if isinstance(multiple, int):
     multiple = [multiple]
   if isinstance(axis, int):
@@ -450,6 +459,7 @@ def _align_seqs(
     cu_seqlens,
     align,
     aligned_cu_seqlens=None,
+    token_order=None,
 ):
   """Align (pad) each variable-length sequence to a multiple of ``align``.
 
@@ -466,19 +476,18 @@ def _align_seqs(
     padded_cus = []
     t_aligned_sizes = []
     for b in range(B):
-      t4 = [t[:, b:b+1, :, :] for t in tensors_4d]
-      t3 = [t[:, b:b+1, :] for t in tensors_3d]
+      t4 = [t[:, b : b + 1, :, :] for t in tensors_4d]
+      t3 = [t[:, b : b + 1, :] for t in tensors_3d]
       aligned_cu_b = (
-          None
-          if aligned_cu_seqlens is None
-          else aligned_cu_seqlens[b]
+          None if aligned_cu_seqlens is None else aligned_cu_seqlens[b]
       )
       aligned_4d, aligned_3d, padded_cu_b, _ = _align_seqs(
-        t4,
-        t3,
-        cu_seqlens[b],
-        align,
-        aligned_cu_seqlens=aligned_cu_b,
+          t4,
+          t3,
+          cu_seqlens[b],
+          align,
+          aligned_cu_seqlens=aligned_cu_b,
+          token_order=None if token_order is None else token_order[b],
       )
       for idx, a in enumerate(aligned_4d):
         per_batch_4d[idx].append(a)
@@ -489,6 +498,7 @@ def _align_seqs(
       t_aligned_sizes.append(aligned_t)
 
     T_max = max(t_aligned_sizes)
+
     # Pad each batch element to T_max and concatenate along B.
     def _pad_and_cat_4d(tensors_per_batch):
       padded = []
@@ -527,7 +537,7 @@ def _align_seqs(
     )
   else:
     padded_cu = aligned_cu_seqlens
-  T_new = ((T_old + N * (align - 1) + align - 1) // align) * align
+  T_new = _aligned_token_bound(T_old, N, align)
 
   def _build_gather(i, gather_idx):
     old_start = cu_seqlens[i]
@@ -539,29 +549,74 @@ def _align_seqs(
     return jnp.where(in_seg, src, gather_idx)
 
   gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
-  gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+  if N > 8192:
+    positions = jnp.arange(T_new, dtype=jnp.int32)
+    seq = jnp.minimum(
+        jnp.searchsorted(padded_cu[1:], positions, side="right"), N - 1
+    )
+    offset = positions - padded_cu[seq]
+    valid = (positions < padded_cu[-1]) & (offset < seg_lens[seq])
+    gather_idx = jnp.where(valid, cu_seqlens[seq] + offset, T_old)
+  else:
+    gather_idx = jax.lax.fori_loop(
+        0, N, _build_gather, gather_idx, unroll=min(N, 8) if N <= 64 else 1
+    )
+
+  if token_order is not None:
+    # Compose packing with the existing alignment gather, avoiding a full
+    # intermediate copy of every Q/K/V/gate/beta operand.
+    order_with_guard = jnp.pad(token_order, (0, 1), constant_values=T_old)
+    gather_idx = order_with_guard[gather_idx]
 
   def repack_4d(t):
     # t: [H, B, T, K] — gather along axis 2 (T dimension)
-    return jnp.pad(t, ((0, 0), (0, 0), (0, T_new - T_old), (0, 0)))[:, :, gather_idx]
+    return jnp.pad(t, ((0, 0), (0, 0), (0, T_new - T_old), (0, 0)))[
+        :, :, gather_idx
+    ]
 
   def repack_3d(t):
     # t: [H, B, T] — gather along axis 2 (T dimension)
     return jnp.pad(t, ((0, 0), (0, 0), (0, T_new - T_old)))[:, :, gather_idx]
 
   return (
-    [repack_4d(t) for t in tensors_4d],
-    [repack_3d(t) for t in tensors_3d],
-    padded_cu,
-    cu_seqlens,
+      [repack_4d(t) for t in tensors_4d],
+      [repack_3d(t) for t in tensors_3d],
+      padded_cu,
+      cu_seqlens,
   )
 
 
-def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
+def _gather_unaligned_rows(o, source, valid, guard_end, *, zero_guard):
+  if zero_guard:
+    # _align_seqs reserves a zeroable row beyond the valid content. If its
+    # allocation bound is tight, the last allocated row is final-chunk padding.
+    # Clear only that row, allowing XLA to update the dead input buffer in place
+    # instead of materializing a full output-sized floating-point selection.
+    guard = jnp.minimum(guard_end, o.shape[2] - 1)
+    o = jax.lax.dynamic_update_slice_in_dim(
+        o, jnp.zeros_like(o[:, :, :1]), guard, axis=2
+    )
+    return o[:, :, jnp.where(valid, source, guard)]
+  values = o[:, :, source]
+  mask = valid.reshape((1, 1, valid.shape[0]) + (1,) * (o.ndim - 3))
+  return jnp.where(mask, values, 0)
+
+
+def _unalign_output(
+    o,
+    orig_cu_seqlens,
+    aligned_cu_seqlens,
+    T_out,
+    token_order=None,
+    *,
+    zero_guard=False,
+):
   """Reverse _align_seqs: scatter aligned output back to original positions.
 
   Supports batched cu_seqlens [B, N+1] — processes each batch element
-  independently.
+  independently. ``zero_guard`` is private to buffers allocated by
+  ``_align_seqs`` with alignment greater than one; arbitrary inputs retain
+  explicit masking.
   """
   if orig_cu_seqlens.ndim == 2:
     B = orig_cu_seqlens.shape[0]
@@ -570,23 +625,44 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
       # Use slicing that works for both 3D [H,B,T] and 4D [H,B,T,X]
       ob_slice = jax.lax.dynamic_slice_in_dim(o, b, 1, axis=1)
       ob = _unalign_output(
-        ob_slice,
-        orig_cu_seqlens[b],
-        aligned_cu_seqlens[b],
-        T_out,
+          ob_slice,
+          orig_cu_seqlens[b],
+          aligned_cu_seqlens[b],
+          T_out,
+          token_order=None if token_order is None else token_order[b],
+          zero_guard=zero_guard,
       )
       per_batch.append(ob)
     return jnp.concatenate(per_batch, axis=1)
 
   # --- Single-batch path (original) ---
   N = orig_cu_seqlens.shape[0] - 1
+  if N > 8192:
+    positions = (
+        jnp.arange(T_out, dtype=jnp.int32)
+        if token_order is None
+        else token_order
+    )
+    seq = jnp.minimum(
+        jnp.searchsorted(orig_cu_seqlens[1:], positions, side="right"),
+        N - 1,
+    )
+    source = aligned_cu_seqlens[seq] + positions - orig_cu_seqlens[seq]
+    valid = positions < orig_cu_seqlens[-1]
+    return _gather_unaligned_rows(
+        o,
+        source if zero_guard else jnp.where(valid, source, 0),
+        valid,
+        aligned_cu_seqlens[-1],
+        zero_guard=zero_guard,
+    )
   orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
 
   def _build_gather(i, gather_idx):
     orig_start = orig_cu_seqlens[i]
     aligned_start = aligned_cu_seqlens[i]
     sl = orig_seg_lens[i]
-    j = jnp.arange(T_out)
+    j = jnp.arange(T_out) if token_order is None else token_order
     in_seg = (j >= orig_start) & (j < orig_start + sl)
     src = aligned_start + (j - orig_start)
     return jnp.where(in_seg, src, gather_idx)
@@ -596,8 +672,35 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
   # index is always valid and always reads padding (zero).
   safe_default = aligned_cu_seqlens[-1]
   gather_idx = jnp.full(T_out, safe_default, dtype=jnp.int32)
-  gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
-  return o[:, :, gather_idx]
+  gather_idx = jax.lax.fori_loop(
+      0, N, _build_gather, gather_idx, unroll=min(N, 8) if N <= 64 else 1
+  )
+  positions = jnp.arange(T_out) if token_order is None else token_order
+  valid = positions < orig_cu_seqlens[-1]
+  return _gather_unaligned_rows(
+      o, gather_idx, valid, aligned_cu_seqlens[-1], zero_guard=zero_guard
+  )
+
+
+def _bounded_chunk_boundaries(boundaries, mapping):
+  """Flatten large per-chunk boundary windows to avoid narrow-tile padding."""
+  if boundaries.size <= 8193:
+    return boundaries.astype(jnp.int32)
+  starts = jnp.take_along_axis(boundaries[:, :-1], mapping, axis=1)
+  ends = jnp.take_along_axis(boundaries[:, 1:], mapping, axis=1)
+  return jnp.stack((starts, ends), axis=-1).reshape(-1).astype(jnp.int32)
+
+
+def _aligned_token_bound(tokens, capacity, chunk_size):
+  """Bound padding by nonempty runs without changing public state capacity."""
+  if capacity <= 8192:
+    return align_up(tokens + capacity * (chunk_size - 1), chunk_size)
+  # Each nonempty run consumes at least one original token. Keep a zero guard
+  # chunk even when every token forms its own run (unalignment reads the tail).
+  return (
+      align_up(tokens + min(capacity, tokens) * (chunk_size - 1), chunk_size)
+      + chunk_size
+  )
 
 
 def align_segment_ids(
@@ -610,17 +713,17 @@ def align_segment_ids(
     raise ValueError(f"`segment_ids` must be 1D, got {segment_ids.shape}.")
   T = segment_ids.shape[0]
 
-  is_boundary = jnp.concatenate([
-      jnp.ones(1, dtype=jnp.bool_),
-      segment_ids[1:] != segment_ids[:-1],
-  ])
+  is_boundary = jnp.concatenate(
+      [
+          jnp.ones(1, dtype=jnp.bool_),
+          segment_ids[1:] != segment_ids[:-1],
+      ]
+  )
   seg_idx = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
   positions = jnp.arange(T, dtype=jnp.int32)
 
   seg_starts = (
-      jnp.full(max_num_segments, T, dtype=jnp.int32)
-      .at[seg_idx]
-      .min(positions)
+      jnp.full(max_num_segments, T, dtype=jnp.int32).at[seg_idx].min(positions)
   )
   seg_ends = (
       jnp.zeros(max_num_segments, dtype=jnp.int32)
@@ -632,14 +735,14 @@ def align_segment_ids(
 
   is_real = (seg_labels > 0) & (seg_lens > 0)
   aligned_lens = jnp.where(is_real, align_up(seg_lens, chunk_size), 0)
-  aligned_starts = jnp.concatenate([
-      jnp.zeros(1, dtype=jnp.int32),
-      jnp.cumsum(aligned_lens)[:-1],
-  ])
+  aligned_starts = jnp.concatenate(
+      [
+          jnp.zeros(1, dtype=jnp.int32),
+          jnp.cumsum(aligned_lens)[:-1],
+      ]
+  )
 
-  T_aligned = (
-      (T + max_num_segments * (chunk_size - 1) + chunk_size - 1) // chunk_size
-  ) * chunk_size
+  T_aligned = _aligned_token_bound(T, max_num_segments, chunk_size)
   out = jnp.zeros((T_aligned,), dtype=jnp.int32)
   apos = jnp.arange(T_aligned, dtype=jnp.int32)
 
@@ -649,7 +752,16 @@ def align_segment_ids(
     mask = is_real[i] & (apos >= start) & (apos < end)
     return jnp.where(mask, seg_labels[i], ids)
 
-  return jax.lax.fori_loop(0, max_num_segments, body, out)
+  if max_num_segments > 8192:
+    ends = aligned_starts + aligned_lens
+    seq = jnp.minimum(
+        jnp.searchsorted(ends, apos, side="right"), max_num_segments - 1
+    )
+    return jnp.where(apos < ends[-1], seg_labels[seq], 0)
+  return jax.lax.fori_loop(
+      0, max_num_segments, body, out,
+      unroll=min(max_num_segments, 8) if max_num_segments <= 64 else 1,
+  )
 
 
 def segment_ids_to_seqlens(
@@ -665,22 +777,34 @@ def segment_ids_to_seqlens(
     ]
     return jnp.stack(rows, axis=0)
   if segment_ids.ndim != 1:
-    raise ValueError(f"`segment_ids` must be [T] or [B, T], got {segment_ids.shape}.")
+    raise ValueError(
+        f"`segment_ids` must be [T] or [B, T], got {segment_ids.shape}."
+    )
 
   seg = segment_ids.reshape(-1)
   valid = seg != 0
-  is_boundary = jnp.concatenate([
-      jnp.ones(1, dtype=jnp.bool_),
-      seg[1:] != seg[:-1],
-  ]) & valid
+  is_boundary = (
+      jnp.concatenate(
+          [
+              jnp.ones(1, dtype=jnp.bool_),
+              seg[1:] != seg[:-1],
+          ]
+      )
+      & valid
+  )
   seg_idx = jnp.where(valid, jnp.cumsum(is_boundary.astype(jnp.int32)), 0)
   n_segs = seg_idx.max()
   n_real = jnp.sum(valid).astype(jnp.int32)
 
-  is_end = jnp.concatenate([
-      seg[1:] != seg[:-1],
-      jnp.ones(1, dtype=jnp.bool_),
-  ]) & valid
+  is_end = (
+      jnp.concatenate(
+          [
+              seg[1:] != seg[:-1],
+              jnp.ones(1, dtype=jnp.bool_),
+          ]
+      )
+      & valid
+  )
   prefix_len = jnp.cumsum(valid.astype(jnp.int32))
 
   drop_idx = jnp.asarray(max_segs + 1, dtype=jnp.int32)
@@ -715,10 +839,12 @@ def prepare_chunk_indices(
       n_chunks,
       total_repeat_length=total_nt,
   )
-  prefix_chunks = jnp.concatenate([
-      jnp.zeros(1, dtype=jnp.int32),
-      jnp.cumsum(n_chunks),
-  ])
+  prefix_chunks = jnp.concatenate(
+      [
+          jnp.zeros(1, dtype=jnp.int32),
+          jnp.cumsum(n_chunks),
+      ]
+  )
   seq_offsets = jnp.repeat(
       prefix_chunks[:-1],
       n_chunks,
@@ -742,9 +868,9 @@ def chunk_local_cumsum_vector(
     packed_tok_meta: Int[Array, "B NT 8 BT"] | None = None,
 ) -> Float[Array, "H B T K"]:
   """Computes prefix or suffix sums independently within each chunk."""
-  assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-      "chunk_size must be power of 2"
-  )
+  assert chunk_size == 2 ** (
+      chunk_size.bit_length() - 1
+  ), "chunk_size must be power of 2"
 
   bt = chunk_size
   out_dtype = output_dtype or g.dtype
@@ -824,9 +950,7 @@ def kda_gate_chunk_cumsum(
   if lower_bound is None:
     g_act = -jnp.exp(a).reshape(h, 1, 1, 1) * jax.nn.softplus(g_f32)
   else:
-    g_act = lower_bound * jax.nn.sigmoid(
-        jnp.exp(a).reshape(h, 1, 1, 1) * g_f32
-    )
+    g_act = lower_bound * jax.nn.sigmoid(jnp.exp(a).reshape(h, 1, 1, 1) * g_f32)
 
   if valid_mask is not None:
     g_act = jnp.where(valid_mask[None, :, :, None], g_act, 0)

@@ -636,6 +636,43 @@ def _recompute_w_u_fwd(
   )
 
 
+def _cp_gated_qk_pallas(
+    q: jax.Array, k: jax.Array, g: jax.Array, chunk_size: int
+) -> tuple[jax.Array, jax.Array]:
+  """Keep CP gated Q/K broadcasts chunk-local during TPU lowering."""
+  heads, batch, tokens, width = q.shape
+  chunks = tokens // chunk_size
+  shape = (heads, batch, chunks, chunk_size, width)
+  spec = pl.BlockSpec(
+      (1, 1, 1, chunk_size, width), lambda h, b, c: (h, b, c, 0, 0)
+  )
+
+  def kernel(q_ref, k_ref, g_ref, qg_ref, kg_ref):
+    gates = g_ref[...].astype(jnp.float32)
+    qg_ref[...] = (q_ref[...].astype(jnp.float32) * jnp.exp2(gates)).astype(
+        q_ref.dtype
+    )
+    kg_ref[...] = (
+        k_ref[...].astype(jnp.float32) * jnp.exp2(gates[..., -1:, :] - gates)
+    ).astype(k_ref.dtype)
+
+  qg, kg = pl.pallas_call(
+      kernel,
+      out_shape=(
+          jax.ShapeDtypeStruct(shape, q.dtype),
+          jax.ShapeDtypeStruct(shape, k.dtype),
+      ),
+      grid=(heads, batch, chunks),
+      in_specs=(spec, spec, spec),
+      out_specs=(spec, spec),
+      interpret=get_interpret(),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "parallel")
+      ),
+  )(q.reshape(shape), k.reshape(shape), g.reshape(shape))
+  return qg.reshape(q.shape), kg.reshape(k.shape)
+
+
 def compute_dhu_recurrence(
     bkg, dh, bdv0, dh_tmp, g_exp_last, bqg, bw, bdo, scale, precision
 ):
@@ -3788,6 +3825,7 @@ def chunk_kda_bwd_custom(
         cu_seqlens,
         align=chunk_size,
         aligned_cu_seqlens=aligned_cu,
+        token_order=residuals.token_order,
     )
     cu_seqlens_bwd = aligned_cu
   elif do.shape[2] < q.shape[2]:
@@ -3940,7 +3978,8 @@ def chunk_kda_bwd_custom(
 
   if disable_recompute:
     # Path A: save-h fast path.
-    if use_gate_in_kernel:
+    # Reuse the FP32 prefix saved by forward; rematerialize only if absent.
+    if use_gate_in_kernel and g_cumsum is None:
       if a_log is None:
         raise ValueError("a_log is required when use_gate_in_kernel=True")
       assert g_org is not None
@@ -4021,7 +4060,8 @@ def chunk_kda_bwd_custom(
       )
   else:
     # Path B: full recompute fallback.
-    if use_gate_in_kernel:
+    # Reuse the FP32 prefix saved by forward; rematerialize only if absent.
+    if use_gate_in_kernel and g_cumsum is None:
       if a_log is None:
         raise ValueError("a_log is required when use_gate_in_kernel=True")
       assert g_org is not None
@@ -4189,7 +4229,7 @@ def chunk_kda_bwd_custom(
           if g.shape[-1] == q.shape[-1]
           else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
       )
-      w, _, qg, kg = _recompute_w_u_fwd(
+      w, _, _, _ = _recompute_w_u_fwd(
           k=k,
           v=v,
           beta=beta,
@@ -4199,6 +4239,8 @@ def chunk_kda_bwd_custom(
           chunk_size=BT,
           two_pass_bf16=two_pass_bf16,
       )
+      # Keep the two gated broadcasts out of a rank-flattened XLA fusion.
+      qg, kg = _cp_gated_qk_pallas(q, k, g_wide, BT)
     # Inputs already in [H, B, T, X]; pre_process consumes this layout
     # directly (no transpose round-trip).
     dS_ext, dM = chunk_gated_delta_rule_bwd_dhu_pre_process(
@@ -4292,7 +4334,36 @@ def chunk_kda_bwd_custom(
       two_pass_bf16=two_pass_bf16,
       packed_tok_meta=packed_tok_meta,
       packed_chunk_keep=packed_chunk_keep,
+      dqkv_dtype=(
+          q.dtype
+          if residuals.q_raw is None
+          and (not use_qk_l2norm or _l2norm_in_kernel)
+          and q.dtype == k.dtype == v.dtype
+          else None
+      ),
   )
+
+  # Padding chunks need not write their backward output buffers. Clear those
+  # lanes before gate-parameter reductions, rather than reducing uninitialized
+  # values or multiplying a raw-gate -inf sentinel by a zero cotangent.
+  if segment_ids is not None:
+    valid = segment_ids[None, :, :] != 0
+    # Row-local gradients are masked by unalignment. Convolution consumes
+    # neighboring rows first, so it still needs the aligned padding cleared.
+    if original_cu_seqlens is None or residuals.q_raw is not None:
+      dq = jnp.where(valid[..., None], dq, 0)
+      dk = jnp.where(valid[..., None], dk, 0)
+      dv = jnp.where(valid[..., None], dv, 0)
+      db = jnp.where(valid, db, 0)
+    dg = jnp.where(valid[..., None], dg, 0)
+    if g_org is not None:
+      g_org = jnp.where(valid[..., None], g_org, 0)
+
+  # Empty sequences preserve their initial state, so their initial-state
+  # gradient is exactly the final-state cotangent (zero when not requested).
+  if dh0 is not None and cu_seqlens is not None:
+    empty = (jnp.diff(cu_seqlens, axis=-1) == 0)[..., None, None, None]
+    dh0 = jnp.where(empty, 0 if dht_m4 is None else dht_m4, dh0)
 
   dA, dbias = None, None
   if use_gate_in_kernel:
@@ -4398,11 +4469,54 @@ def chunk_kda_bwd_custom(
       )
 
   if cu_seqlens is not None:
-    dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig)
-    dk = _unalign_output(dk, cu_seqlens, aligned_cu, T_orig)
-    dv = _unalign_output(dv, cu_seqlens, aligned_cu, T_orig)
-    dg = _unalign_output(dg, cu_seqlens, aligned_cu, T_orig)
-    db = _unalign_output(db, cu_seqlens, aligned_cu, T_orig)
+    # No arithmetic follows unalignment. Apply the public gradient dtype
+    # before moving rows so the gather does not transport FP32 temporaries
+    # that the Op would immediately convert back to the primal dtype.
+    dq = dq.astype(q.dtype)
+    dk = dk.astype(k.dtype)
+    dv = dv.astype(v.dtype)
+    dg = dg.astype(g_dtype_marker.dtype)
+    db = db.astype(beta.dtype)
+    dq = _unalign_output(
+        dq,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+        zero_guard=residuals.padding_guard,
+    )
+    dk = _unalign_output(
+        dk,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+        zero_guard=residuals.padding_guard,
+    )
+    dv = _unalign_output(
+        dv,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+        zero_guard=residuals.padding_guard,
+    )
+    dg = _unalign_output(
+        dg,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+        zero_guard=residuals.padding_guard,
+    )
+    db = _unalign_output(
+        db,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+        zero_guard=residuals.padding_guard,
+    )
   elif T_orig is not None:
     dq = dq[:, :, :T_orig, :]
     dk = dk[:, :, :T_orig, :]
