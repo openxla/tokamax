@@ -2232,6 +2232,61 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     for r, g in zip(ref_vals, opt_vals):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
+  def test_near_diagonal_static_segments_bit_exact(self):
+    """Static near-diagonal schedule with segment ids matches the pruned one."""
+    batch, seq_len, head_dim, block = 2, 1024, 128, 256
+    num_q_heads, num_kv_heads = 4, 2
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = random.normal(k1, (batch, num_q_heads, seq_len, head_dim))
+    k = random.normal(k2, (batch, num_kv_heads, seq_len, head_dim))
+    v = random.normal(k3, (batch, num_kv_heads, seq_len, head_dim))
+    do = random.normal(k4, (batch, num_q_heads, seq_len, head_dim))
+    q, k, v, do = (x.astype(jnp.bfloat16) for x in (q, k, v, do))
+    # Packed documents, with boundaries inside blocks and on a block edge
+    # (512), where the pruning drops the tile left of the diagonal.
+    seg = np.zeros((batch, seq_len), np.int32)
+    for b, bounds in enumerate(((100, 512, 700), (256, 300, 900))):
+      for start in bounds:
+        seg[b, start:] += 1
+    segment_ids = base.SegmentIds(q=jnp.asarray(seg), kv=jnp.asarray(seg))
+    mask = mask_lib.LocalMask(
+        shape=(seq_len, seq_len), window_size=(block - 1, 0), offset=0
+    )
+
+    def run(near_diagonal_static_segments):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=1,
+          near_diagonal_static_segments=near_diagonal_static_segments,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      self.assertEqual(
+          attn.kwargs["config"].static_segment_schedule,
+          near_diagonal_static_segments,
+      )
+
+      def fwd_bwd(q, k, v, do, segment_ids):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids),
+            q,
+            k,
+            v,
+        )
+        return (out, *vjp(do))
+
+      return jax.jit(jax.vmap(fwd_bwd))(q, k, v, do, segment_ids)
+
+    for name, ref, got in zip(("out", "dq", "dk", "dv"), run(False), run(True)):
+      with self.subTest(name):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
 
 if __name__ == "__main__":
   absltest.main()
