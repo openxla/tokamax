@@ -73,7 +73,8 @@ def segment_ids_strategy(draw, seq_len: int) -> base.SegmentIds:
     if end - start < 2:
       end = start + 2
     ids_array[start:end] = i
-  return base.SegmentIds(jnp.asarray(ids_array), jnp.asarray(ids_array))
+  ids = jnp.asarray(ids_array)
+  return base.SegmentIds(ids, ids)
 
 
 def seed_strategy() -> hps.SearchStrategy[int]:
@@ -229,9 +230,13 @@ def mask_strategy(draw: Draw, q_seq_len: int, kv_seq_len: int) -> Mask:
 
 
 @hps.composite
-def model_config_strategy(draw: Draw) -> ModelConfig:
+def model_config_strategy(
+    draw: Draw, is_segmented: bool = False
+) -> ModelConfig:
   q_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
-  kv_seq_len = draw(hps.sampled_from([1024, 2048, 4096]))
+  kv_seq_len = (
+      q_seq_len if is_segmented else draw(hps.sampled_from([1024, 2048, 4096]))
+  )
   head_dim_qk, head_dim_v = draw(
       hps.sampled_from(
           [(64, 128), (64, 64), (128, 128), (256, 256), (192, 128)]
@@ -260,14 +265,20 @@ def model_config_strategy(draw: Draw) -> ModelConfig:
 
 def check_mask_no_empty_rows(
     mask: mask_lib.Mask, segment_ids: splash.SegmentIds | None
-):
-  effective_mask = np.array(mask[:, :])
+) -> jax.Array:
+  dense_mask = np.asarray(mask[:, :])
 
   if segment_ids is not None:
-    segment_mask = segment_ids.q[:, None] == segment_ids.kv[None, :]
-    effective_mask = effective_mask & segment_mask
+    q_ids = np.asarray(segment_ids.q)
+    kv_ids = (
+        q_ids if segment_ids.kv is segment_ids.q else np.asarray(segment_ids.kv)
+    )
+    effective_mask = dense_mask & (q_ids[:, None] == kv_ids[None, :])
+  else:
+    effective_mask = dense_mask
 
-  hp.assume(np.all(np.any(effective_mask, axis=1)))
+  hp.assume(bool(np.all(np.any(effective_mask, axis=1))))
+  return jnp.asarray(dense_mask)
 
 
 @hps.composite
@@ -324,15 +335,21 @@ def _generate_inputs(
     is_mqa: bool,
     is_segmented: bool,
     use_sinks: bool = False,
+    need_do: bool = False,
 ) -> tuple[
     jax.Array,
     jax.Array,
     jax.Array,
     jax.Array | None,
     splash.SegmentIds | None,
-    jax.Array,
+    jax.Array | None,
 ]:
   seed = data.draw(seed_strategy())
+  segment_ids = None
+  if is_segmented:
+    hp.assume(config.q_seq_len == config.kv_seq_len)
+    segment_ids = data.draw(segment_ids_strategy(config.q_seq_len))
+
   key = random.key(seed)
   k1, k2, k3, k_sinks, k_do = random.split(key, 5)
 
@@ -352,18 +369,18 @@ def _generate_inputs(
   if use_sinks:
     sinks = random.uniform(k_sinks, (config.num_q_heads,), dtype=config.dtype)
 
-  segment_ids = None
-  if is_segmented:
-    hp.assume(config.q_seq_len == config.kv_seq_len)
-    segment_ids = data.draw(segment_ids_strategy(config.q_seq_len))
-
-  o_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_v)
-  do = random.uniform(k_do, o_shape, dtype=config.dtype)
+  do = None
+  if need_do:
+    o_shape = (config.num_q_heads, config.q_seq_len, config.head_dim_v)
+    do = random.uniform(k_do, o_shape, dtype=config.dtype)
   return (q, k, v, sinks, segment_ids, do)
 
 
 def attn_logits_soft_cap_strategy() -> hps.SearchStrategy[float | None]:
-  return hps.one_of(hps.just(None), hps.floats(min_value=1.0, max_value=50.0))
+  return hps.one_of(
+      hps.just(None),
+      hps.sampled_from([1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]),
+  )
 
 
 @test_utils.thread_unsafe_test_class()  # hypothesis is not thread safe
@@ -381,16 +398,16 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   )
   @hp.given(hps.data())
   def test_splash_attention(self, is_mqa, is_segmented, is_dynamic_mask, data):
-    model_config = data.draw(model_config_strategy())
+    model_config = data.draw(model_config_strategy(is_segmented=is_segmented))
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, _, segment_ids, _ = _generate_inputs(
         data, model_config, is_mqa, is_segmented
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
-    check_mask_no_empty_rows(mask, segment_ids)
+    dense_mask = check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
-      mask = jnp.array(mask[:, :])
+      mask = dense_mask
     config = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
     config = dataclasses.replace(
         config,
@@ -417,7 +434,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         q.astype(np.float32),
         k.astype(np.float32),
         v.astype(np.float32),
-        jnp.array(mask[:, :]),
+        dense_mask,
         segment_ids,
         attn_logits_soft_cap=attn_logits_soft_cap,
     )
@@ -436,16 +453,16 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
                                 fuse_reciprocal, use_sinks, data):
-    model_config = data.draw(model_config_strategy())
+    model_config = data.draw(model_config_strategy(is_segmented=is_segmented))
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, sinks, segment_ids, _ = _generate_inputs(
         data, model_config, is_mqa, is_segmented, use_sinks
     )
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
-    check_mask_no_empty_rows(mask, segment_ids)
+    dense_mask = check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
-      mask = jnp.array(mask[:, :])
+      mask = dense_mask
     config = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
     if is_mqa:
       if not is_dynamic_mask:
@@ -502,7 +519,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         q.astype(jnp.float32),
         k.astype(jnp.float32),
         v.astype(jnp.float32),
-        jnp.array(mask[:, :]),
+        dense_mask,
         segment_ids,
         sinks,
     )
@@ -553,11 +570,17 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     dkv_reuse_scaled_q = data.draw(hp.strategies.booleans())
     q_prescaled_log2e = data.draw(hp.strategies.booleans()) and use_base2_exp
 
-    model_config = data.draw(model_config_strategy())
+    model_config = data.draw(model_config_strategy(is_segmented=is_segmented))
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, sinks, segment_ids, do = _generate_inputs(
-        data, model_config, is_mqa, is_segmented, use_sinks=use_sinks
+        data,
+        model_config,
+        is_mqa,
+        is_segmented,
+        use_sinks=use_sinks,
+        need_do=True,
     )
+    assert do is not None
     q = q / np.sqrt(model_config.head_dim_qk).astype(q.dtype)
     q_quant_mode = data.draw(hp.strategies.booleans())
     if q_quant_mode:
@@ -574,9 +597,9 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       q_in = q * math.log2(math.e)
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
-    check_mask_no_empty_rows(mask, segment_ids)
+    dense_mask = check_mask_no_empty_rows(mask, segment_ids)
     if is_dynamic_mask:
-      mask = jnp.array(mask[:, :])
+      mask = dense_mask
     config = data.draw(
         block_sizes_strategy(q_seq_len, kv_seq_len, include_bwd_blocks=True)
     )
@@ -644,7 +667,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         q32,
         k32,
         v32,
-        jnp.array(mask[:, :]),
+        dense_mask,
         segment_ids,
         sinks,
         is_mqa=is_mqa,
@@ -668,7 +691,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         q32,
         k32,
         v32,
-        jnp.array(mask[:, :]),
+        dense_mask,
         segment_ids,
         sinks,
         o.astype(jnp.float32),
@@ -693,8 +716,15 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=dk_rtol)
     self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=dv_rtol)
     if use_sinks:
+      assert sinks is not None
       dsinks_atol = 5e-1 if has_fp8_input else 4e-3
-      dsinks_rtol = 1.5e-1 if has_fp8_input else 6e-3
+      # bfloat16 dsinks has 1 ULP = 2^-7 (~7.8e-3) > 6e-3 and accumulates in
+      # bfloat16; match o_tol / upstream JAX tolerance for bfloat16 sinks.
+      dsinks_rtol = (
+          1.5e-1
+          if has_fp8_input
+          else (1.5e-2 if sinks.dtype == jnp.bfloat16 else 6e-3)
+      )
       self._assert_allclose(
           dsinks, dsinks_ref, atol=dsinks_atol, rtol=dsinks_rtol
       )

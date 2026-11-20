@@ -197,7 +197,6 @@ def _attention_reference_custom_bwd(
     static_argnames=[
         "mask_value",
         "save_residuals",
-        "attn_logits_soft_cap",
         "is_mqa",
         "dropout_rate",
     ],
@@ -263,7 +262,6 @@ def attention_reference(
     static_argnames=[
         "is_mqa",
         "backward_impl",
-        "attn_logits_soft_cap",
         "dropout_rate",
     ],
 )
