@@ -2470,6 +2470,7 @@ def chunk_kda_bwd_custom(
         cu_seqlens,
         align=chunk_size,
         aligned_cu_seqlens=aligned_cu,
+        token_order=residuals.token_order,
     )
     cu_seqlens_bwd = aligned_cu
 
@@ -2789,6 +2790,25 @@ def chunk_kda_bwd_custom(
       rstd_k=rstd_k if (use_qk_l2norm and _l2norm_in_kernel) else None,
   )
 
+  # Padding chunks need not write their backward output buffers. Clear those
+  # lanes before gate-parameter reductions, rather than reducing uninitialized
+  # values or multiplying a raw-gate -inf sentinel by a zero cotangent.
+  if segment_ids is not None:
+    valid = segment_ids[None, :, :] != 0
+    dq = jnp.where(valid[..., None], dq, 0)
+    dk = jnp.where(valid[..., None], dk, 0)
+    dv = jnp.where(valid[..., None], dv, 0)
+    dg = jnp.where(valid[..., None], dg, 0)
+    db = jnp.where(valid, db, 0)
+    if g_org is not None:
+      g_org = jnp.where(valid[..., None], g_org, 0)
+
+  # Empty sequences preserve their initial state, so their initial-state
+  # gradient is exactly the final-state cotangent (zero when not requested).
+  if dh0 is not None and cu_seqlens is not None:
+    empty = (jnp.diff(cu_seqlens, axis=-1) == 0)[..., None, None, None]
+    dh0 = jnp.where(empty, 0 if dht_m4 is None else dht_m4, dh0)
+
   dA, dbias = None, None
   if use_gate_in_kernel:
     assert g_org is not None and a_log is not None
@@ -2844,11 +2864,41 @@ def chunk_kda_bwd_custom(
     )
 
   if cu_seqlens is not None:
-    dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig)
-    dk = _unalign_output(dk, cu_seqlens, aligned_cu, T_orig)
-    dv = _unalign_output(dv, cu_seqlens, aligned_cu, T_orig)
-    dg = _unalign_output(dg, cu_seqlens, aligned_cu, T_orig)
-    db = _unalign_output(db, cu_seqlens, aligned_cu, T_orig)
+    dq = _unalign_output(
+        dq,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+    )
+    dk = _unalign_output(
+        dk,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+    )
+    dv = _unalign_output(
+        dv,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+    )
+    dg = _unalign_output(
+        dg,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+    )
+    db = _unalign_output(
+        db,
+        cu_seqlens,
+        aligned_cu,
+        T_orig,
+        token_order=residuals.token_unpermute,
+    )
 
   if dh0 is not None and dh0.ndim == 4 and has_initial_state:
     dh0 = dh0[:, None]
