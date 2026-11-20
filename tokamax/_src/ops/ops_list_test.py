@@ -201,6 +201,39 @@ def _module_op_dir(module: str) -> str | None:
   return None
 
 
+def _imported_modules(tree: ast.Module) -> set[str]:
+  modules: set[str] = set()
+  for node in ast.walk(tree):
+    if isinstance(node, ast.ImportFrom) and node.module:
+      modules.add(node.module)
+      modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    elif isinstance(node, ast.Import):
+      modules.update(alias.name for alias in node.names)
+  return modules
+
+
+def _imported_op_dirs(path: pathlib.Path) -> set[str]:
+  used: set[str] = set()
+  for module in _imported_modules(_parse_source_file(path)):
+    package, _, leaf = module.rpartition(".")
+    if leaf in ("api", "base") and package.startswith("tokamax._src.ops."):
+      rel = package.removeprefix("tokamax._src.ops.").replace(".", "/")
+      if (op_dir := _module_op_dir(f"_src/ops/{rel}/x")) is not None:
+        used.add(op_dir)
+  return used
+
+
+def _used_op_dirs(op: ops_list.Op) -> set[str]:
+  """Returns op dirs whose api or base the op's non-test modules import."""
+  used: set[str] = set()
+  for root in ("_src", "google"):
+    for op_dir in op.dirs:
+      for path in (_TOKAMAX_ROOT / root / "ops" / op_dir).rglob("*.py"):
+        if "test" not in path.stem.split("_"):
+          used.update(_imported_op_dirs(path))
+  return used - set(op.dirs)
+
+
 class OpsListTest(absltest.TestCase):
   """Tests verifying ops_list manifest integrity and consistency."""
 
@@ -497,6 +530,32 @@ class OpsListTest(absltest.TestCase):
             ),
             f"kernel_dir '{kernel_dir}' on op '{op.name}' has no python files",
         )
+
+  def test_dependent_ops_match_imports(self):
+    dependents: dict[str, set[str]] = {}
+    for op in ops_list.OPS:
+      for used_dir in _used_op_dirs(op):
+        dependents.setdefault(used_dir, set()).add(op.name)
+    for op in ops_list.OPS:
+      actual = dependents.get(op.op_dir, set())
+      missing = sorted(actual - set(op.dependent_ops))
+      self.assertEmpty(
+          missing,
+          f"{missing} import the api or base of '{op.name}'; add them to its"
+          " dependent_ops in ops_list.py",
+      )
+      stale = sorted(set(op.dependent_ops) - actual)
+      self.assertEmpty(
+          stale,
+          f"'{op.name}' lists {stale} in dependent_ops, but they no longer"
+          " import its api or base; drop them",
+      )
+
+  def test_dependent_ops_validation(self):
+    for bad_dep in ("", "foo", cast(Any, None)):
+      with self.subTest(bad_dep=bad_dep):
+        with self.assertRaisesRegex(ValueError, "invalid dependent_ops"):
+          ops_list.Op(name="foo", apis=(), impls=(), dependent_ops=(bad_dep,))
 
   def test_experimental_ops_and_impl_modules_consistency(self):
     for op in ops_list.OPS:
