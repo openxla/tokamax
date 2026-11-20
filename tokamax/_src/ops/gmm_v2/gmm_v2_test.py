@@ -23,6 +23,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import config
 from tokamax._src import mosaic_tpu
 from tokamax._src import test_utils
@@ -208,6 +209,63 @@ def _poison_vmem_all_cores(num_rows: int = 8192) -> None:
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
   )()
   jax.block_until_ready(out)
+
+
+def _reference_fill_metadata(
+    group_sizes, group_offset, size_group, tile_m, sublane, max_num_gm
+):
+  """Python copy of fill_metadata's walk over every group from group 0."""
+  group_ids = [-1] * max_num_gm
+  m_offsets = [-1] * (max_num_gm + 1)
+  m_offsets[0] = 0
+  num_gm = 0
+  start = 0
+  for lhs_group_id in range(group_offset + size_group):
+    size = int(group_sizes[lhs_group_id])
+    end = start + size
+    if size > 0 and lhs_group_id >= group_offset:
+      curr_num_gm = math.ceil((size + start % sublane) / tile_m)
+      curr = start
+      for tm_id in range(num_gm, num_gm + curr_num_gm):
+        tm_size = min(tile_m - curr % sublane, end - curr)
+        group_ids[tm_id] = lhs_group_id - group_offset
+        m_offsets[tm_id] = curr
+        m_offsets[tm_id + 1] = curr + tm_size
+        curr += tm_size
+      num_gm += curr_num_gm
+    start = end
+  return num_gm, group_ids, m_offsets
+
+
+def _run_fill_metadata(group_sizes, group_offset, cfgs, max_num_gm):
+  """Runs gmm_v2.fill_metadata in a kernel and returns its outputs."""
+
+  def kernel(
+      group_sizes_ref, group_offset_ref, num_gm_ref, group_id_ref, m_offset_ref
+  ):
+    # Sentinels, so that a stray or missing write shows up in the comparison.
+    for i in range(max_num_gm):
+      group_id_ref[i] = -1
+    for i in range(max_num_gm + 1):
+      m_offset_ref[i] = -1
+    metadata_ref = gmm_v2.MetadataRef(
+        gm_id_to_group_id=group_id_ref, gm_id_to_m_offset=m_offset_ref
+    )
+    num_gm_ref[0] = gmm_v2.fill_metadata(
+        group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+    )
+
+  smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+  return pl.pallas_call(
+      kernel,
+      out_shape=(
+          jax.ShapeDtypeStruct((1,), jnp.int32),
+          jax.ShapeDtypeStruct((max_num_gm,), jnp.int32),
+          jax.ShapeDtypeStruct((max_num_gm + 1,), jnp.int32),
+      ),
+      in_specs=[smem, smem],
+      out_specs=(smem, smem, smem),
+  )(group_sizes, group_offset)
 
 
 class GmmTest(parameterized.TestCase):
@@ -682,6 +740,86 @@ class GmmTest(parameterized.TestCase):
             int(gmm_v2.select_bucket_idx(jnp.int32(rows), bucket_base)),
             expected,
         )
+
+  @parameterized.named_parameters(
+      # name, num_groups, size_group, group_offset, tile_m, sublane, pattern
+      ("offset_0", 16, 16, 0, 128, 16, "random"),
+      ("offset_1", 64, 8, 1, 128, 16, "random"),
+      ("offset_7", 64, 8, 7, 32, 8, "random"),
+      ("offset_8", 64, 8, 8, 128, 16, "random"),
+      ("offset_13", 64, 8, 13, 32, 16, "random"),
+      ("last_shard", 64, 8, 56, 128, 16, "random"),
+      ("empty_before_offset", 64, 8, 21, 32, 16, "empty_before"),
+      ("empty_local_groups", 64, 8, 21, 32, 16, "empty_local"),
+      ("ep16_384_last_shard", 384, 24, 360, 128, 16, "random"),
+      ("ep8_512_last_shard", 512, 64, 448, 256, 16, "random"),
+      ("offset_451", 512, 61, 451, 32, 8, "random"),
+  )
+  def test_fill_metadata_matches_reference(
+      self, num_groups, size_group, group_offset, tile_m, sublane, pattern
+  ):
+    """The metadata matches a walk over every group from group 0.
+
+    Covers small, large and odd offsets, and empty groups before the offset and
+    in the local groups, whose sizes still leave the next group's start off a
+    sublane boundary.
+
+    Args:
+      num_groups: Number of lhs groups.
+      size_group: Number of local groups.
+      group_offset: First local group.
+      tile_m: Rows per gm tile.
+      sublane: Rows per lhs sublane.
+      pattern: How group sizes are drawn.
+    """
+    rng = np.random.default_rng(num_groups + group_offset)
+    group_sizes = rng.integers(1, 3 * tile_m, num_groups)
+    group_sizes[rng.random(num_groups) < 0.3] = 0
+    if pattern == "empty_before":
+      group_sizes[:group_offset] = 0
+    elif pattern == "empty_local":
+      group_sizes[group_offset : group_offset + size_group] = 0
+    group_sizes = group_sizes.astype(np.int32)
+
+    size_m = max(math.ceil(int(group_sizes.sum()) / sublane), 1) * sublane
+    max_num_gm = size_group + math.ceil(size_m / tile_m) - 1
+    input_cfgs = gmm_v2.InputConfigs(
+        quant_dtype=None,
+        quant_block_size=None,
+        dtype=jnp.dtype(jnp.bfloat16),
+    )
+    cfgs = gmm_v2.GmmConfigs(
+        tiles=gmm_v2.TileSizes(
+            tile_m=tile_m, tile_k=128, tile_n=128, bucket_base=tile_m
+        ),
+        dims=gmm_v2.Dimensions(
+            size_m=size_m,
+            size_k=128,
+            size_n=128,
+            size_group=size_group,
+            size_lhs_group=num_groups,
+            size_lhs_sublane=sublane,
+        ),
+        lhs_cfgs=input_cfgs,
+        rhs_cfgs=input_cfgs,
+        out_dtype=jnp.dtype(jnp.bfloat16),
+        acc_dtype=jnp.dtype(jnp.float32),
+        zero_init=False,
+        fuse_act=None,
+    )
+
+    num_gm, group_ids, m_offsets = _run_fill_metadata(
+        jnp.asarray(group_sizes),
+        jnp.array([group_offset], jnp.int32),
+        cfgs,
+        max_num_gm,
+    )
+    exp_num_gm, exp_group_ids, exp_m_offsets = _reference_fill_metadata(
+        group_sizes, group_offset, size_group, tile_m, sublane, max_num_gm
+    )
+    self.assertEqual(int(num_gm[0]), exp_num_gm)
+    np.testing.assert_array_equal(np.asarray(group_ids), exp_group_ids)
+    np.testing.assert_array_equal(np.asarray(m_offsets), exp_m_offsets)
 
   @parameterized.parameters(False, True)
   def test_tgmm_tile_fn_receives_tiling_request(self, use_partial_sum):

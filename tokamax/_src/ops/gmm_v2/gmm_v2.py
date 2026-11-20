@@ -1217,6 +1217,24 @@ def select_bucket_idx(m_end_local: jax.Array, bucket_base: int) -> jax.Array:
   return (m_end_local - 1) // bucket_base
 
 
+def _start_m_offset(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset: jax.Array,
+) -> jax.Array:
+  """Returns the sum of the sizes of the groups before group_offset.
+
+  Args:
+    lhs_group_sizes_ref: The group sizes of lhs.
+    group_offset: Offset of the first group to process.
+  """
+
+  @jax.named_scope("skip_group_loop")
+  def skip_group_loop(lhs_group_id, start_m_offset):
+    return start_m_offset + lhs_group_sizes_ref[lhs_group_id]
+
+  return lax.fori_loop(0, group_offset, skip_group_loop, 0)
+
+
 def fill_metadata(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
@@ -1226,10 +1244,10 @@ def fill_metadata(
 ) -> jax.Array:
   """Fills the metadata for the given lhs group sizes and group offset.
 
-  Iterates over the lhs group sizes and if the group id is valid, determines
-  the number of gm tiles that are needed to process the current group. Then,
-  it fills starting and ending offset (gm_id_to_m_offset), and the group id
-  (gm_id_to_group_id) for each gm tile.
+  Sums the sizes of the groups before group_offset to find where the local
+  groups start. Then, for each local group, determines the number of gm tiles
+  that are needed to process it and fills starting and ending offset
+  (gm_id_to_m_offset), and the group id (gm_id_to_group_id) for each gm tile.
 
   Args:
     lhs_group_sizes_ref: The group sizes of lhs.
@@ -1287,11 +1305,8 @@ def fill_metadata(
     aligned_group_size = group_size + local_offset
     curr_num_gm = pl.cdiv(aligned_group_size, cfgs.tiles.tile_m)
 
-    # We need to handle cases where we should not process the group.
-    # 1. Even if group_size is 0, if local_offset is not 0, cdiv will return 1.
-    # 2. If group comes before the group_offset, we should not process it.
-    should_process = jnp.logical_and(group_size > 0, group_id >= 0)
-    curr_num_gm = jnp.where(should_process, curr_num_gm, 0)
+    # Even if group_size is 0, if local_offset is not 0, cdiv will return 1.
+    curr_num_gm = jnp.where(group_size > 0, curr_num_gm, 0)
     next_num_gm = num_gm + curr_num_gm
 
     tm_loop_fn = functools.partial(
@@ -1303,7 +1318,13 @@ def fill_metadata(
 
     return next_num_gm, end_m_offset
 
-  num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+  # Groups before group_offset get no gm tiles; they only move where the local
+  # groups start. Sum their sizes in a separate loop instead of walking them
+  # through outer_group_loop, which runs before the first DMA of the call.
+  start_m_offset = _start_m_offset(lhs_group_sizes_ref, group_offset)
+  num_gm, _ = lax.fori_loop(
+      group_offset, max_num_group, outer_group_loop, (0, start_m_offset)
+  )
   return num_gm
 
 
