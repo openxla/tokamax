@@ -392,7 +392,14 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
   x, scales = lhs.qvalue, lhs.scale
   expected_d = k_x // tile_k
 
-  if is_fp8 and scales.shape[1] == 2 * expected_d:
+  # The packed [scale | x_sum] layout is float32. A plain lhs whose subchannel
+  # is half the weight subchannel has the same shape, so plain float32 scales
+  # at that ratio are ambiguous and take this branch.
+  if (
+      is_fp8
+      and scales.dtype == jnp.float32
+      and scales.shape[1] == 2 * expected_d
+  ):
     tile_xk = k_x // expected_d
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)

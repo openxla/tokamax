@@ -292,20 +292,33 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(_Sm100QuantTestBase):
     chex.assert_trees_all_equal(out.qvalue, out2.qvalue)
     chex.assert_trees_all_equal(out.scale, out2.scale)
 
-  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
-  def test_relaxed_activation_subchannel(self, block_k, activation):
+  # A weight subchannel of 2x the activation subchannel gives the same scale
+  # shape as the packed [scale | x_sum] layout. The `float32` case checks that a
+  # plain float32-scale lhs outside the 2x shape takes the plain branch.
+  @parameterized.product(
+      case=(
+          (128, 256, jnp.bfloat16),
+          (128, 512, jnp.bfloat16),
+          (256, 512, jnp.bfloat16),
+          (128, 512, jnp.float32),
+      ),
+      block_k=(128,),
+      activation=(None, test_base.relu),
+  )
+  def test_relaxed_activation_subchannel(self, case, block_k, activation):
+    a_subchannel, weight_subchannel, dtype = case
     num_groups, m, k, n = 8, 512, 512, 512
     a, b, group_sizes = self._create_inputs(
         num_groups,
         m,
         k,
         n,
-        jnp.bfloat16,
+        dtype,
         use_as_qarray=False,
         quant_a_dtype=jnp.float8_e4m3fn,
-        a_tile_shape=(1, 128),
+        a_tile_shape=(1, a_subchannel),
         quant_b_dtype=jnp.int4,
-        b_tile_shape=(1, 512, 1),
+        b_tile_shape=(1, weight_subchannel, 1),
     )
     config = dataclasses.replace(
         _CONFIG, block_m=16, block_n=128, block_k=block_k
