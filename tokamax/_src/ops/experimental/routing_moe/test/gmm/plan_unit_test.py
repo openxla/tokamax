@@ -894,7 +894,11 @@ class SmemBudgetTest(parameterized.TestCase):
       _traced_smem_allocations(cfg, metadata_in, scratch, inputs)
 
   def test_smem_total_is_derived_from_kernel_args(self):
-    cfg = _make_config(4096, gmm_plan.RoutingGmmPlan(live_group_walk=True))
+    # Streamed indices, so the gather and scatter tables are HBM ring buffers.
+    custom_plan = gmm_plan.RoutingGmmPlan(
+        live_group_walk=True, smem_indices=False
+    )
+    cfg = _make_config(4096, custom_plan)
     allocs = _kernel_smem(cfg)
     self.assertEqual(allocs["row_group"], 4 * 40960)
     self.assertEqual(
@@ -1054,14 +1058,21 @@ class SmemIndicesTest(parameterized.TestCase):
   """Checks the smem_indices heuristic."""
 
   @parameterized.named_parameters(
-      # The cutoff is 4096 routed rows (num_tokens * top_k).
+      # Default uses SMEM whenever worst-case SMEM estimate fits budget
+      # (596,377 B on 1 MiB TPU v7x SMEM).
       dict(testcase_name="decode_1", num_tokens=1, top_k=10, expected=True),
       dict(
-          testcase_name="at_threshold", num_tokens=4096, top_k=1, expected=True
+          testcase_name="prefill_4k_top10",
+          num_tokens=4096,
+          top_k=10,
+          expected=True,
+      ),
+      dict(
+          testcase_name="at_threshold", num_tokens=62398, top_k=1, expected=True
       ),
       dict(
           testcase_name="above_threshold",
-          num_tokens=4097,
+          num_tokens=62399,
           top_k=1,
           expected=False,
       ),
@@ -1071,16 +1082,34 @@ class SmemIndicesTest(parameterized.TestCase):
   ):
     self.assertEqual(_resolve(num_tokens, top_k=top_k).smem_indices, expected)
 
+  def test_smem_indices_accounts_for_row_group_under_live_group_walk(self):
+    self.assertTrue(
+        _resolve(
+            50000, gmm_plan.RoutingGmmPlan(live_group_walk=False), top_k=1
+        ).smem_indices
+    )
+    self.assertFalse(
+        _resolve(
+            50000, gmm_plan.RoutingGmmPlan(live_group_walk=True), top_k=1
+        ).smem_indices
+    )
+
   def test_smem_indices_default_with_gather_only(self):
     self.assertTrue(_resolve(8, with_scatter=False).smem_indices)
+    self.assertTrue(_resolve(65000, top_k=1, with_scatter=False).smem_indices)
 
   def test_smem_indices_default_is_off_in_direct_mode(self):
     self.assertFalse(_resolve(8, routed=False).smem_indices)
 
+  def test_smem_indices_default_is_off_when_empty(self):
+    self.assertFalse(_resolve(0, top_k=10).smem_indices)
+
   @parameterized.parameters(True, False)
   def test_explicit_smem_indices_is_kept(self, smem_indices: bool):
     custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=smem_indices)
-    self.assertEqual(_resolve(410, custom_plan).smem_indices, smem_indices)
+    self.assertEqual(
+        _resolve(6500, custom_plan, top_k=10).smem_indices, smem_indices
+    )
 
   def _block_scaled_spec_and_fmt(self):
     if not block_scaled.is_available():

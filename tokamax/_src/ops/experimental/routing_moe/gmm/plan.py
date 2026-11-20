@@ -127,21 +127,24 @@ def _resolve_smem_indices(
     plan: RoutingGmmPlan,
     *,
     spec: gmm_spec_lib.RoutingGmmSpec,
+    live_group_walk: bool,
     tpu_info: pltpu.TpuInfo,
 ) -> bool:
   """Resolves whether routing indices reside entirely in SMEM."""
   if plan.smem_indices is not None:
     return plan.smem_indices
-  num_idx = int(spec.gather is not None) + int(spec.scatter is not None)
-  size_out_m = spec.size_out_m
-  # Empirical cutoff: up to 4096 routed rows (8 bytes per row for a
-  # gather/scatter pair within 1/32 of SMEM), SMEM indices measured neutral to
-  # faster than HBM index ring buffers, including 32-512 token batches at
-  # tile_m=256, and they also skip padding the index tables on XLA.
-  # The full plan, index tables included, is checked against
-  # smem_budget_bytes by check_smem in ResolvedGmmPlan.create.
-  max_idx_bytes = tpu_info.smem_capacity_bytes // 32
-  return num_idx > 0 and 0 < size_out_m * 8 <= max_idx_bytes
+  if (spec.gather is None and spec.scatter is None) or spec.size_out_m <= 0:
+    return False
+  # Bound `gm_id_to_*` before tiling runs using minimum `tile_m` so SMEM
+  # indices stay within smem_budget_bytes for any tiling.
+  min_tile_m = plan.tile_m or tpu_info.num_sublanes
+  allocs = _estimate_smem_allocations(
+      spec,
+      live_group_walk=live_group_walk,
+      tile_m=min_tile_m,
+      smem_indices=True,
+  )
+  return sum(allocs.values()) <= smem_budget_bytes(tpu_info)
 
 
 @dataclass_util.resolves_from(
@@ -234,7 +237,9 @@ class ResolvedGmmPlan:
     )
 
     live_group_walk = _resolve_live_group_walk(plan, spec=spec)
-    smem_indices = _resolve_smem_indices(plan, spec=spec, tpu_info=tpu_info)
+    smem_indices = _resolve_smem_indices(
+        plan, spec=spec, live_group_walk=live_group_walk, tpu_info=tpu_info
+    )
 
     if spec.w2 is None and plan.tile_k2 is not None:
       raise ValueError("tile_k2 requires w2 to be set.")
@@ -960,6 +965,42 @@ def _fused_tiling(
   return None
 
 
+def _estimate_smem_allocations(
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    *,
+    live_group_walk: bool,
+    tile_m: int,
+    smem_indices: bool,
+    num_idx_buffers: int = 0,
+    idx_buffer_size: int = 0,
+) -> dict[str, int]:
+  """Estimates SMEM allocation sizes in bytes for routing GMM."""
+  allocs = {}
+  allocs["group_sizes"] = 4 * spec.num_global_groups
+  allocs["group_offset"] = 4
+  if live_group_walk and spec.size_row_group:
+    allocs["row_group"] = 4 * spec.size_row_group
+
+  max_num_gm = spec.size_local_groups + pl.cdiv(spec.size_out_m, tile_m)
+  allocs["gm_id_to_group_id"] = 4 * max_num_gm
+  allocs["gm_id_to_m_offset"] = 4 * max_num_gm
+  allocs["gm_id_to_num_rows"] = 4 * max_num_gm
+  allocs["num_gm"] = 4
+
+  # smem_indices covers indices passed as SMEM kernel inputs.
+  for name, routing in (
+      ("gather_idx", spec.gather),
+      ("scatter_idx", spec.scatter),
+  ):
+    if routing is not None:
+      if smem_indices:
+        allocs[name] = 4 * routing.num_indices
+      else:
+        allocs[f"{name}_buffers"] = 4 * num_idx_buffers * idx_buffer_size
+
+  return allocs
+
+
 def smem_estimate(
     spec: gmm_spec_lib.RoutingGmmSpec,
     plan: ResolvedGmmPlan,
@@ -979,32 +1020,14 @@ def smem_estimate(
   """
   if smem_indices is None:
     smem_indices = plan.smem_indices
-  allocs = {}
-  allocs["group_sizes"] = 4 * spec.num_global_groups
-  allocs["group_offset"] = 4
-  if plan.live_group_walk and spec.size_row_group:
-    allocs["row_group"] = 4 * spec.size_row_group
-
-  max_num_gm = spec.size_local_groups + pl.cdiv(spec.size_out_m, plan.tile_m)
-  allocs["gm_id_to_group_id"] = 4 * max_num_gm
-  allocs["gm_id_to_m_offset"] = 4 * max_num_gm
-  allocs["gm_id_to_num_rows"] = 4 * max_num_gm
-  allocs["num_gm"] = 4
-
-  # smem_indices covers indices passed as SMEM kernel inputs.
-  for name, routing in (
-      ("gather_idx", spec.gather),
-      ("scatter_idx", spec.scatter),
-  ):
-    if routing is not None:
-      if smem_indices:
-        allocs[name] = 4 * routing.num_indices
-      else:
-        allocs[f"{name}_buffers"] = (
-            4 * plan.num_idx_buffers * plan.idx_buffer_size
-        )
-
-  return allocs
+  return _estimate_smem_allocations(
+      spec,
+      live_group_walk=plan.live_group_walk,
+      tile_m=plan.tile_m,
+      smem_indices=smem_indices,
+      num_idx_buffers=plan.num_idx_buffers,
+      idx_buffer_size=plan.idx_buffer_size,
+  )
 
 
 def _matmul_vmem_bytes(
