@@ -421,6 +421,7 @@ class InputConfigs:
   # (dtype == quant_dtype) the scale dequantizes it (rhs); when it arrives
   # unquantized (dtype != quant_dtype) the scale quantizes it online (lhs).
   has_scale: bool = False
+  is_per_group_scale: bool = False
   is_transposed: bool = False
 
   @property

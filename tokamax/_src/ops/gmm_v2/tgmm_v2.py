@@ -360,7 +360,7 @@ def calculate_tgmm_tiling(
 def make_tgmm_configs(
     lhs: jax.Array,  # [m, k]
     rhs: jax.Array,  # [m, n]
-    rhs_scale: jax.Array,  # [1, 1, n] (per-N scale)
+    rhs_scale: jax.Array,  # [1, 1, n] or [num_actual_groups, 1, n]
     partial_sum: jax.Array | None,  # [num_actual_groups, k, n]
     group_sizes: jax.Array,
     num_actual_groups: int,
@@ -380,22 +380,21 @@ def make_tgmm_configs(
   )
   size_m, size_k = lhs.shape
   _, size_n = rhs.shape
+  is_per_group_scale = False
   if rhs_scale is not None:
-    # rhs_scale.shape[0] is the number of quant blocks along the m (reduction)
-    # dimension. tgmm_v2 only implements per-N (per-output-channel) scaling,
-    # i.e. a single m-block: rhs_scale.shape == (1, 1, size_n). A leading dim
-    # > 1 means the caller wants sub-channel (per-m-block) quantization.
-    if rhs_scale.ndim == 3 and rhs_scale.shape[0] > 1:
-      raise NotImplementedError(
-          "tgmm_v2 only supports per-N rhs_scale with shape (1, 1, size_n);"
-          f" got {rhs_scale.shape}, which implies {rhs_scale.shape[0]}"
-          " sub-channel quant blocks along the m (reduction) dimension."
-          " Sub-channel quantization is not implemented."
+    if rhs_scale.ndim != 3 or rhs_scale.shape[1:] != (1, size_n):
+      raise ValueError(
+          "expecting rhs_scale.shape to be (1, 1, size_n) or"
+          f" (num_actual_groups, 1, size_n) with size_n={size_n}, but got"
+          f" {rhs_scale.shape}"
       )
-    assert rhs_scale.shape == (1, 1, size_n), (
-        "expecting rhs_scale.shape to be (1, 1, size_n) but got"
-        f" {rhs_scale.shape}"
-    )
+    if rhs_scale.shape[0] not in (1, num_actual_groups):
+      raise NotImplementedError(
+          "tgmm_v2 only supports pooled (1, 1, size_n) or per-group"
+          f" (num_actual_groups={num_actual_groups}, 1, size_n) rhs_scale;"
+          f" got {rhs_scale.shape}."
+      )
+    is_per_group_scale = rhs_scale.shape[0] > 1
   if partial_sum is not None:
     assert partial_sum.shape == (num_actual_groups, size_k, size_n), (
         f"partial_sum shape {partial_sum.shape}. Expecting"
@@ -432,6 +431,7 @@ def make_tgmm_configs(
       quant_block_size=rhs_quant_block_size_m,
       dtype=rhs.dtype,
       has_scale=(rhs_scale is not None),
+      is_per_group_scale=is_per_group_scale,
   )
   lhs_cfgs = gmm_v2.InputConfigs(
       quant_dtype=None,
@@ -695,6 +695,9 @@ class TgmmIndexMaps:
   def rhs_scale_index_map(
       self, n_id: jax.Array, k_id: jax.Array, gm_id: jax.Array
   ):
+    if self.cfgs.rhs_cfgs.is_per_group_scale:
+      group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+      return (group_id, 0, n_id)
     return (0, 0, n_id)
 
   def out_index_map(self, n_id: jax.Array, k_id: jax.Array, gm_id: jax.Array):
@@ -826,8 +829,8 @@ def tgmm_kernel_main(
     group_offset_ref: Reference to the group offset.
     lhs_ref: Reference to the LHS array [m, k] (or prologue-fused LHS refs).
     rhs_ref: OperandRef (or FusedOperandRef) bundling the RHS array ('.value'
-      [m, n]) and its optional per-N scale ('.scale' [1, 1, n], None when there
-      is no scale).
+      [m, n]) and its optional per-N scale ('.scale' [1, 1, n] or
+      [num_actual_groups, 1, n], None when there is no scale).
     out_fusion_input_refs: References to HBM arrays closed over by the output
       fusion, or `()` when unfused.
     out_ref: Reference to the output array [num_groups, k, n].
@@ -989,7 +992,7 @@ def tgmm_v2(
     rhs: jax.Array,  # [size_m, size_n]
     group_sizes: jax.Array,
     num_actual_groups: int,
-    rhs_scale: jax.Array | None = None,  # [1, 1, size_n] (per-N scale)
+    rhs_scale: jax.Array | None = None,  # [1, 1, size_n] or [num_actual_groups, 1, size_n]
     group_offset: jax.Array | None = None,
     partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
@@ -1013,7 +1016,8 @@ def tgmm_v2(
     rhs: The right-hand side array with shape [size_m, size_n].
     group_sizes: The group sizes of lhs with shape [size_lhs_group].
     num_actual_groups: The actual number of groups: weight.shape[0].
-    rhs_scale: The per-N scale of the rhs.
+    rhs_scale: Optional per-N scale of rhs, with shape [1, 1, size_n] (pooled)
+      or [num_actual_groups, 1, size_n] (per-group).
     group_offset: An optional offset for the group indices.
     partial_sum: Optional. Partial sums of shape [num_actual_groups, size_k,
       size_n], added to the result inside the kernel (after rhs_scale). This
