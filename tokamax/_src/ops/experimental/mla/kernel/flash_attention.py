@@ -21,6 +21,7 @@ RoPE Q_pe * K_pe), causal & sliding window masking, and PV accumulation
 """
 
 from collections.abc import Sequence
+import math
 from typing import Any
 
 import jax
@@ -121,16 +122,22 @@ def flash_attention_qk_softmax(
       preferred_element_type=jnp.float32,
   )
 
-  s *= cfgs.model.sm_scale
-
+  logit_scale = cfgs.model.sm_scale
   if cfgs.serve.scale_k is not None:
-    s *= cfgs.serve.scale_k
+    logit_scale *= cfgs.serve.scale_k
   if cfgs.serve.scale_q is not None:
-    s *= cfgs.serve.scale_q
+    logit_scale *= cfgs.serve.scale_q
 
-  # 2. Soft-capping (Gemma / Grok style)
+  # 2. Soft-capping and base-2 scaling for single-instruction `exp2` softmax:
+  #   exp(x) = (2^log2(e))^x = 2^(x * log2(e))
+  #   exp(c * tanh(x / c)) = 2^((c * log2(e)) * tanh(x / c))
+  # Scaling before masking also avoids overflowing `mask_value` in float32.
+  log2e = math.log2(math.e)
   if cfgs.model.soft_cap is not None:
-    s = cfgs.model.soft_cap * jnp.tanh(s / cfgs.model.soft_cap)
+    s *= logit_scale
+    s = (cfgs.model.soft_cap * log2e) * jnp.tanh(s / cfgs.model.soft_cap)
+  else:
+    s *= logit_scale * log2e
 
   # 3. Causal & Sliding-Window Masking
   assert (q_abs_start is None) == (
@@ -186,7 +193,7 @@ def flash_attention_qk_softmax(
   for b_idx in range(b):
     m_curr_b = s_curr_max[b_idx]
     m_next_b = jnp.maximum(m_prev, m_curr_b)
-    alpha_b = jnp.exp(m_prev - m_next_b)
+    alpha_b = jnp.exp2(m_prev - m_next_b)
     alpha_list.append(alpha_b)
     m_next_list.append(m_next_b)
     if is_last_k is not None:
@@ -197,8 +204,10 @@ def flash_attention_qk_softmax(
   m_next = jnp.stack(m_next_list, axis=0)
 
   # 5. Softmax Probabilities
-  p = jnp.exp(s - utils.broadcast_minor(m_next, s.shape))
+  p = jnp.exp2(s - utils.broadcast_minor(m_next, s.shape))
   p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=jnp.float32)
+  if cfgs.p_same_dtype_as_v:
+    p = p.astype(k.dtype)
 
   l_next_list = []
   for b_idx in range(b):
@@ -243,9 +252,6 @@ def flash_attention_pv(
     Updated unnormalized output accumulator [B, bq_sz * H_q, d_nope].
   """
   b = p.shape[0]
-
-  if cfgs.p_same_dtype_as_v:
-    p = p.astype(v.dtype)
 
   pv = lax.dot(
       p,
