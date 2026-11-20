@@ -1068,6 +1068,123 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
 
+  @parameterized.product(
+      block_kv_compute=(128, 256),
+      is_segmented=(False, True),
+      dq_reduction_steps=(None, 1),
+  )
+  def test_local_band_mask_bit_exact(
+      self, block_kv_compute, is_segmented, dq_reduction_steps
+  ):
+    """`local_band_mask` is bit-exact vs the full dkv mask.
+
+    Causal sliding window with left window block - 1 and equal square blocks,
+    so every partial dkv block is a diagonal block or the block left of it, and
+    each kv compute tile splits into a masked, a triangle band and a visible q
+    part. GQA with head dim 128 and blocks 512.
+    """
+    seq_len, num_q_heads, num_kv_heads, head_dim, block = 2048, 8, 2, 128, 512
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (
+        random.normal(k1, (num_q_heads, seq_len, head_dim)) * head_dim**-0.5
+    ).astype(jnp.bfloat16)
+    k = random.normal(k2, (num_kv_heads, seq_len, head_dim), jnp.bfloat16)
+    v = random.normal(k3, (num_kv_heads, seq_len, head_dim), jnp.bfloat16)
+    do = random.normal(k4, (num_q_heads, seq_len, head_dim), jnp.bfloat16)
+    segment_ids = None
+    if is_segmented:
+      seg = jnp.repeat(
+          jnp.arange(4, dtype=jnp.int32),
+          jnp.array([300, 900, 500, 348]),
+          total_repeat_length=seq_len,
+      )
+      segment_ids = splash.SegmentIds(q=seg, kv=seg)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len)) & mask_lib.LocalMask(
+        shape=(seq_len, seq_len), window_size=(block - 1, None), offset=0
+    )
+
+    def build(local_band_mask):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block_kv_compute,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block_kv_compute,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          fuse_reciprocal=True,
+          residual_checkpoint_name="context",
+          dq_reduction_steps=dq_reduction_steps,
+          local_band_mask=local_band_mask,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def fwd_and_bwd(q, k, v, do):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids),
+            q,
+            k,
+            v,
+        )
+        return out, *vjp(do)
+
+      return jax.jit(fwd_and_bwd)
+
+    args = (q, k, v, do)
+    off, on = build(False), build(True)
+    # The flag reaches the kernel: the lowered programs differ.
+    self.assertNotEqual(off.lower(*args).as_text(), on.lower(*args).as_text())
+    for name, r, o in zip(("out", "dq", "dk", "dv"), off(*args), on(*args)):
+      with self.subTest(name):
+        np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
+  def test_local_band_mask_ignored_on_other_masks(self):
+    """`local_band_mask` leaves the program unchanged where it does not apply."""
+    seq_len, num_heads, head_dim, block = 1024, 2, 128, 256
+    k1, k2, k3, k4 = random.split(random.key(1), 4)
+    shape = (num_heads, seq_len, head_dim)
+    q, k, v, do = (
+        random.normal(key, shape, jnp.bfloat16) for key in (k1, k2, k3, k4)
+    )
+    causal = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def local(left):
+      return mask_lib.LocalMask(
+          shape=(seq_len, seq_len), window_size=(left, None), offset=0
+      )
+
+    cases = {
+        "causal_only": (causal, block),
+        "window_not_block_minus_one": (causal & local(block), block),
+        "unequal_dkv_blocks": (causal & local(block - 1), 2 * block),
+    }
+    for name, (mask, block_dkv) in cases.items():
+
+      def build(local_band_mask, mask=mask, block_dkv=block_dkv):
+        config = splash.SplashConfig(
+            block_q=block,
+            block_kv=block,
+            block_kv_compute=block // 2,
+            block_q_dkv=block_dkv,
+            block_kv_dkv=block_dkv,
+            block_kv_dkv_compute=block // 2,
+            use_fused_bwd_kernel=True,
+            local_band_mask=local_band_mask,
+            interpret=self.INTERPRET,
+        )
+        attn = splash.make_splash_mha_single_device(mask, config=config)
+
+        def bwd(q, k, v, do):
+          _, vjp = jax.vjp(attn, q, k, v)
+          return vjp(do)
+
+        return jax.jit(bwd).lower(q, k, v, do).as_text()
+
+      with self.subTest(name):
+        self.assertEqual(build(False), build(True))
+
 
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:
   """Relative L2 error ‖x - y‖ / ‖y‖."""
