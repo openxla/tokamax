@@ -60,8 +60,21 @@ jobs:
           # See the script for why it upgrades uv and retries downloads.
           bash .github/ci/install_deps.sh "${DEVICE}" "${JAX_PIN}"
       - name: Test Tokamax ops with pytest
+        env:
+          RUNNER: ${{ matrix.runner }}
         run: |
-          pytest -s --ignore-glob="*/test_base.py" tokamax/_src/ops/attention
+          pytest -s --ignore-glob="*/test_base.py" \
+            --junitxml="junit/${RUNNER}--attention.xml" \
+            tokamax/_src/ops/attention
+
+      - name: Upload JUnit results for the ops page
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: nightly-junit-attention-${{ matrix.runner }}
+          path: junit/
+          if-no-files-found: ignore
+          retention-days: 7
   # TODO: Re-enable ragged dot on b200 once it is supported.
   # TODO: Re-enable B200 once it is supported.
   tokamax-nightly-ops-tests:
@@ -102,11 +115,22 @@ jobs:
         env:
           # As above: read as data, not interpolated into the `run:` block.
           ADDITIONAL_IGNORE: ${{ matrix.additional_ignore }}
+          RUNNER: ${{ matrix.runner }}
         run: |
           # `ADDITIONAL_IGNORE` is one string holding zero or more arguments,
           # so it has to be word-split with `xargs` to reach pytest as separate arguments.
           printf '%s tokamax/_src/ops' "${ADDITIONAL_IGNORE}" \
-            | xargs pytest -s --ignore-glob="*/test_base.py"  --ignore=tokamax/_src/ops/attention/
+            | xargs pytest -s --ignore-glob="*/test_base.py"  --ignore=tokamax/_src/ops/attention/ \
+                --junitxml="junit/${RUNNER}--ops.xml"
+
+      - name: Upload JUnit results for the ops page
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: nightly-junit-ops-${{ matrix.runner }}
+          path: junit/
+          if-no-files-found: ignore
+          retention-days: 7
 
   tokamax-nightly-tests:
     strategy:
