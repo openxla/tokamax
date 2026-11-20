@@ -36,6 +36,7 @@ import shlex
 import subprocess
 import tempfile
 import textwrap
+import types
 from typing import NoReturn
 import unittest
 from unittest import mock
@@ -255,9 +256,8 @@ class ShardTableTest(unittest.TestCase):
     self.assertIn('test files no shard runs', ' '.join(errors))
 
   def test_leftover_devices_key_is_rejected(self) -> None:
-    # Every shard runs on every runner, so `devices` pins nothing. A stale key
-    # has to fail rather than be ignored, or the table reads as pinned when it
-    # is not.
+    # Routing comes from ops_list.py, not per-shard keys. A stale key has to
+    # fail rather than be ignored, or the table reads as pinned when it is not.
     errors = check({'s1': dict(paths=FILES[:3], devices=('tpu',))})
     self.assertIn('has a `devices` key', ' '.join(errors))
 
@@ -1765,6 +1765,454 @@ class DryRunTest(unittest.TestCase):
     live, _ = self._matrix('--changed-from', self._changed('README.md'))
     self.assertEqual(live['include'], '[]')
     self.assertEqual(live['compat_include'], '[]')
+
+
+class OpRoutingTest(unittest.TestCase):
+  """Tests for routing op tests to runners using the ops list."""
+
+  def _changed(self, *paths: str) -> str:
+    handle, file_path = tempfile.mkstemp()
+    with os.fdopen(handle, 'w') as file_obj:
+      file_obj.write(''.join(f'{path}\0' for path in paths))
+    self.addCleanup(os.unlink, file_path)
+    return file_path
+
+  def test_single_backend_op_tags_to_its_platform(self) -> None:
+    ops_list = shards._load_ops_list()
+    op_dir = 'tokamax/_src/ops/foo_tpu'
+    base_py, helper_py, api_py, tpu_py = (
+        f'{op_dir}/{n}.py'
+        for n in ('base', 'helper', 'api', 'pallas_mosaic_tpu')
+    )
+    base_test, api_test, tpu_test = (
+        f'{op_dir}/{n}_test.py' for n in ('base', 'api', 'pallas_mosaic_tpu')
+    )
+    xla_base = 'tokamax/_src/ops/foo_xla/base.py'
+    xla_api = 'tokamax/_src/ops/foo_xla/api.py'
+    xla_base_test = 'tokamax/_src/ops/foo_xla/base_test.py'
+    init_py, top_test = 'tokamax/__init__.py', 'tokamax/tokamax_test.py'
+    files = [
+        base_py,
+        helper_py,
+        api_py,
+        tpu_py,
+        base_test,
+        api_test,
+        tpu_test,
+        xla_base,
+        xla_api,
+        xla_base_test,
+        init_py,
+        top_test,
+    ]
+    edges = {
+        base_py: {helper_py},
+        api_py: {base_py, tpu_py},
+        tpu_py: {base_py},
+        base_test: {base_py},
+        api_test: {api_py},
+        tpu_test: {tpu_py},
+        xla_api: {xla_base},
+        xla_base_test: {xla_base},
+        init_py: {api_py},
+        top_test: {init_py},
+    }
+    reverse_edges = {
+        helper_py: {base_py},
+        base_py: {api_py, tpu_py, base_test},
+        tpu_py: {api_py, tpu_test},
+        api_py: {api_test, init_py},
+        init_py: {top_test},
+    }
+    fake_ops = types.SimpleNamespace(
+        OPS=(
+            ops_list.Op(
+                name='foo_tpu',
+                apis=('foo_tpu',),
+                impls=(
+                    ops_list.Impl(
+                        name='mosaic',
+                        backend=ops_list.MOSAIC_TPU,
+                        module='_src/ops/foo_tpu/pallas_mosaic_tpu.py',
+                    ),
+                ),
+            ),
+            ops_list.Op(
+                name='foo_xla',
+                apis=(),
+                impls=(
+                    ops_list.Impl(
+                        name='xla',
+                        backend=ops_list.XLA,
+                        module='_src/ops/foo_xla/base.py',
+                    ),
+                ),
+            ),
+        )
+    )
+    platforms = shards.get_file_platforms_map(fake_ops, files, edges)
+    for tpu_only_file in (
+        base_py,
+        helper_py,
+        api_py,
+        base_test,
+        api_test,
+        tpu_py,
+        tpu_test,
+    ):
+      self.assertEqual(platforms[tpu_only_file], {'tpu'}, tpu_only_file)
+    self.assertEqual(platforms[xla_api], {'gpu', 'tpu'})
+    self.assertEqual(platforms[xla_base_test], {'gpu', 'tpu'})
+    self.assertEqual(
+        shards.per_platform_reachability(
+            [api_py], 'tpu', platforms, reverse_edges
+        ),
+        {api_test, top_test},
+    )
+    for changed_file in (api_py, base_py, tpu_py):
+      self.assertEqual(
+          shards.per_platform_reachability(
+              [changed_file], 'gpu', platforms, reverse_edges
+          ),
+          set(),
+      )
+
+  def test_shared_op_kernel_isolation_and_api_helpers(self) -> None:
+    ops_list = shards._load_ops_list()
+    op_dir = 'tokamax/_src/ops/baz_shared'
+    base_py, api_py, api_helper = (
+        f'{op_dir}/{n}.py' for n in ('base', 'api', 'api_helper')
+    )
+    triton_py, tpu_py = f'{op_dir}/triton.py', f'{op_dir}/pallas_mosaic_tpu.py'
+    api_test = f'{op_dir}/api_test.py'
+    tpu_test = f'{op_dir}/pallas_mosaic_tpu_test.py'
+    triton_test = f'{op_dir}/triton_test.py'
+    files = [
+        base_py,
+        api_py,
+        api_helper,
+        triton_py,
+        tpu_py,
+        api_test,
+        tpu_test,
+        triton_test,
+    ]
+    edges = {
+        api_py: {base_py, api_helper, triton_py, tpu_py},
+        triton_py: {base_py},
+        tpu_py: {base_py, api_helper},
+        api_test: {api_py},
+        tpu_test: {tpu_py},
+        triton_test: {triton_py},
+    }
+    reverse_edges = {
+        api_helper: {api_py, tpu_py},
+        triton_py: {api_py, triton_test},
+        tpu_py: {api_py, tpu_test},
+        api_py: {api_test},
+    }
+    fake_ops = types.SimpleNamespace(
+        OPS=(
+            ops_list.Op(
+                name='baz_shared',
+                apis=('baz_shared',),
+                impls=(
+                    ops_list.Impl(
+                        name='triton',
+                        backend=ops_list.TRITON,
+                        module='_src/ops/baz_shared/triton.py',
+                    ),
+                    ops_list.Impl(
+                        name='mosaic_tpu',
+                        backend=ops_list.MOSAIC_TPU,
+                        module='_src/ops/baz_shared/pallas_mosaic_tpu.py',
+                    ),
+                ),
+            ),
+        )
+    )
+    platforms = shards.get_file_platforms_map(fake_ops, files, edges)
+    # Helper imported by api.py stays shared even if also imported by tpu_py.
+    self.assertEqual(platforms[api_helper], {'gpu', 'tpu'})
+    self.assertEqual(platforms[tpu_py], {'tpu'})
+    self.assertEqual(platforms[triton_py], {'gpu'})
+    self.assertEqual(
+        shards.per_platform_reachability(
+            [tpu_py], 'gpu', platforms, reverse_edges
+        ),
+        set(),
+    )
+    self.assertEqual(
+        shards.per_platform_reachability(
+            [tpu_py], 'tpu', platforms, reverse_edges
+        ),
+        {tpu_test, api_test},
+    )
+    self.assertEqual(
+        shards.per_platform_reachability(
+            [api_helper], 'gpu', platforms, reverse_edges
+        ),
+        {api_test},
+    )
+
+  def test_impl_kernel_dirs_take_impl_platforms(self) -> None:
+    ops_list = shards._load_ops_list()
+    op_file = 'tokamax/_src/ops/experimental/foo_op/pallas_mosaic_tpu.py'
+    triton_file = 'tokamax/_src/ops/experimental/foo_op/triton.py'
+    kernel = 'tokamax/_src/ops/experimental/foo/layer/kernel.py'
+    kernel_test = 'tokamax/_src/ops/experimental/foo/test/kernel_test.py'
+    files = [op_file, triton_file, kernel, kernel_test]
+    edges = {op_file: {kernel}, kernel_test: {kernel}}
+    reverse_edges = {kernel: {op_file, kernel_test}}
+    tpu_impl = ops_list.Impl(
+        name='mosaic_tpu',
+        backend=ops_list.MOSAIC_TPU,
+        module=op_file.removeprefix('tokamax/'),
+        kernel_dirs=('experimental/foo',),
+    )
+    triton_impl = ops_list.Impl(
+        name='triton',
+        backend=ops_list.TRITON,
+        module=triton_file.removeprefix('tokamax/'),
+    )
+    for label, impls in (
+        ('tpu_only_op', (tpu_impl,)),
+        ('shared_op', (tpu_impl, triton_impl)),
+    ):
+      with self.subTest(label):
+        fake_ops = types.SimpleNamespace(
+            OPS=(ops_list.Op(name='foo', apis=(), impls=impls),)
+        )
+        platforms = shards.get_file_platforms_map(fake_ops, files, edges)
+        self.assertEqual(platforms[kernel], {'tpu'})
+        self.assertEqual(platforms[kernel_test], {'tpu'})
+        self.assertEqual(
+            shards.per_platform_reachability(
+                [kernel], 'tpu', platforms, reverse_edges
+            ),
+            {kernel_test},
+        )
+        self.assertEqual(
+            shards.per_platform_reachability(
+                [kernel], 'gpu', platforms, reverse_edges
+            ),
+            set(),
+        )
+        if label == 'shared_op':
+          self.assertEqual(platforms[triton_file], {'gpu'})
+
+  def test_dependent_ops_direct_transitive_and_cyclic(self) -> None:
+    ops_list = shards._load_ops_list()
+    op_dir = 'tokamax/_src/ops/op_a'
+    base_py, api_py, triton_py = (
+        f'{op_dir}/{n}.py' for n in ('base', 'api', 'triton')
+    )
+    base_test, triton_test = (
+        f'{op_dir}/base_test.py',
+        f'{op_dir}/triton_test.py',
+    )
+    files = [base_py, api_py, triton_py, base_test, triton_test]
+    edges = {
+        api_py: {base_py, triton_py},
+        triton_py: {base_py},
+        base_test: {base_py},
+        triton_test: {triton_py},
+    }
+    # A (GPU) -> B (GPU, cyclic back to A) -> C (TPU).
+    fake_ops = types.SimpleNamespace(
+        OPS=(
+            ops_list.Op(
+                name='op_a',
+                apis=(),
+                impls=(
+                    ops_list.Impl(
+                        name='xla',
+                        backend=ops_list.XLA,
+                        module='_src/ops/op_a/base.py',
+                    ),
+                    ops_list.Impl(
+                        name='triton',
+                        backend=ops_list.TRITON,
+                        module='_src/ops/op_a/triton.py',
+                    ),
+                ),
+                dependent_ops=('op_b',),
+            ),
+            ops_list.Op(
+                name='op_b',
+                apis=(),
+                impls=(
+                    ops_list.Impl(
+                        name='triton',
+                        backend=ops_list.TRITON,
+                        module='_src/ops/op_b/triton.py',
+                    ),
+                ),
+                dependent_ops=('op_a', 'op_c'),
+            ),
+            ops_list.Op(
+                name='op_c',
+                apis=(),
+                impls=(
+                    ops_list.Impl(
+                        name='mosaic_tpu',
+                        backend=ops_list.MOSAIC_TPU,
+                        module='_src/ops/op_c/pallas_mosaic_tpu.py',
+                    ),
+                ),
+            ),
+        )
+    )
+    platforms = shards.get_file_platforms_map(fake_ops, files, edges)
+    for shared_file in (base_py, api_py, base_test):
+      self.assertEqual(platforms[shared_file], {'gpu', 'tpu'}, shared_file)
+    self.assertEqual(platforms[triton_py], {'gpu'})
+    self.assertEqual(platforms[triton_test], {'gpu'})
+
+  def test_narrowed_module_test_longest_stem_wins(self) -> None:
+    ops_list = shards._load_ops_list()
+    op_dir = 'tokamax/_src/ops/foo_shared'
+    base_py = f'{op_dir}/base.py'
+    gpu_py, tpu_py = f'{op_dir}/mosaic.py', f'{op_dir}/mosaic_tpu.py'
+    gpu_test = f'{op_dir}/mosaic_test.py'
+    gpu_sub_test = f'{op_dir}/mosaic_sm90_test.py'
+    tpu_test = f'{op_dir}/mosaic_tpu_test.py'
+    files = [base_py, gpu_py, tpu_py, gpu_test, gpu_sub_test, tpu_test]
+    edges = {
+        gpu_py: {base_py},
+        tpu_py: {base_py},
+        gpu_test: {gpu_py},
+        gpu_sub_test: {gpu_py},
+        tpu_test: {tpu_py},
+    }
+    fake_ops = types.SimpleNamespace(
+        OPS=(
+            ops_list.Op(
+                name='foo_shared',
+                apis=('foo_shared',),
+                impls=(
+                    ops_list.Impl(
+                        name='mosaic_gpu',
+                        backend=ops_list.MOSAIC_GPU,
+                        module='_src/ops/foo_shared/mosaic.py',
+                    ),
+                    ops_list.Impl(
+                        name='mosaic_tpu',
+                        backend=ops_list.MOSAIC_TPU,
+                        module='_src/ops/foo_shared/mosaic_tpu.py',
+                    ),
+                ),
+            ),
+        )
+    )
+    platforms = shards.get_file_platforms_map(fake_ops, files, edges)
+    self.assertEqual(platforms[gpu_test], {'gpu'})
+    self.assertEqual(platforms[gpu_sub_test], {'gpu'})
+    self.assertEqual(platforms[tpu_test], {'tpu'})
+
+  def test_build_matrix_and_compat_honor_changed_files_when_only_is_none(
+      self,
+  ) -> None:
+    resolved, *_ = shards.resolve_shards()
+    tpu_file = 'tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu.py'
+    jobs = shards.build_matrix(resolved, changed_files=[tpu_file])
+    self.assertTrue(jobs)
+    self.assertEqual({job['device'] for job in jobs}, {'tpu'})
+    self.assertEqual(
+        shards.compat_bins(
+            resolved,
+            only=None,
+            filter_platforms=True,
+            changed_files=[tpu_file],
+            platforms={'gpu'},
+        ),
+        [],
+    )
+
+  def test_multi_runner_compat_matrix_isolates_platforms(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    multi_runners = (
+        'linux-x86-a3-8g-h100-1gpu',
+        'linux-x86-tpu7x-56-1tpu',
+    )
+    with mock.patch.object(shards, 'COMPAT_RUNNERS', multi_runners):
+      compat_jobs = shards.build_compat_matrix(
+          resolved,
+          only={'attention-triton', 'splash-kernel'},
+          filter_platforms=True,
+      )
+      gpu_shards: set[str] = set()
+      tpu_shards: set[str] = set()
+      for job in compat_jobs:
+        target = gpu_shards if job['device'] == 'cuda' else tpu_shards
+        target.update(job['shards'].split())
+      self.assertEqual(gpu_shards, {'attention-triton'})
+      self.assertEqual(tpu_shards, {'splash-kernel'})
+
+      gpu_edit = ['tokamax/_src/ops/ragged_dot/triton.py']
+      selected, _ = shards.select(
+          resolved, shards.all_test_files(), self._changed(*gpu_edit)
+      )
+      edit_jobs = shards.build_compat_matrix(
+          resolved,
+          only=selected,
+          filter_platforms=True,
+          changed_files=gpu_edit,
+      )
+      self.assertEqual({j['device'] for j in edit_jobs}, {'cuda'})
+
+  def test_fail_open_runs_all_shards_on_matching_platforms(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    test_files = shards.all_test_files()
+    for trigger in ('pyproject.toml', 'tokamax/_src/ops/ops_list.py'):
+      with self.subTest(trigger=trigger):
+        selected, _ = shards.select(
+            resolved, test_files, self._changed(trigger)
+        )
+        self.assertIsNone(selected)
+        jobs = shards.build_matrix(
+            resolved,
+            only=selected,
+            changed_files=[trigger],
+            filter_platforms=True,
+        )
+        tpu = {j['shard_name'] for j in jobs if j['device'] == 'tpu'}
+        cuda = {j['shard_name'] for j in jobs if j['device'] == 'cuda'}
+        self.assertIn('splash-kernel', tpu)
+        self.assertNotIn('splash-kernel', cuda)
+        self.assertIn('attention-triton', cuda)
+        self.assertNotIn('attention-triton', tpu)
+
+    # Unknown autotuning table fails open even when paired with a GPU edit.
+    jobs = shards.build_matrix(
+        resolved,
+        only={'ragged-dot-api'},
+        changed_files=[
+            'tokamax/data/autotuning/tpu7x/pallas_mosaic_tpu_nonexistent_op.json',
+            'tokamax/_src/ops/ragged_dot/triton.py',
+        ],
+    )
+    self.assertEqual({j['device'] for j in jobs}, {'cuda', 'tpu'})
+
+  def test_real_repo_smoke_routing(self) -> None:
+    resolved, *_ = shards.resolve_shards()
+    test_files = shards.all_test_files()
+    cases = (
+        ('tokamax/_src/ops/ragged_dot/pallas_mosaic_tpu.py', {'tpu'}),
+        ('tokamax/_src/ops/ragged_dot/triton.py', {'cuda'}),
+        ('tokamax/_src/ops/normalization/triton.py', {'cuda'}),
+        ('tokamax/_src/ops/normalization/api.py', {'cuda', 'tpu'}),
+    )
+    for changed_file, expected_devices in cases:
+      with self.subTest(changed_file=changed_file):
+        selected, _ = shards.select(
+            resolved, test_files, self._changed(changed_file)
+        )
+        self.assertIsNotNone(selected)
+        jobs = shards.build_matrix(
+            resolved, only=selected, changed_files=[changed_file]
+        )
+        self.assertEqual({j['device'] for j in jobs}, expected_devices)
 
 
 if __name__ == '__main__':

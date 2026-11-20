@@ -201,6 +201,46 @@ def _module_op_dir(module: str) -> str | None:
   return None
 
 
+def _imported_modules(tree: ast.Module) -> set[str]:
+  modules: set[str] = set()
+  for node in ast.walk(tree):
+    if isinstance(node, ast.ImportFrom) and node.module:
+      modules.add(node.module)
+      modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    elif isinstance(node, ast.Import):
+      modules.update(alias.name for alias in node.names)
+  return modules
+
+
+def _imported_op_dirs(path: pathlib.Path) -> set[str]:
+  used: set[str] = set()
+  for module in _imported_modules(_parse_source_file(path)):
+    package, _, leaf = module.rpartition(".")
+    if leaf in ("api", "base") and package.startswith("tokamax._src.ops."):
+      rel = package.removeprefix("tokamax._src.ops.").replace(".", "/")
+      if (op_dir := _module_op_dir(f"_src/ops/{rel}/x")) is not None:
+        used.add(op_dir)
+  return used
+
+
+def _used_op_dirs(op: ops_list.Op) -> set[str]:
+  """Returns op dirs whose api or base the op's non-test modules import."""
+  used: set[str] = set()
+  for root in ("_src", "google"):
+    for op_dir in op.dirs:
+      for path in (_TOKAMAX_ROOT / root / "ops" / op_dir).rglob("*.py"):
+        if "test" not in path.stem.split("_"):
+          used.update(_imported_op_dirs(path))
+  return used - set(op.dirs)
+
+
+def _top_level_class_names(file_path: pathlib.Path) -> set[str]:
+  tree = _parse_source_file(file_path)
+  return {
+      node.name for node in tree.body if isinstance(node, ast.ClassDef)
+  }
+
+
 class OpsListTest(absltest.TestCase):
   """Tests verifying ops_list manifest integrity and consistency."""
 
@@ -498,6 +538,32 @@ class OpsListTest(absltest.TestCase):
             f"kernel_dir '{kernel_dir}' on op '{op.name}' has no python files",
         )
 
+  def test_dependent_ops_match_imports(self):
+    dependents: dict[str, set[str]] = {}
+    for op in ops_list.OPS:
+      for used_dir in _used_op_dirs(op):
+        dependents.setdefault(used_dir, set()).add(op.name)
+    for op in ops_list.OPS:
+      actual = dependents.get(op.op_dir, set())
+      missing = sorted(actual - set(op.dependent_ops))
+      self.assertEmpty(
+          missing,
+          f"{missing} import the api or base of '{op.name}'; add them to its"
+          " dependent_ops in ops_list.py",
+      )
+      stale = sorted(set(op.dependent_ops) - actual)
+      self.assertEmpty(
+          stale,
+          f"'{op.name}' lists {stale} in dependent_ops, but they no longer"
+          " import its api or base; drop them",
+      )
+
+  def test_dependent_ops_validation(self):
+    for bad_dep in ("", "foo", cast(Any, None)):
+      with self.subTest(bad_dep=bad_dep):
+        with self.assertRaisesRegex(ValueError, "invalid dependent_ops"):
+          ops_list.Op(name="foo", apis=(), impls=(), dependent_ops=(bad_dep,))
+
   def test_experimental_ops_and_impl_modules_consistency(self):
     for op in ops_list.OPS:
       self.assertNotEmpty(
@@ -522,6 +588,62 @@ class OpsListTest(absltest.TestCase):
             f"Impl {impl.module} resolves to {impl_op_dir}, expected"
             f" {op.op_dir}",
         )
+
+  def test_impl_cls_defined_in_module(self):
+    google_dir_exists = (_TOKAMAX_ROOT / "google").is_dir()
+    for op_entry in ops_list.OPS:
+      base_path = _TOKAMAX_ROOT / f"_src/ops/{op_entry.op_dir}/base.py"
+      has_base = base_path.is_file()
+      for impl in op_entry.impls:
+        if has_base:
+          self.assertIsNotNone(
+              impl.cls,
+              f"Op '{op_entry.name}' has base.py so impl '{impl.name}' must set"
+              " cls",
+          )
+        if impl.cls is None:
+          continue
+        if impl.module.startswith("google/") and not google_dir_exists:
+          continue
+        class_names = _top_level_class_names(_TOKAMAX_ROOT / impl.module)
+        self.assertIn(
+            impl.cls,
+            class_names,
+            f"Class '{impl.cls}' for op '{op_entry.name}' impl '{impl.name}'"
+            f" not found in '{impl.module}'",
+        )
+
+  def test_impl_cls_validation(self):
+    impl = ops_list.Impl(
+        name="xla",
+        backend=ops_list.XLA,
+        module="_src/ops/attention/base.py",
+        cls="DotProductAttention",
+    )
+    self.assertEqual(impl.cls, "DotProductAttention")
+
+    no_cls_impl = ops_list.Impl(
+        name="raw",
+        backend=ops_list.XLA,
+        module="_src/ops/gmm_v2/gmm_v2.py",
+    )
+    self.assertIsNone(no_cls_impl.cls)
+
+    for bad_cls in (
+        "",
+        "not an identifier",
+        "123invalid",
+        "class",
+        cast(Any, 123),
+    ):
+      with self.subTest(bad_cls=bad_cls):
+        with self.assertRaisesRegex(ValueError, "Impl.cls"):
+          ops_list.Impl(
+              name="xla",
+              backend=ops_list.XLA,
+              module="_src/ops/attention/base.py",
+              cls=bad_cls,
+          )
 
 
 if __name__ == "__main__":

@@ -33,8 +33,9 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence, Set as AbstractSet
 import fnmatch
+import importlib.util
 import json
 import os
 import re
@@ -42,17 +43,23 @@ import shlex
 import subprocess
 import sys
 import tomllib
-from typing import TypedDict
+import types
+from typing import Any, TypedDict
 
 # Sibling module, same directory, stdlib-only: computes affected test files.
 import deps
 
 # Runner label -> (device extra installed, short name used in job titles).
-# Every shard runs on every runner.
+# Shards run only on runners their tests' platforms need; see `build_matrix`.
 RUNNERS = {
     'linux-x86-a3-8g-h100-1gpu': ('cuda', 'h100'),
     'linux-x86-ct6e-44-1tpu': ('tpu', 'tpu6e'),
     'linux-x86-tpu7x-56-1tpu': ('tpu', 'tpu7x'),
+}
+
+RUNNER_PLATFORMS = {
+    runner: 'gpu' if device == 'cuda' else device
+    for runner, (device, _) in RUNNERS.items()
 }
 
 # pytest default `python_files` patterns.
@@ -91,8 +98,9 @@ THEMES = (
     'catch-all',
 )
 
-# Test files intentionally run by no shard.
-EXCLUDED_TESTS = ()
+# Test files intentionally run by no shard (`ops_list_test.py` runs on CPU in
+# the `collect-tests` job of `ci-build.yml`).
+EXCLUDED_TESTS = ('tokamax/_src/ops/ops_list_test.py',)
 
 # JAX versions tested in CI: `latest_jax()` for the shard jobs, `older_jaxs()`
 # for compat-tests. The oldest must match the floor in pyproject.toml.
@@ -743,7 +751,6 @@ SHARDS: ShardMap = {
             'tokamax/_src/mosaic_gpu_test.py',
             'tokamax/_src/numerics_test.py',
             'tokamax/_src/ops/op_test.py',
-            'tokamax/_src/ops/ops_list_test.py',
             'tokamax/_src/precision_test.py',
             'tokamax/_src/pydantic_test.py',
             'tokamax/_src/shape_test.py',
@@ -1064,8 +1071,8 @@ def check_consistency(
         )
     if 'devices' in spec:
       errors.append(
-          f'shard {name!r} has a `devices` key: every shard runs on every'
-          ' runner, so this pins nothing. Drop it.'
+          f'shard {name!r} has a `devices` key: runner eligibility is derived'
+          ' from ops_list.py rather than Spec, so this pins nothing. Drop it.'
       )
 
   uncovered = sorted(set(test_files) - set(claims) - excluded - ignored)
@@ -1238,25 +1245,457 @@ def unclaimed_tests(
   }
 
 
+_ACCELERATORS = frozenset({'gpu', 'tpu'})
+_DEFAULT_REPO_GRAPH: (
+    tuple[
+        str,
+        list[str],
+        dict[str, set[str]],
+        set[str],
+        dict[str, frozenset[str]],
+    ]
+    | None
+) = None
+
+
+def _find_ops_list_path() -> str:
+  """Locates ops_list.py relative to shards.py or repository root."""
+  repo_root = os.path.normpath(
+      os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+  )
+  candidates = (
+      os.path.join(repo_root, 'tokamax', '_src', 'ops', 'ops_list.py'),
+      os.path.join(repo_root, '_src', 'ops', 'ops_list.py'),
+      'tokamax/_src/ops/ops_list.py',
+  )
+  for candidate in candidates:
+    if os.path.isfile(candidate):
+      return candidate
+  raise FileNotFoundError(f'Could not find ops_list.py in {candidates}')
+
+
+def _load_ops_list(ops_list_path: str | None = None) -> types.ModuleType:
+  """Loads and returns the ops_list module."""
+  if ops_list_path is None:
+    ops_list_path = _find_ops_list_path()
+  loader_spec = importlib.util.spec_from_file_location(
+      '_tokamax_ops_list', ops_list_path
+  )
+  if loader_spec is None or loader_spec.loader is None:
+    raise ImportError(f'Could not load spec for ops_list at {ops_list_path}')
+  module = importlib.util.module_from_spec(loader_spec)
+  loader_spec.loader.exec_module(module)
+  return module
+
+
+def _normalize_repo_path(path: str) -> str:
+  """Normalizes a repo-relative path to start with 'tokamax/'."""
+  normalized = path.replace('\\', '/')
+  if normalized.startswith('tokamax/'):
+    return normalized
+  return f'tokamax/{normalized}'
+
+
+def _impl_accelerators(impl_entry: Any) -> set[str]:
+  """Returns the GPU/TPU platforms for a non-XLA implementation."""
+  if impl_entry.backend.name.lower() == 'xla':
+    return set()
+  platforms: set[str] = set()
+  for platform in impl_entry.backend.platforms:
+    if platform.value in _ACCELERATORS:
+      platforms.add(platform.value)
+  return platforms
+
+
+def _op_accelerators(
+    op_entry: Any,
+    ops_by_name: Mapping[str, Any],
+    seen: AbstractSet[str] = frozenset(),
+) -> set[str]:
+  """Returns the op's kernel platforms plus those of its `dependent_ops`."""
+  platforms = set().union(*map(_impl_accelerators, op_entry.impls))
+  platforms = platforms or set(_ACCELERATORS)
+  for name in op_entry.dependent_ops:
+    if name not in seen:
+      platforms |= _op_accelerators(
+          ops_by_name[name], ops_by_name, seen | {op_entry.name}
+      )
+  return platforms
+
+
+def _op_dir_platforms(ops_seq: Iterable[Any]) -> dict[str, set[str]]:
+  """Maps each normalized op_dir and kernel_dir to its accelerator platforms."""
+  ops_seq = tuple(ops_seq)
+  ops_by_name = {op_entry.name: op_entry for op_entry in ops_seq}
+  by_dir: dict[str, set[str]] = {}
+  for op_entry in ops_seq:
+    op_dir = _normalize_repo_path(f'_src/ops/{op_entry.op_dir}')
+    platforms = by_dir.setdefault(op_dir, set())
+    platforms |= _op_accelerators(op_entry, ops_by_name)
+    kernel_platforms: dict[str, set[str]] = collections.defaultdict(set)
+    for impl in op_entry.impls:
+      for kernel_dir in impl.kernel_dirs:
+        kernel_platforms[kernel_dir].update(_impl_accelerators(impl))
+    for kernel_dir, k_plats in kernel_platforms.items():
+      norm_kdir = _normalize_repo_path(f'_src/ops/{kernel_dir}')
+      by_dir[norm_kdir] = k_plats or set(platforms)
+  return by_dir
+
+
+def _normalize_edges(
+    edges: Mapping[str, Collection[str]],
+) -> dict[str, set[str]]:
+  """Normalizes source and target paths in an import graph mapping."""
+  normalized = collections.defaultdict(set)
+  for src, targets in edges.items():
+    norm_src = _normalize_repo_path(src)
+    for tgt in targets:
+      normalized[norm_src].add(_normalize_repo_path(tgt))
+  return normalized
+
+
+def _invert_edges(
+    edges: Mapping[str, Collection[str]],
+) -> dict[str, set[str]]:
+  """Inverts an import graph mapping while normalizing repo-relative paths."""
+  inverted: dict[str, set[str]] = collections.defaultdict(set)
+  for src, targets in edges.items():
+    norm_src = _normalize_repo_path(src)
+    for tgt in targets:
+      inverted[_normalize_repo_path(tgt)].add(norm_src)
+  return inverted
+
+
+def _is_impl_helper(
+    path: str, prefixes: tuple[str, ...], blocked: AbstractSet[str]
+) -> bool:
+  """Returns True if `path` is a private helper under `prefixes`."""
+  return (
+      path.startswith(prefixes)
+      and not deps.is_test_file(path)
+      and os.path.basename(path) not in ('api.py', 'base.py')
+      and path not in blocked
+  )
+
+
+def _bfs_within_prefixes(
+    starts: str | Iterable[str],
+    edges: Mapping[str, Collection[str]],
+    prefixes: tuple[str, ...],
+    blocked: AbstractSet[str] = frozenset(),
+) -> set[str]:
+  """Returns files under `prefixes` reachable from `starts` avoiding `blocked`."""
+  seeds = (starts,) if isinstance(starts, str) else tuple(starts)
+  visited = set(seeds)
+  queue = collections.deque(seeds)
+  while queue:
+    curr = queue.popleft()
+    for nxt in edges.get(curr, ()):
+      if nxt not in visited and _is_impl_helper(nxt, prefixes, blocked):
+        visited.add(nxt)
+        queue.append(nxt)
+  return visited
+
+
+def _classify_op_modules(
+    op_entry: Any, edges: Mapping[str, Collection[str]]
+) -> tuple[set[str], list[tuple[str, set[str]]], tuple[str, ...]]:
+  """Returns (shared_mods, non_xla_impls, prefixes) for one op entry."""
+  op_dir = _normalize_repo_path(f'_src/ops/{op_entry.op_dir}')
+  prefixes = tuple(
+      f'{_normalize_repo_path(f"_src/ops/{dir_rel}")}/'
+      for dir_rel in op_entry.dirs
+  )
+  non_xla = [
+      (_normalize_repo_path(impl.module), plats)
+      for impl in op_entry.impls
+      if (plats := _impl_accelerators(impl))
+  ]
+  non_xla_mods = {mod for mod, _ in non_xla}
+  xla_seeds = {
+      f'{op_dir}/__init__.py',
+      f'{op_dir}/api.py',
+      f'{op_dir}/base.py',
+  } | {
+      _normalize_repo_path(impl.module)
+      for impl in op_entry.impls
+      if impl.backend.name.lower() == 'xla'
+  }
+  shared_mods = _bfs_within_prefixes(xla_seeds, edges, prefixes, non_xla_mods)
+  return shared_mods, non_xla, prefixes
+
+
+def _op_module_platforms(
+    ops_seq: Iterable[Any],
+    edges: Mapping[str, Collection[str]],
+    norm_files_set: AbstractSet[str],
+) -> dict[str, set[str]]:
+  """Returns per-module platform overrides for op directories."""
+  overrides: dict[str, set[str]] = collections.defaultdict(set)
+  ops_seq = tuple(ops_seq)
+  ops_by_name = {op_entry.name: op_entry for op_entry in ops_seq}
+  for op_entry in ops_seq:
+    shared_mods, non_xla, prefixes = _classify_op_modules(op_entry, edges)
+    op_plats = _op_accelerators(op_entry, ops_by_name)
+    for path in shared_mods & norm_files_set:
+      overrides[path].update(op_plats)
+    blocked = shared_mods | {mod for mod, _ in non_xla}
+    for impl_mod, impl_plats in non_xla:
+      impl_files = _bfs_within_prefixes(impl_mod, edges, prefixes, blocked)
+      for path in impl_files & norm_files_set:
+        overrides[path].update(impl_plats)
+  return overrides
+
+
+def _matches_module_test(test_name: str, stem: str) -> bool:
+  """Returns whether `test_name` (basename) is a test file for `stem`."""
+  return test_name == f'{stem}_test.py' or (
+      test_name.startswith(f'{stem}_') and test_name.endswith('_test.py')
+  )
+
+
+def _add_matching_module_tests(
+    overrides: dict[str, set[str]], norm_files: Sequence[str]
+) -> None:
+  """Propagates module platforms to test files using longest-stem matching."""
+  mods_by_dir: dict[str, list[tuple[str, set[str]]]] = collections.defaultdict(
+      list
+  )
+  for mod_path, plats in list(overrides.items()):
+    if not deps.is_test_file(mod_path):
+      stem = os.path.splitext(os.path.basename(mod_path))[0]
+      mods_by_dir[os.path.dirname(mod_path)].append((stem, set(plats)))
+  for cand in norm_files:
+    if not deps.is_test_file(cand):
+      continue
+    test_name = os.path.basename(cand)
+    matches = [
+        (stem, plats)
+        for stem, plats in mods_by_dir.get(os.path.dirname(cand), ())
+        if _matches_module_test(test_name, stem)
+    ]
+    if not matches:
+      continue
+    best_len = max(len(stem) for stem, _ in matches)
+    for stem, plats in matches:
+      if len(stem) == best_len:
+        overrides[cand].update(plats)
+
+
+def get_file_platforms_map(
+    ops_list_module: types.ModuleType | None = None,
+    all_files: Sequence[str] | None = None,
+    forward_edges: Mapping[str, Collection[str]] | None = None,
+) -> dict[str, frozenset[str]]:
+  """Derives per-file platform map from ops_list.py."""
+  ops_mod = _load_ops_list() if ops_list_module is None else ops_list_module
+  files = deps.python_files() if all_files is None else all_files
+  raw_edges = (
+      deps.import_graph(files)[0] if forward_edges is None else forward_edges
+  )
+  norm_files = [_normalize_repo_path(f) for f in files]
+  by_dir = _op_dir_platforms(ops_mod.OPS)
+  op_dirs = tuple(sorted(by_dir, key=len, reverse=True))
+  overrides = _op_module_platforms(
+      ops_mod.OPS, _normalize_edges(raw_edges), set(norm_files)
+  )
+  _add_matching_module_tests(overrides, norm_files)
+
+  file_platforms = {}
+  for norm_file in norm_files:
+    op_dir = next((d for d in op_dirs if norm_file.startswith(f'{d}/')), None)
+    if op_dir is not None:
+      file_platforms[norm_file] = set(by_dir[op_dir])
+  file_platforms.update(overrides)
+  return {path: frozenset(plats) for path, plats in file_platforms.items()}
+
+
+def per_platform_reachability(
+    changed_files: Collection[str],
+    platform: str,
+    file_platforms: Mapping[str, frozenset[str]],
+    reverse_edges: Mapping[str, Collection[str]],
+) -> set[str]:
+  """Performs BFS on reverse import graph for a single hardware platform."""
+  visited = {
+      norm_path
+      for path in changed_files
+      if platform in file_platforms.get(
+          norm_path := _normalize_repo_path(path), _ACCELERATORS
+      )
+  }
+  queue = collections.deque(sorted(visited))
+  reached_tests: set[str] = set()
+  while queue:
+    current = queue.popleft()
+    if deps.is_test_file(current):
+      reached_tests.add(current)
+    for next_file in reverse_edges.get(current, ()):
+      if next_file not in visited and platform in file_platforms.get(
+          next_file, _ACCELERATORS
+      ):
+        visited.add(next_file)
+        queue.append(next_file)
+  return reached_tests
+
+
+def _shard_test_files(spec: Spec) -> set[str]:
+  """Returns normalized test file paths for `spec`."""
+  return {
+      _normalize_repo_path(split_node_id(t)[0]) for t in spec['paths'] or ()
+  }
+
+
+def _static_shard_platforms(
+    shard_tests: Iterable[str], file_platforms: Mapping[str, frozenset[str]]
+) -> set[str]:
+  """Returns the union of static platforms across `shard_tests`."""
+  platforms: set[str] = set()
+  for test_path in shard_tests:
+    platforms.update(file_platforms.get(test_path, _ACCELERATORS))
+  return platforms
+
+
+def _expand_autotuning_seeds(
+    changed_files: Collection[str], all_files: Sequence[str]
+) -> set[str]:
+  """Expands autotuning JSON paths to op module files and cache test."""
+  expanded = set()
+  has_tables = False
+  ops_index: dict[str, set[str]] | None = None
+  for path in changed_files:
+    norm_path = _normalize_repo_path(path)
+    op_name = deps.autotuning_op_name(norm_path)
+    if op_name is not None:
+      has_tables = True
+      if ops_index is None:
+        ops_index = deps.op_modules(all_files)
+      expanded.update(ops_index.get(op_name, ()))
+  if has_tables:
+    expanded.add(deps.AUTOTUNING_CACHE_TEST)
+  return expanded
+
+
+def _expand_deleted_seeds(
+    changed_files: Collection[str], all_files: Sequence[str]
+) -> set[str]:
+  """Expands deleted .py files to surviving referrers."""
+  known = {_normalize_repo_path(f) for f in all_files}
+  expanded = set()
+  deleted_paths = [
+      path
+      for path in changed_files
+      if _normalize_repo_path(path) not in known and path.endswith('.py')
+  ]
+  if deleted_paths:
+    referrers = deps.module_referrers(all_files)
+    for path in deleted_paths:
+      norm_path = _normalize_repo_path(path)
+      mod_name = deps.module_name(norm_path)
+      for referrer in referrers.get(mod_name, ()):
+        expanded.add(referrer)
+  return expanded
+
+
+def _reached_tests_by_platform(
+    changed_files: Collection[str],
+    file_platforms: Mapping[str, frozenset[str]],
+    forward_edges: Mapping[str, Collection[str]],
+    all_files: Sequence[str],
+) -> dict[str, set[str]]:
+  """Computes reached test files per accelerator platform from `changed_files`."""
+  if any(os.path.basename(path) == '__init__.py' for path in changed_files):
+    forward_edges = deps.execution_edges(forward_edges, all_files)
+  reverse_edges = _invert_edges(forward_edges)
+
+  seeds = set(changed_files)
+  seeds.update(_expand_autotuning_seeds(changed_files, all_files))
+  seeds.update(_expand_deleted_seeds(changed_files, all_files))
+
+  return {
+      platform: per_platform_reachability(
+          seeds, platform, file_platforms, reverse_edges
+      )
+      for platform in ('gpu', 'tpu')
+  }
+
+
+def _default_repo_graph() -> (
+    tuple[list[str], dict[str, set[str]], set[str], dict[str, frozenset[str]]]
+):
+  """Returns cached (files, edges, unparsed, file_platforms) for cwd."""
+  global _DEFAULT_REPO_GRAPH
+  cwd = os.getcwd()
+  if _DEFAULT_REPO_GRAPH is not None and _DEFAULT_REPO_GRAPH[0] == cwd:
+    return _DEFAULT_REPO_GRAPH[1:]
+  all_files = deps.python_files()
+  forward_edges, unparsed = deps.import_graph(all_files)
+  file_platforms = get_file_platforms_map(
+      all_files=all_files, forward_edges=forward_edges
+  )
+  _DEFAULT_REPO_GRAPH = (
+      cwd,
+      all_files,
+      forward_edges,
+      unparsed,
+      file_platforms,
+  )
+  return all_files, forward_edges, unparsed, file_platforms
+
+
+def _eligible_shard_platforms(
+    shards: ShardMap,
+    changed_files: Collection[str] | None,
+) -> dict[str, set[str]]:
+  """Maps each shard name to the platforms it should run on."""
+  all_files, forward_edges, unparsed, file_platforms = _default_repo_graph()
+  if changed_files is None:
+    affected = None
+  else:
+    affected, _ = deps.affected_tests(
+        changed_files, forward_edges, unparsed, all_files
+    )
+  if affected is None:
+    return {
+        name: _static_shard_platforms(_shard_test_files(spec), file_platforms)
+        for name, spec in shards.items()
+        if spec['paths']
+    }
+  reached = _reached_tests_by_platform(
+      changed_files, file_platforms, forward_edges, all_files
+  )
+  eligible: dict[str, set[str]] = {}
+  for name, spec in shards.items():
+    if not spec['paths']:
+      continue
+    tests = _shard_test_files(spec)
+    eligible[name] = {
+        platform for platform in ('gpu', 'tpu') if tests & reached[platform]
+    }
+  return eligible
+
+
 def build_matrix(
-    shards: ShardMap, only: Collection[str] | None = None
+    shards: ShardMap,
+    only: Collection[str] | None = None,
+    *,
+    changed_files: Collection[str] | None = None,
+    filter_platforms: bool = False,
 ) -> list[MatrixEntry]:
-  """Builds strategy.matrix.include entries for primary shard jobs.
-
-  Args:
-    shards: Resolved shard mapping.
-    only: Shard names to include. None includes all shards.
-
-  Returns:
-    Matrix entries for each (shard, runner) combination.
-  """
+  """Builds strategy.matrix.include entries for primary shard jobs."""
   ordered = sorted(shards.items(), key=shard_order)
+  eligible = (
+      _eligible_shard_platforms(shards, changed_files)
+      if (filter_platforms or changed_files is not None)
+      else None
+  )
   jobs = []
   for runner, (device, short) in RUNNERS.items():
+    platform = RUNNER_PLATFORMS[runner]
     for name, spec in ordered:
-      if only is not None and name not in only:
+      if not spec['paths'] or (only is not None and name not in only):
         continue
-      if not spec['paths']:
+      if eligible is not None and platform not in eligible.get(name, set()):
         continue
       jobs.append({
           'runner': runner,
@@ -1270,33 +1709,74 @@ def build_matrix(
 
 
 def compat_size(spec: Spec) -> float:
-  """Estimated runtime in minutes for a shard in a compat bin.
-
-  Args:
-    spec: Shard specification.
-
-  Returns:
-    Estimated runtime in minutes, or `COMPAT_BIN_MINUTES` if unmeasured.
-  """
+  """Estimated runtime in minutes for a shard in a compat bin."""
   return spec.get('compat_minutes') or spec.get('minutes') or COMPAT_BIN_MINUTES
 
 
+def _compat_candidate_names(
+    shards: ShardMap,
+    only: Collection[str] | None,
+    filter_platforms: bool,
+    changed_files: Collection[str] | None,
+    platforms: AbstractSet[str] | None,
+    eligible: Mapping[str, AbstractSet[str]] | None = None,
+) -> set[str]:
+  """Returns shard names eligible for packing into compat bins."""
+  candidates = set(shards) if only is None else set(only)
+  if not filter_platforms and changed_files is None:
+    return candidates
+  if platforms is None:
+    target_platforms = {
+        RUNNER_PLATFORMS[runner]
+        for runner in COMPAT_RUNNERS
+        if runner in RUNNER_PLATFORMS
+    }
+  else:
+    target_platforms = set(platforms)
+  if eligible is None:
+    eligible = _eligible_shard_platforms(shards, changed_files)
+  return {
+      name
+      for name in candidates
+      if eligible.get(name, set()) & target_platforms
+  }
+
+
 def compat_bins(
-    shards: ShardMap, only: Collection[str] | None = None
+    shards: ShardMap,
+    only: Collection[str] | None = None,
+    *,
+    filter_platforms: bool = False,
+    changed_files: Collection[str] | None = None,
+    platforms: AbstractSet[str] | None = None,
+    eligible: Mapping[str, AbstractSet[str]] | None = None,
 ) -> list[list[str]]:
   """Packs shards into bins of COMPAT_BIN_MINUTES using first-fit decreasing.
 
   Args:
     shards: Resolved shard mapping.
     only: Shard names to include, or None for all shards.
+    filter_platforms: If True, drop shards that run on none of `platforms`.
+    changed_files: If given, filter by per-platform reachability from these
+      changed files.
+    platforms: Target platforms. Defaults to the compat runner platforms.
+    eligible: Precomputed eligible shard platforms map.
 
   Returns:
     List of bins, each containing shard names packed together.
   """
+  candidate_names = _compat_candidate_names(
+      shards,
+      only,
+      filter_platforms,
+      changed_files,
+      platforms,
+      eligible=eligible,
+  )
   sizes = {
       name: compat_size(spec)
       for name, spec in shards.items()
-      if spec['paths'] and (only is None or name in only)
+      if spec['paths'] and name in candidate_names
   }
   bins: list[list[str]] = []
   loads: list[float] = []
@@ -1313,21 +1793,45 @@ def compat_bins(
 
 
 def build_compat_matrix(
-    shards: ShardMap, only: Collection[str] | None = None
+    shards: ShardMap,
+    only: Collection[str] | None = None,
+    *,
+    filter_platforms: bool = False,
+    changed_files: Collection[str] | None = None,
+    eligible: Mapping[str, AbstractSet[str]] | None = None,
 ) -> list[MatrixEntry]:
   """Builds strategy.matrix.include entries for compat-tests jobs.
+
+  Applies platform filtering so pure-GPU shards are not packed onto TPU runners,
+  and pure-TPU shards are not packed onto GPU runners.
 
   Args:
     shards: Resolved shard mapping.
     only: Shard names to include, or None for all shards.
+    filter_platforms: If True, filter shards by runner platform.
+    changed_files: As in `build_matrix`.
+    eligible: Precomputed eligible shard platforms map.
 
   Returns:
     Matrix entries for each compat job combination.
   """
-  bins = compat_bins(shards, only)
+  use_platforms = filter_platforms or changed_files is not None
+  if use_platforms and eligible is None:
+    eligible = _eligible_shard_platforms(shards, changed_files)
   jobs = []
   for runner in COMPAT_RUNNERS:
     device, short = RUNNERS[runner]
+    if use_platforms:
+      bins = compat_bins(
+          shards,
+          only,
+          filter_platforms=True,
+          changed_files=changed_files,
+          platforms={RUNNER_PLATFORMS[runner]},
+          eligible=eligible,
+      )
+    else:
+      bins = compat_bins(shards, only, filter_platforms=False)
     for index, names in enumerate(bins, start=1):
       paths = [p for name in names for p in shards[name]['paths']]
       for version in older_jaxs():
@@ -1713,6 +2217,99 @@ def explain(
   return out
 
 
+def _print_compat_bins(
+    shards: ShardMap,
+    only: Collection[str] | None = None,
+    *,
+    changed_files: Collection[str] | None = None,
+    eligible: Mapping[str, AbstractSet[str]] | None = None,
+    show_load: bool = False,
+    file: Any = sys.stdout,
+) -> None:
+  """Logs compat bin assignments per runner."""
+  for runner in COMPAT_RUNNERS:
+    runner_suffix = (
+        f' ({RUNNERS[runner][1]})' if len(COMPAT_RUNNERS) > 1 else ''
+    )
+    bins = compat_bins(
+        shards,
+        only,
+        filter_platforms=True,
+        changed_files=changed_files,
+        platforms={RUNNER_PLATFORMS[runner]},
+        eligible=eligible,
+    )
+    for index, names in enumerate(bins, start=1):
+      if show_load:
+        load = sum(compat_size(shards[n]) for n in names)
+        print(
+            f'  compat-{index:<3d}{runner_suffix} {load:5.1f}m'
+            f'  {" ".join(names)}',
+            file=file,
+        )
+      else:
+        print(f'compat-{index}{runner_suffix}: {" ".join(names)}', file=file)
+
+
+def _emit_matrix(
+    shards: ShardMap,
+    test_files: Collection[str],
+    catch_all: Sequence[str],
+    excluded: Collection[str],
+    changed_from: str | None,
+    dry_run: bool,
+) -> int:
+  """Emits GitHub Actions matrix outputs and logs selection details."""
+  only, reason = select(shards, test_files, changed_from)
+  effective_only = None if dry_run else only
+  changed_files = (
+      read_changed(changed_from)
+      if (changed_from and not dry_run and effective_only is not None)
+      else None
+  )
+  eligible = _eligible_shard_platforms(shards, changed_files)
+  combos = build_matrix(
+      shards,
+      effective_only,
+      changed_files=changed_files,
+      filter_platforms=True,
+  )
+  compat = build_compat_matrix(
+      shards,
+      effective_only,
+      filter_platforms=True,
+      changed_files=changed_files,
+      eligible=eligible,
+  )
+  flags = shlex.join(PYTEST_SELECT_FLAGS)
+  if dry_run and only is not None:
+    reason = f'{reason} -- DRY RUN, not applied: every shard runs'
+  print(f'selection: {reason}', file=sys.stderr)
+  print(
+      f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs',
+      file=sys.stderr,
+  )
+  if only is not None:
+    verb = 'would select' if dry_run else 'selected'
+    print(f'{verb} {len(only)} of {len(shards)} shards:', file=sys.stderr)
+    for name in sorted(only):
+      print(f'  {name}', file=sys.stderr)
+  _print_compat_bins(
+      shards,
+      effective_only,
+      changed_files=changed_files,
+      eligible=eligible,
+      file=sys.stderr,
+  )
+  print(f'not run by design: {sorted(excluded)}', file=sys.stderr)
+  print(f'pytest select flags: {flags}', file=sys.stderr)
+  print(f'include={json.dumps(combos)}')
+  print(f'compat_include={json.dumps(compat)}')
+  print(f'pytest_flags={flags}')
+  print(f'catch_all={json.dumps(catch_all)}')
+  return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
   """Runs the matrix, check, list, or explain CLI subcommand.
 
@@ -1771,36 +2368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
   if args.command == 'matrix':
-    only, reason = select(shards, test_files, args.changed_from)
-    combos = build_matrix(shards, None if args.dry_run else only)
-    compat = build_compat_matrix(shards, None if args.dry_run else only)
-    flags = shlex.join(PYTEST_SELECT_FLAGS)
-    if args.dry_run and only is not None:
-      reason = f'{reason} -- DRY RUN, not applied: every shard runs'
-    print(f'selection: {reason}', file=sys.stderr)
-    print(
-        f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs',
-        file=sys.stderr,
+    return _emit_matrix(
+        shards, test_files, catch_all, excluded, args.changed_from, args.dry_run
     )
-    if only is not None:
-      verb = 'would select' if args.dry_run else 'selected'
-      print(f'{verb} {len(only)} of {len(shards)} shards:', file=sys.stderr)
-      for name in sorted(only):
-        print(f'  {name}', file=sys.stderr)
-    for index, names in enumerate(
-        compat_bins(shards, None if args.dry_run else only), start=1
-    ):
-      print(f'compat-{index}: {" ".join(names)}', file=sys.stderr)
-    print(f'not run by design: {sorted(excluded)}', file=sys.stderr)
-    print(f'pytest select flags: {flags}', file=sys.stderr)
-    print(f'include={json.dumps(combos)}')
-    print(f'compat_include={json.dumps(compat)}')
-    print(f'pytest_flags={flags}')
-    print(f'catch_all={json.dumps(catch_all)}')
-    return 0
 
-  combos = build_matrix(shards)
-  compat = build_compat_matrix(shards)
+  combos = build_matrix(shards, filter_platforms=True)
+  compat = build_compat_matrix(shards, filter_platforms=True)
   per_shard = collections.Counter(c['shard_name'] for c in combos)
   print(f'{len(shards)} shards, {len(combos)} jobs, {len(compat)} compat jobs')
   order = sorted(shards.items(), key=shard_order)
@@ -1827,9 +2400,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       f'  compat bins, each run once per {", ".join(older_jaxs())} on'
       f' {", ".join(RUNNERS[r][1] for r in COMPAT_RUNNERS)}:'
   )
-  for index, names in enumerate(compat_bins(shards), start=1):
-    load = sum(compat_size(shards[n]) for n in names)
-    print(f'  compat-{index:<3d} {load:5.1f}m  {" ".join(names)}')
+  _print_compat_bins(shards, show_load=True)
   return 0
 
 
