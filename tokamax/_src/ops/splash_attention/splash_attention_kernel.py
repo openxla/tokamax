@@ -329,6 +329,13 @@ class SplashConfig:
   dq_reduction_steps: int | None = None
   # An experimental scheduler that sometimes produces better softmax overlap.
   use_experimental_scheduler: bool = False
+  # [experimental] On the dynamic dkv grid with GQA and dq_reduction_steps=1,
+  # run a kv group's q heads as the innermost grid axis and keep each head's
+  # dq/dk/dv accumulators in its own VMEM slot; dk/dv are written once per kv
+  # block as the head-ordered slot sum, instead of being accumulated across q
+  # heads through aliased f32 HBM buffers. Used only when the group's f32 dk/dv
+  # slots fit in 8 MiB. Bit-identical to False.
+  dkv_head_slots: bool = False
   # Skip the wasted causal-diagonal work. Bit-exact: the output, dQ, dK and dV
   # are identical to qk_diag_skip=False.
   # Forward: requires block_q == block_kv (block_kv_compute may be smaller). On
@@ -2151,12 +2158,22 @@ def _flash_attention_dkv_kernel(
     mask_function: MaskFunctionType | None,
     q_heads_per_kv_head: int,
     config: SplashConfig,
+    dkv_head_slots: bool = False,
     use_vmem_dq_reduction: bool = False,
     group_dkv_by_kv_head: bool = False,
 ):
   del mask_next_ref
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   dropout_rate = config.dropout_rate
+  # With `dkv_head_slots`, the q heads of a kv group are the innermost grid axis
+  # and each accumulates dq/dk/dv in its own scratch slot.
+  slot = pl.program_id(2) if dkv_head_slots else 0
+  last_slot = slot == q_heads_per_kv_head - 1
+  dq_slots, dk_slots, dv_slots = dq_scratch_ref, dk_scratch_ref, dv_scratch_ref
+  if dkv_head_slots:
+    dq_scratch_ref = dq_slots.at[slot]
+    dk_scratch_ref = dk_slots.at[slot]
+    dv_scratch_ref = dv_slots.at[slot]
   attn_logits_soft_cap = config.attn_logits_soft_cap
   if attn_logits_soft_cap is not None and config.use_base2_exp:
     attn_logits_soft_cap *= LOG2E
@@ -2191,7 +2208,7 @@ def _flash_attention_dkv_kernel(
       # Mirrors the fwd indices: rows are kv blocks and cols are q blocks here.
       q_head = (
           pl.program_id(0) * q_heads_per_kv_head + pl.program_id(2)
-          if group_dkv_by_kv_head
+          if group_dkv_by_kv_head or dkv_head_slots
           else pl.program_id(0)
       )
       q_index = active_cols_ref[grid_idx].astype(jnp.int32)
@@ -2238,8 +2255,8 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(should_initialize)
   def init():
-    dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
-    dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
+    dk_scratch_ref[...] = jnp.zeros(dk_scratch_ref.shape, dk_scratch_ref.dtype)
+    dv_scratch_ref[...] = jnp.zeros(dv_scratch_ref.shape, dv_scratch_ref.dtype)
 
   def body(i, _, has_partial_mask=False):
     dropout_mask = None
@@ -2524,7 +2541,9 @@ def _flash_attention_dkv_kernel(
 
     @pl.when(should_initialize_dq)
     def _init_dq_scratch():
-      dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
+      dq_scratch_ref[...] = jnp.zeros(
+          dq_scratch_ref.shape, dq_scratch_ref.dtype
+      )
 
   elif dq_alias is not None:
     dq_ref[...] = dq_alias[...]
@@ -2545,24 +2564,40 @@ def _flash_attention_dkv_kernel(
         0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
     )
 
+  write_dq, write_dkv = should_write_dq, should_write
+  if dkv_head_slots:
+    write_dq = jnp.logical_and(should_write_dq, last_slot)
+    write_dkv = jnp.logical_and(should_write, last_slot)
+
+  def slot_sum(ref):
+    # Sums in head order, like the aliased HBM accumulation.
+    acc = ref[0]
+    for t in range(1, q_heads_per_kv_head):
+      acc = acc + ref[t]
+    return acc
+
   if dq_scratch_ref is not None:
 
-    @pl.when(should_write_dq)
+    @pl.when(write_dq)
     def _write_dq_scratch():
       if dq_alias is not None:
         dq_ref[...] = (
-            dq_alias[...].astype(jnp.float32) + dq_scratch_ref[...]
+            dq_alias[...].astype(jnp.float32) + dq_slots[...]
         ).astype(dq_ref.dtype)
       else:
-        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+        dq_ref[...] = dq_slots[...].astype(dq_ref.dtype)
 
   if dk_alias is None:
     assert dv_alias is None
 
-    @pl.when(should_write)
+    @pl.when(write_dkv)
     def _():
-      dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
-      dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
+      if dkv_head_slots:
+        dk_ref[...] = slot_sum(dk_slots).astype(dk_ref.dtype)
+        dv_ref[...] = slot_sum(dv_slots).astype(dv_ref.dtype)
+      else:
+        dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
+        dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
 
   else:
     q_head = pl.program_id(0)
@@ -2653,6 +2688,26 @@ def _splash_attention_bwd_dkv(
       dynamic_grid and q_heads_per_kv_head != 1 and not use_vmem_dq_reduction
   )
 
+  # On the dynamic grid with GQA, run a kv group's q heads innermost and keep
+  # their dq/dk/dv accumulators in VMEM slots when the dk/dv slots fit, instead
+  # of accumulating dk/dv across q heads through aliased f32 HBM buffers.
+  dkv_head_slots = (
+      config.dkv_head_slots
+      and dynamic_grid
+      and not is_mqa
+      and q_heads_per_kv_head > 1
+      and kv_steps > 2
+      and config.dq_reduction_steps == 1
+      and q_heads_per_kv_head * bkv * (head_dim_qk + head_dim_v) * 4
+      <= 8 * 1024 * 1024
+  )
+
+  def head_slots(index_map):
+    if not dkv_head_slots:
+      return index_map
+    g = q_heads_per_kv_head
+    return lambda hk, grid_idx, s, *refs: index_map(hk * g + s, grid_idx, *refs)
+
   if group_dkv_by_kv_head:
 
     def unravel(f):
@@ -2682,10 +2737,12 @@ def _splash_attention_bwd_dkv(
         i = to_i32(cols_ref[grid_idx])
         return f(h, i, j)
 
-      return index_map
+      return head_slots(index_map)
 
     grid_size = mask_info.num_active_blocks[0]  # pyrefly: ignore[unsupported-operation]
     grid = (num_q_heads, grid_size)
+    if dkv_head_slots:
+      grid = (num_kv_heads, grid_size, q_heads_per_kv_head)
 
     def mask_index_map(h, grid_idx, rows_ref, cols_ref, mask_next_ref=None, *_):
       del h, rows_ref, cols_ref  # Unused.
@@ -2759,6 +2816,7 @@ def _splash_attention_bwd_dkv(
       and not group_dkv_by_kv_head
       and q_heads_per_kv_head != 1
       and not reduce_dkv_over_q_heads
+      and not dkv_head_slots
   )
 
   dkv_index_map = (
@@ -2780,7 +2838,7 @@ def _splash_attention_bwd_dkv(
       else (None, bkv, head_dim_v),
       dkv_index_map,
   )
-  mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
+  mask_spec = pl.BlockSpec((None, bkv, bq), head_slots(mask_index_map))
 
   q_segment_ids_index_map = unravel(lambda h, i, j: (0, i))
   if segment_ids is not None:
@@ -2856,13 +2914,20 @@ def _splash_attention_bwd_dkv(
   if not dynamic_grid and kv_steps <= 3 and dq_reduction_steps == 3:
     dq_reduction_steps = None
 
+  # Under `dkv_head_slots`, one dq block holds the whole kv group's q heads.
+  dq_block = (q_heads_per_kv_head if dkv_head_slots else None, bq, head_dim_qk)
+  dq_head_index_map = (
+      unravel(lambda h, i, j: (_div(h, q_heads_per_kv_head), i, 0))
+      if dkv_head_slots
+      else o_index_map
+  )
   dq = dq_alias_spec = None
   if dq_in_vmem_only:
-    dq_spec = pl.BlockSpec((None, bq, head_dim_qk), o_index_map)
+    dq_spec = pl.BlockSpec(dq_block, dq_head_index_map)
     dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
   elif dq_reduction_steps == 1:
     dq_spec = pl.BlockSpec(
-        (None, bq, head_dim_qk), o_index_map, pipeline_mode=pl.Buffered(1)
+        dq_block, dq_head_index_map, pipeline_mode=pl.Buffered(1)
     )
     dq_alias_spec = dq_spec
     dq_shape = jax.ShapeDtypeStruct(q.shape, _unquantized_dtype(q))
@@ -2897,10 +2962,11 @@ def _splash_attention_bwd_dkv(
 
   # `use_vmem_dq_reduction` also provides `dq_scratch` for `diag_band_skip`
   # when `bkv == bkv_compute`.
+  slots = (q_heads_per_kv_head,) if dkv_head_slots else ()
   if bkv == bkv_compute and not use_vmem_dq_reduction:
     dq_scratch = None
   else:
-    dq_scratch = pltpu.VMEM((bq, head_dim_qk), jnp.float32)
+    dq_scratch = pltpu.VMEM((*slots, bq, head_dim_qk), jnp.float32)
 
   if alias_dkv:
     # in/out aliasing to accumulate within kv groups.
@@ -2912,8 +2978,9 @@ def _splash_attention_bwd_dkv(
   else:
     in_specs += [None, None]
     dk, dv = None, None
-    dk_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(k)
-    dv_type = jnp.float32 if reduce_dkv_over_q_heads else _unquantized_dtype(v)
+    f32_dkv = reduce_dkv_over_q_heads or dkv_head_slots
+    dk_type = jnp.float32 if f32_dkv else _unquantized_dtype(k)
+    dv_type = jnp.float32 if f32_dkv else _unquantized_dtype(v)
 
   dk_shape = (
       (num_q_heads, kv_seq_len, head_dim_qk)
@@ -2943,6 +3010,7 @@ def _splash_attention_bwd_dkv(
       bkv=bkv,
       mask_function=mask_function,
       q_heads_per_kv_head=q_heads_per_kv_head,
+      dkv_head_slots=dkv_head_slots,
       use_vmem_dq_reduction=use_vmem_dq_reduction,
       group_dkv_by_kv_head=group_dkv_by_kv_head,
   )
@@ -2999,8 +3067,8 @@ def _splash_attention_bwd_dkv(
 
   scratch_shapes = [
       dq_scratch,
-      pltpu.VMEM((bkv, head_dim_qk), jnp.float32),
-      pltpu.VMEM((bkv, head_dim_v), jnp.float32),
+      pltpu.VMEM((*slots, bkv, head_dim_qk), jnp.float32),
+      pltpu.VMEM((*slots, bkv, head_dim_v), jnp.float32),
   ]
 
   def _bwd_cost_estimate(
@@ -3099,7 +3167,9 @@ def _splash_attention_bwd_dkv(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",) * len(grid),
             vmem_limit_bytes=(
-                64 * 1024 * 1024 if (bq >= 2048 or bkv >= 2048) else None
+                64 * 1024 * 1024
+                if (bq >= 2048 or bkv >= 2048 or dkv_head_slots)
+                else None
             ),
         ),
         name=kernel_name,

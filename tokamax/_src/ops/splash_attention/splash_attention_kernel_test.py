@@ -2066,6 +2066,127 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         self._assert_allclose(g, r, atol=atol, rtol=atol)
 
   @parameterized.product(
+      mask_kind=("causal", "local"),
+      use_segments=(False, True),
+      num_q_heads=(4, 8),
+      dropout_rate=(0.0, 0.25),
+  )
+  def test_dkv_head_slots(
+      self, mask_kind, use_segments, num_q_heads, dropout_rate
+  ):
+    """dkv_head_slots changes the dkv grid; outputs and grads are identical."""
+    seq_len, num_kv_heads, head_dim, block = 1024, 2, 128, 256
+    q_heads_per_kv_head = num_q_heads // num_kv_heads
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = (random.normal(k1, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    k = (random.normal(k2, (num_kv_heads, seq_len, head_dim)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    v = (random.normal(k3, (num_kv_heads, seq_len, head_dim)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_q_heads, seq_len, head_dim)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    if mask_kind == "causal":
+      mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    else:
+      mask = mask_lib.LocalMask(
+          shape=(seq_len, seq_len), window_size=(block, 0), offset=0
+      )
+    segment_ids = None
+    if use_segments:
+      seg = jnp.repeat(jnp.arange(3, dtype=jnp.int32), seq_len // 3 + 1)
+      segment_ids = base.SegmentIds(q=seg[:seq_len], kv=seg[:seq_len])
+    prng_key = random.key(1234) if dropout_rate else None
+
+    def make_bwd(dkv_head_slots, q, k, v, mask=mask, segment_ids=segment_ids):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          dq_reduction_steps=1,
+          dropout_rate=dropout_rate,
+          dropout_block_q=block if dropout_rate else None,
+          dropout_block_kv=block if dropout_rate else None,
+          dkv_head_slots=dkv_head_slots,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def bwd(q, k, v, do):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(
+                q_, k_, v_, segment_ids=segment_ids, prng_key=prng_key
+            ),
+            q,
+            k,
+            v,
+        )
+        return (out, *vjp(do))
+
+      jaxpr = jax.make_jaxpr(bwd)(q, k, v, do[:, : q.shape[1]])
+      dkv_call = [
+          sub_e
+          for e in jaxpr.jaxpr.eqns
+          if e.primitive.name == "jit"
+          for sub_e in e.params["jaxpr"].eqns
+          if sub_e.primitive.name == "pallas_call"
+      ][-1]
+      return jax.jit(bwd), dkv_call
+
+    bwd_off, call_off = make_bwd(False, q, k, v)
+    bwd_on, call_on = make_bwd(True, q, k, v)
+
+    # Off: grid (q heads, steps), dq per q head, dk/dv aliased across q heads.
+    # On: grid (kv heads, steps, q heads per kv head), one dq block per kv
+    # group, dk/dv not aliased.
+    grid_off = call_off.params["grid_mapping"].grid
+    grid_on = call_on.params["grid_mapping"].grid
+    self.assertLen(grid_off, 2)
+    self.assertEqual(grid_off[0], num_q_heads)
+    self.assertEqual(grid_on, (num_kv_heads, grid_off[1], q_heads_per_kv_head))
+
+    def dq_block_shape(call):
+      grid_mapping = call.params["grid_mapping"]
+      return grid_mapping.block_mappings[
+          grid_mapping.num_inputs
+      ].block_aval.shape
+
+    self.assertEqual(dq_block_shape(call_off), (block, head_dim))
+    self.assertEqual(
+        dq_block_shape(call_on), (q_heads_per_kv_head, block, head_dim)
+    )
+    self.assertLen(
+        call_on.params["input_output_aliases"],
+        len(call_off.params["input_output_aliases"]) - 2,
+    )
+
+    for name, r, g in zip(
+        ("out", "dq", "dk", "dv"), bwd_off(q, k, v, do), bwd_on(q, k, v, do)
+    ):
+      with self.subTest(name):
+        np.testing.assert_array_equal(g, r)
+
+    if mask_kind == "causal" and not use_segments and not dropout_rate:
+      # With only 2 kv steps the existing path runs.
+      short = seq_len // 2
+      _, call_short = make_bwd(
+          True,
+          q[:, :short],
+          k[:, :short],
+          v[:, :short],
+          mask=mask_lib.CausalMask(shape=(short, short)),
+      )
+      self.assertLen(call_short.params["grid_mapping"].grid, 2)
+
+  @parameterized.product(
       dq_reduction_steps=(None, 3),
       qk_diag_grid=(2, 4),
       q_layout=(
