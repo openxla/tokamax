@@ -352,7 +352,7 @@ OPS: tuple[Op, ...] = (
     ),
     Op(
         name="kda",
-        apis=("tokamax.ops.kimi_delta_attention",),
+        apis=("tokamax.ops.kimi_delta_attention", "tokamax.ops.gated_delta_net"),
         impls=(
             Impl(
                 name="xla",

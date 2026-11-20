@@ -18,22 +18,29 @@ import dataclasses
 from typing import Annotated, Any, ClassVar
 
 import jax
+from jax import ad_checkpoint
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import shape
 from tokamax._src.ops import op
 from tokamax._src.ops.kda import base
+from tokamax._src.ops.kda import common
 from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
     ContextParallelMetadataArg,
 )
 from tokamax._src.ops.kda.pallas_mosaic_tpu_kernel import (
+    chunk_gdn_bwd_custom,
+    chunk_gdn_fwd_custom,
     chunk_kda_bwd_custom,
     chunk_kda_fwd_custom,
 )
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import (
+    GdnResiduals,
     KdaResiduals,
 )
 from tokamax._src.ops.kda.utils import (
@@ -75,6 +82,7 @@ class Config:
   mini_batch: Annotated[int, pydantic.Field(gt=0)] | None = None
   safe_gate: bool | None = None
   rematerialize_for_backward: bool = False
+  residual_checkpoint_name: str | None = None
 
 
 def _resolve_safe_gate(
@@ -94,15 +102,182 @@ def _check_gate_support(
     use_gate_in_kernel: bool,
     lower_bound: float | None,
     safe_gate: bool,
+    per_channel_gate: bool = True,
 ) -> None:
   """Checks the numerically bounded fused gate configuration."""
-  if not use_gate_in_kernel:
-    # The caller supplies log-space gates; lower_bound does not constrain them.
+  if not use_gate_in_kernel or not per_channel_gate:
+    # Pre-activated log-space gates and scalar gates (`-exp(a_log) * softplus <= 0`)
+    # do not require a sigmoid lower_bound.
     return
   if lower_bound is None:
     raise NotImplementedError("`mosaic` requires `lower_bound` to be set.")
   if not safe_gate:
     raise NotImplementedError("`mosaic` requires `safe_gate=True`.")
+
+
+def _tag_array(arr: jax.Array | None, name: str) -> jax.Array | None:
+  return ad_checkpoint.checkpoint_name(arr, name=name) if arr is not None else None
+
+
+def _tag_kda_residuals(
+    output: base.Output,
+    residuals: KdaResiduals | None,
+    ckpt_name: str,
+    *,
+    tag_qkv: bool,
+    tag_initial_state: bool = False,
+) -> tuple[base.Output, KdaResiduals | None]:
+  """Tags KDA outputs and computed forward residuals with `checkpoint_name`."""
+  val, final_state = output
+  output = (
+      ad_checkpoint.checkpoint_name(val, name=ckpt_name),
+      _tag_array(final_state, ckpt_name),
+  )
+  if residuals is None:
+    return output, None
+  residuals = dataclasses.replace(
+      residuals,
+      q=(
+          ad_checkpoint.checkpoint_name(residuals.q, name=ckpt_name)
+          if tag_qkv
+          else residuals.q
+      ),
+      k=(
+          ad_checkpoint.checkpoint_name(residuals.k, name=ckpt_name)
+          if tag_qkv
+          else residuals.k
+      ),
+      v=(
+          ad_checkpoint.checkpoint_name(residuals.v, name=ckpt_name)
+          if tag_qkv
+          else residuals.v
+      ),
+      g_cumsum=_tag_array(residuals.g_cumsum, ckpt_name),
+      aqk=ad_checkpoint.checkpoint_name(residuals.aqk, name=ckpt_name),
+      akk=ad_checkpoint.checkpoint_name(residuals.akk, name=ckpt_name),
+      h=_tag_array(residuals.h, ckpt_name),
+      v_new=_tag_array(residuals.v_new, ckpt_name),
+      q_rstd=_tag_array(residuals.q_rstd, ckpt_name),
+      k_rstd=_tag_array(residuals.k_rstd, ckpt_name),
+      initial_state=(
+          _tag_array(residuals.initial_state, ckpt_name)
+          if tag_initial_state
+          else residuals.initial_state
+      ),
+  )
+  return output, residuals
+
+
+def _tag_gdn_residuals(
+    output: base.Output,
+    residuals: GdnResiduals | None,
+    ckpt_name: str,
+    *,
+    tag_qkv_conv: bool,
+    tag_beta: bool,
+) -> tuple[base.Output, GdnResiduals | None]:
+  """Tags GDN outputs and computed forward residuals with `checkpoint_name`."""
+  val, final_state = output
+  output = (
+      ad_checkpoint.checkpoint_name(val, name=ckpt_name),
+      _tag_array(final_state, ckpt_name),
+  )
+  if residuals is None:
+    return output, None
+  residuals = dataclasses.replace(
+      residuals,
+      qkv_conv=(
+          _tag_array(residuals.qkv_conv, ckpt_name)
+          if tag_qkv_conv
+          else residuals.qkv_conv
+      ),
+      beta=(
+          ad_checkpoint.checkpoint_name(residuals.beta, name=ckpt_name)
+          if tag_beta
+          else residuals.beta
+      ),
+      g_cumsum=_tag_array(residuals.g_cumsum, ckpt_name),
+      akk=_tag_array(residuals.akk, ckpt_name),
+      h=_tag_array(residuals.h, ckpt_name),
+  )
+  return output, residuals
+
+
+def _call_with_selective_checkpoint_vjp(
+    op_self: Any, *args: Any, **kwargs: Any
+) -> base.Output:
+  """Calls `op_self` with a direct `custom_vjp` visible to `jax.checkpoint`."""
+  if not op_self.supports_symbolic_shapes and shape.contains_symbolic_shape(
+      (args, kwargs)
+  ):
+    raise NotImplementedError("This op does not support symbolic shapes.")
+  ba = op_self.bind(*args, return_residuals=False, **kwargs)
+  if not (op_self.bypass_device_check or op.config_lib.cross_compile.value):
+    devices = op.infer_devices(ba) or {op.backend.get_default_device()}
+    for device in devices:
+      if not op_self.supported_on(device):
+        raise NotImplementedError(f"Not supported on {device.device_kind}.")
+  config = ba.default_config
+  args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
+  is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
+  array_idxs = {i for i, x in enumerate(args_flat) if is_array(x)}
+  arrays = [x for i, x in enumerate(args_flat) if i in array_idxs]
+  other = [x for i, x in enumerate(args_flat) if i not in array_idxs]
+
+  def unflatten_inputs(arrs: tuple[jax.Array, ...]):
+    arr_it = iter(arrs)
+    oth_it = iter(other)
+    merged = [
+        next(arr_it) if i in array_idxs else next(oth_it)
+        for i in range(len(args_flat))
+    ]
+    return args_tree.unflatten(merged)
+
+  def _metadata_json(call_args: Any, call_kwargs: dict[str, Any]) -> str:
+    ba_meta = op_self.bind(*call_args, **call_kwargs)
+    json_op = op_self.replace(config=config, vjp=None)
+    json_ba = op.BoundArguments(
+        json_op,
+        op._abstractify(dict(ba_meta.arguments)),  # pylint: disable=protected-access
+    )
+    return str(op.BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+
+  def f(*arrs: jax.Array) -> base.Output:
+    call_args, call_kwargs = unflatten_inputs(arrs)
+    call_kwargs["return_residuals"] = False
+    with op._tokamax_metadata(_metadata_json(call_args, call_kwargs)):  # pylint: disable=protected-access
+      return op_self._fwd(*call_args, config=config, **call_kwargs)[0]  # pylint: disable=protected-access
+
+  def fwd(*arrs: jax.Array):
+    call_args, call_kwargs = unflatten_inputs(arrs)
+    call_kwargs["return_residuals"] = True
+    with op._tokamax_metadata(_metadata_json(call_args, call_kwargs)):  # pylint: disable=protected-access
+      out, res = op_self._fwd(*call_args, config=config, **call_kwargs)  # pylint: disable=protected-access
+    return out, op.Residuals(call_args, call_kwargs, out, res)
+
+  def bwd(full_res: op.Residuals, dout: base.Output):
+    call_args = full_res.args
+    call_kwargs = dict(full_res.kwargs)
+    call_kwargs.pop("return_residuals", None)
+    grads = op_self.vjp(
+        full_res.residuals, full_res.out, dout, *call_args, **call_kwargs
+    )
+    grads_ba = ba.signature.bind_partial(**grads)
+    in_args = ba.signature.bind_partial(*call_args, **call_kwargs).arguments
+    for k_name, v_val in in_args.items():
+      if (dv := grads_ba.arguments.get(k_name)) is None:
+        zeros_like = lambda x: jnp.zeros_like(x) if is_array(x) else x
+        grads_ba.arguments[k_name] = jax.tree.map(zeros_like, v_val)
+      else:
+        grads_ba.arguments[k_name] = jax.tree.map(lambda _, g: g, v_val, dv)
+    dargs = jax.tree.map(lambda _, g: g, call_args, grads_ba.args)
+    return tuple(
+        x for x in jax.tree.leaves((dargs, grads_ba.kwargs)) if is_array(x)
+    )
+
+  f_vjp = jax.custom_vjp(f)
+  f_vjp.defvjp(fwd, bwd, optimize_remat=False)
+  return f_vjp(*arrays)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,6 +306,14 @@ def _requested_chunk_size(ba) -> int:
   return int(requested)
 
 
+def _vjp_chunk_size(ba: op.BoundArguments | None, fallback_fn) -> int:
+  args = getattr(ba, "arguments", None) or {}
+  residuals = args.get("residuals")
+  if residuals is not None and hasattr(residuals, "chunk_size"):
+    return int(residuals.chunk_size)
+  return fallback_fn(ba)
+
+
 # Maximum fused conv1d width: the forward kernel keeps an 8-row halo of the
 # previous chunk (`_CONV_HALO` in the forward kernel).
 _MAX_CONV_WIDTH = 8
@@ -157,6 +340,7 @@ def check_inputs_support(
     q: jax.Array,
     v: jax.Array,
     *,
+    k: jax.Array | None = None,
     initial_state: jax.Array | None,
     output_final_state: bool,
     segment_ids: jax.Array | None,
@@ -165,11 +349,18 @@ def check_inputs_support(
     max_num_segments: int | None,
     per_channel_gate: bool = True,
     conv_weights: tuple[jax.Array | None, ...] = (),
+    mini_batch: int | None = None,
 ) -> None:
   """Checks whether the Pallas/Mosaic TPU backend supports static inputs."""
   if q.dtype not in (jnp.bfloat16, jnp.float32):
     raise NotImplementedError(
         "`mosaic` currently supports bfloat16 and float32 inputs only."
+    )
+  if (k is not None and k.dtype != q.dtype) or v.dtype != q.dtype:
+    raise NotImplementedError(
+        "`mosaic` requires `query`, `key`, and `value` to share the same"
+        f" dtype; got q={q.dtype},"
+        f" k={k.dtype if k is not None else None}, v={v.dtype}."
     )
   heads, batch, seq_len, key_dim = q.shape
   value_dim = v.shape[-1]
@@ -177,6 +368,11 @@ def check_inputs_support(
     raise NotImplementedError(
         "`mosaic` requires positive head, batch, and sequence "
         f"dimensions; got H={heads}, B={batch}, T={seq_len}."
+    )
+  if mini_batch is not None and (mini_batch < 1 or heads % mini_batch != 0):
+    raise NotImplementedError(
+        "`mosaic` requires `mini_batch` to be a positive divisor of"
+        f" H={heads}; got mini_batch={mini_batch}."
     )
   if key_dim < 1 or value_dim < 1:
     raise NotImplementedError(
@@ -256,7 +452,22 @@ class PallasMosaicTpuKimiDeltaAttention(
 
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(self, "vjp", PallasMosaicTpuKimiDeltaAttentionVjp())
+      object.__setattr__(
+          self, "vjp", PallasMosaicTpuKimiDeltaAttentionVjp(config=self.config)
+      )
+
+  @override
+  def replace(self, **kwargs):
+    if (
+        "config" in kwargs
+        and "vjp" not in kwargs
+        and isinstance(self.vjp, PallasMosaicTpuKimiDeltaAttentionVjp)
+        and self.vjp.config == self.config
+    ):
+      kwargs = kwargs | {
+          "vjp": PallasMosaicTpuKimiDeltaAttentionVjp(config=kwargs["config"])
+      }
+    return super().replace(**kwargs)
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
@@ -273,11 +484,13 @@ class PallasMosaicTpuKimiDeltaAttention(
     heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
     per_channel_gate = args.get("per_channel_gate", True)
     segment_ids = args.get("segment_ids")
-    chunk_sizes = (
-        (64,)
-        if (per_channel_gate or segment_ids is not None)
-        else (32, 64, 128)
-    )
+    req_cs = args.get("chunk_size")
+    if per_channel_gate or segment_ids is not None:
+      chunk_sizes = (64,)
+    elif req_cs is not None:
+      chunk_sizes = (int(req_cs),)
+    else:
+      chunk_sizes = (32, 64, 128)
     mini_batches = tuple(
         mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
     ) or (None,)
@@ -290,6 +503,18 @@ class PallasMosaicTpuKimiDeltaAttention(
   @override
   def supported_on(self, device: jax.Device) -> bool:
     return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
+
+  def __call__(  # pyrefly: ignore[bad-override]
+      self, *args: Any, return_residuals: bool = False, **kwargs: Any
+  ) -> Any:
+    ckpt_name = kwargs.get("residual_checkpoint_name") or (
+        self.config.residual_checkpoint_name
+        if self.config is not None
+        else None
+    )
+    if ckpt_name is None or return_residuals or self.vjp is None:
+      return super().__call__(*args, return_residuals=return_residuals, **kwargs)
+    return _call_with_selective_checkpoint_vjp(self, *args, **kwargs)
 
   @staticmethod
   def _preprocess_inputs(
@@ -450,7 +675,7 @@ class PallasMosaicTpuKimiDeltaAttention(
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
-      delta_time_bias: Float[Array, "H*K"] | None,
+      delta_time_bias: Float[Array, "H*GW"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
       output_final_state: bool,
@@ -470,13 +695,16 @@ class PallasMosaicTpuKimiDeltaAttention(
       conv_bias_k: Float[Array, "H_K K"] | None = None,
       conv_bias_v: Float[Array, "H V"] | None = None,
       use_conv1d_in_kernel: bool = False,
+      residual_checkpoint_name: str | None = None,
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
     if chunk_size is not None:
       # `config.chunk_size` is pinned to 64 for per-channel gates (see
       # `_requested_chunk_size`), so the requested value is checked as well.
       _check_chunk_size_support(chunk_size, per_channel_gate=per_channel_gate)
-    chunk_size = config.chunk_size
+    effective_chunk_size = (
+        chunk_size if chunk_size is not None else config.chunk_size
+    )
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -486,6 +714,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
         safe_gate=safe_gate,
+        per_channel_gate=per_channel_gate,
     )
     save_intermediates_for_backward = not config.rematerialize_for_backward
 
@@ -494,11 +723,12 @@ class PallasMosaicTpuKimiDeltaAttention(
     check_inputs_support(
         query,
         value,
+        k=key,
         initial_state=initial_state,
         output_final_state=output_final_state,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
-        chunk_size=chunk_size,
+        chunk_size=effective_chunk_size,
         max_num_segments=max_num_segments,
         per_channel_gate=per_channel_gate,
         conv_weights=(
@@ -506,6 +736,7 @@ class PallasMosaicTpuKimiDeltaAttention(
             if use_conv1d_in_kernel
             else ()
         ),
+        mini_batch=config.mini_batch,
     )
 
     prepared = self._preprocess_inputs(
@@ -520,7 +751,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
-        chunk_size=chunk_size,
+        chunk_size=effective_chunk_size,
         max_num_segments=max_num_segments,
         use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
@@ -543,7 +774,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         lower_bound=lower_bound,
         disable_recompute=save_intermediates_for_backward,
         context_parallel_metadata=prepared.context_parallel_metadata,
-        chunk_size=chunk_size,
+        chunk_size=effective_chunk_size,
         return_residuals=return_residuals,
         cu_seqlens=prepared.cu_seqlens,
         aligned_cu_seqlens=prepared.aligned_cu_seqlens,
@@ -564,7 +795,21 @@ class PallasMosaicTpuKimiDeltaAttention(
     value, final_state = output
     if final_state is not None and final_state.ndim == 4:
       final_state = final_state[:, None]
-    return (value, final_state), residuals
+    output = (value, final_state)
+    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
+    if ckpt_name is not None:
+      cp_enabled = (
+          prepared.context_parallel_metadata is not None
+          and prepared.context_parallel_metadata.is_cp_enabled
+      )
+      output, residuals = _tag_kda_residuals(
+          output,
+          residuals,
+          ckpt_name,
+          tag_qkv=use_conv1d_in_kernel or use_qk_l2norm,
+          tag_initial_state=cp_enabled,
+      )
+    return output, residuals
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -577,7 +822,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config(chunk_size=_requested_chunk_size(ba))
+    return Config(chunk_size=_vjp_chunk_size(ba, _requested_chunk_size))
 
   @override
   def _get_autotuning_configs(
@@ -588,21 +833,11 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       return {Config(chunk_size=_requested_chunk_size(ba))}
     q = args.get("query")
     heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
-    per_channel_gate = args.get("per_channel_gate", True)
-    segment_ids = args.get("segment_ids")
-    chunk_sizes = (
-        (64,)
-        if (per_channel_gate or segment_ids is not None)
-        else (32, 64, 128)
-    )
+    cs = _vjp_chunk_size(ba, _requested_chunk_size)
     mini_batches = tuple(
         mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
     ) or (None,)
-    configs = set()
-    for cs in chunk_sizes:
-      for mb in mini_batches:
-        configs.add(Config(chunk_size=cs, mini_batch=mb))
-    return configs
+    return {Config(chunk_size=cs, mini_batch=mb) for mb in mini_batches}
 
   def _fwd(
       self,
@@ -636,6 +871,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       conv_bias_k: jax.Array | None = None,
       conv_bias_v: jax.Array | None = None,
       use_conv1d_in_kernel: bool = False,
+      residual_checkpoint_name: str | None = None,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
     # Tokamax's VJP contract replays the original inputs here, but the backward
@@ -643,7 +879,8 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     # in `residuals`. Reusing these arguments would skip that preprocessing.
     del out, query, key, value, gate, beta
     del output_final_state, return_residuals, use_conv1d_in_kernel
-    chunk_size = config.chunk_size
+    del residual_checkpoint_name, chunk_size
+    effective_chunk_size = residuals.chunk_size
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -653,6 +890,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
         safe_gate=safe_gate,
+        per_channel_gate=per_channel_gate,
     )
     # The forward residual set records the selected policy: a retained hidden
     # state means backward can use the saved-state path; otherwise it must
@@ -682,7 +920,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         lower_bound,
         use_saved_state,
         context_parallel_metadata,
-        chunk_size,
+        effective_chunk_size,
         max_num_segments,
         initial_state is not None,
         residuals,
@@ -738,4 +976,456 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
           if dsegment_ids is not None
           else jnp.zeros_like(segment_ids)
       )
+    return grads, None
+
+
+def _requested_gdn_chunk_size(ba: op.BoundArguments) -> int:
+  args = getattr(ba, "arguments", None) or {}
+  requested = args.get("chunk_size")
+  return 64 if requested is None else int(requested)
+
+
+def _estimate_gdn_per_head_vmem_bytes(
+    *,
+    act_dtype: jnp.dtype,
+    chunk_size: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> int:
+  elem_size = jnp.dtype(act_dtype).itemsize
+  bt, k, v = chunk_size, head_k_dim, head_v_dim
+  per_head_intra = (bt * k + bt * v + 2 * bt * bt) * elem_size
+  io_bwd = (
+      (3 * bt * k + bt * v + 2 * bt + bt * bt + k * v) * elem_size
+      + (2 * bt * k + bt * v) * elem_size
+      + (k * v + 5 * bt * k + bt * v + 2 * bt + 2 * bt * bt) * 4
+  )
+  per_head_bwd = io_bwd + io_bwd * 3 // 2
+  return max(per_head_intra, per_head_bwd)
+
+
+def check_gdn_inputs_support(
+    *,
+    act_dtype: jnp.dtype,
+    k_dtype: Any = None,
+    v_dtype: Any = None,
+    batch: int,
+    seq_len: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    chunk_size: int,
+    conv_weight: jax.Array | None,
+    segment_ids: jax.Array | None,
+    context_parallel_metadata: ContextParallelMetadata | None,
+    mini_batch: int | None = None,
+) -> None:
+  """Checks whether the Pallas/Mosaic TPU GDN backend supports static inputs."""
+  if act_dtype not in (jnp.bfloat16, jnp.float32):
+    raise NotImplementedError(
+        "`mosaic` currently supports bfloat16 and float32 inputs only."
+    )
+  if (k_dtype is not None and k_dtype != act_dtype) or (
+      v_dtype is not None and v_dtype != act_dtype
+  ):
+    raise NotImplementedError(
+        "`mosaic` requires `query`, `key`, and `value` to share the same"
+        f" dtype; got q={act_dtype}, k={k_dtype}, v={v_dtype}."
+    )
+  if batch < 1 or seq_len < 1 or num_k_heads < 1 or num_v_heads < 1:
+    raise NotImplementedError(
+        "`mosaic` requires positive batch, sequence, and head dimensions."
+    )
+  if head_k_dim < 1 or head_v_dim < 1 or head_k_dim > 256:
+    raise NotImplementedError(
+        "`mosaic` supports key dimensions in [1, 256] and positive value"
+        f" dimensions; got K={head_k_dim}, V={head_v_dim}."
+    )
+  _check_chunk_size_support(chunk_size, per_channel_gate=False)
+  if seq_len % chunk_size != 0:
+    raise NotImplementedError(
+        "`mosaic` requires sequence length divisible by `chunk_size`; got"
+        f" T={seq_len}, chunk_size={chunk_size}."
+    )
+  if conv_weight is not None:
+    conv_width = conv_weight.shape[0]
+    if not 1 <= conv_width <= _MAX_CONV_WIDTH:
+      raise NotImplementedError(
+          f"`mosaic` supports conv1d widths in [1, {_MAX_CONV_WIDTH}]; got"
+          f" W={conv_width}."
+      )
+  if segment_ids is not None:
+    raise NotImplementedError(
+        "`mosaic` GDN does not yet support `segment_ids`."
+    )
+  if (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  ):
+    raise NotImplementedError(
+        "`mosaic` GDN does not yet support sequence context parallelism."
+    )
+  gqa_repeats = num_v_heads // num_k_heads
+  if mini_batch is not None and (
+      mini_batch < 1
+      or num_v_heads % mini_batch != 0
+      or mini_batch % gqa_repeats != 0
+  ):
+    raise NotImplementedError(
+        "`mosaic` GDN requires `mini_batch` to be a positive divisor of"
+        f" H_V={num_v_heads} and a multiple of gqa_repeats={gqa_repeats};"
+        f" got mini_batch={mini_batch}."
+    )
+  vmem_limit_bytes = common.get_vmem_limit_bytes()
+  per_head_bytes = _estimate_gdn_per_head_vmem_bytes(
+      act_dtype=act_dtype,
+      chunk_size=chunk_size,
+      head_k_dim=head_k_dim,
+      head_v_dim=head_v_dim,
+  )
+  if gqa_repeats * per_head_bytes > vmem_limit_bytes:
+    raise NotImplementedError(
+        f"`mosaic` GDN GQA group size ({gqa_repeats}) exceeds VMEM budget"
+        f" ({gqa_repeats * per_head_bytes} > {vmem_limit_bytes} bytes)."
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
+  """Pallas/Mosaic TPU Gated Delta Net backend."""
+
+  config_cls: ClassVar[type[Config]] = Config
+
+  def __post_init__(self):
+    if self.vjp is None:
+      object.__setattr__(
+          self, "vjp", PallasMosaicTpuGatedDeltaNetVjp(config=self.config)
+      )
+
+  @override
+  def replace(self, **kwargs):
+    if (
+        "config" in kwargs
+        and "vjp" not in kwargs
+        and isinstance(self.vjp, PallasMosaicTpuGatedDeltaNetVjp)
+        and self.vjp.config == self.config
+    ):
+      kwargs = kwargs | {
+          "vjp": PallasMosaicTpuGatedDeltaNetVjp(config=kwargs["config"])
+      }
+    return super().replace(**kwargs)
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    return Config(chunk_size=_requested_gdn_chunk_size(ba))
+
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    args = getattr(ba, "arguments", None)
+    if not args:
+      return {Config(chunk_size=_requested_gdn_chunk_size(ba))}
+    heads = int(args.get("num_v_heads") or 32)
+    gqa_repeats = heads // int(args.get("num_k_heads") or heads)
+    req_cs = args.get("chunk_size")
+    chunk_sizes = (int(req_cs),) if req_cs is not None else (32, 64)
+    configs = set()
+    for cs in chunk_sizes:
+      max_mb = 16 if cs > 64 else 32
+      mbs = tuple(
+          mb
+          for mb in (8, 16, 32)
+          if mb <= max_mb
+          and mb <= heads
+          and heads % mb == 0
+          and mb % gqa_repeats == 0
+      ) or (None,)
+      for mb in mbs:
+        configs.add(Config(chunk_size=cs, mini_batch=mb))
+    return configs
+
+  @override
+  def supported_on(self, device: jax.Device) -> bool:
+    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 6
+
+  def __call__(  # pyrefly: ignore[bad-override]
+      self, *args: Any, return_residuals: bool = False, **kwargs: Any
+  ) -> Any:
+    ckpt_name = kwargs.get("residual_checkpoint_name") or (
+        self.config.residual_checkpoint_name
+        if self.config is not None
+        else None
+    )
+    if ckpt_name is None or return_residuals or self.vjp is None:
+      return super().__call__(*args, return_residuals=return_residuals, **kwargs)
+    return _call_with_selective_checkpoint_vjp(self, *args, **kwargs)
+
+  @jaxtyping.jaxtyped
+  @override
+  def _fwd(
+      self,
+      query: Float[Array, "B T H_QK K"] | None,
+      key: Float[Array, "B T H_QK K"] | None,
+      value: Float[Array, "B T H_V V"] | None,
+      gate: Float[Array, "B T H_V"],
+      beta: Float[Array, "B T H_V"],
+      *,
+      qkv: Float[Array, "B T C_QKV"] | None,
+      num_k_heads: int,
+      num_v_heads: int,
+      head_k_dim: int,
+      head_v_dim: int,
+      conv_weight: Float[Array, "W C_QKV"] | None,
+      conv_bias: Float[Array, "C_QKV"] | None,
+      a_log: Float[Array, "H_V"] | None,
+      delta_time_bias: Float[Array, "H_V"] | None,
+      scale: float,
+      initial_state: Float[Array, "B H_V K V"] | None,
+      output_final_state: bool,
+      use_qk_l2norm: bool,
+      use_gate_in_kernel: bool,
+      use_beta_sigmoid_in_kernel: bool,
+      chunk_size: int | None,
+      segment_ids: Int[Array, "B T"] | None,
+      context_parallel_metadata: ContextParallelMetadataArg,
+      residual_checkpoint_name: str | None = None,
+      return_residuals: bool,
+      config: Config,
+  ) -> tuple[base.Output, base.Residuals]:
+    if chunk_size is not None:
+      _check_chunk_size_support(chunk_size, per_channel_gate=False)
+    effective_chunk_size = (
+        chunk_size if chunk_size is not None else config.chunk_size
+    )
+    act_source = qkv if qkv is not None else query
+    assert act_source is not None
+    check_gdn_inputs_support(
+        act_dtype=act_source.dtype,
+        k_dtype=key.dtype if qkv is None and key is not None else None,
+        v_dtype=value.dtype if qkv is None and value is not None else None,
+        batch=act_source.shape[0],
+        seq_len=act_source.shape[1],
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        chunk_size=effective_chunk_size,
+        conv_weight=conv_weight,
+        segment_ids=segment_ids,
+        context_parallel_metadata=context_parallel_metadata,
+        mini_batch=config.mini_batch,
+    )
+    safe_gate = _resolve_safe_gate(
+        config, use_gate_in_kernel=use_gate_in_kernel, lower_bound=None
+    )
+    save_intermediates = not config.rematerialize_for_backward
+    output, residuals = chunk_gdn_fwd_custom(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        beta=beta,
+        qkv=qkv,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        a_log=a_log,
+        delta_time_bias=delta_time_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm=use_qk_l2norm,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        safe_gate=safe_gate,
+        disable_recompute=save_intermediates,
+        chunk_size=effective_chunk_size,
+        segment_ids=segment_ids,
+        return_residuals=return_residuals,
+        mini_batch=config.mini_batch,
+    )
+    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
+    if ckpt_name is not None:
+      output, residuals = _tag_gdn_residuals(
+          output,
+          residuals,
+          ckpt_name,
+          tag_qkv_conv=(
+              save_intermediates and (conv_weight is not None or qkv is None)
+          ),
+          tag_beta=save_intermediates and use_beta_sigmoid_in_kernel,
+      )
+    return output, residuals
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PallasMosaicTpuGatedDeltaNetVjp(
+    op.Op[Any, dict[str, Any], None, Config, Any]
+):
+  """Tokamax Op VJP wrapper for Pallas/Mosaic TPU Gated Delta Net."""
+
+  config_cls: ClassVar[type[Config]] = Config
+
+  @override
+  def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
+    return Config(chunk_size=_vjp_chunk_size(ba, _requested_gdn_chunk_size))
+
+  @override
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
+    args = getattr(ba, "arguments", None)
+    if not args:
+      return {Config(chunk_size=_requested_gdn_chunk_size(ba))}
+    heads = int(args.get("num_v_heads") or 32)
+    gqa_repeats = heads // int(args.get("num_k_heads") or heads)
+    cs = _vjp_chunk_size(ba, _requested_gdn_chunk_size)
+    max_mb = 16 if cs > 64 else 32
+    mini_batches = tuple(
+        mb
+        for mb in (8, 16, 32)
+        if mb <= max_mb
+        and mb <= heads
+        and heads % mb == 0
+        and mb % gqa_repeats == 0
+    ) or (None,)
+    return {Config(chunk_size=cs, mini_batch=mb) for mb in mini_batches}
+
+  def _fwd(
+      self,
+      residuals: GdnResiduals,
+      out: base.Output,
+      dout: base.Output,
+      query: jax.Array | None,
+      key: jax.Array | None,
+      value: jax.Array | None,
+      gate: jax.Array,
+      beta: jax.Array,
+      *,
+      qkv: jax.Array | None,
+      num_k_heads: int,
+      num_v_heads: int,
+      head_k_dim: int,
+      head_v_dim: int,
+      conv_weight: jax.Array | None,
+      conv_bias: jax.Array | None,
+      a_log: jax.Array | None,
+      delta_time_bias: jax.Array | None,
+      scale: float,
+      initial_state: jax.Array | None,
+      output_final_state: bool,
+      use_qk_l2norm: bool,
+      use_gate_in_kernel: bool,
+      use_beta_sigmoid_in_kernel: bool,
+      chunk_size: int | None,
+      segment_ids: jax.Array | None,
+      context_parallel_metadata: ContextParallelMetadataArg,
+      residual_checkpoint_name: str | None = None,
+      return_residuals: bool,
+      config: Config,
+  ) -> tuple[dict[str, jax.Array], None]:
+    del out, output_final_state, return_residuals
+    del context_parallel_metadata, residual_checkpoint_name, chunk_size
+    effective_chunk_size = residuals.chunk_size
+    has_fused_qkv = qkv is not None
+    if residuals.h is None:
+      safe_gate = _resolve_safe_gate(
+          config, use_gate_in_kernel=use_gate_in_kernel, lower_bound=None
+      )
+      _, recomputed = chunk_gdn_fwd_custom(
+          query=query,
+          key=key,
+          value=value,
+          gate=gate,
+          beta=beta,
+          qkv=qkv,
+          num_k_heads=num_k_heads,
+          num_v_heads=num_v_heads,
+          head_k_dim=head_k_dim,
+          head_v_dim=head_v_dim,
+          conv_weight=conv_weight,
+          conv_bias=conv_bias,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+          scale=scale,
+          initial_state=initial_state,
+          output_final_state=False,
+          use_qk_l2norm=use_qk_l2norm,
+          use_gate_in_kernel=use_gate_in_kernel,
+          use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+          safe_gate=safe_gate,
+          disable_recompute=True,
+          chunk_size=effective_chunk_size,
+          segment_ids=segment_ids,
+          return_residuals=True,
+          mini_batch=config.mini_batch,
+      )
+      assert recomputed is not None
+      residuals = recomputed
+    del query, key, value, gate, beta, qkv
+
+    (
+        dqkv,
+        dq,
+        dk,
+        dv,
+        dg,
+        db,
+        da_log,
+        ddt_bias,
+        dh0,
+        dconv_w,
+        dconv_b,
+    ) = chunk_gdn_bwd_custom(
+        scale,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        use_qk_l2norm,
+        use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel,
+        effective_chunk_size,
+        initial_state is not None,
+        has_fused_qkv,
+        residuals,
+        dout,
+        mini_batch=config.mini_batch,
+    )
+
+    grads: dict[str, jax.Array] = {
+        "gate": dg,
+        "beta": db,
+    }
+    if has_fused_qkv:
+      assert dqkv is not None
+      grads["qkv"] = dqkv
+    else:
+      assert dq is not None and dk is not None and dv is not None
+      grads["query"] = dq
+      grads["key"] = dk
+      grads["value"] = dv
+    if conv_weight is not None:
+      grads["conv_weight"] = (
+          dconv_w if dconv_w is not None else jnp.zeros_like(conv_weight)
+      )
+    if conv_bias is not None:
+      grads["conv_bias"] = (
+          dconv_b if dconv_b is not None else jnp.zeros_like(conv_bias)
+      )
+    if a_log is not None:
+      grads["a_log"] = da_log if da_log is not None else jnp.zeros_like(a_log)
+    if delta_time_bias is not None:
+      grads["delta_time_bias"] = (
+          ddt_bias
+          if ddt_bias is not None
+          else jnp.zeros_like(delta_time_bias)
+      )
+    if initial_state is not None:
+      grads["initial_state"] = (
+          dh0 if dh0 is not None else jnp.zeros_like(initial_state)
+      )
+    if segment_ids is not None:
+      grads["segment_ids"] = jnp.zeros_like(segment_ids)
     return grads, None

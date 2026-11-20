@@ -276,3 +276,57 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         num_segments=64,
     ),
 )
+
+
+def _gdn_qwen3_5_397b_a17b_spec(
+    *,
+    name: str,
+    seq_len: int,
+    num_segments: int | None = None,
+) -> arg_spec.ArgSpec:
+  """Builds a natural-layout GQA `gated_delta_net` training workload."""
+  batch_size = 1
+  num_k_heads = 8
+  num_v_heads = 32
+  head_dim = 128
+  conv_width = 4
+  dtype = jnp.bfloat16
+  c_qkv = 2 * num_k_heads * head_dim + num_v_heads * head_dim
+
+  args: dict[str, Any] = {
+      "qkv": ShapeDtype((batch_size, seq_len, c_qkv), dtype),
+      "gate": ShapeDtype((batch_size, seq_len, num_v_heads), dtype),
+      "beta": ShapeDtype((batch_size, seq_len, num_v_heads), dtype),
+      "num_k_heads": num_k_heads,
+      "num_v_heads": num_v_heads,
+      "head_k_dim": head_dim,
+      "head_v_dim": head_dim,
+      "conv_weight": ShapeDtype((conv_width, c_qkv), dtype),
+      "conv_bias": ShapeDtype((c_qkv,), dtype),
+      "a_log": ShapeDtype((num_v_heads,), jnp.float32),
+      "delta_time_bias": ShapeDtype((num_v_heads,), jnp.float32),
+      "output_final_state": False,
+      "use_qk_l2norm": True,
+      "use_gate_in_kernel": True,
+      "use_beta_sigmoid_in_kernel": True,
+  }
+  if num_segments is not None:
+    args["segment_ids"] = _make_segment_ids(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_segments=num_segments,
+    )
+  return arg_spec.ArgSpec(
+      args=args,
+      project="qwen3_5_397b_a17b",
+      name=name,
+      tags=("primary",),
+  )
+
+
+GDN_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
+    _gdn_qwen3_5_397b_a17b_spec(
+        name="gdn_gqa_fixed_training_b1_t8192_bf16",
+        seq_len=8192,
+    ),
+)

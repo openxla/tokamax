@@ -25,7 +25,12 @@ def _accumulator_dtype(dtype: jax.typing.DTypeLike) -> jnp.dtype:
 
 def _l2_normalize(x: jax.Array, acc_dtype: jnp.dtype) -> jax.Array:
   x_f = x.astype(acc_dtype)
-  rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1) + 1e-6)
+  norm_sq = jnp.sum(x_f * x_f, axis=-1)
+  rstd = jnp.where(
+      norm_sq == 0.0,
+      0.0,
+      jax.lax.rsqrt(jnp.where(norm_sq == 0.0, 1.0, norm_sq) + 1e-6),
+  )
   return x_f * rstd[..., None]
 
 
@@ -36,12 +41,14 @@ def _activate_gate(
     delta_time_bias: jax.Array | None,
     lower_bound: float | None,
 ) -> jax.Array:
-  heads, _, _, key_dim = g.shape
+  heads, _, _, gate_dim = g.shape
   if a_log is None:
     raise ValueError("`a_log` must be provided when `use_gate_in_kernel=True`.")
   g_f = g.astype(jnp.float32)
   if delta_time_bias is not None:
-    g_f = g_f + delta_time_bias.astype(jnp.float32).reshape(heads, 1, 1, key_dim)
+    g_f = g_f + delta_time_bias.astype(jnp.float32).reshape(
+        heads, 1, 1, gate_dim
+    )
   A = jnp.exp(a_log.astype(jnp.float32)).reshape(heads, 1, 1, 1)
   if lower_bound is None:
     return -A * jax.nn.softplus(g_f)
@@ -128,6 +135,10 @@ def kimi_delta_attention(
     q = _ref_conv(q, conv_weight_q, conv_bias_q)
     k = _ref_conv(k, conv_weight_k, conv_bias_k)
     v = _ref_conv(v, conv_weight_v, conv_bias_v)
+  if use_gate_in_kernel:
+    g = _activate_gate(
+        g, a_log=a_log, delta_time_bias=delta_time_bias, lower_bound=lower_bound
+    )
   # Broadcast scalar gates to key dimension width.
   if g.shape[-1] != q.shape[-1]:
     g = jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
@@ -136,11 +147,6 @@ def kimi_delta_attention(
   acc_dtype = _accumulator_dtype(q.dtype)
   output_dtype = q.dtype
   local_seq_len = seq_len
-
-  if use_gate_in_kernel:
-    g = _activate_gate(
-        g, a_log=a_log, delta_time_bias=delta_time_bias, lower_bound=lower_bound
-    )
   if use_qk_l2norm:
     q_h = _l2_normalize(q, acc_dtype)
     k_h = _l2_normalize(k, acc_dtype)
@@ -253,4 +259,190 @@ def kimi_delta_attention(
 
   output = output_h.astype(output_dtype)
   final_state = states if output_final_state else None
+  return output, final_state
+
+
+def gated_delta_net(
+    query: jax.Array | None,
+    key: jax.Array | None,
+    value: jax.Array | None,
+    gate: jax.Array,
+    beta: jax.Array,
+    *,
+    qkv: jax.Array | None = None,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    conv_weight: jax.Array | None = None,
+    conv_bias: jax.Array | None = None,
+    a_log: jax.Array | None = None,
+    delta_time_bias: jax.Array | None = None,
+    scale: float,
+    initial_state: jax.Array | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm: bool = True,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    segment_ids: jax.Array | None = None,
+    context_parallel_metadata: ContextParallelMetadataArg = None,
+) -> tuple[jax.Array, jax.Array | None]:
+  """Computes Gated Delta Net with an explicit token-by-token JAX recurrence."""
+  from tokamax._src.ops.kda.utils import causal_conv1d_silu_fwd_bt  # pylint: disable=g-import-not-at-top
+
+  q_size = num_k_heads * head_k_dim
+  k_size = num_k_heads * head_k_dim
+  v_size = num_v_heads * head_v_dim
+  gqa_repeats = num_v_heads // num_k_heads
+
+  if qkv is not None:
+    batch, local_seq_len, _ = qkv.shape
+    output_dtype = qkv.dtype
+    qkv_work = qkv
+  else:
+    assert query is not None and key is not None and value is not None
+    batch, local_seq_len, _, _ = query.shape
+    output_dtype = query.dtype
+    qkv_work = jnp.concatenate(
+        [
+            query.reshape(batch, local_seq_len, q_size),
+            key.reshape(batch, local_seq_len, k_size),
+            value.reshape(batch, local_seq_len, v_size),
+        ],
+        axis=-1,
+    )
+
+  cp_enabled = context_parallel_metadata is not None and getattr(
+      context_parallel_metadata, "is_cp_enabled", False
+  )
+  if cp_enabled:
+    assert context_parallel_metadata is not None
+    axis_name = context_parallel_metadata.axis_name
+    from tokamax._src.ops.kda.cp_utils import all_gather_into_tensor  # pylint: disable=g-import-not-at-top
+
+    def gather_time_axis(x, axis: int):
+      x_all, _ = all_gather_into_tensor(x, axis_name)
+      return jnp.concatenate(
+          [x_all[i] for i in range(x_all.shape[0])], axis=axis
+      )
+
+    qkv_work = gather_time_axis(qkv_work, 1)
+    gate = gather_time_axis(gate, 1)
+    beta = gather_time_axis(beta, 1)
+    if segment_ids is not None:
+      segment_ids = gather_time_axis(segment_ids, 1)
+
+  seq_len = qkv_work.shape[1]
+  if conv_weight is not None:
+    qkv_work = causal_conv1d_silu_fwd_bt(
+        qkv_work, conv_weight, conv_bias, segment_ids=segment_ids
+    )
+
+  q_bt = qkv_work[:, :, :q_size].reshape(
+      batch, seq_len, num_k_heads, head_k_dim
+  )
+  k_bt = qkv_work[:, :, q_size : q_size + k_size].reshape(
+      batch, seq_len, num_k_heads, head_k_dim
+  )
+  v_bt = qkv_work[:, :, q_size + k_size :].reshape(
+      batch, seq_len, num_v_heads, head_v_dim
+  )
+
+  acc_dtype = _accumulator_dtype(output_dtype)
+  if use_qk_l2norm:
+    q_bt = _l2_normalize(q_bt, acc_dtype)
+    k_bt = _l2_normalize(k_bt, acc_dtype)
+  else:
+    q_bt = q_bt.astype(acc_dtype)
+    k_bt = k_bt.astype(acc_dtype)
+
+  if gqa_repeats > 1:
+    q_bt = jnp.repeat(q_bt, gqa_repeats, axis=2)
+    k_bt = jnp.repeat(k_bt, gqa_repeats, axis=2)
+
+  q_h = q_bt.transpose(2, 0, 1, 3) * scale
+  k_h = k_bt.transpose(2, 0, 1, 3)
+  v_h = v_bt.astype(acc_dtype).transpose(2, 0, 1, 3)
+  g_h = gate.transpose(2, 0, 1)[..., None]
+  if use_gate_in_kernel:
+    g_h = _activate_gate(
+        g_h,
+        a_log=a_log,
+        delta_time_bias=delta_time_bias,
+        lower_bound=None,
+    )
+  g_h = g_h.astype(acc_dtype)[..., 0]
+  beta_f = beta.transpose(2, 0, 1).astype(acc_dtype)
+  if use_beta_sigmoid_in_kernel:
+    beta_f = jax.nn.sigmoid(beta_f)
+
+  state_init = jnp.zeros(
+      (batch, num_v_heads, head_k_dim, head_v_dim), dtype=acc_dtype
+  )
+  if initial_state is not None:
+    state_init = state_init + initial_state.astype(acc_dtype)
+
+  output_h = jnp.zeros(
+      (num_v_heads, batch, seq_len, head_v_dim), dtype=acc_dtype
+  )
+
+  def step_head(h, carry):
+    states_b, out_h = carry
+
+    def body_b(b, b_carry):
+      state_cur = states_b[b, h]
+      prev_seg = jnp.int32(0)
+
+      def body_t(t, t_carry):
+        st, last_active_seg, out_arr = t_carry
+        if segment_ids is None:
+          valid = jnp.asarray(True)
+          reset = jnp.asarray(False)
+          next_active_seg = last_active_seg
+        else:
+          seg_id = segment_ids[b, t].astype(jnp.int32)
+          valid = seg_id > 0
+          reset = valid & (last_active_seg > 0) & (seg_id != last_active_seg)
+          next_active_seg = jnp.where(valid, seg_id, last_active_seg)
+        st_in = jnp.where(reset, jnp.zeros_like(st), st)
+        decayed = st_in * jnp.exp(g_h[h, b, t])
+        pred = k_h[h, b, t] @ decayed
+        resid = v_h[h, b, t] - pred
+        new_st = decayed + (beta_f[h, b, t] * k_h[h, b, t])[:, None] * resid[
+            None, :
+        ]
+        out_t = q_h[h, b, t] @ new_st
+        out_arr = out_arr.at[h, b, t].set(
+            jnp.where(valid, out_t, jnp.zeros_like(out_t))
+        )
+        st_next = jnp.where(valid, new_st, st)
+        return st_next, next_active_seg, out_arr
+
+      final_st, _, out_h_b = jax.lax.fori_loop(
+          0, seq_len, body_t, (state_cur, prev_seg, b_carry[1])
+      )
+      return b_carry[0].at[b, h].set(final_st), out_h_b
+
+    return jax.lax.fori_loop(0, batch, body_b, (states_b, out_h))
+
+  if cp_enabled:
+    step_head = jax.checkpoint(
+        step_head,
+        prevent_cse=False,
+        policy=jax.checkpoint_policies.dots_saveable,
+    )
+
+  final_states, output_h = jax.lax.fori_loop(
+      0, num_v_heads, step_head, (state_init, output_h)
+  )
+
+  if cp_enabled:
+    assert context_parallel_metadata is not None
+    rank = jax.lax.axis_index(context_parallel_metadata.axis_name)
+    output_h = jax.lax.dynamic_slice_in_dim(
+        output_h, rank * local_seq_len, local_seq_len, axis=2
+    )
+
+  output = output_h.transpose(1, 2, 0, 3).astype(output_dtype)
+  final_state = final_states if output_final_state else None
   return output, final_state

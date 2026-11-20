@@ -47,9 +47,9 @@ class KdaResiduals:
   initial_state: (
       Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
   )
-  g_org: Float[Array, "H B T_ALIGNED K"] | None
+  g_org: Float[Array, "H B T_ALIGNED GW"] | None
   a_log: Float[Array, "H"] | None
-  delta_time_bias: Float[Array, "H*K"] | None
+  delta_time_bias: Float[Array, "H*GW"] | None
   h: Float[Array, "H B NT K V"] | None
   g_dtype_marker: Float[Array, ""]
   q_rstd: Float[Array, "H B T_ALIGNED"] | None
@@ -70,3 +70,32 @@ class KdaResiduals:
   conv_bias_q: Float[Array, "H_Q K"] | None = None
   conv_bias_k: Float[Array, "H_K K"] | None = None
   conv_bias_v: Float[Array, "H V"] | None = None
+  chunk_size: int = dataclasses.field(default=64, metadata=dict(static=True))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True)
+class GdnResiduals:
+  """Prepared forward values consumed by the GDN custom backward."""
+
+  qkv_conv: Float[Array, "B T C_QKV"] | None
+  q: Float[Array, "B T H_QK K"] | None
+  k: Float[Array, "B T H_QK K"] | None
+  v: Float[Array, "B T H_V V"] | None
+  beta: Float[Array, "H_V B T"]
+  g_cumsum: Float[Array, "H_V B T 1"] | None
+  akk: Float[Array, "H_V B T BT"] | None
+  h: Float[Array, "H_V B NT K V"] | None
+  initial_state: Float[Array, "B H_V K V"] | None
+  g_org: Float[Array, "H_V B T 1"] | None
+  a_log: Float[Array, "H_V"] | None
+  delta_time_bias: Float[Array, "H_V"] | None
+  qkv_raw: Float[Array, "B T C_QKV"] | None
+  conv_weight: Float[Array, "W C_QKV"] | None
+  conv_bias: Float[Array, "C_QKV"] | None
+  segment_ids: Int[Array, "B T"] | None
+  g_dtype_marker: Float[Array, ""]
+  chunk_size: int = dataclasses.field(default=64, metadata=dict(static=True))
+  beta_dtype: str = dataclasses.field(
+      default="float32", metadata=dict(static=True)
+  )

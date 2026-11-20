@@ -35,10 +35,12 @@ from tokamax._src.ops.kda.cp_utils import (
   _merge_initial_state,
   all_gather_into_tensor,
 )
+from tokamax._src.ops.kda.pallas_mosaic_tpu_types import GdnResiduals
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import KdaResiduals
 from tokamax._src.ops.kda.utils import (
     _unalign_output,
     align_up,
+    causal_conv1d_silu_fwd_bt,
     exp2,
     get_chain_precision,
     get_interpret,
@@ -586,7 +588,7 @@ def _solve_unit_lower_triangular_neumann_batched(A, b):
   neg_transformed_off_diag = -transformed_off_diag
   off_diag_inverse = identity[None] + neg_transformed_off_diag
   power = neg_transformed_off_diag
-  log2_num_blocks = {2: 1, 4: 2, 8: 3, 16: 4, 32: 5}[num_blocks]
+  log2_num_blocks = num_blocks.bit_length() - 1
   for _ in range(log2_num_blocks - 1):
     power = dot_batch(power, power)
     off_diag_inverse = off_diag_inverse + dot_batch(off_diag_inverse, power)
@@ -602,7 +604,14 @@ def _solve_unit_lower_triangular_neumann_batched(A, b):
 
 
 def _scalar_gate_intra(
-    q_f32, k_f32, g_cumsum, beta_f32, *, BT: int, scale: float
+    q_f32,
+    k_f32,
+    g_cumsum,
+    beta_f32,
+    *,
+    BT: int,
+    scale: float,
+    gqa_repeats: int = 1,
 ):
   """Computes intra-chunk Aqk and L for a scalar gate (Gated Delta Net)."""
   gs = g_cumsum[:, :, 0]  # [MB, BT]
@@ -620,13 +629,16 @@ def _scalar_gate_intra(
       k_f32,
       (((2,), (2,)), ((0,), (0,))),
       preferred_element_type=jnp.float32,
-  )  # [MB, BT, BT]
+  )  # [MB_QK, BT, BT]
   kk = jax.lax.dot_general(
       k_f32,
       k_f32,
       (((2,), (2,)), ((0,), (0,))),
       preferred_element_type=jnp.float32,
-  )  # [MB, BT, BT]
+  )  # [MB_QK, BT, BT]
+  if gqa_repeats > 1:
+    qk = jnp.repeat(qk, gqa_repeats, axis=0)
+    kk = jnp.repeat(kk, gqa_repeats, axis=0)
 
   zero = jnp.float32(0.0)
   Aqk = jnp.where(causal[None], qk * decay * scale, zero)
@@ -714,6 +726,9 @@ def _fused_gate_intra_kernel(
     use_gate_in_kernel: bool,
     lower_bound: float | None,
     mini_batch: int = 1,
+    gqa_repeats: int = 1,
+    native_qkv_layout: bool = False,
+    write_q_norm: bool = False,
     use_conv1d_in_kernel: bool = False,
     use_qk_l2norm: bool = False,
     return_conv_intermediates: bool = False,
@@ -742,6 +757,7 @@ def _fused_gate_intra_kernel(
   K = head_dim
   V = value_dim
   MB = mini_batch
+  MB_QK = MB // gqa_repeats
 
   q_prev_ref = k_prev_ref = v_prev_ref = None
   w_q_ref = w_k_ref = w_v_ref = None
@@ -775,15 +791,26 @@ def _fused_gate_intra_kernel(
   extra_out_refs = out_refs[6:]
 
   # Load all MB heads at once
-  q_in = q_ref[:, 0, 0]  # [MB, BT, K]
-  k_in = k_ref[:, 0, 0]  # [MB, BT, K]
+  if native_qkv_layout:
+    q_in = jnp.stack(
+        [q_ref[0, :, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    )
+    k_in = jnp.stack(
+        [k_ref[0, :, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    )
+    v_in = jnp.stack(
+        [v_ref[0, :, h * V : (h + 1) * V] for h in range(MB)], axis=0
+    )
+  else:
+    q_in = q_ref[:, 0, 0]  # [MB_QK, BT, K]
+    k_in = k_ref[:, 0, 0]  # [MB_QK, BT, K]
+    v_in = v_ref[:, 0, 0]  # [MB, BT, V]
   # Transpose width-1 inputs stored as [.., 1, BT] back to [MB, BT, 1].
   if g_ref.shape[-2] == 1:
     g = g_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
   else:
     g = g_ref[:, 0, 0]  # [MB, BT, K]
   beta = beta_ref[:, 0, 0, 0][..., None]  # [MB, BT] -> [MB, BT, 1]
-  v_in = v_ref[:, 0, 0]  # [MB, BT, V]
 
   if use_conv1d_in_kernel:
     assert (
@@ -821,11 +848,17 @@ def _fused_gate_intra_kernel(
     if use_qk_l2norm:
       q_f32_s = q_silu.astype(jnp.float32)
       k_f32_s = k_silu.astype(jnp.float32)
-      q_rstd_val = jax.lax.rsqrt(
-          jnp.sum(q_f32_s * q_f32_s, axis=-1, keepdims=True) + 1e-6
+      q_sq = jnp.sum(q_f32_s * q_f32_s, axis=-1, keepdims=True)
+      k_sq = jnp.sum(k_f32_s * k_f32_s, axis=-1, keepdims=True)
+      q_rstd_val = jnp.where(
+          q_sq == 0.0,
+          0.0,
+          jax.lax.rsqrt(jnp.where(q_sq == 0.0, 1.0, q_sq) + 1e-6),
       )
-      k_rstd_val = jax.lax.rsqrt(
-          jnp.sum(k_f32_s * k_f32_s, axis=-1, keepdims=True) + 1e-6
+      k_rstd_val = jnp.where(
+          k_sq == 0.0,
+          0.0,
+          jax.lax.rsqrt(jnp.where(k_sq == 0.0, 1.0, k_sq) + 1e-6),
       )
       q = (q_f32_s * q_rstd_val).astype(dtype)
       k = (k_f32_s * k_rstd_val).astype(dtype)
@@ -848,18 +881,38 @@ def _fused_gate_intra_kernel(
         q_rstd_ref[:, 0, 0, 0] = q_rstd_val[..., 0]
         k_rstd_ref[:, 0, 0, 0] = k_rstd_val[..., 0]
   else:
-    q = q_in
-    k = k_in
+    if use_qk_l2norm:
+      q_f32_s = q_in.astype(jnp.float32)
+      k_f32_s = k_in.astype(jnp.float32)
+      q_sq = jnp.sum(q_f32_s * q_f32_s, axis=-1, keepdims=True)
+      k_sq = jnp.sum(k_f32_s * k_f32_s, axis=-1, keepdims=True)
+      q_rstd_val = jnp.where(
+          q_sq == 0.0,
+          0.0,
+          jax.lax.rsqrt(jnp.where(q_sq == 0.0, 1.0, q_sq) + 1e-6),
+      )
+      k_rstd_val = jnp.where(
+          k_sq == 0.0,
+          0.0,
+          jax.lax.rsqrt(jnp.where(k_sq == 0.0, 1.0, k_sq) + 1e-6),
+      )
+      q = (q_f32_s * q_rstd_val).astype(dtype)
+      k = (k_f32_s * k_rstd_val).astype(dtype)
+    else:
+      q = q_in
+      k = k_in
     v = v_in
+    if write_q_norm:
+      q_norm_ref = extra_out_refs[0]
+      q_norm_ref[:, 0, 0] = q
 
   # --- Gate activation + cumsum ---
   g_f32 = g.astype(jnp.float32)
 
   if use_gate_in_kernel:
-    assert per_channel_gate, "use_gate_in_kernel requires per_channel_gate=True"
-    dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, K]
-    g_f32 = g_f32 + dt_b[:, None, :]       # [MB, BT, K]
-    A_val = a_log_ref[:, 0, 0, 0, 0]       # [MB]
+    dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, GW]
+    g_f32 = g_f32 + dt_b[:, None, :]              # [MB, BT, GW]
+    A_val = a_log_ref[:, 0, 0, 0, 0]              # [MB]
     if lower_bound is None:
       g_f32 = -jnp.exp(A_val)[:, None, None] * jax.nn.softplus(g_f32)
     else:
@@ -868,17 +921,36 @@ def _fused_gate_intra_kernel(
       )
 
   if fuse_cumsum:
-    tril = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-    # tril[BT,BT] @ g_f32[MB,BT,K] → [MB,BT,K]: contract on BT, batch on MB
-    g_cumsum = jax.lax.dot_general(
-      tril, g_f32, (((1,), (1,)), ((), ())),
-      preferred_element_type=jnp.float32,
-    ).transpose(1, 0, 2) * cumsum_scale  # [BT,MB,K] → [MB,BT,K]
+    if g_f32.shape[-1] == 1:
+      idx_g = jnp.arange(BT, dtype=jnp.int32)
+      _fwd_mask = (idx_g[:, None] <= idx_g[None, :]).astype(jnp.float32)
+      g_cumsum = (
+          jnp.matmul(
+              g_f32[..., 0],
+              _fwd_mask,
+              precision=jax.lax.Precision.HIGHEST,
+              preferred_element_type=jnp.float32,
+          )[..., None]
+          * cumsum_scale
+      )
+    else:
+      tril = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
+      # tril[BT,BT] @ g_f32[MB,BT,K] → [MB,BT,K]: contract on BT, batch on MB
+      g_cumsum = jax.lax.dot_general(
+        tril, g_f32, (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+      ).transpose(1, 0, 2) * cumsum_scale  # [BT,MB,K] → [MB,BT,K]
   else:
     g_cumsum = g_f32
 
-  q_f32 = q.astype(jnp.float32)
-  k_f32 = k.astype(jnp.float32)
+  q_f32_qk = q.astype(jnp.float32)
+  k_f32_qk = k.astype(jnp.float32)
+  if per_channel_gate and gqa_repeats > 1:
+    q_f32 = jnp.repeat(q_f32_qk, gqa_repeats, axis=0)
+    k_f32 = jnp.repeat(k_f32_qk, gqa_repeats, axis=0)
+  else:
+    q_f32 = q_f32_qk
+    k_f32 = k_f32_qk
   beta_f32 = beta.astype(jnp.float32)
 
   # --- BC=16 sub-block factored Aqk/L (fla safe-gate style, j-batched) ---
@@ -950,9 +1022,17 @@ def _fused_gate_intra_kernel(
     L = jnp.concatenate(L_rows, axis=1)  # [MB, BT, BT]
   else:
     Aqk, L = _scalar_gate_intra(
-        q_f32, k_f32, g_cumsum, beta_f32, BT=BT, scale=scale
+        q_f32_qk,
+        k_f32_qk,
+        g_cumsum,
+        beta_f32,
+        BT=BT,
+        scale=scale,
+        gqa_repeats=gqa_repeats,
     )
     Aqk = Aqk.astype(dtype)
+    if gqa_repeats > 1:
+      k_f32 = jnp.repeat(k_f32_qk, gqa_repeats, axis=0)
 
   # --- Solve (I + L) x = rhs ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
@@ -990,7 +1070,9 @@ def _fused_gate_intra_kernel(
   g_cumsum_out_ref[:, 0, 0] = g_cumsum
 
 
-def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
+def _compute_intra_fused_mini_batch(
+    H, BT, K, V, dtype=None, *, multiple_of: int = 1
+):
   """Auto-compute mini-batch size for intra fused kernel.
 
   Each head needs VMEM for intermediates: BT*K + BT*V + 2*BT*BT (Aqk, L).
@@ -998,7 +1080,7 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
   """
   elem_size = dtype.itemsize if dtype is not None else 4
   per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-  return estimate_mini_batch(per_head, H)
+  return estimate_mini_batch(per_head, H, multiple_of=multiple_of)
 
 
 @functools.partial(
@@ -1016,13 +1098,18 @@ def _compute_intra_fused_mini_batch(H, BT, K, V, dtype=None):
         "use_conv1d_in_kernel",
         "use_qk_l2norm",
         "return_conv_intermediates",
+        "num_k_heads",
+        "head_k_dim",
+        "head_v_dim",
+        "native_bt_qkv",
+        "write_q_norm",
     ],
 )
 @jaxtyping.jaxtyped
 def pallas_kda_fwd_intra_fused(
-    q: Float[Array, "H B T K"],
-    k: Float[Array, "H B T K"],
-    v: Float[Array, "H B T V"],
+    q: Float[Array, "..."] | None,
+    k: Float[Array, "..."] | None,
+    v: Float[Array, "..."] | None,
     g: Float[Array, "H B T GW"],
     beta: Float[Array, "H B T"],
     scale: float,
@@ -1032,7 +1119,7 @@ def pallas_kda_fwd_intra_fused(
     disable_recompute: bool = False,
     cumsum_scale: float = RCP_LN2,
     a_log: Float[Array, "H"] | None = None,
-    delta_time_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*GW"] | None = None,
     use_gate_in_kernel: bool = False,
     lower_bound: float | None = None,
     mini_batch: int | None = None,
@@ -1046,6 +1133,12 @@ def pallas_kda_fwd_intra_fused(
     use_qk_l2norm: bool = False,
     return_conv_intermediates: bool = False,
     aligned_segment_ids: Int[Array, "B T"] | None = None,
+    qkv_conv: Float[Array, "B T C_QKV"] | None = None,
+    num_k_heads: int | None = None,
+    head_k_dim: int | None = None,
+    head_v_dim: int | None = None,
+    native_bt_qkv: bool = False,
+    write_q_norm: bool = False,
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H B T V"],
@@ -1053,7 +1146,7 @@ def pallas_kda_fwd_intra_fused(
     Float[Array, "H B T BT"],
     Float[Array, "H B T BT"],
     Float[Array, "H B T GW"],
-    Float[Array, "H B T K"] | None,
+    Float[Array, "H_QK B T K"] | None,
     Float[Array, "H B T K"] | None,
     Float[Array, "H B T V"] | None,
     Float[Array, "H B T"] | None,
@@ -1064,43 +1157,83 @@ def pallas_kda_fwd_intra_fused(
   Heads are mini-batched to amortize DMA. When `use_conv1d_in_kernel` is
   true, causal conv1d + SiLU (+ optional L2 norm) are fused into the kernel.
   """
-  H, B, T, K = q.shape
-  V = v.shape[-1]
+  H, B, T, GW = g.shape
   BT = chunk_size
   assert T % BT == 0, f"T={T} must be divisible by chunk_size={BT}"
   NC = T // BT
+
+  if qkv_conv is not None:
+    assert (
+        num_k_heads is not None
+        and head_k_dim is not None
+        and head_v_dim is not None
+    )
+    H_QK = num_k_heads
+    K = head_k_dim
+    V = head_v_dim
+    act_dtype = qkv_conv.dtype
+  else:
+    assert q is not None and k is not None and v is not None
+    if native_bt_qkv:
+      _, _, H_QK, K = q.shape
+      V = v.shape[-1]
+    else:
+      H_QK, _, _, K = q.shape
+      V = v.shape[-1]
+    act_dtype = k.dtype
+  assert H % H_QK == 0, f"H={H} must be divisible by H_QK={H_QK}"
+  gqa_repeats = H // H_QK
+  native_qkv_layout = qkv_conv is not None or native_bt_qkv
 
   if use_gate_in_kernel:
     assert a_log is not None, "a_log required when use_gate_in_kernel=True"
 
   if mini_batch is None:
-    MB = _compute_intra_fused_mini_batch(H, BT, K, V, dtype=q.dtype)
+    MB = _compute_intra_fused_mini_batch(
+        H, BT, K, V, dtype=act_dtype, multiple_of=gqa_repeats
+    )
   else:
     MB = mini_batch
     assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
+    assert (
+        MB % gqa_repeats == 0
+    ), f"mini_batch={MB} must be divisible by gqa_repeats={gqa_repeats}"
+  MB_QK = MB // gqa_repeats
 
-  # [H, B, T, K] -> [H, B, NC, BT, K]
-  q_r = q.reshape(H, B, NC, BT, K)
-  k_r = k.reshape(H, B, NC, BT, K)
-  GW = g.shape[-1]
+  if qkv_conv is not None:
+    q_r = qkv_conv
+    k_r = qkv_conv
+    v_r = qkv_conv
+  elif native_bt_qkv:
+    assert q is not None and k is not None and v is not None
+    q_r = q.reshape(B, T, H_QK * K)
+    k_r = k.reshape(B, T, H_QK * K)
+    v_r = v.reshape(B, T, H * V)
+  else:
+    assert q is not None and k is not None and v is not None
+    # [H_QK, B, T, K] -> [H_QK, B, NC, BT, K]
+    q_r = q.reshape(H_QK, B, NC, BT, K)
+    k_r = k.reshape(H_QK, B, NC, BT, K)
+    v_r = v.reshape(H, B, NC, BT, V)
   scalar_gate = GW == 1
   # Store width-1 axes as [.., 1, BT] to avoid 128-lane minor-axis padding in HBM.
   g_r = (
       g.reshape(H, B, NC, 1, BT) if scalar_gate else g.reshape(H, B, NC, BT, GW)
   )
   beta_r = beta.reshape(H, B, NC, 1, BT)
-  v_r = v.reshape(H, B, NC, BT, V)
 
   if use_gate_in_kernel:
     assert a_log is not None
     a_log_r = a_log.astype(jnp.float32).reshape(H, 1, 1, 1, 1)
     if delta_time_bias is not None:
-      delta_time_bias_r = delta_time_bias.astype(jnp.float32).reshape(H, 1, 1, 1, K)
+      delta_time_bias_r = delta_time_bias.astype(jnp.float32).reshape(
+          H, 1, 1, 1, GW
+      )
     else:
-      delta_time_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
+      delta_time_bias_r = jnp.zeros((H, 1, 1, 1, GW), dtype=jnp.float32)
   else:
     a_log_r = jnp.zeros((H, 1, 1, 1, 1), dtype=jnp.float32)
-    delta_time_bias_r = jnp.zeros((H, 1, 1, 1, K), dtype=jnp.float32)
+    delta_time_bias_r = jnp.zeros((H, 1, 1, 1, GW), dtype=jnp.float32)
 
   grid = (H // MB, B, NC)
 
@@ -1135,22 +1268,69 @@ def pallas_kda_fwd_intra_fused(
         block_shape=(MB, 1, 1, 1, BT),
     )
 
+  def _make_qk_spec(last_dim):
+    return pl.BlockSpec(
+        index_map=lambda i, j, l: (i, j, l, 0, 0),
+        block_shape=(MB_QK, 1, 1, BT, last_dim),
+    )
+
+  if qkv_conv is not None:
+    q_size = H_QK * K
+    k_size = H_QK * K
+    tile_q = MB_QK * K
+    tile_k = MB_QK * K
+    tile_v = MB * V
+    q_spec = pl.BlockSpec(
+        (pl.Element(1), pl.Element(BT), pl.Element(tile_q)),
+        lambda hg, b, c: (
+            b,
+            pl.multiple_of(c * BT, 8),
+            pl.multiple_of(hg * tile_q, 128),
+        ),
+    )
+    k_spec = pl.BlockSpec(
+        (pl.Element(1), pl.Element(BT), pl.Element(tile_k)),
+        lambda hg, b, c: (
+            b,
+            pl.multiple_of(c * BT, 8),
+            pl.multiple_of(q_size + hg * tile_k, 128),
+        ),
+    )
+    v_spec = pl.BlockSpec(
+        (pl.Element(1), pl.Element(BT), pl.Element(tile_v)),
+        lambda hg, b, c: (
+            b,
+            pl.multiple_of(c * BT, 8),
+            pl.multiple_of(q_size + k_size + hg * tile_v, 128),
+        ),
+    )
+  elif native_bt_qkv:
+    tile_q = MB_QK * K
+    tile_v = MB * V
+    q_spec = pl.BlockSpec((1, BT, tile_q), lambda hg, b, c: (b, c, hg))
+    k_spec = q_spec
+    v_spec = pl.BlockSpec((1, BT, tile_v), lambda hg, b, c: (b, c, hg))
+  else:
+    q_spec = _make_qk_spec(K)
+    k_spec = _make_qk_spec(K)
+    v_spec = _make_spec(V)
+
   in_args = [q_r, k_r, g_r, beta_r, v_r, a_log_r, delta_time_bias_r]
   in_specs = [
-      _make_spec(K),
-      _make_spec(K),
+      q_spec,
+      k_spec,
       _make_narrow_spec() if scalar_gate else _make_spec(GW),
       _make_narrow_spec(),
-      _make_spec(V),
+      v_spec,
       _make_per_head_spec(1),
-      _make_per_head_spec(K),
+      _make_per_head_spec(GW),
   ]
   out_shape = [
-      jax.ShapeDtypeStruct((H, B, NC, BT, V), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, BT), k.dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, V), act_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, K), act_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, K), act_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, BT), act_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, BT), act_dtype),
       jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32),
   ]
   out_specs = [
@@ -1165,7 +1345,9 @@ def pallas_kda_fwd_intra_fused(
   conv_kernel_size = 4
   if use_conv1d_in_kernel:
     assert (
-        conv_weight_q is not None
+        k is not None
+        and v is not None
+        and conv_weight_q is not None
         and conv_weight_k is not None
         and conv_weight_v is not None
     )
@@ -1276,6 +1458,31 @@ def pallas_kda_fwd_intra_fused(
             _make_narrow_spec(),
             _make_narrow_spec(),
         ])
+  elif write_q_norm:
+    out_shape.append(jax.ShapeDtypeStruct((H_QK, B, NC, BT, K), act_dtype))
+    out_specs.append(_make_qk_spec(K))
+
+  total_chunks = H * B * NC
+  intra_flops_per_chunk = (
+      4 * BT * BT * K // gqa_repeats + 2 * BT * BT * (V + K + GW) + BT * BT * BT
+  )
+  intra_transcendentals_per_chunk = (
+      2 * BT * K if per_channel_gate else (BT * BT + 2 * BT)
+  )
+  # When `qkv_conv` is aliased across q/k/v specs, count its HBM bytes once.
+  unique_in_args = (
+      [qkv_conv, g_r, beta_r, a_log_r, delta_time_bias_r]
+      if qkv_conv is not None
+      else in_args
+  )
+  intra_bytes = sum(
+      int(x.size) * jnp.dtype(x.dtype).itemsize for x in unique_in_args
+  ) + sum(int(s.size) * jnp.dtype(s.dtype).itemsize for s in out_shape)
+  intra_cost_estimate = pl.CostEstimate(
+      flops=total_chunks * intra_flops_per_chunk,
+      transcendentals=total_chunks * intra_transcendentals_per_chunk,
+      bytes_accessed=intra_bytes,
+  )
 
   pallas_outs = pl.pallas_call(
       functools.partial(
@@ -1292,6 +1499,9 @@ def pallas_kda_fwd_intra_fused(
           use_gate_in_kernel=use_gate_in_kernel,
           lower_bound=lower_bound,
           mini_batch=MB,
+          gqa_repeats=gqa_repeats,
+          native_qkv_layout=native_qkv_layout,
+          write_q_norm=write_q_norm,
           use_conv1d_in_kernel=use_conv1d_in_kernel,
           use_qk_l2norm=use_qk_l2norm,
           return_conv_intermediates=return_conv_intermediates,
@@ -1302,6 +1512,7 @@ def pallas_kda_fwd_intra_fused(
       in_specs=in_specs,
       out_specs=out_specs,
       grid=grid,
+      cost_estimate=intra_cost_estimate,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "parallel", "parallel"),
       ),
@@ -1327,6 +1538,8 @@ def pallas_kda_fwd_intra_fused(
       if use_qk_l2norm:
         q_rstd_out = extra_outs[3].reshape(H, B, T)
         k_rstd_out = extra_outs[4].reshape(H, B, T)
+  elif write_q_norm:
+    q_norm_out = extra_outs[0].reshape(H_QK, B, T, K)
 
   return (
       w_out,
@@ -1344,9 +1557,9 @@ def pallas_kda_fwd_intra_fused(
 
 
 def kda_fwd_intra_fused(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    q: jax.Array | None,
+    k: jax.Array | None,
+    v: jax.Array | None,
     g: jax.Array,
     beta: jax.Array,
     scale: float,
@@ -1372,6 +1585,12 @@ def kda_fwd_intra_fused(
     return_conv_intermediates: bool = False,
     aligned_segment_ids: jax.Array | None = None,
     mini_batch: int | None = None,
+    qkv_conv: jax.Array | None = None,
+    num_k_heads: int | None = None,
+    head_k_dim: int | None = None,
+    head_v_dim: int | None = None,
+    native_bt_qkv: bool = False,
+    write_q_norm: bool = False,
 ):
   """Fused gate cumsum + intra-chunk solve entry.
 
@@ -1423,6 +1642,12 @@ def kda_fwd_intra_fused(
       use_qk_l2norm=use_qk_l2norm,
       return_conv_intermediates=return_conv_intermediates,
       aligned_segment_ids=aligned_segment_ids,
+      qkv_conv=qkv_conv,
+      num_k_heads=num_k_heads,
+      head_k_dim=head_k_dim,
+      head_v_dim=head_v_dim,
+      native_bt_qkv=native_bt_qkv,
+      write_q_norm=write_q_norm,
   )
 
 
@@ -1459,6 +1684,8 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     STORE_H,
     STORE_V_NEW,
     MB,
+    GQA_REPEATS,
+    NATIVE_OUT_LAYOUT,
     OUTPUT_PRECISION,
 ):
   """Fused Stage 3+4 Pallas kernel body for varlen with H-dim mini-batch.
@@ -1521,7 +1748,9 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # Stage 4 inter-chunk output: scale * (q * exp2(g - g_ref)) @ (h * exp2(g_ref))
   # Reference-point stabilization mirrors the production varlen kernel's
   # g_ref = g[0] choice for bit-identical numerics.
-  b_q = q_ref[:,0,:]                              # [MB, BT, K]
+  b_q = q_ref[:,0,:]                              # [MB_QK, BT, K]
+  if GQA_REPEATS > 1:
+    b_q = jnp.repeat(b_q, GQA_REPEATS, axis=0)    # [MB, BT, K]
   b_g = gk_ref[:,0,:].astype(jnp.float32)         # [MB, BT, K]
   b_A = A_ref[:,0,:]                               # [MB, BT, BT]
 
@@ -1555,7 +1784,13 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     preferred_element_type=jnp.float32,
   )                                            # [MB, BT, V]
 
-  o_ref[:,0,:] = b_o.astype(o_ref.dtype)
+  if NATIVE_OUT_LAYOUT:
+    b_o_cast = b_o.astype(o_ref.dtype)
+    o_ref[...] = jnp.concatenate([b_o_cast[h] for h in range(MB)], axis=-1)[
+        None, ...
+    ]
+  else:
+    o_ref[:,0,:] = b_o.astype(o_ref.dtype)
 
   # Stage 3 state update: h = decay(h) + kg^T @ v_new
   # On the serial chain: accumulates directly into the recursive hidden state,
@@ -1590,6 +1825,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     "store_v_new",
     "store_intermediates",
     "mini_batch",
+    "native_out_layout",
   ],
 )
 @jaxtyping.jaxtyped
@@ -1598,7 +1834,7 @@ def chunk_kda_fwd_h_o_varlen(
     u: Float[Array, "H B T V"],
     kg: Float[Array, "H B T K"],
     gk: Float[Array, "H B T GW"],
-    q: Float[Array, "H B T K"],
+    q: Float[Array, "H_QK B T K"],
     A: Float[Array, "H B T BT"],
     cu_seqlens: Int[Array, "N_CU"] | Int[Array, "B N_CU"],
     chunk_indices: Int[Array, "NT 2"] | Int[Array, "B NT 2"] | None = None,
@@ -1610,8 +1846,9 @@ def chunk_kda_fwd_h_o_varlen(
     store_v_new: bool = False,
     store_intermediates: bool | None = None,
     mini_batch: int | None = None,
+    native_out_layout: bool = False,
 ) -> tuple[
-    Float[Array, "H B T V"],
+    Float[Array, "..."],
     Float[Array, "B N H K V"] | None,
     Float[Array, "H B NT K V"] | None,
     Float[Array, "H B T V"] | None,
@@ -1626,7 +1863,10 @@ def chunk_kda_fwd_h_o_varlen(
   if store_intermediates is not None:
     store_h = store_h or store_intermediates
     store_v_new = store_v_new or store_intermediates
-  H, B, T, K = q.shape
+  H, B, T, K = w.shape
+  H_QK = q.shape[0]
+  assert H % H_QK == 0, f"H={H} must be divisible by H_QK={H_QK}"
+  gqa_repeats = H // H_QK
   V = u.shape[-1]
   BT = chunk_size
 
@@ -1657,10 +1897,14 @@ def chunk_kda_fwd_h_o_varlen(
     out_bytes = BT * V_ALIGNED * elem_size
     scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
     per_head = in_bytes + out_bytes + scratch_bytes
-    MB = estimate_mini_batch(per_head, H)  # pylint: disable=invalid-name
+    MB = estimate_mini_batch(per_head, H, multiple_of=gqa_repeats)  # pylint: disable=invalid-name
   else:
     MB = mini_batch
     assert H % MB == 0, f"H={H} must be divisible by mini_batch={MB}"
+    assert (
+        MB % gqa_repeats == 0
+    ), f"mini_batch={MB} must be divisible by gqa_repeats={gqa_repeats}"
+  MB_QK = MB // gqa_repeats
 
   # Generate chunk_to_seq mapping from chunk_indices
   if chunk_indices is None:
@@ -1716,6 +1960,7 @@ def chunk_kda_fwd_h_o_varlen(
     return (h, b, c, 0)
 
   bspec_k = pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_t_index_map)
+  bspec_q = pl.BlockSpec([MB_QK, 1, BT, K_PADSIZE], index_map=_t_index_map)
   # Narrow when the gate is scalar; identical to bspec_k otherwise.
   bspec_gk = pl.BlockSpec(
       [MB, 1, BT, K_PADSIZE if GW == K else GW], index_map=_t_index_map
@@ -1733,7 +1978,16 @@ def chunk_kda_fwd_h_o_varlen(
   )
 
   # Output specs.
-  o_spec = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_t_index_map)
+  if native_out_layout:
+    assert V == V_ALIGNED, f"native_out_layout requires aligned V={V}"
+    o_spec = pl.BlockSpec(
+        [1, BT, MB * V],
+        index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (b, c, h),
+    )
+    o_shape = jax.ShapeDtypeStruct([B, T_alloc, H * V], u.dtype)
+  else:
+    o_spec = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_t_index_map)
+    o_shape = jax.ShapeDtypeStruct([H, B, T_alloc, V_ALIGNED], jnp.float32)
   ht_spec = (
     pl.BlockSpec(
       [1, 1, MB, K_PADSIZE, V_ALIGNED],
@@ -1760,7 +2014,6 @@ def chunk_kda_fwd_h_o_varlen(
     if store_v_new else None
   )
 
-  o_shape = jax.ShapeDtypeStruct([H, B, T_alloc, V_ALIGNED], jnp.float32)
   ht_shape = (
     jax.ShapeDtypeStruct([B, N, H, K_PADSIZE, V_ALIGNED], jnp.float32)
     if output_final_state else None
@@ -1790,6 +2043,26 @@ def chunk_kda_fwd_h_o_varlen(
     else jax.lax.Precision.HIGHEST
   )
 
+  total_h_o_chunks = H * B * NT
+  h_o_flops = total_h_o_chunks * (6 * BT * K * V + 2 * BT * BT * V)
+  h_o_transcendentals = total_h_o_chunks * (BT + 1) * GW
+  h_o_in_tensors = (w_t, u_t, kg_t, gk_t, q_t, A_t, h0)
+  h_o_out_shapes = (o_shape, ht_shape, h_out_shape, v_new_out_shape)
+  h_o_bytes = sum(
+      int(x.size) * jnp.dtype(x.dtype).itemsize
+      for x in h_o_in_tensors
+      if x is not None
+  ) + sum(
+      int(s.size) * jnp.dtype(s.dtype).itemsize
+      for s in h_o_out_shapes
+      if s is not None
+  )
+  h_o_cost_estimate = pl.CostEstimate(
+      flops=h_o_flops,
+      transcendentals=h_o_transcendentals,
+      bytes_accessed=h_o_bytes,
+  )
+
   o_out, ht_out, h_out, v_new_out = pl.pallas_call(
       functools.partial(
           _chunk_kda_fwd_h_o_varlen_kernel,
@@ -1800,6 +2073,8 @@ def chunk_kda_fwd_h_o_varlen(
           STORE_H=store_h,
           STORE_V_NEW=store_v_new,
           MB=MB,
+          GQA_REPEATS=gqa_repeats,
+          NATIVE_OUT_LAYOUT=native_out_layout,
           OUTPUT_PRECISION=_output_prec,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1810,7 +2085,7 @@ def chunk_kda_fwd_h_o_varlen(
               bspec_v,  # u
               bspec_k,  # kg
               bspec_gk,  # gk
-              bspec_k,  # q
+              bspec_q,  # q
               bspec_a,  # A
               bspec_h0,  # h0
           ],
@@ -1822,6 +2097,7 @@ def chunk_kda_fwd_h_o_varlen(
           disable_bounds_checks=True,
       ),
       out_shape=[o_shape, ht_shape, h_out_shape, v_new_out_shape],
+      cost_estimate=h_o_cost_estimate,
       interpret=interpret,
   )(
       cu_seqlens.astype(jnp.int32),
@@ -1835,10 +2111,13 @@ def chunk_kda_fwd_h_o_varlen(
       h0,
   )
 
-  # Post-process: o is [H, 1, T, V_ALIGNED]
-  if V_ALIGNED > V:
-    o_out = o_out[..., :V]
-  o_out = o_out.astype(u.dtype)
+  if native_out_layout:
+    o_out = o_out.reshape(B, T_alloc, H, V)
+  else:
+    # Post-process: o is [H, B, T, V_ALIGNED]
+    if V_ALIGNED > V:
+      o_out = o_out[..., :V]
+    o_out = o_out.astype(u.dtype)
 
   if output_final_state and ht_out is not None:
     if V_ALIGNED > V:
@@ -1888,7 +2167,7 @@ def chunk_kda_fwd_custom(
     g: Float[Array, "H B T_ALIGNED GW"],
     beta: Float[Array, "H B T_ALIGNED"],
     a_log: Float[Array, "H"] | None = None,
-    delta_time_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*GW"] | None = None,
     scale: float | None = None,
     initial_state: (
         Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
@@ -1993,7 +2272,7 @@ def chunk_kda_fwd_custom(
       conv_bias_k=conv_bias_k,
       conv_bias_v=conv_bias_v,
       use_conv1d_in_kernel=use_conv1d_in_kernel,
-      use_qk_l2norm=use_qk_l2norm,
+      use_qk_l2norm=(use_qk_l2norm and use_conv1d_in_kernel),
       return_conv_intermediates=(use_conv1d_in_kernel and return_residuals),
       aligned_segment_ids=aligned_segment_ids,
       mini_batch=mini_batch,
@@ -2082,7 +2361,7 @@ def chunk_kda_fwd_custom(
       chunk_indices=stage34_chunk_indices,
       initial_state=stage34_initial_state,
       output_final_state=output_final_state,
-      scale=scale,
+      scale=scale_val,
       chunk_size=BT,
       store_h=disable_recompute,
       store_v_new=disable_recompute,
@@ -2154,5 +2433,246 @@ def chunk_kda_fwd_custom(
       conv_bias_q=conv_bias_q if use_conv1d_in_kernel else None,
       conv_bias_k=conv_bias_k if use_conv1d_in_kernel else None,
       conv_bias_v=conv_bias_v if use_conv1d_in_kernel else None,
+      chunk_size=BT,
+  )
+  return output, residuals
+
+
+@jaxtyping.jaxtyped
+def chunk_gdn_fwd_custom(
+    query: Float[Array, "B T H_QK K"] | None,
+    key: Float[Array, "B T H_QK K"] | None,
+    value: Float[Array, "B T H_V V"] | None,
+    gate: Float[Array, "B T H_V"],
+    beta: Float[Array, "B T H_V"],
+    *,
+    qkv: Float[Array, "B T C_QKV"] | None = None,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    conv_weight: Float[Array, "W C_QKV"] | None = None,
+    conv_bias: Float[Array, "C_QKV"] | None = None,
+    a_log: Float[Array, "H_V"] | None = None,
+    delta_time_bias: Float[Array, "H_V"] | None = None,
+    scale: float,
+    initial_state: Float[Array, "B H_V K V"] | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm: bool = True,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    safe_gate: bool = True,
+    disable_recompute: bool = True,
+    chunk_size: int = 64,
+    segment_ids: Int[Array, "B T"] | None = None,
+    return_residuals: bool = False,
+    mini_batch: int | None = None,
+) -> tuple[
+    tuple[Float[Array, "B T H_V V"], Float[Array, "B H_V K V"] | None],
+    GdnResiduals | None,
+]:
+  """Natural-layout `[B, T, ...]` GDN forward sharing KDA Pallas TPU kernels."""
+  save_for_backward = return_residuals and disable_recompute
+  H_QK = num_k_heads
+  H_V = num_v_heads
+  K = head_k_dim
+  V = head_v_dim
+  gqa_repeats = H_V // H_QK
+  q_size = H_QK * K
+  k_size = H_QK * K
+  v_size = H_V * V
+  BT = chunk_size
+
+  qkv_raw = None
+  qkv_conv = None
+  if qkv is not None or conv_weight is not None:
+    if qkv is not None:
+      B, T, _ = qkv.shape
+      act_dtype = qkv.dtype
+      qkv_in = qkv
+    else:
+      assert query is not None and key is not None and value is not None
+      B, T, _, _ = query.shape
+      act_dtype = query.dtype
+      qkv_in = jnp.concatenate(
+          [
+              query.reshape(B, T, q_size),
+              key.reshape(B, T, k_size),
+              value.reshape(B, T, v_size),
+          ],
+          axis=-1,
+      )
+    if conv_weight is not None:
+      qkv_raw = qkv_in if return_residuals else None
+      qkv_conv = causal_conv1d_silu_fwd_bt(
+          qkv_in, conv_weight, conv_bias, segment_ids=segment_ids
+      )
+    else:
+      qkv_conv = qkv_in
+  else:
+    assert query is not None and key is not None and value is not None
+    B, T, _, _ = query.shape
+    act_dtype = query.dtype
+
+  interpret = get_interpret()
+  can_native_qkv = (
+      K % 128 == 0 and V % 128 == 0 and BT % 8 == 0 and not interpret
+  )
+  can_native_out = V % 128 == 0 and BT % 8 == 0 and not interpret
+
+  if qkv_conv is not None and can_native_qkv:
+    q_intra = k_intra = v_intra = None
+    qkv_conv_intra = qkv_conv
+    native_bt_qkv = False
+  elif qkv_conv is None and can_native_qkv:
+    q_intra, k_intra, v_intra = query, key, value
+    qkv_conv_intra = None
+    native_bt_qkv = True
+  elif qkv_conv is not None:
+    q_intra = (
+        qkv_conv[:, :, :q_size].reshape(B, T, H_QK, K).transpose(2, 0, 1, 3)
+    )
+    k_intra = (
+        qkv_conv[:, :, q_size : q_size + k_size]
+        .reshape(B, T, H_QK, K)
+        .transpose(2, 0, 1, 3)
+    )
+    v_intra = (
+        qkv_conv[:, :, q_size + k_size :]
+        .reshape(B, T, H_V, V)
+        .transpose(2, 0, 1, 3)
+    )
+    qkv_conv_intra = None
+    native_bt_qkv = False
+  else:
+    assert query is not None and key is not None and value is not None
+    q_intra = query.transpose(2, 0, 1, 3)
+    k_intra = key.transpose(2, 0, 1, 3)
+    v_intra = value.transpose(2, 0, 1, 3)
+    qkv_conv_intra = None
+    native_bt_qkv = False
+
+  g_hbt = gate.transpose(2, 0, 1)[..., None]
+  beta_hbt = beta.transpose(2, 0, 1)
+  if use_beta_sigmoid_in_kernel:
+    beta_act = jax.nn.sigmoid(beta_hbt.astype(jnp.float32))
+  else:
+    beta_act = beta_hbt
+
+  need_q_from_intra = use_qk_l2norm or qkv_conv_intra is not None or native_bt_qkv
+  (
+      w,
+      u,
+      kg,
+      Aqk,
+      Akk,
+      g_cumsum,
+      q_stage34,
+      _,
+      _,
+      _,
+      _,
+  ) = kda_fwd_intra_fused(
+      q=q_intra,
+      k=k_intra,
+      v=v_intra,
+      g=g_hbt,
+      beta=beta_act,
+      scale=scale,
+      chunk_size=BT,
+      safe_gate=safe_gate,
+      per_channel_gate=False,
+      disable_recompute=save_for_backward,
+      cumsum_scale=RCP_LN2,
+      a_log=a_log,
+      delta_time_bias=delta_time_bias,
+      use_gate_in_kernel=use_gate_in_kernel,
+      lower_bound=None,
+      use_conv1d_in_kernel=False,
+      use_qk_l2norm=use_qk_l2norm,
+      return_conv_intermediates=False,
+      mini_batch=mini_batch,
+      qkv_conv=qkv_conv_intra,
+      num_k_heads=H_QK,
+      head_k_dim=K,
+      head_v_dim=V,
+      native_bt_qkv=native_bt_qkv,
+      write_q_norm=need_q_from_intra,
+  )
+  if not need_q_from_intra:
+    q_stage34 = q_intra
+  assert q_stage34 is not None
+
+  stage34_cu_seqlens = jnp.broadcast_to(
+      jnp.asarray([0, T], dtype=jnp.int32), (B, 2)
+  )
+  block_ids = jnp.arange(T // BT, dtype=jnp.int32)
+  fixed_chunk_indices = jnp.stack(
+      [jnp.zeros_like(block_ids), block_ids], axis=-1
+  )
+  stage34_chunk_indices = jnp.broadcast_to(
+      fixed_chunk_indices[None, :, :], (B, T // BT, 2)
+  )
+  stage34_initial_state = (
+      initial_state[:, None, ...] if initial_state is not None else None
+  )
+
+  o_raw, final_state, h, _ = chunk_kda_fwd_h_o_varlen(
+      w=w,
+      u=u,
+      kg=kg,
+      gk=g_cumsum,
+      q=q_stage34,
+      A=Aqk,
+      cu_seqlens=stage34_cu_seqlens,
+      chunk_indices=stage34_chunk_indices,
+      initial_state=stage34_initial_state,
+      output_final_state=output_final_state,
+      scale=scale,
+      chunk_size=BT,
+      store_h=save_for_backward,
+      store_v_new=False,
+      mini_batch=mini_batch,
+      native_out_layout=can_native_out,
+  )
+  if final_state is not None:
+    final_state = final_state[:, 0]
+
+  out_bt = (
+      o_raw.astype(act_dtype)
+      if can_native_out
+      else o_raw.transpose(1, 2, 0, 3).astype(act_dtype)
+  )
+  output = (out_bt, final_state)
+  if not return_residuals:
+    return output, None
+
+  save_split_qkv = save_for_backward and qkv_conv is None
+  if not save_for_backward:
+    qkv_conv = None
+    qkv_raw = None
+    g_cumsum = None
+    Akk = None
+    h = None
+  residuals = GdnResiduals(
+      qkv_conv=qkv_conv,
+      q=query if save_split_qkv else None,
+      k=key if save_split_qkv else None,
+      v=value if save_split_qkv else None,
+      beta=beta_act,
+      g_cumsum=g_cumsum,
+      akk=Akk,
+      h=h,
+      initial_state=initial_state,
+      g_org=g_hbt if use_gate_in_kernel else None,
+      a_log=a_log,
+      delta_time_bias=delta_time_bias,
+      qkv_raw=qkv_raw,
+      conv_weight=conv_weight,
+      conv_bias=conv_bias,
+      segment_ids=segment_ids,
+      g_dtype_marker=jnp.zeros((), dtype=gate.dtype),
+      chunk_size=BT,
+      beta_dtype=jnp.dtype(beta.dtype).name,
   )
   return output, residuals

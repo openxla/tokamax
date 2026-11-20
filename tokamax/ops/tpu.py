@@ -29,7 +29,9 @@ from tokamax._src.ops.dsv4_compressor.pallas_mosaic_tpu import Config as Dsv4Com
 from tokamax._src.ops.dsv4_compressor.pallas_mosaic_tpu import PallasTpuDsv4Compressor as Dsv4Compressor
 from tokamax._src.ops.grouped_lowrank_proj.pallas_mosaic_tpu import Config as GroupedLowrankProjConfig
 from tokamax._src.ops.grouped_lowrank_proj.pallas_mosaic_tpu import PallasTpuGroupedLowrankProj as GroupedLowrankProj
+from tokamax._src.ops.kda.pallas_mosaic_tpu import Config as GatedDeltaNetConfig
 from tokamax._src.ops.kda.pallas_mosaic_tpu import Config as KimiDeltaAttentionConfig
+from tokamax._src.ops.kda.pallas_mosaic_tpu import PallasMosaicTpuGatedDeltaNet as GatedDeltaNet
 from tokamax._src.ops.kda.pallas_mosaic_tpu import PallasMosaicTpuKimiDeltaAttention as KimiDeltaAttention
 from tokamax._src.ops.lightning_indexer.pallas_mosaic_tpu import Config as LightningIndexerConfig
 from tokamax._src.ops.lightning_indexer.pallas_mosaic_tpu import PallasTpuLightningIndexer as LightningIndexer
@@ -76,6 +78,8 @@ __all__ = (
     "Dsv4CompressorConfig",
     "FlashAttention",
     "FlashAttentionConfig",
+    "GatedDeltaNet",
+    "GatedDeltaNetConfig",
     "GroupedLowrankProj",
     "GroupedLowrankProjConfig",
     "KimiDeltaAttention",

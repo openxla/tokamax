@@ -148,7 +148,7 @@ table.ops-table code {
       <td>TPU</td>
       <td align="center" style="text-align: center;"></td>
       <td align="center" style="text-align: center;">✅</td>
-      <td>Computes <a href="https://arxiv.org/abs/2510.26692">Kimi Delta Attention (KDA)</a> (<code>kimi_delta_attention</code>), a linear attention mechanism with delta-rule state updates used in Kimi Linear.</td>
+      <td>Computes <a href="https://arxiv.org/abs/2510.26692">Kimi Delta Attention (KDA)</a> (<code>kimi_delta_attention</code>) and token-major grouped-query <a href="https://arxiv.org/abs/2412.06464">Gated DeltaNet (GDN)</a> (<code>gated_delta_net</code>) linear attention with delta-rule state updates used in Kimi Linear and Qwen 3.5.</td>
     </tr>
     <tr>
       <td colspan="2"><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/flex_attention"><code>flex_attention</code></a> (experimental)</td>

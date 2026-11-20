@@ -72,7 +72,12 @@ def cdiv(x, y: int):
 
 def l2norm_fwd(x: jax.Array, eps: float = 1e-6):
   x_f = x.astype(jnp.float32)
-  rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1) + eps)
+  norm_sq = jnp.sum(x_f * x_f, axis=-1)
+  rstd = jnp.where(
+      norm_sq == 0.0,
+      0.0,
+      jax.lax.rsqrt(jnp.where(norm_sq == 0.0, 1.0, norm_sq) + eps),
+  )
   return (x_f * rstd[..., None]).astype(x.dtype), rstd.astype(jnp.float32)
 
 
@@ -83,6 +88,107 @@ def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
   dot_dy_y = jnp.sum(dy_f * y_f, axis=-1)
   dx = dy_f * rstd_f[..., None] - dot_dy_y[..., None] * y_f * rstd_f[..., None]
   return dx.astype(y.dtype)
+
+
+def causal_conv1d_silu_fwd_bt(
+    x: jax.Array,
+    weight: jax.Array,
+    bias: jax.Array | None = None,
+    segment_ids: jax.Array | None = None,
+) -> jax.Array:
+  """Applies token-major `[B, T, C]` depthwise causal conv1d + SiLU."""
+  w_len = weight.shape[0]
+  t_len = x.shape[1]
+  x_pad = jnp.pad(x, ((0, 0), (w_len - 1, 0), (0, 0))) if w_len > 1 else x
+  w_f32 = weight.astype(jnp.float32)
+  acc = x.astype(jnp.float32) * w_f32[w_len - 1 : w_len, :][None, :, :]
+  for lag in range(1, min(w_len, t_len)):
+    start = w_len - 1 - lag
+    x_lag_f32 = x_pad[:, start : start + t_len, :].astype(jnp.float32)
+    if segment_ids is not None:
+      same_seg = (segment_ids[:, lag:] == segment_ids[:, :-lag]) & (
+          segment_ids[:, lag:] > 0
+      )
+      same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
+      x_lag_f32 = jnp.where(same_seg[:, :, None], x_lag_f32, 0.0)
+    acc = acc + x_lag_f32 * w_f32[start : start + 1, :][None, :, :]
+  if bias is not None:
+    acc = acc + bias.astype(jnp.float32)[None, None, :]
+  out = jax.nn.silu(acc)
+  if segment_ids is not None:
+    out = jnp.where((segment_ids > 0)[:, :, None], out, 0.0)
+  return out.astype(x.dtype)
+
+
+def causal_conv1d_silu_bwd_bt(
+    x: jax.Array,
+    weight: jax.Array,
+    bias: jax.Array | None,
+    dy: jax.Array,
+    segment_ids: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+  """Analytical VJP of `causal_conv1d_silu_fwd_bt` on `[B, T, C]`."""
+  w_len = weight.shape[0]
+  t_len = x.shape[1]
+  x_pad = jnp.pad(x, ((0, 0), (w_len - 1, 0), (0, 0))) if w_len > 1 else x
+  w_f32 = weight.astype(jnp.float32)
+  dy_f32 = dy.astype(jnp.float32)
+  if segment_ids is not None:
+    valid = (segment_ids > 0)[:, :, None]
+    dy_f32 = jnp.where(valid, dy_f32, 0.0)
+
+  acc = x.astype(jnp.float32) * w_f32[w_len - 1 : w_len, :][None, :, :]
+  for lag in range(1, min(w_len, t_len)):
+    start = w_len - 1 - lag
+    x_lag_f32 = x_pad[:, start : start + t_len, :].astype(jnp.float32)
+    if segment_ids is not None:
+      same_seg = (segment_ids[:, lag:] == segment_ids[:, :-lag]) & (
+          segment_ids[:, lag:] > 0
+      )
+      same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
+      x_lag_f32 = jnp.where(same_seg[:, :, None], x_lag_f32, 0.0)
+    acc = acc + x_lag_f32 * w_f32[start : start + 1, :][None, :, :]
+  if bias is not None:
+    acc = acc + bias.astype(jnp.float32)[None, None, :]
+
+  sig = jax.nn.sigmoid(acc)
+  dsilu = sig * (1.0 + acc * (1.0 - sig))
+  dacc = dy_f32 * dsilu
+  if segment_ids is not None:
+    dacc = jnp.where((segment_ids > 0)[:, :, None], dacc, 0.0)
+
+  dx = dacc * w_f32[w_len - 1 : w_len, :][None, :, :]
+  dw_rev: list[jax.Array] = [jnp.sum(dacc * x.astype(jnp.float32), axis=(0, 1))]
+  for lag in range(1, w_len):
+    if lag >= t_len:
+      dw_rev.append(jnp.zeros((x.shape[-1],), dtype=jnp.float32))
+      continue
+    tap_idx = w_len - 1 - lag
+    x_lag_f32 = x_pad[:, tap_idx : tap_idx + t_len, :].astype(jnp.float32)
+    if segment_ids is not None:
+      same_seg = (segment_ids[:, lag:] == segment_ids[:, :-lag]) & (
+          segment_ids[:, lag:] > 0
+      )
+      same_seg = jnp.pad(same_seg, ((0, 0), (lag, 0)))
+      x_lag_f32 = jnp.where(same_seg[:, :, None], x_lag_f32, 0.0)
+    dw_rev.append(jnp.sum(dacc * x_lag_f32, axis=(0, 1)))
+    dacc_lead = jnp.pad(dacc[:, lag:, :], ((0, 0), (0, lag), (0, 0)))
+    if segment_ids is not None:
+      same_seg_lead = (segment_ids[:, lag:] == segment_ids[:, :-lag]) & (
+          segment_ids[:, lag:] > 0
+      )
+      same_seg_lead = jnp.pad(same_seg_lead, ((0, 0), (0, lag)))
+      dacc_lead = jnp.where(same_seg_lead[:, :, None], dacc_lead, 0.0)
+    dx = dx + dacc_lead * w_f32[tap_idx : tap_idx + 1, :][None, :, :]
+
+  dw = jnp.stack(list(reversed(dw_rev)), axis=0).astype(weight.dtype)
+  db = (
+      jnp.sum(dacc, axis=(0, 1)).astype(bias.dtype)
+      if bias is not None
+      else None
+  )
+  return dx.astype(x.dtype), dw, db
+
 
 def derive_context_parallel_metadata(
     *,
@@ -510,21 +616,21 @@ def chunk_local_cumsum_vector(
 
 @jaxtyping.jaxtyped
 def kda_gate_chunk_cumsum(
-    g: Float[Array, "H B T K"],
+    g: Float[Array, "H B T GW"],
     a_log: Float[Array, "H"],
     chunk_size: int,
     scale: float | None = None,
-    delta_time_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*GW"] | None = None,
     output_dtype: jax.typing.DTypeLike = jnp.float32,
     lower_bound: float | None = None,
     valid_mask: Bool[Array, "B T"] | None = None,
-) -> Float[Array, "H B T K"]:
+) -> Float[Array, "H B T GW"]:
   """Applies the KDA gate activation and its chunk-local cumulative sum."""
-  h, _, _, k = g.shape
+  h, _, _, gw = g.shape
   g_f32 = g.astype(jnp.float32)
 
   if delta_time_bias is not None:
-    g_f32 = g_f32 + delta_time_bias.astype(jnp.float32).reshape(h, 1, 1, k)
+    g_f32 = g_f32 + delta_time_bias.astype(jnp.float32).reshape(h, 1, 1, gw)
 
   a = a_log.astype(jnp.float32)
 

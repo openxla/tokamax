@@ -126,7 +126,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       beta: Float[Array, "H B T"],
       *,
       a_log: Float[Array, "H"] | None,
-      delta_time_bias: Float[Array, "H*K"] | None,
+      delta_time_bias: Float[Array, "H*GW"] | None,
       scale: float,
       initial_state: Float[Array, "B N H K V"] | None,
       output_final_state: bool,
@@ -138,6 +138,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
+      residual_checkpoint_name: str | None = None,
       return_residuals: bool,
       conv_weight_q: Float[Array, "H_Q W K"] | None = None,
       conv_weight_k: Float[Array, "H_K W K"] | None = None,
@@ -148,7 +149,7 @@ class XlaChunkedKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
       use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[base.Output, None]:
-    del return_residuals
+    del return_residuals, residual_checkpoint_name
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -233,6 +234,7 @@ class XlaChunkedKimiDeltaAttentionVjp(
       lower_bound: float | None,
       context_parallel_metadata: ContextParallelMetadataArg,
       max_num_segments: int | None,
+      residual_checkpoint_name: str | None = None,
       return_residuals: bool,
       conv_weight_q: jax.Array | None = None,
       conv_weight_k: jax.Array | None = None,
@@ -243,7 +245,7 @@ class XlaChunkedKimiDeltaAttentionVjp(
       use_conv1d_in_kernel: bool = False,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
-    del residuals, out, return_residuals
+    del residuals, out, return_residuals, residual_checkpoint_name
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,

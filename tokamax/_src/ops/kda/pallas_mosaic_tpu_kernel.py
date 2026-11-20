@@ -15,9 +15,11 @@
 """Low-level Pallas/Mosaic TPU kernels for Kimi Delta Attention."""
 
 from tokamax._src.ops.kda.pallas_mosaic_tpu_bwd_kernel import (
+    chunk_gdn_bwd_custom,
     chunk_kda_bwd_custom,
 )
 from tokamax._src.ops.kda.pallas_mosaic_tpu_fwd_kernel import (
+    chunk_gdn_fwd_custom,
     chunk_kda_fwd_custom,
 )
 
@@ -31,6 +33,8 @@ from tokamax._src.ops.kda.pallas_mosaic_tpu_fwd_kernel import (
 #   # Inputs. / # Outputs. / # Scratch.
 
 __all__ = [
+    "chunk_gdn_bwd_custom",
+    "chunk_gdn_fwd_custom",
     "chunk_kda_bwd_custom",
     "chunk_kda_fwd_custom",
 ]

@@ -25,6 +25,7 @@ from tokamax._src.ops.deepseek_rope.api import deepseek_rope as deepseek_rope
 from tokamax._src.ops.dsv4_compressor.api import dsv4_compressor as dsv4_compressor
 from tokamax._src.ops.gated_linear_unit.api import gated_linear_unit as gated_linear_unit
 from tokamax._src.ops.grouped_lowrank_proj.api import grouped_lowrank_proj as grouped_lowrank_proj
+from tokamax._src.ops.kda.api import gated_delta_net as gated_delta_net
 from tokamax._src.ops.kda.api import kimi_delta_attention as kimi_delta_attention
 from tokamax._src.ops.linear_softmax_cross_entropy_loss.api import linear_softmax_cross_entropy_loss as linear_softmax_cross_entropy_loss
 from tokamax._src.ops.masked_dense_mla.api import masked_dense_mla as masked_dense_mla
@@ -62,6 +63,7 @@ __all__ = (
     "dot_product_attention",
     "dsv4_compressor",
     "experimental",
+    "gated_delta_net",
     "gated_linear_unit",
     "gpu",
     "grouped_lowrank_proj",

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from functools import partial
@@ -42,11 +43,15 @@ from tokamax._src.ops.kda.cp_utils import (
     _merge_dht,
     all_gather_into_tensor,
 )
-from tokamax._src.ops.kda.pallas_mosaic_tpu_types import KdaResiduals
+from tokamax._src.ops.kda.pallas_mosaic_tpu_types import (
+    GdnResiduals,
+    KdaResiduals,
+)
 from tokamax._src.ops.kda.utils import (
     _align_seqs,
     _unalign_output,
     align_up,
+    causal_conv1d_silu_bwd_bt,
     cdiv,
     exp,
     exp2,
@@ -396,46 +401,46 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
 
 @jaxtyping.jaxtyped
 def kda_gate_bwd(
-  g: Float[Array, "H B T K"],
+  g: Float[Array, "H B T GW"],
   a_log: Float[Array, "H"],
   *,
-  dyg: Float[Array, "H B T K"],
-  delta_time_bias: Float[Array, "H*K"] | None = None,
+  dyg: Float[Array, "H B T GW"],
+  delta_time_bias: Float[Array, "H*GW"] | None = None,
   lower_bound: float | None = None,
 ) -> tuple[
-    Float[Array, "H B T K"],
+    Float[Array, "H B T GW"],
     Float[Array, "H"],
-    Float[Array, "H*K"] | None,
+    Float[Array, "H*GW"] | None,
 ]:
   """Differentiates the KDA gate with respect to g, a_log, and delta_time_bias.
 
   The standard path differentiates `-exp(a_log) * softplus(g + bias)`; the
   lower-bound path differentiates the sigmoid form.
   """
-  H, K = g.shape[0], g.shape[-1]
+  H, GW = g.shape[0], g.shape[-1]
 
   g_f = g.astype(jnp.float32)
   dyg_f = dyg.astype(jnp.float32)
 
   # Apply bias if present
   if delta_time_bias is not None:
-    g_f = g_f + delta_time_bias.reshape(H, 1, 1, K).astype(jnp.float32)
+    g_f = g_f + delta_time_bias.reshape(H, 1, 1, GW).astype(jnp.float32)
 
   if lower_bound is None:
     # Forward: yg = -exp(a_log) * softplus(g + bias)
     # softplus(x) = log(1 + exp(x)), d/dx softplus(x) = sigmoid(x)
     b_A = -jnp.exp(a_log.astype(jnp.float32))  # [H]
-    b_yg = b_A.reshape(H, 1, 1, 1) * jax.nn.softplus(g_f)  # [H, B, T, K]
-    dg_f = b_A.reshape(H, 1, 1, 1) * (dyg_f * jax.nn.sigmoid(g_f))  # [H, B, T, K]
-    dA_per_elem = dyg_f * b_yg  # [H, B, T, K]
+    b_yg = b_A.reshape(H, 1, 1, 1) * jax.nn.softplus(g_f)  # [H, B, T, GW]
+    dg_f = b_A.reshape(H, 1, 1, 1) * (dyg_f * jax.nn.sigmoid(g_f))  # [H, B, T, GW]
+    dA_per_elem = dyg_f * b_yg  # [H, B, T, GW]
   else:
     # Forward: yg = lower_bound * sigmoid(exp(a_log) * g)
     b_A = jnp.exp(a_log.astype(jnp.float32))  # [H]
-    b_inner = b_A.reshape(H, 1, 1, 1) * g_f  # [H, B, T, K]
+    b_inner = b_A.reshape(H, 1, 1, 1) * g_f  # [H, B, T, GW]
     b_sig = jax.nn.sigmoid(b_inner)
     b_dsig = b_sig * (1.0 - b_sig)
-    dg_f = dyg_f * (lower_bound * b_dsig) * b_A.reshape(H, 1, 1, 1)  # [H, B, T, K]
-    dA_per_elem = dg_f * g_f  # [H, B, T, K]
+    dg_f = dyg_f * (lower_bound * b_dsig) * b_A.reshape(H, 1, 1, 1)  # [H, B, T, GW]
+    dA_per_elem = dg_f * g_f  # [H, B, T, GW]
 
   # dA: reduce over all dims except H (axis 0) → [H]
   reduce_axes = (1, 2, 3)
@@ -445,9 +450,9 @@ def kda_gate_bwd(
   # Cast dg back to input dtype
   dg = dg_f.astype(g.dtype)
 
-  # dbias: sum dg over B, T (axes 1, 2) → [H, K] → [H*K]
+  # dbias: sum dg over B, T (axes 1, 2) → [H, GW] → [H*GW]
   if delta_time_bias is not None:
-    dbias = jnp.sum(dg_f, axis=(1, 2)).reshape(-1)  # [H*K]
+    dbias = jnp.sum(dg_f, axis=(1, 2)).reshape(-1)  # [H*GW]
     dbias = dbias.astype(delta_time_bias.dtype)
   else:
     dbias = None
@@ -1253,8 +1258,16 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   if use_qk_l2norm_in_kernel:
     q_sq = jnp.sum(bq_raw * bq_raw, axis=-1, keepdims=True)
     k_sq = jnp.sum(bk_raw * bk_raw, axis=-1, keepdims=True)
-    brstd_q = jax.lax.rsqrt(q_sq + 1e-6)
-    brstd_k = jax.lax.rsqrt(k_sq + 1e-6)
+    brstd_q = jnp.where(
+        q_sq == 0.0,
+        0.0,
+        jax.lax.rsqrt(jnp.where(q_sq == 0.0, 1.0, q_sq) + 1e-6),
+    )
+    brstd_k = jnp.where(
+        k_sq == 0.0,
+        0.0,
+        jax.lax.rsqrt(jnp.where(k_sq == 0.0, 1.0, k_sq) + 1e-6),
+    )
     bq_unit = bq_raw * brstd_q
     bk_unit = bk_raw * brstd_k
     bq_k = bq_unit.astype(q_ref.dtype).astype(jnp.float32)
@@ -1555,6 +1568,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
         "gqa_repeats",
         "dqkv_dtype",
         "native_state_layout",
+        "native_bt_qkv",
         "use_qk_l2norm_in_kernel",
         "g_is_cumsummed",
     ],
@@ -1565,9 +1579,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     # When `qkv_conv` is passed, `q`, `k`, and `v` may be None and the kernel
     # reads `qkv_conv [B, T, 2*H_QK*K + H*V]` and `do [B, T, H, V]` in place
     # and writes `dy_conv [B, T, 2*H_QK*K + H*V]` directly.
-    q: Float[Array, "H_QK B T K"] | None,
-    k: Float[Array, "H_QK B T K"] | None,
-    v: Float[Array, "H B T V"] | None,
+    q: Float[Array, "..."] | None,
+    k: Float[Array, "..."] | None,
+    v: Float[Array, "..."] | None,
     v_new: Float[Array, "H B T V"] | None,
     qg: Float[Array, "H B T K"] | None,
     kg: Float[Array, "H B T K"] | None,
@@ -1597,13 +1611,14 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     rstd_k: Float[Array, "H_QK B T ..."] | None = None,
     dqkv_dtype=None,
     native_state_layout: bool = False,
+    native_bt_qkv: bool = False,
     qkv_conv: Float[Array, "B T C"] | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     g_is_cumsummed: bool = False,
 ) -> tuple[
     Float[Array, "..."],
-    Float[Array, "H_QK B T K"] | None,
-    Float[Array, "H B T V"] | None,
+    Float[Array, "..."] | None,
+    Float[Array, "..."] | None,
     Float[Array, "H B T"],
     Float[Array, "H B T GW"],
     Float[Array, "B N_OUT H K V"] | None,
@@ -1627,8 +1642,11 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # head count. H below is always the value head count.
   *_, K, V = h.shape
   H, _, _, GW = g.shape
-  native_qkv_do_layout = qkv_conv is not None
-  if native_qkv_do_layout:
+  native_aliased_qkv = qkv_conv is not None
+  native_qkv_do_layout = native_aliased_qkv or native_bt_qkv
+  if native_aliased_qkv:
+    if native_bt_qkv:
+      raise ValueError("native_bt_qkv must be False when qkv_conv is provided.")
     if q is not None or k is not None or v is not None:
       raise ValueError("q, k, and v must be None when qkv_conv is provided.")
     B, T, C = qkv_conv.shape
@@ -1641,7 +1659,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       raise ValueError(
           "q, k, and v must all be provided when qkv_conv is None."
       )
-    H_QK, B, T, K = q.shape
+    if native_bt_qkv:
+      B, T, H_QK, K = q.shape
+    else:
+      H_QK, B, T, K = q.shape
     H = H_QK * gqa_repeats
     V = v.shape[-1]
     C = 2 * H_QK * K + H * V
@@ -1652,15 +1673,15 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   k_size = H_QK * K
   v_size = H * V
   if native_qkv_do_layout:
-    if C != q_size + k_size + v_size:
+    if native_aliased_qkv and C != q_size + k_size + v_size:
       raise ValueError(f"qkv_conv.shape[-1]={C} != {q_size + k_size + v_size}.")
     if K % 128 != 0 or V % 128 != 0:
       raise NotImplementedError(
-          f"native qkv_conv layout requires K={K}, V={V} multiples of 128."
+          f"native qkv layout requires K={K}, V={V} multiples of 128."
       )
     if BT % 8 != 0:
       raise NotImplementedError(
-          f"native qkv_conv layout requires chunk_size={BT} divisible by 8."
+          f"native qkv layout requires chunk_size={BT} divisible by 8."
       )
     if do.shape not in ((B, T, H, V), (B, T, v_size)):
       raise ValueError(
@@ -1797,11 +1818,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
 
   # Keep [H, B, ...] layout; reshape T → (NT, BT) only. No transpose.
   # B is an independent dimension handled by a separate grid axis.
-  if native_qkv_do_layout:
+  if native_aliased_qkv:
     q_r = qkv_conv
     k_r = qkv_conv
     v_r = qkv_conv
     do_r = do.reshape(B, T, H * V)
+  elif native_bt_qkv:
+    assert q is not None and k is not None and v is not None
+    q_r = q.reshape(B, T, q_size)
+    k_r = k.reshape(B, T, k_size)
+    v_r = v.reshape(B, T, v_size)
+    do_r = do.reshape(B, T, v_size)
   else:
     assert q is not None and k is not None and v is not None
     q_r = q.reshape(H_QK, B, NT, BT, K)
@@ -1854,9 +1881,9 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   interpret = get_interpret()
   if native_qkv_do_layout and interpret:
     raise NotImplementedError(
-        "native qkv_conv layout does not support Pallas interpret mode"
+        "native qkv layout does not support Pallas interpret mode"
     )
-  if native_qkv_do_layout:
+  if native_aliased_qkv:
     tile_q = MB_QK * K
     tile_k = MB_QK * K
     tile_v = MB * V
@@ -1883,6 +1910,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     do_spec = pl.BlockSpec(
         (1, BT, tile_v), lambda hg, b, c, _: (b, NT - 1 - c, hg)
     )
+  elif native_bt_qkv:
+    tile_q = MB_QK * K
+    tile_v = MB * V
+    q_spec = pl.BlockSpec(
+        (1, BT, tile_q), lambda hg, b, c, _: (b, NT - 1 - c, hg)
+    )
+    k_spec = q_spec
+    v_spec = pl.BlockSpec(
+        (1, BT, tile_v), lambda hg, b, c, _: (b, NT - 1 - c, hg)
+    )
+    do_spec = v_spec
   else:
     q_spec = pl.BlockSpec((MB_QK, 1, 1, BT, K), index_map=idx_chunk)
     k_spec = q_spec
@@ -1949,9 +1987,17 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       if scalar_gate
       else jax.ShapeDtypeStruct((H, B, NT, BT, GW), jnp.float32)
   )
-  if native_qkv_do_layout:
+  if native_aliased_qkv:
     out_shape = [
         jax.ShapeDtypeStruct((B, T, C), dqkv_out_dtype),
+        b_out_shape,
+        g_out_shape,
+    ]
+  elif native_bt_qkv:
+    out_shape = [
+        jax.ShapeDtypeStruct((B, T, q_size), dqkv_out_dtype),
+        jax.ShapeDtypeStruct((B, T, k_size), dqkv_out_dtype),
+        jax.ShapeDtypeStruct((B, T, v_size), dqkv_out_dtype),
         b_out_shape,
         g_out_shape,
     ]
@@ -2012,9 +2058,10 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   # the kernel body as None.
   present = [x is not None for x in inputs]
   in_specs = [s for s, p in zip(in_specs, present) if p]
-  if native_qkv_do_layout:
+  if native_aliased_qkv:
     # Pass qkv_conv once as an HBM operand; pipeline_kernel expands it to 3
     # refs.
+    assert qkv_conv is not None
     hbm_inputs = [qkv_conv] + [x for x in inputs[3:] if x is not None]
   else:
     hbm_inputs = [x for x in inputs if x is not None]
@@ -2040,7 +2087,7 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
     in_hbm_refs = refs[:num_hbm_in]
     out_hbm_refs = refs[num_hbm_in : num_hbm_in + num_hbm_out]
     scratch_vmem_refs = refs[num_hbm_in + num_hbm_out :]
-    if native_qkv_do_layout:
+    if native_aliased_qkv:
       pipe_in_refs = (
           in_hbm_refs[0],
           in_hbm_refs[0],
@@ -2071,20 +2118,52 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
           *block_vmem_refs[num_pipe_in + num_pipe_out :],
       )
 
-    pltpu.emit_pipeline(
-        body,
-        grid=(H // MB, B, NT),
-        in_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in in_specs],
-        out_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in out_specs],
-        _explicit_indices=True,
-    )(*pipe_in_refs, *pipe_out_refs, scratches=tuple(scratch_vmem_refs))
+    if interpret and not pltpu.is_tpu_device():
+      prev_mesh = jax.sharding.get_abstract_mesh()
+      tpu_ctx = jax.sharding.use_abstract_mesh(
+          jax.sharding.AbstractMesh(
+              prev_mesh.axis_sizes,
+              prev_mesh.axis_names,
+              prev_mesh.axis_types,
+              abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+          )
+      )
+    else:
+      tpu_ctx = contextlib.nullcontext()
+    with tpu_ctx:
+      pltpu.emit_pipeline(
+          body,
+          grid=(H // MB, B, NT),
+          in_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in in_specs],
+          out_specs=[bind_seg_ids(s, seg_ids_smem_ref) for s in out_specs],
+          _explicit_indices=True,
+      )(*pipe_in_refs, *pipe_out_refs, scratches=tuple(scratch_vmem_refs))
 
   # Operands stay in HBM. Inside a single kernel invocation, emit_pipeline
   # walks the (head group, batch, reversed chunk) grid and pipelines the block
   # copies. Chunks run in order: `dh_tmp` carries dh from one chunk to the
   # previous one.
   hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-  pallas_args = [chunk_seg_ids, *hbm_inputs] if is_varlen else hbm_inputs
+  pallas_args = (
+      [chunk_seg_ids, *hbm_inputs]
+      if chunk_seg_ids is not None
+      else hbm_inputs
+  )
+  total_bwd_chunks = H * B * NT
+  bwd_flops_per_chunk = (
+      12 * BT * K * V + 8 * BT * BT * K + 6 * BT * BT * V
+  )
+  bwd_transcendentals_per_chunk = (
+      4 * BT * K if per_channel_gate else (BT * BT + 3 * BT)
+  )
+  bwd_bytes = sum(
+      int(x.size) * jnp.dtype(x.dtype).itemsize for x in pallas_args
+  ) + sum(int(s.size) * jnp.dtype(s.dtype).itemsize for s in out_shape)
+  bwd_cost_estimate = pl.CostEstimate(
+      flops=total_bwd_chunks * bwd_flops_per_chunk,
+      transcendentals=total_bwd_chunks * bwd_transcendentals_per_chunk,
+      bytes_accessed=bwd_bytes,
+  )
   pallas_out = pl.pallas_call(
       pipeline_kernel,
       out_shape=out_shape,
@@ -2097,13 +2176,16 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
       ),
       compiler_params=pltpu.CompilerParams(
           disable_bounds_checks=True,
-          vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
+          vmem_limit_bytes=(
+              None if interpret else get_tpu_limits().vmem_limit_bytes
+          ),
       ),
+      cost_estimate=bwd_cost_estimate,
       interpret=interpret,
       name="_fused_dhu_wy_intra_cumsum_pallas_jit",
   )(*pallas_args)
 
-  if native_qkv_do_layout:
+  if native_aliased_qkv:
     if return_dh0:
       dy_conv_r, db_r, dg_r, dh0_r = pallas_out
       dh0_out = dh0_r.transpose(1, 2, 0, 3, 4)
@@ -2125,6 +2207,15 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
   else:
     dq_r, dk_r, dv_r, db_r, dg_r = pallas_out
     dh0_out = None
+  if native_bt_qkv:
+    return (
+        dq_r.reshape(B, T, H_QK, K),
+        dk_r.reshape(B, T, H_QK, K),
+        dv_r.reshape(B, T, H, V),
+        db_r.reshape(H, B, T),
+        dg_r.reshape(H, B, T, GW),
+        dh0_out,
+    )
   return (
       dq_r.reshape(H_QK, B, T, K),
       dk_r.reshape(H_QK, B, T, K),
@@ -2312,7 +2403,16 @@ def chunk_kda_bwd_dAv_kernel(
     compiler_params=pltpu.CompilerParams(
       dimension_semantics=("parallel",),
       disable_bounds_checks=True,
-      vmem_limit_bytes=get_tpu_limits().vmem_limit_bytes,
+      vmem_limit_bytes=None if interpret else get_tpu_limits().vmem_limit_bytes,
+    ),
+    cost_estimate=pl.CostEstimate(
+      flops=4 * total * BT * BT * V,
+      transcendentals=0,
+      bytes_accessed=(
+          (int(v_r.size) + int(A_r.size) + int(do_r.size))
+          * jnp.dtype(v_r.dtype).itemsize
+          + total * (BT * BT + BT * V) * 4
+      ),
     ),
     interpret=interpret,
   )(v_r, A_r, do_r)
@@ -2345,7 +2445,7 @@ def _conv1d_silu_bwd(
     x_f32 = x_in.astype(jnp.float32)
     w_f32 = w_in.astype(jnp.float32)
     acc = x_f32 * w_f32[:, None, W - 1 : W, :]
-    for lag in range(1, W):
+    for lag in range(1, min(W, x_in.shape[2])):
       x_lag = jnp.pad(x_f32[:, :, :-lag, :], ((0, 0), (0, 0), (lag, 0), (0, 0)))
       if aligned_segment_ids is not None:
         same_seg = (
@@ -2422,7 +2522,7 @@ def chunk_kda_bwd_custom(
     Float[Array, "H B T_ORIG GW"],
     Float[Array, "H B T_ORIG"],
     Float[Array, "H"] | None,
-    Float[Array, "H*K"] | None,
+    Float[Array, "H*GW"] | None,
     Float[Array, "B N H K V"] | None,
     None,
     Float[Array, "H_Q W K"] | None,
@@ -2869,4 +2969,269 @@ def chunk_kda_bwd_custom(
       db_q,
       db_k,
       db_v,
+  )
+
+
+def chunk_gdn_bwd_custom(
+    scale: float,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    use_qk_l2norm: bool,
+    use_gate_in_kernel: bool,
+    use_beta_sigmoid_in_kernel: bool,
+    chunk_size: int,
+    has_initial_state: bool,
+    has_fused_qkv: bool,
+    residuals: GdnResiduals,
+    grad_outputs: tuple[
+        Float[Array, "B T H_V V"],
+        Float[Array, "B H_V K V"] | None,
+    ],
+    *,
+    mini_batch: int | None = None,
+) -> tuple[
+    Float[Array, "B T C_QKV"] | None,
+    Float[Array, "B T H_QK K"] | None,
+    Float[Array, "B T H_QK K"] | None,
+    Float[Array, "B T H_V V"] | None,
+    Float[Array, "B T H_V"],
+    Float[Array, "B T H_V"],
+    Float[Array, "H_V"] | None,
+    Float[Array, "H_V"] | None,
+    Float[Array, "B H_V K V"] | None,
+    Float[Array, "W C_QKV"] | None,
+    Float[Array, "C_QKV"] | None,
+]:
+  """Runs the natural-layout `[B, T, ...]` GDN backward pipeline."""
+  do_bt, dht = grad_outputs
+  H_QK = num_k_heads
+  H_V = num_v_heads
+  K = head_k_dim
+  V = head_v_dim
+  BT = chunk_size
+  gqa_repeats = H_V // H_QK
+  q_size = H_QK * K
+  k_size = H_QK * K
+  B, T, _, _ = do_bt.shape
+  act_dtype = do_bt.dtype
+
+  g = residuals.g_cumsum
+  if g is None:
+    if not use_gate_in_kernel or residuals.g_org is None or residuals.a_log is None:
+      raise ValueError("GDN backward requires g_cumsum or (g_org, a_log).")
+    g = kda_gate_chunk_cumsum(
+        g=residuals.g_org,
+        a_log=residuals.a_log,
+        chunk_size=BT,
+        scale=RCP_LN2,
+        delta_time_bias=residuals.delta_time_bias,
+        lower_bound=None,
+    )
+  if residuals.h is None or residuals.akk is None:
+    raise ValueError("GDN backward requires h and akk in residuals.")
+
+  dht_5d = dht[:, None] if dht is not None else None
+  interpret = get_interpret()
+  can_native_qkv_do = (
+      K % 128 == 0 and V % 128 == 0 and BT % 8 == 0 and not interpret
+  )
+
+  dy_conv = None
+  dq_bt = dk_bt = dv_bt = None
+  if residuals.qkv_conv is not None and can_native_qkv_do:
+    dy_conv, _, _, db_hbt, dg_hbt, dh0 = _fused_dhu_wy_intra_cumsum_pallas_jit(
+        q=None,
+        k=None,
+        v=None,
+        v_new=None,
+        qg=None,
+        kg=None,
+        w=None,
+        g=g,
+        beta=residuals.beta,
+        A=residuals.akk,
+        h=residuals.h,
+        do=do_bt,
+        dv0=None,
+        dAqk=None,
+        dht=dht_5d,
+        scale=scale,
+        chunk_size=BT,
+        use_exp2=True,
+        per_channel_gate=False,
+        mini_batch=mini_batch,
+        return_dh0=has_initial_state,
+        gqa_repeats=gqa_repeats,
+        dqkv_dtype=act_dtype,
+        qkv_conv=residuals.qkv_conv,
+        use_qk_l2norm_in_kernel=use_qk_l2norm,
+        g_is_cumsummed=True,
+    )
+  elif residuals.qkv_conv is None and can_native_qkv_do:
+    dq_bt, dk_bt, dv_bt, db_hbt, dg_hbt, dh0 = (
+        _fused_dhu_wy_intra_cumsum_pallas_jit(
+            q=residuals.q,
+            k=residuals.k,
+            v=residuals.v,
+            v_new=None,
+            qg=None,
+            kg=None,
+            w=None,
+            g=g,
+            beta=residuals.beta,
+            A=residuals.akk,
+            h=residuals.h,
+            do=do_bt,
+            dv0=None,
+            dAqk=None,
+            dht=dht_5d,
+            scale=scale,
+            chunk_size=BT,
+            use_exp2=True,
+            per_channel_gate=False,
+            mini_batch=mini_batch,
+            return_dh0=has_initial_state,
+            gqa_repeats=gqa_repeats,
+            dqkv_dtype=act_dtype,
+            native_bt_qkv=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            g_is_cumsummed=True,
+        )
+    )
+  else:
+    if residuals.qkv_conv is not None:
+      qkv_c = residuals.qkv_conv
+      q_hbt = qkv_c[:, :, :q_size].reshape(B, T, H_QK, K).transpose(2, 0, 1, 3)
+      k_hbt = (
+          qkv_c[:, :, q_size : q_size + k_size]
+          .reshape(B, T, H_QK, K)
+          .transpose(2, 0, 1, 3)
+      )
+      v_hbt = (
+          qkv_c[:, :, q_size + k_size :]
+          .reshape(B, T, H_V, V)
+          .transpose(2, 0, 1, 3)
+      )
+    else:
+      assert (
+          residuals.q is not None
+          and residuals.k is not None
+          and residuals.v is not None
+      )
+      q_hbt = residuals.q.transpose(2, 0, 1, 3)
+      k_hbt = residuals.k.transpose(2, 0, 1, 3)
+      v_hbt = residuals.v.transpose(2, 0, 1, 3)
+    do_hbt = do_bt.transpose(2, 0, 1, 3)
+    dq_hbt, dk_hbt, dv_hbt, db_hbt, dg_hbt, dh0 = (
+        _fused_dhu_wy_intra_cumsum_pallas_jit(
+            q=q_hbt,
+            k=k_hbt,
+            v=v_hbt,
+            v_new=None,
+            qg=None,
+            kg=None,
+            w=None,
+            g=g,
+            beta=residuals.beta,
+            A=residuals.akk,
+            h=residuals.h,
+            do=do_hbt,
+            dv0=None,
+            dAqk=None,
+            dht=dht_5d,
+            scale=scale,
+            chunk_size=BT,
+            use_exp2=True,
+            per_channel_gate=False,
+            mini_batch=mini_batch,
+            return_dh0=has_initial_state,
+            gqa_repeats=gqa_repeats,
+            dqkv_dtype=act_dtype,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            g_is_cumsummed=True,
+        )
+    )
+    assert dq_hbt is not None and dk_hbt is not None and dv_hbt is not None
+    dq_bt = dq_hbt.transpose(1, 2, 0, 3)
+    dk_bt = dk_hbt.transpose(1, 2, 0, 3)
+    dv_bt = dv_hbt.transpose(1, 2, 0, 3)
+    if residuals.qkv_conv is not None:
+      dy_conv = jnp.concatenate(
+          [
+              dq_bt.reshape(B, T, q_size),
+              dk_bt.reshape(B, T, k_size),
+              dv_bt.reshape(B, T, H_V * V),
+          ],
+          axis=-1,
+      )
+
+  da_log = ddt_bias = None
+  if use_gate_in_kernel:
+    assert residuals.g_org is not None and residuals.a_log is not None
+    dg_hbt, da_log, ddt_bias = kda_gate_bwd(
+        g=residuals.g_org,
+        a_log=residuals.a_log,
+        delta_time_bias=residuals.delta_time_bias,
+        dyg=dg_hbt,
+        lower_bound=None,
+    )
+  dg_bt = dg_hbt[..., 0].transpose(1, 2, 0).astype(residuals.g_dtype_marker.dtype)
+
+  if use_beta_sigmoid_in_kernel:
+    b_f32 = residuals.beta.astype(jnp.float32)
+    db_hbt = db_hbt.astype(jnp.float32) * b_f32 * (1.0 - b_f32)
+  db_bt = db_hbt.transpose(1, 2, 0).astype(jnp.dtype(residuals.beta_dtype))
+
+  dconv_w = dconv_b = None
+  if residuals.conv_weight is not None:
+    assert residuals.qkv_raw is not None and dy_conv is not None
+    dqkv_in, dconv_w, dconv_b = causal_conv1d_silu_bwd_bt(
+        residuals.qkv_raw,
+        residuals.conv_weight,
+        residuals.conv_bias,
+        dy_conv,
+        segment_ids=residuals.segment_ids,
+    )
+  else:
+    dqkv_in = dy_conv
+
+  if has_fused_qkv:
+    assert dqkv_in is not None
+    dqkv_out = dqkv_in.astype(act_dtype)
+    dq_out = dk_out = dv_out = None
+  elif dqkv_in is not None:
+    dq_out = dqkv_in[:, :, :q_size].reshape(B, T, H_QK, K).astype(act_dtype)
+    dk_out = (
+        dqkv_in[:, :, q_size : q_size + k_size]
+        .reshape(B, T, H_QK, K)
+        .astype(act_dtype)
+    )
+    dv_out = dqkv_in[:, :, q_size + k_size :].reshape(B, T, H_V, V).astype(act_dtype)
+    dqkv_out = None
+  else:
+    assert dq_bt is not None and dk_bt is not None and dv_bt is not None
+    dq_out = dq_bt.astype(act_dtype)
+    dk_out = dk_bt.astype(act_dtype)
+    dv_out = dv_bt.astype(act_dtype)
+    dqkv_out = None
+
+  if dh0 is not None and dh0.ndim == 5:
+    dh0 = dh0[:, 0]
+  if dh0 is not None and residuals.initial_state is not None:
+    dh0 = dh0.astype(residuals.initial_state.dtype)
+
+  return (
+      dqkv_out,
+      dq_out,
+      dk_out,
+      dv_out,
+      dg_bt,
+      db_bt,
+      da_log,
+      ddt_bias,
+      dh0,
+      dconv_w,
+      dconv_b,
   )

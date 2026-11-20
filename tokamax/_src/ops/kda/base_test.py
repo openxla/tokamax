@@ -385,5 +385,288 @@ class KimiDeltaAttentionTest(parameterized.TestCase):
         )
 
 
+class GatedDeltaNetTest(parameterized.TestCase):
+
+  def test_public_gdn_signature(self):
+    params = inspect.signature(api.gated_delta_net).parameters
+    for name in (
+        "query",
+        "key",
+        "value",
+        "gate",
+        "beta",
+        "qkv",
+        "num_k_heads",
+        "num_v_heads",
+        "head_k_dim",
+        "head_v_dim",
+        "conv_weight",
+        "conv_bias",
+        "a_log",
+        "delta_time_bias",
+        "initial_state",
+        "output_final_state",
+        "use_qk_l2norm",
+        "use_gate_in_kernel",
+        "use_beta_sigmoid_in_kernel",
+        "chunk_size",
+        "segment_ids",
+        "context_parallel_metadata",
+        "residual_checkpoint_name",
+    ):
+      self.assertIn(name, params)
+
+  def test_xla_gdn_gqa_and_fused_qkv_parity(self):
+    b, t, h_qk, h_v, k_dim, v_dim = 2, 16, 2, 8, 16, 16
+    c_qkv = 2 * h_qk * k_dim + h_v * v_dim
+    keys = jax.random.split(jax.random.PRNGKey(0), 7)
+    qkv = jax.random.normal(keys[0], (b, t, c_qkv), jnp.float32)
+    conv_w = jax.random.normal(keys[1], (4, c_qkv), jnp.float32) * 0.2
+    conv_b = jax.random.normal(keys[2], (c_qkv,), jnp.float32) * 0.1
+    gate_raw = jax.random.normal(keys[3], (b, t, h_v), jnp.float32)
+    beta_raw = jax.random.normal(keys[4], (b, t, h_v), jnp.float32)
+    a_log = jnp.log(jax.random.uniform(keys[5], (h_v,), minval=0.1, maxval=1.0))
+    dt_bias = jax.random.normal(keys[6], (h_v,), jnp.float32) * 0.1
+    h0 = jnp.ones((b, h_v, k_dim, v_dim), jnp.float32) * 0.05
+
+    out_fused, ht_fused = api.gated_delta_net(
+        qkv=qkv,
+        gate=gate_raw,
+        beta=beta_raw,
+        num_k_heads=h_qk,
+        num_v_heads=h_v,
+        head_k_dim=k_dim,
+        head_v_dim=v_dim,
+        conv_weight=conv_w,
+        conv_bias=conv_b,
+        a_log=a_log,
+        delta_time_bias=dt_bias,
+        initial_state=h0,
+        output_final_state=True,
+        use_qk_l2norm=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        implementation="xla",
+    )
+    q_s = qkv[:, :, : h_qk * k_dim].reshape(b, t, h_qk, k_dim)
+    k_s = qkv[:, :, h_qk * k_dim : 2 * h_qk * k_dim].reshape(b, t, h_qk, k_dim)
+    v_s = qkv[:, :, 2 * h_qk * k_dim :].reshape(b, t, h_v, v_dim)
+    out_split, ht_split = api.gated_delta_net(
+        q_s,
+        k_s,
+        v_s,
+        gate_raw,
+        beta_raw,
+        conv_weight=conv_w,
+        conv_bias=conv_b,
+        a_log=a_log,
+        delta_time_bias=dt_bias,
+        initial_state=h0,
+        output_final_state=True,
+        use_qk_l2norm=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        implementation="xla",
+    )
+    chex.assert_trees_all_close(
+        (out_fused, ht_fused), (out_split, ht_split), atol=1e-6, rtol=1e-6
+    )
+
+  def test_zero_norm_l2norm_zero_gradient(self):
+    b, t, h_qk, h_v, d = 1, 8, 2, 4, 16
+    keys = jax.random.split(jax.random.PRNGKey(99), 5)
+    q_nz = jax.random.normal(keys[0], (b, t, h_qk, d), jnp.float32) * 0.5
+    k_nz = jax.random.normal(keys[1], (b, t, h_qk, d), jnp.float32) * 0.5
+    # Zero out disjoint token halves so upstream cotangents are non-zero at
+    # the zero-norm rows (t < 4 for q, t >= 4 for k).
+    q = jnp.concatenate([jnp.zeros_like(q_nz[:, :4]), q_nz[:, 4:]], axis=1)
+    k = jnp.concatenate([k_nz[:, :4], jnp.zeros_like(k_nz[:, 4:])], axis=1)
+    v = jax.random.normal(keys[2], (b, t, h_v, d), jnp.float32)
+    h0 = jax.random.normal(keys[3], (b, h_v, d, d), jnp.float32) * 0.2
+    do = jax.random.normal(keys[4], (b, t, h_v, d), jnp.float32)
+    gate = jnp.full((b, t, h_v), -0.1, jnp.float32)
+    beta = jnp.full((b, t, h_v), 0.5, jnp.float32)
+
+    def loss_fn(q_in, k_in):
+      out, _ = api.gated_delta_net(
+          q_in,
+          k_in,
+          v,
+          gate,
+          beta,
+          initial_state=h0,
+          use_qk_l2norm=True,
+          implementation="xla",
+      )
+      return jnp.sum(out * do)
+
+    dq, dk = jax.grad(loss_fn, argnums=(0, 1))(q, k)
+    np.testing.assert_array_equal(np.asarray(dq[:, :4]), np.zeros_like(dq[:, :4]))
+    np.testing.assert_array_equal(np.asarray(dk[:, 4:]), np.zeros_like(dk[:, 4:]))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(dq))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(dk))))
+    self.assertGreater(float(jnp.max(jnp.abs(dq[:, 4:]))), 0.0)
+    self.assertGreater(float(jnp.max(jnp.abs(dk[:, :4]))), 0.0)
+
+  def test_gated_delta_net_bind_validates_split_qkv_and_segment_shapes(self):
+    b, t, h_qk, h_v, d = 2, 16, 2, 4, 16
+    q = jnp.ones((b, t, h_qk, d), jnp.float32)
+    k_bad = jnp.ones((b, t, h_qk + 1, d), jnp.float32)
+    v = jnp.ones((b, t, h_v, d), jnp.float32)
+    v_bad = jnp.ones((b, t + 1, h_v, d), jnp.float32)
+    gate = jnp.full((b, t, h_v), -0.1, jnp.float32)
+    beta = jnp.full((b, t, h_v), 0.5, jnp.float32)
+
+    with self.assertRaises(jt.TypeCheckError):
+      api.gated_delta_net(q, k_bad, v, gate, beta, implementation="xla")
+    with jaxtyping.disable_jaxtyping():
+      with self.assertRaisesRegex(ValueError, "key.shape.*must match"):
+        api.gated_delta_net(q, k_bad, v, gate, beta, implementation="xla")
+      with self.assertRaisesRegex(ValueError, "value.shape.*leading"):
+        api.gated_delta_net(q, q, v_bad, gate, beta, implementation="xla")
+      with self.assertRaisesRegex(ValueError, "segment_ids.*must have shape"):
+        api.gated_delta_net(
+            q,
+            q,
+            v,
+            gate,
+            beta,
+            segment_ids=jnp.ones((b, t + 1), jnp.int32),
+            implementation="xla",
+        )
+      c_qkv = 2 * h_qk * d + h_v * d
+      qkv = jnp.ones((b, t, c_qkv), jnp.float32)
+      conv_w = jnp.ones((4, c_qkv), jnp.float32)
+      with self.assertRaisesRegex(ValueError, "qkv.*must be rank 3"):
+        api.gated_delta_net(
+            qkv=jnp.ones((b, c_qkv), jnp.float32),
+            gate=gate,
+            beta=beta,
+            num_k_heads=h_qk,
+            head_k_dim=d,
+            implementation="xla",
+        )
+      with self.assertRaisesRegex(ValueError, "gate.*must be rank 3"):
+        api.gated_delta_net(
+            qkv=qkv,
+            gate=jnp.ones((b, t), jnp.float32),
+            beta=beta,
+            num_k_heads=h_qk,
+            head_k_dim=d,
+            implementation="xla",
+        )
+      with self.assertRaisesRegex(ValueError, "conv_weight.*must have shape"):
+        api.gated_delta_net(
+            qkv=qkv,
+            gate=gate,
+            beta=beta,
+            num_k_heads=h_qk,
+            head_k_dim=d,
+            conv_weight=jnp.ones((0, c_qkv), jnp.float32),
+            implementation="xla",
+        )
+      with self.assertRaisesRegex(ValueError, "conv_bias.*must have shape"):
+        api.gated_delta_net(
+            qkv=qkv,
+            gate=gate,
+            beta=beta,
+            num_k_heads=h_qk,
+            head_k_dim=d,
+            conv_weight=conv_w,
+            conv_bias=jnp.ones((1,), jnp.float32),
+            implementation="xla",
+        )
+
+  @parameterized.parameters((1, False), (1, True), (2, False), (2, True))
+  def test_short_seq_smaller_than_conv_width_fwd_and_bwd(
+      self, seq_len: int, with_segments: bool
+  ):
+    b, h_qk, h_v, d, w_len = 2, 2, 4, 8, 4
+    c_qkv = 2 * h_qk * d + h_v * d
+    keys = jax.random.split(jax.random.PRNGKey(10 + seq_len), 5)
+    qkv = jax.random.normal(keys[0], (b, seq_len, c_qkv), jnp.float32)
+    conv_w = jax.random.normal(keys[1], (w_len, c_qkv), jnp.float32) * 0.2
+    conv_b = jax.random.normal(keys[2], (c_qkv,), jnp.float32) * 0.1
+    gate = jax.random.normal(keys[3], (b, seq_len, h_v), jnp.float32) - 1.0
+    beta = jax.nn.sigmoid(
+        jax.random.normal(keys[4], (b, seq_len, h_v), jnp.float32)
+    )
+    segment_ids = (
+        jnp.ones((b, seq_len), dtype=jnp.int32) if with_segments else None
+    )
+
+    def loss_fn(qkv_, conv_w_, conv_b_):
+      out, _ = api.gated_delta_net(
+          qkv=qkv_,
+          gate=gate,
+          beta=beta,
+          num_k_heads=h_qk,
+          num_v_heads=h_v,
+          head_k_dim=d,
+          head_v_dim=d,
+          conv_weight=conv_w_,
+          conv_bias=conv_b_,
+          segment_ids=segment_ids,
+          implementation="xla",
+      )
+      return jnp.sum(out**2)
+
+    loss, (dqkv, dconv_w, dconv_b) = jax.value_and_grad(
+        loss_fn, argnums=(0, 1, 2)
+    )(qkv, conv_w, conv_b)
+    self.assertTrue(bool(jnp.isfinite(loss)))
+    self.assertEqual(dqkv.shape, qkv.shape)
+    self.assertEqual(dconv_w.shape, (w_len, c_qkv))
+    self.assertEqual(dconv_b.shape, (c_qkv,))
+    np.testing.assert_allclose(
+        np.asarray(dconv_w[: w_len - seq_len]),
+        0.0,
+        atol=1e-7,
+    )
+
+  def test_initial_state_feeds_first_active_non_unit_segment(self):
+    b, h_qk, h_v, d = 1, 2, 4, 8
+    keys = jax.random.split(jax.random.PRNGKey(77), 6)
+    q = jax.random.normal(keys[0], (b, 4, h_qk, d), jnp.float32)
+    k = jax.random.normal(keys[1], (b, 4, h_qk, d), jnp.float32)
+    v = jax.random.normal(keys[2], (b, 4, h_v, d), jnp.float32)
+    gate = -jax.random.uniform(keys[3], (b, 4, h_v), minval=0.05, maxval=0.3)
+    beta = jax.random.uniform(keys[4], (b, 4, h_v), minval=0.2, maxval=0.8)
+    h0 = jax.random.normal(keys[5], (b, h_v, d, d), jnp.float32) * 0.5
+    segment_ids = jnp.array([[0, 2, 2, 3]], dtype=jnp.int32)
+
+    out, _ = api.gated_delta_net(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial_state=h0,
+        segment_ids=segment_ids,
+        implementation="xla",
+    )
+    out_seg2, _ = api.gated_delta_net(
+        q[:, 1:3],
+        k[:, 1:3],
+        v[:, 1:3],
+        gate[:, 1:3],
+        beta[:, 1:3],
+        initial_state=h0,
+        implementation="xla",
+    )
+    out_seg3, _ = api.gated_delta_net(
+        q[:, 3:4],
+        k[:, 3:4],
+        v[:, 3:4],
+        gate[:, 3:4],
+        beta[:, 3:4],
+        initial_state=None,
+        implementation="xla",
+    )
+    np.testing.assert_array_equal(np.asarray(out[:, :1]), 0.0)
+    chex.assert_trees_all_close(out[:, 1:3], out_seg2, atol=1e-6, rtol=1e-6)
+    chex.assert_trees_all_close(out[:, 3:4], out_seg3, atol=1e-6, rtol=1e-6)
+
+
 if __name__ == "__main__":
   absltest.main()

@@ -26,9 +26,15 @@ from tokamax._src.ops.kda.cp_utils import ContextParallelMetadata
 
 Implementation: TypeAlias = Literal["xla", "xla_chunked", "mosaic"]
 
+GdnImplementation: TypeAlias = Literal["xla", "mosaic"]
+
 IMPLEMENTATIONS = dict(
     xla=base.KimiDeltaAttention(),
     xla_chunked=xla_chunked.XlaChunkedKimiDeltaAttention(),
+)
+
+GDN_IMPLEMENTATIONS = dict(
+    xla=base.GatedDeltaNet(),
 )
 
 try:
@@ -37,11 +43,17 @@ try:
   IMPLEMENTATIONS["mosaic_tpu"] = (
       pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
   )
+  GDN_IMPLEMENTATIONS["mosaic_tpu"] = (
+      pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet()
+  )
 except ImportError:
   pass
 
 _DEFAULT_IMPLEMENTATIONS: Final[Sequence[Implementation]] = (
     ("mosaic", "xla") if "mosaic_tpu" in IMPLEMENTATIONS else ("xla",)
+)
+_DEFAULT_GDN_IMPLEMENTATIONS: Final[Sequence[GdnImplementation]] = (
+    ("mosaic", "xla") if "mosaic_tpu" in GDN_IMPLEMENTATIONS else ("xla",)
 )
 
 
@@ -54,7 +66,7 @@ def kimi_delta_attention(
     beta: Float[Array, "H B T"],
     *,
     a_log: Float[Array, "H"] | None = None,
-    delta_time_bias: Float[Array, "H*K"] | None = None,
+    delta_time_bias: Float[Array, "H*GW"] | None = None,
     scale: float | None = None,
     initial_state: Float[Array, "B N H K V"] | None = None,
     output_final_state: bool = False,
@@ -73,6 +85,7 @@ def kimi_delta_attention(
     conv_bias_k: Float[Array, "H_K K"] | None = None,
     conv_bias_v: Float[Array, "H V"] | None = None,
     use_conv1d_in_kernel: bool = False,
+    residual_checkpoint_name: str | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
 ) -> tuple[Float[Array, "H B T V"], Float[Array, "B N H K V"] | None]:
   """Kimi Delta Attention.
@@ -87,17 +100,17 @@ def kimi_delta_attention(
     value: Value tensor with shape `[H, B, T, V]`.
     gate: Gate tensor with shape `[H, B, T, K]` for a per-channel gate, or `[H,
       B, T, 1]` for a scalar gate (`per_channel_gate=False`). When
-      `use_gate_in_kernel=True` (per-channel gates only), this is the raw
-      delta-time input; otherwise, it is already the log-space decay.
+      `use_gate_in_kernel=True`, this is the raw delta-time input; otherwise, it
+      is already the log-space decay.
     beta: Post-activation per-token delta-rule learning-rate tensor with values
       in `[0, 1]`, shape `[H, B, T]`.
     a_log: Per-head log decay-rate parameter, shape `[H]`. Required when
       `use_gate_in_kernel=True`.
-    delta_time_bias: Optional per-head, per-key-channel bias added to the raw
-      gate before the delta-time activation, shape `[H * K]`. In the standard
-      activation path, KDA computes `delta_time = softplus(gate +
-      delta_time_bias)` and `log_decay = -exp(a_log) * delta_time`. This
-      argument is used only when `use_gate_in_kernel=True`.
+    delta_time_bias: Optional bias added to the raw gate before the delta-time
+      activation, shape `[H * K]` for per-channel gates or `[H]` for scalar
+      gates. In the standard activation path, KDA computes `delta_time =
+      softplus(gate + delta_time_bias)` and `log_decay = -exp(a_log) *
+      delta_time`. This argument is used only when `use_gate_in_kernel=True`.
     scale: Query scale. Defaults to `K ** -0.5`.
     initial_state: Optional initial recurrent state, shape `[B, N, H, K, V]`.
       Its segment dimension `N` determines `max_num_segments` when the latter is
@@ -137,6 +150,8 @@ def kimi_delta_attention(
       `segment_ids` boundaries. Requires all three `conv_weight_*` arguments.
       `"mosaic"` fuses it into its kernels and supports `W <= 8`;
       `"xla_chunked"` does not support it.
+    residual_checkpoint_name: Optional `jax.ad_checkpoint.checkpoint_name` tag
+      applied to outputs and forward Pallas residuals for custom remat policies.
     implementation: The implementation to use. By default, the Mosaic TPU
       implementation is attempted first when available, with XLA as a fallback.
       `"xla"` evaluates the recurrent reference implementation. `"mosaic"` uses
@@ -195,6 +210,134 @@ def kimi_delta_attention(
           conv_bias_k=conv_bias_k,
           conv_bias_v=conv_bias_v,
           use_conv1d_in_kernel=use_conv1d_in_kernel,
+          residual_checkpoint_name=residual_checkpoint_name,
+      )
+    except NotImplementedError as e:
+      if len(implementation) == 1:
+        raise
+      errors.append(e)
+
+  raise ExceptionGroup("all implementations failed", errors)
+
+
+@jaxtyping.jaxtyped
+def gated_delta_net(
+    query: Float[Array, "B T H_QK K"] | None = None,
+    key: Float[Array, "B T H_QK K"] | None = None,
+    value: Float[Array, "B T H_V V"] | None = None,
+    gate: Float[Array, "B T H_V"] | None = None,
+    beta: Float[Array, "B T H_V"] | None = None,
+    *,
+    qkv: Float[Array, "B T C_QKV"] | None = None,
+    num_k_heads: int | None = None,
+    num_v_heads: int | None = None,
+    head_k_dim: int | None = None,
+    head_v_dim: int | None = None,
+    conv_weight: Float[Array, "W C_QKV"] | None = None,
+    conv_bias: Float[Array, "C_QKV"] | None = None,
+    a_log: Float[Array, "H_V"] | None = None,
+    delta_time_bias: Float[Array, "H_V"] | None = None,
+    scale: float | None = None,
+    initial_state: Float[Array, "B H_V K V"] | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm: bool = True,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    chunk_size: int | None = None,
+    segment_ids: Int[Array, "B T"] | None = None,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
+    residual_checkpoint_name: str | None = None,
+    implementation: (
+        GdnImplementation | Sequence[GdnImplementation] | None
+    ) = None,
+) -> tuple[Float[Array, "B T H_V V"], Float[Array, "B H_V K V"] | None]:
+  """Gated Delta Net in natural token-major layout (`[B, T, ...]`).
+
+  Supports grouped query/key heads (`H_V % H_QK == 0`), fused `qkv` with
+  optional causal depthwise `conv_weight`/`conv_bias` + SiLU, or split
+  `(query, key, value)` inputs, sharing the KDA Pallas/Mosaic TPU kernels.
+
+  Args:
+    query: Split query tensor `[B, T, H_QK, K]` when `qkv` is `None`.
+    key: Split key tensor `[B, T, H_QK, K]` when `qkv` is `None`.
+    value: Split value tensor `[B, T, H_V, V]` when `qkv` is `None`.
+    gate: Scalar per-value-head gate `[B, T, H_V]`. Raw delta-time input when
+      `use_gate_in_kernel=True`, otherwise natural-log decay `<= 0`.
+    beta: Per-value-head learning rate `[B, T, H_V]`. Pre-sigmoid logits when
+      `use_beta_sigmoid_in_kernel=True`, otherwise in `[0, 1]`.
+    qkv: Optional fused `[B, T, 2 * H_QK * K + H_V * V]` input (mutually
+      exclusive with `query`, `key`, `value`).
+    num_k_heads: Number of query/key heads `H_QK` (required when `qkv` is used).
+    num_v_heads: Number of value heads `H_V` (inferred from `gate` if omitted).
+    head_k_dim: Key head dimension `K` (required when `qkv` is used).
+    head_v_dim: Value head dimension `V` (inferred from `qkv` if omitted).
+    conv_weight: Optional depthwise causal conv1d weights `[W, C_QKV]`.
+    conv_bias: Optional depthwise causal conv1d bias `[C_QKV]`.
+    a_log: Per-value-head log decay rate `[H_V]` (`use_gate_in_kernel=True`).
+    delta_time_bias: Optional per-value-head bias `[H_V]`
+      (`use_gate_in_kernel=True`).
+    scale: Query scale; defaults to `K ** -0.5`.
+    initial_state: Optional initial recurrent state `[B, H_V, K, V]`.
+    output_final_state: Whether to return `final_state` `[B, H_V, K, V]`.
+    use_qk_l2norm: Whether to L2-normalize `query` and `key` on `K`.
+    use_gate_in_kernel: Whether to compute `-exp(a_log) * softplus(gate +
+      delta_time_bias)` inside the kernel.
+    use_beta_sigmoid_in_kernel: Whether to apply `sigmoid(beta)` inside the op.
+    chunk_size: Chunk length for `"mosaic"`; defaults to None (autotuned, 64
+      heuristic fallback).
+    segment_ids: Optional `[B, T]` document segment IDs (`0` for padding;
+      `segment_ids > 0` denote contiguous spans, so IDs must be unique per
+      contiguous span).
+    context_parallel_metadata: Optional sequence context-parallel metadata.
+    residual_checkpoint_name: Optional `jax.ad_checkpoint.checkpoint_name` tag
+      applied to outputs and forward Pallas residuals for custom remat policies.
+    implementation: `"mosaic"`, `"xla"`, or a fallback sequence (defaults to
+      `("mosaic", "xla")` when TPU Mosaic is available).
+
+  Returns:
+    `(output, final_state)` with `output` `[B, T, H_V, V]` and `final_state`
+    `[B, H_V, K, V]` (or `None` when `output_final_state=False`).
+  """
+  if implementation is None:
+    implementation = _DEFAULT_GDN_IMPLEMENTATIONS
+  elif isinstance(implementation, str):
+    implementation = (implementation,)
+  elif not implementation:
+    raise ValueError("`implementation` must not be an empty sequence.")
+
+  errors = []
+  for impl in implementation:
+    if impl == "mosaic":
+      impl = "mosaic_tpu"
+    if impl not in GDN_IMPLEMENTATIONS:
+      raise ValueError(f"Unknown implementation: {impl}")
+
+    try:
+      return GDN_IMPLEMENTATIONS[impl](
+          query=query,
+          key=key,
+          value=value,
+          gate=gate,
+          beta=beta,
+          qkv=qkv,
+          num_k_heads=num_k_heads,
+          num_v_heads=num_v_heads,
+          head_k_dim=head_k_dim,
+          head_v_dim=head_v_dim,
+          conv_weight=conv_weight,
+          conv_bias=conv_bias,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+          scale=scale,
+          initial_state=initial_state,
+          output_final_state=output_final_state,
+          use_qk_l2norm=use_qk_l2norm,
+          use_gate_in_kernel=use_gate_in_kernel,
+          use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+          chunk_size=chunk_size,
+          segment_ids=segment_ids,
+          context_parallel_metadata=context_parallel_metadata,
+          residual_checkpoint_name=residual_checkpoint_name,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:

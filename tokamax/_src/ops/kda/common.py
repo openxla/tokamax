@@ -54,7 +54,15 @@ class _TpuLimits:
 
 def get_tpu_limits() -> _TpuLimits:
   """Returns KDA limits for the TPU selected by Mosaic dispatch."""
-  tpu_info = pltpu.get_tpu_info()
+  try:
+    tpu_info = pltpu.get_tpu_info()
+  except (RuntimeError, ValueError):
+    vmem_bytes = 16 * 1024 * 1024 if get_interpret() else 64 * 1024 * 1024
+    return _TpuLimits(
+        vmem_limit_bytes=int(vmem_bytes * _TPU_VMEM_USAGE_FRACTION),
+        block_align_minor=8,
+        block_align_major=128,
+    )
   return _TpuLimits(
       # Preserve headroom for compiler-managed VMEM allocations.
       vmem_limit_bytes=int(
