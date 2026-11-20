@@ -705,8 +705,7 @@ def _store_residuals(
   assert num_lanes == NUM_LANES and bq % NUM_LANES == 0
   assert len(residuals) * NUM_SUBLANES <= NUM_LANES
   lane_group = (
-      lax.broadcasted_iota(jnp.int32, packed.shape, packed.ndim - 1)
-      // NUM_SUBLANES
+      lax.div(lax.broadcasted_iota(jnp.int32, packed.shape, packed.ndim - 1), NUM_SUBLANES)
   )
   for r, (_, x) in enumerate(residuals[1:], start=1):
     packed = jnp.where(lane_group == r, x, packed)
