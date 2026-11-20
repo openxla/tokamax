@@ -79,6 +79,46 @@ class GmmFuserTest(parameterized.TestCase):
       )
       chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="m65536_k1280_n1536_g128",
+          m=65536,
+          k=1280,
+          n=1536,
+          num_groups=128,
+      ),
+      dict(
+          testcase_name="m147456_k1280_n512_g32",
+          m=147456,
+          k=1280,
+          n=512,
+          num_groups=32,
+      ),
+      dict(
+          testcase_name="m98304_k1280_n1536_g128",
+          m=98304,
+          k=1280,
+          n=1536,
+          num_groups=128,
+      ),
+  )
+  def test_gmm_v2_fusible_residual_add_epilogue(self, m, k, n, num_groups):
+    """Test `GMM(lhs, rhs, group_sizes) + residual` can be fused into the kernel."""
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    residual = jax.random.normal(k2, (m, n), jnp.bfloat16)
+    group_sizes = util.get_group_sizes(m, num_groups)
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm(x, r, res, gs):
+      return gmm_fuser.gmm_v2_fusible(x, r, gs) + res
+
+    actual = fused_gmm(lhs, rhs, residual, group_sizes)
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes) + residual
+    chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
+
   def test_gmm_v2_fusible_rhs_prologue(self):
     m, k, n, num_groups = 256, 256, 256, 4
     k0, k1, k2 = jax.random.split(jax.random.key(1), 3)

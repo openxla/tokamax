@@ -267,14 +267,29 @@ class GmmFusionSpec:
 
       if out_fn is not None:
         assert out_values_type is not None
-        pulled_out_fn, out_fusion_input_specs, out_spec = (
+        out_2d_spec = _to_2d_bounded_spec(out_spec)
+        out_read_spec = _make_out_read_spec(lhs_spec.value, out_2d_spec)
+        # Note that: We can NOT use the `out_fusion_input_specs` derived from
+        # `fuser_adapter.push_pull_block_spec(..., out_2d_spec, ...)`
+        # because `out_2d_spec` has a trick that does not write the last sublane
+        # and then defer to the next grid iteration.
+        # This is problematic because when we are reading, we always want to
+        # read all the contents, including the last sublane.
+        pulled_out_fn, out_fusion_input_specs, _ = (
             fuser_adapter.push_pull_block_spec(
                 out_fn,
-                _to_2d_bounded_spec(out_spec),
+                out_read_spec,
                 out_values_type,
                 raw_out_type,
                 grid_len=3,
             )
+        )
+        _, _, out_spec = fuser_adapter.push_pull_block_spec(
+            out_fn,
+            out_2d_spec,
+            out_values_type,
+            raw_out_type,
+            grid_len=3,
         )
         k_out_in = out_ref
       else:
@@ -865,3 +880,27 @@ def tgmm_v2_fusible(
   return fuser.fusible(_fusible)(
       lhs, rhs, group_sizes, rhs_scale, group_offset, partial_sum
   )
+
+
+def _make_out_read_spec(
+    lhs_spec_3d: pl.BlockSpec, out_spec_2d: pl.BlockSpec
+) -> pl.BlockSpec:
+  """Builds a 2D BlockSpec for `(m, n)` that does not throw away the last sublane."""
+  lhs_spec_2d = _to_2d_bounded_spec(lhs_spec_3d)
+  assert lhs_spec_2d.index_map is not None
+  assert out_spec_2d.index_map is not None
+  lhs_index_map = lhs_spec_2d.index_map
+  out_index_map = out_spec_2d.index_map
+
+  def out_read_index_map(n_id, gm_id, _):
+    row_slice, _ = lhs_index_map(n_id, gm_id, 0)
+    _, col_idx = out_index_map(n_id, gm_id, 0)
+    return (row_slice, col_idx)
+
+  return pl.BlockSpec(
+      out_spec_2d.block_shape,
+      out_read_index_map,
+      memory_space=out_spec_2d.memory_space,
+      pipeline_mode=out_spec_2d.pipeline_mode,
+  )
+
