@@ -195,8 +195,14 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
         config=config,
     )
 
+    # The SM90 kernel pads K/V, bias and mask itself, and masks the partial last
+    # K/V block with `k_end`.
+    skip_pad_seq_k = isinstance(config, ConfigSM90) and split_k == 1
+
     def pad_seq_k(x, axis):
-      if x is None or axis is None or x.shape[axis] == 1:
+      if skip_pad_seq_k or x is None or axis is None:
+        return x
+      if axis == -1 and x.shape[axis] == 1:  # Broadcast along K.
         return x
       block = split_k * config.block_kv
       return shape_lib.pad_to_next_multiple_of(x, block, axis)

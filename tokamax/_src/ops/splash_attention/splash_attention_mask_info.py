@@ -209,15 +209,169 @@ class _HashableNDArray:
     return np.array_equal(self.array, other.array, equal_nan=True)
 
 
+def _q_block_stats(
+    q_sequence: np.ndarray, q_blocks_count: int, q_block_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """Computes per-block min, max, and step-1 contiguity for `q_sequence`."""
+  q_seq = np.asarray(q_sequence).reshape(q_blocks_count, q_block_size)
+  q_min = q_seq.min(axis=1).astype(np.int64)
+  q_max = q_seq.max(axis=1).astype(np.int64)
+  if q_block_size == 1:
+    q_contig = np.ones(q_blocks_count, dtype=np.bool_)
+  else:
+    q_contig = (q_seq[:, 1:] == q_seq[:, :-1] + 1).all(axis=1)
+  return q_min, q_max, q_contig
+
+
+def _classify_mask_blocks(
+    mask: mask_lib.Mask,
+    q_blocks_count: int,
+    kv_blocks_count: int,
+    q_block_size: int,
+    kv_block_size: int,
+) -> np.ndarray:
+  """Classifies mask blocks as 0 (empty), 1 (partial), 2 (full), or -1."""
+  # pylint: disable=unidiomatic-typecheck
+  blocked_shape = (q_blocks_count, kv_blocks_count)
+
+  if type(mask) is mask_lib.FullMask:
+    return np.full(blocked_shape, 2, dtype=np.int32)
+
+  if type(mask) is mask_lib.NumpyMask and mask.array.flags['C_CONTIGUOUS']:
+    blocks = mask.array.reshape(
+        q_blocks_count, q_block_size, kv_blocks_count, kv_block_size
+    ).swapaxes(1, 2)
+    return blocks.any(axis=(2, 3)).astype(np.int32) + blocks.all(
+        axis=(2, 3)
+    ).astype(np.int32)
+
+  if type(mask) is mask_lib.LogicalOr:
+    left = _classify_mask_blocks(
+        mask.left, q_blocks_count, kv_blocks_count, q_block_size, kv_block_size
+    )
+    right = _classify_mask_blocks(
+        mask.right,
+        q_blocks_count,
+        kv_blocks_count,
+        q_block_size,
+        kv_block_size,
+    )
+    grid = np.full(blocked_shape, -1, dtype=np.int32)
+    grid[(left == 0) & (right == 0)] = 0
+    grid[((left == 1) & (right == 0)) | ((left == 0) & (right == 1))] = 1
+    grid[(left == 2) | (right == 2)] = 2
+    return grid
+
+  if type(mask) is mask_lib.LogicalAnd:
+    left = _classify_mask_blocks(
+        mask.left, q_blocks_count, kv_blocks_count, q_block_size, kv_block_size
+    )
+    right = _classify_mask_blocks(
+        mask.right,
+        q_blocks_count,
+        kv_blocks_count,
+        q_block_size,
+        kv_block_size,
+    )
+    grid = np.full(blocked_shape, -1, dtype=np.int32)
+    grid[(left == 0) | (right == 0)] = 0
+    grid[((left == 1) & (right == 2)) | ((left == 2) & (right == 1))] = 1
+    grid[(left == 2) & (right == 2)] = 2
+    return grid
+
+  kv_min = np.arange(kv_blocks_count, dtype=np.int64) * kv_block_size
+  kv_max = kv_min + (kv_block_size - 1)
+
+  if type(mask) is mask_lib.CausalMask:
+    q_min, q_max, _ = _q_block_stats(
+        mask.q_sequence, q_blocks_count, q_block_size
+    )
+    offset = int(mask.offset)
+    grid = np.ones(blocked_shape, dtype=np.int32)
+    grid[(q_max + offset)[:, None] < kv_min[None, :]] = 0
+    grid[(q_min + offset)[:, None] >= kv_max[None, :]] = 2
+    return grid
+
+  if type(mask) is mask_lib.LocalMask:
+    left_w, right_w = mask.window_size
+    if left_w is None and right_w is None:
+      return np.full(blocked_shape, 2, dtype=np.int32)
+    if left_w is not None and right_w is not None and left_w + right_w < 0:
+      return np.zeros(blocked_shape, dtype=np.int32)
+
+    q_min, q_max, q_contig = _q_block_stats(
+        mask.q_sequence, q_blocks_count, q_block_size
+    )
+    offset = int(mask.offset)
+
+    if left_w is None:
+      all_left = True
+      empty_left = False
+    else:
+      all_left = (q_max + offset - left_w)[:, None] <= kv_min[None, :]
+      empty_left = (q_min + offset - left_w)[:, None] > kv_max[None, :]
+
+    if right_w is None:
+      all_right = True
+      empty_right = False
+    else:
+      all_right = (q_min + offset + right_w)[:, None] >= kv_max[None, :]
+      empty_right = (q_max + offset + right_w)[:, None] < kv_min[None, :]
+
+    full = all_left & all_right
+    empty = empty_left | empty_right
+
+    grid = np.full(blocked_shape, 1, dtype=np.int32)
+    if left_w is not None and right_w is not None and not q_contig.all():
+      grid[~q_contig, :] = -1
+    grid[empty] = 0
+    grid[full] = 2
+    return grid
+
+  if type(mask) is mask_lib.ChunkedCausalMask:
+    q_min, q_max, q_contig = _q_block_stats(
+        mask.q_sequence, q_blocks_count, q_block_size
+    )
+    chunk_size = int(mask.chunk_size)
+    q_chunk_min = q_min // chunk_size
+    q_chunk_max = q_max // chunk_size
+    kv_chunk_min = kv_min // chunk_size
+    kv_chunk_max = kv_max // chunk_size
+
+    full = (
+        (q_chunk_min == q_chunk_max)[:, None]
+        & (kv_chunk_min == kv_chunk_max)[None, :]
+        & (q_chunk_min[:, None] == kv_chunk_min[None, :])
+        & (q_min[:, None] >= kv_max[None, :])
+    )
+    empty = (
+        (q_max[:, None] < kv_min[None, :])
+        | (q_chunk_max[:, None] < kv_chunk_min[None, :])
+        | (q_chunk_min[:, None] > kv_chunk_max[None, :])
+    )
+
+    grid = np.full(blocked_shape, 1, dtype=np.int32)
+    if not q_contig.all():
+      grid[~q_contig, :] = -1
+    grid[empty] = 0
+    grid[full] = 2
+    return grid
+
+  return np.full(blocked_shape, -1, dtype=np.int32)
+
+
 def _generate_shard_metadata(
     block_mask: np.ndarray,
     partial_blocks: np.ndarray,
     is_dkv: bool,
     return_dynamic_grid: bool,
+    compute_mask_next: bool = True,
 ):
   if is_dkv:
     block_mask = block_mask.mT
     partial_blocks = partial_blocks.mT
+
+  width = block_mask.shape[1]
 
   if return_dynamic_grid:
     active_mask = block_mask > 0
@@ -228,30 +382,39 @@ def _generate_shard_metadata(
     active_indices = np.argwhere(active_mask)
     active_rows = active_indices[:, 0].astype(np.int32)
     active_cols = active_indices[:, 1].astype(np.int32)
-    block_mask = block_mask[active_mask > 0]
+    block_mask = block_mask[active_mask]
     grid_size = active_rows.size
   else:
-    active_indices = np.ndindex(block_mask.shape)
+    active_indices = None
     active_rows = active_cols = grid_size = None
 
-  partial_coords = np.argwhere(partial_blocks != -1)
-  if partial_coords.size > 0:
-    mask_next = []
-    mask_coords_iter = iter([tuple(c) for c in partial_coords])
-    first_m = coord_m = next(mask_coords_iter)
-
-    for idx in active_indices:
-      is_next_mask = tuple(idx) > tuple(coord_m)
-      if is_next_mask:
-        try:
-          coord_m = next(mask_coords_iter)  # type: ignore
-        except StopIteration:
-          coord_m = first_m
-      mask_next.append(partial_blocks[coord_m])
+  if not compute_mask_next:
+    mask_next = None
   else:
-    mask_next = np.full(block_mask.size, -1, dtype=np.int32)
+    partial_coords = np.argwhere(partial_blocks != -1)
+    if partial_coords.size > 0:
+      partial_flat_indices = (
+          partial_coords[:, 0].astype(np.int64) * width + partial_coords[:, 1]
+      )
+      if active_indices is not None:
+        active_flat_indices = (
+            active_indices[:, 0].astype(np.int64) * width
+            + active_indices[:, 1]
+        )
+      else:
+        active_flat_indices = np.arange(block_mask.size, dtype=np.int64)
+      next_idx = (
+          np.searchsorted(
+              partial_flat_indices, active_flat_indices, side='left'
+          )
+          % partial_flat_indices.size
+      )
+      mask_next = partial_blocks[
+          partial_coords[next_idx, 0], partial_coords[next_idx, 1]
+      ].astype(np.int32)
+    else:
+      mask_next = np.full(block_mask.size, -1, dtype=np.int32)
 
-  mask_next = np.array(mask_next, dtype=np.int32)
   flat_block_mask = block_mask.flatten()
 
   return active_rows, active_cols, mask_next, flat_block_mask, grid_size
@@ -468,33 +631,59 @@ def _process_mask(
   # block.
   # Partial mask blocks are uniquified. When partitioning, all partial mask
   # blocks are replicated across shards.
-
   blocked_shape = (q_blocks_count, kv_blocks_count)
-  state_grid = np.zeros(blocked_shape, dtype=np.int32)
+  state_grid = _classify_mask_blocks(
+      mask, q_blocks_count, kv_blocks_count, q_block_size, kv_block_size
+  )
   partial_id_grid = np.full(blocked_shape, -1, dtype=np.int32)
-
-  partial_blocks_map = collections.defaultdict(lambda: len(partial_blocks_map))
-  unique_chunks = []
 
   # Partition the dense mask into blocks and categorize them:
   # 0 = Empty, 1 = Partial (mixed 0s and 1s), 2 = Full (all 1s).
   # Partial blocks are deduplicated and stored in unique_chunks to save memory.
-  for coords in np.ndindex((q_blocks_count, kv_blocks_count)):
-    (q_idx, kv_idx) = coords
-    chunk = mask[(
-        slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
-        slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
-    )]
-    if chunk.any():
-      if chunk.all():
-        state_grid[q_idx, kv_idx] = 2
+  if mask_function is not None:
+    for q_idx, kv_idx in np.argwhere(state_grid == -1):
+      q_idx, kv_idx = int(q_idx), int(kv_idx)
+      chunk = mask[(
+          slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
+          slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
+      )]
+      if chunk.any():
+        state_grid[q_idx, kv_idx] = 2 if chunk.all() else 1
       else:
+        state_grid[q_idx, kv_idx] = 0
+    partial_mask_blocks = None
+  else:
+    partial_blocks_map = collections.defaultdict(
+        lambda: len(partial_blocks_map)
+    )
+    unique_chunks = []
+    for q_idx, kv_idx in np.argwhere((state_grid == -1) | (state_grid == 1)):
+      q_idx, kv_idx = int(q_idx), int(kv_idx)
+      chunk = mask[(
+          slice(q_idx * q_block_size, (q_idx + 1) * q_block_size),
+          slice(kv_idx * kv_block_size, (kv_idx + 1) * kv_block_size),
+      )]
+      if state_grid[q_idx, kv_idx] == -1:
+        if not chunk.any():
+          state_grid[q_idx, kv_idx] = 0
+          continue
+        if chunk.all():
+          state_grid[q_idx, kv_idx] = 2
+          continue
         state_grid[q_idx, kv_idx] = 1
-        chunk_id = partial_blocks_map[_HashableNDArray(chunk)]
-        partial_id_grid[q_idx, kv_idx] = chunk_id
+      chunk_id = partial_blocks_map[_HashableNDArray(chunk)]
+      partial_id_grid[q_idx, kv_idx] = chunk_id
+      if chunk_id == len(unique_chunks):
+        unique_chunks.append(chunk)
 
-        if chunk_id == len(unique_chunks):
-          unique_chunks.append(chunk)
+    if unique_chunks:
+      partial_mask_blocks = np.stack(unique_chunks).astype(
+          partial_mask_blocks_dtype
+      )
+      if is_dkv:
+        partial_mask_blocks = partial_mask_blocks.mT
+    else:
+      partial_mask_blocks = None
 
   full_mask = (state_grid == 2).all()
   if full_mask:
@@ -508,14 +697,7 @@ def _process_mask(
         q_sequence=q_sequence,
     ), None
 
-  if unique_chunks:
-    partial_mask_blocks = np.stack(unique_chunks).astype(
-        partial_mask_blocks_dtype
-    )
-    if is_dkv:
-      partial_mask_blocks = partial_mask_blocks.mT
-  else:
-    partial_mask_blocks = None
+  need_mask_next = mask_function is None and partial_mask_blocks is not None
 
   # Work on a fraction of the mask at the time to compute the mask. This is
   # needed to compute the correct data indices, which are relative to the
@@ -536,6 +718,7 @@ def _process_mask(
           partial_id_grid[q_slice, kv_slice],
           is_dkv,
           return_dynamic_grid,
+          compute_mask_next=need_mask_next,
       )
       all_shards_metadata.append(metadata)
 
@@ -555,7 +738,8 @@ def _process_mask(
     )
     active_rows_slices = list(map(pad_slice, active_rows_slices))
     active_cols_slices = list(map(pad_slice, active_cols_slices))
-    mask_next_slices = list(map(pad_slice, mask_next_slices))
+    if need_mask_next:
+      mask_next_slices = list(map(pad_slice, mask_next_slices))
     block_mask_slices = list(map(pad_slice, block_mask_slices))
 
     # Concatenate the sequence shards.
@@ -569,14 +753,15 @@ def _process_mask(
   else:
     active_rows = active_cols = num_active_blocks = None
 
-  mask_next = np.concatenate(mask_next_slices, axis=0)
   block_mask = np.concatenate(block_mask_slices, axis=0)
-
   if downcast_smem_data:
-    mask_next = _downcast_to_small_type(mask_next)
     block_mask = _downcast_to_small_type(block_mask)
 
-  if partial_mask_blocks is None:
+  if need_mask_next:
+    mask_next = np.concatenate(mask_next_slices, axis=0)
+    if downcast_smem_data:
+      mask_next = _downcast_to_small_type(mask_next)
+  else:
     mask_next = None
 
   assert (mask_function is not None) == (q_sequence is not None)
@@ -585,14 +770,12 @@ def _process_mask(
   # partial_mask_blocks are unused.
   return (
       MaskInfo(
-          mask_next=mask_next if mask_function is None else None,
+          mask_next=mask_next,
           active_rows=active_rows,
           active_cols=active_cols,
           block_mask=block_mask,
           num_active_blocks=num_active_blocks,
-          partial_mask_blocks=partial_mask_blocks
-          if mask_function is None
-          else None,
+          partial_mask_blocks=partial_mask_blocks,
           q_sequence=q_sequence,
       ),
       mask_function,

@@ -17,6 +17,8 @@
 # pylint: disable=invalid-name
 
 import functools
+import types
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -234,7 +236,23 @@ class SsdScanTest(parameterized.TestCase):
         (1,), ("x",), abstract_device=_FakeTpuDevice("TPU v6 lite")
     )
 
+    self.assertEqual(
+        ssd_scan_lib._get_tpu_vmem_params(interpret=True),
+        (16 * 1024 * 1024, 8, 128, None),
+    )
+    with mock.patch.object(
+        ssd_scan_lib.pltpu, "get_tpu_info", side_effect=ValueError("no TPU")
+    ):
+      self.assertEqual(
+          ssd_scan_lib._get_tpu_vmem_params(interpret=False),
+          (16 * 1024 * 1024, 8, 128, None),
+      )
+
     with jax.sharding.use_abstract_mesh(mesh_16m):
+      self.assertEqual(
+          ssd_scan_lib._get_tpu_vmem_params(interpret=False),
+          (16 * 1024 * 1024, 8, 128, int(0.80 * 16 * 1024 * 1024)),
+      )
       hb_16m = ssd_scan_lib._select_head_block_size(
           64, 64, 512, 128, 256, include_decay_tile=True, interpret=False
       )
@@ -242,6 +260,10 @@ class SsdScanTest(parameterized.TestCase):
           12, 2, 64, 64, 128, include_decay_tile=True, interpret=False
       )
     with jax.sharding.use_abstract_mesh(mesh_128m):
+      self.assertEqual(
+          ssd_scan_lib._get_tpu_vmem_params(interpret=False),
+          (128 * 1024 * 1024, 8, 128, int(0.80 * 128 * 1024 * 1024)),
+      )
       hb_128m = ssd_scan_lib._select_head_block_size(
           64, 64, 512, 128, 256, include_decay_tile=True, interpret=False
       )
@@ -249,6 +271,29 @@ class SsdScanTest(parameterized.TestCase):
     self.assertEqual(hb_16m, 4)
     self.assertEqual(hb_grouped, 6)
     self.assertGreater(hb_128m, hb_16m)
+
+    # Exact VMEM division boundaries (`per_head_bytes == 4_194_304`) to catch
+    # off-by-one byte mutations on double-buffered tile footprints.
+    self.assertEqual(
+        ssd_scan_lib._select_head_block_size(
+            2, 2, 512, 512, 256, include_decay_tile=False, interpret=True
+        ),
+        2,
+    )
+    fake_tpu_tight = types.SimpleNamespace(
+        vmem_capacity_bytes=2 * (3 * 4_194_304 - 1),
+        num_sublanes=8,
+        num_lanes=128,
+    )
+    with mock.patch.object(
+        ssd_scan_lib.pltpu, "get_tpu_info", return_value=fake_tpu_tight
+    ):
+      self.assertEqual(
+          ssd_scan_lib._select_head_block_size(
+              3, 3, 512, 512, 256, include_decay_tile=False, interpret=False
+          ),
+          1,
+      )
 
     with jax.sharding.use_abstract_mesh(mesh_128m):
       jitted = jax.jit(
@@ -265,8 +310,11 @@ class SsdScanTest(parameterized.TestCase):
           jax.ShapeDtypeStruct((2, 12, 64, 128), jnp.float32),
           jax.ShapeDtypeStruct((3,), jnp.bool_),
       )
-      self.assertIn("ssd_chunk_state_pallas", exported.mlir_module())
-      self.assertIn("ssd_chunk_scan_pallas", exported.mlir_module())
+      mlir = exported.mlir_module()
+      self.assertIn("ssd_chunk_state_pallas", mlir)
+      self.assertIn("ssd_chunk_scan_pallas", mlir)
+      expected_vmem_limit = str(int(0.80 * 128 * 1024 * 1024))
+      self.assertEqual(mlir.count(expected_vmem_limit), 2)
 
   @parameterized.product(
       strict_causal=[False, True],

@@ -39,10 +39,11 @@ def _get_params(n, c, h, d, dtype):
       gate_in_weights=jax.ShapeDtypeStruct((c, 2, h), dtype=dtype),
       projection_out_weights=jax.ShapeDtypeStruct((h, d), dtype=dtype),
       gate_out_weights=jax.ShapeDtypeStruct((c, d), dtype=dtype),
-      layernorm_in_scale=jax.ShapeDtypeStruct((c,), dtype=dtype),
-      layernorm_in_offset=jax.ShapeDtypeStruct((c,), dtype=dtype),
-      layernorm_out_scale=jax.ShapeDtypeStruct((h,), dtype=dtype),
-      layernorm_out_offset=jax.ShapeDtypeStruct((h,), dtype=dtype),
+      # Models commonly keep their layer norm parameters in float32.
+      layernorm_in_scale=jax.ShapeDtypeStruct((c,), dtype=jnp.float32),
+      layernorm_in_offset=jax.ShapeDtypeStruct((c,), dtype=jnp.float32),
+      layernorm_out_scale=jax.ShapeDtypeStruct((h,), dtype=jnp.float32),
+      layernorm_out_offset=jax.ShapeDtypeStruct((h,), dtype=jnp.float32),
   )
   return numerics.random_initialize(params)
 
@@ -67,10 +68,29 @@ class TriangleMultiplicationTest(parameterized.TestCase):
           or not api.IMPLEMENTATIONS[mosaic_key].supported_on(jax.devices()[0])  # pyrefly: ignore[missing-attribute]
       ):
         self.skipTest("Mosaic not supported on this platform.")
+    if implementation is not None:
+      impl_key = mosaic_key if implementation == "mosaic" else implementation
+    elif (
+        mosaic_key in api.IMPLEMENTATIONS
+        and api.IMPLEMENTATIONS[mosaic_key].supported_on(jax.devices()[0])  # pyrefly: ignore[missing-attribute]
+    ):
+      impl_key = mosaic_key
+    elif "triton" in api.IMPLEMENTATIONS and gpu_utils.has_triton_support():
+      impl_key = "triton"
+    else:
+      impl_key = "xla"
 
     n = 128
     d = 64
     params = _get_params(n=n, c=32, h=32, d=d, dtype=jnp.bfloat16)
+    if impl_key in ("triton", "mosaic_tpu"):
+      # Triton and Mosaic TPU require the layer norm parameters to have the
+      # dtype of `x`.
+      params = params | {
+          k: v.astype(jnp.bfloat16)
+          for k, v in params.items()
+          if k.startswith("layernorm_")
+      }
     mask = params.pop("mask")
     dout = (
         jax.random.normal(jax.random.key(0), (n, n, d), dtype=jnp.bfloat16) / n
@@ -106,18 +126,7 @@ class TriangleMultiplicationTest(parameterized.TestCase):
     with self.subTest("correct_implementation_used"):
       args = hlo_utils.get_bound_args(f, params)
       self.assertLen(args, 1)
-      if implementation is not None:
-        impl_key = mosaic_key if implementation == "mosaic" else implementation
-        impl = api.IMPLEMENTATIONS[impl_key]
-      elif (
-          mosaic_key in api.IMPLEMENTATIONS
-          and api.IMPLEMENTATIONS[mosaic_key].supported_on(jax.devices()[0])  # pyrefly: ignore[missing-attribute]
-      ):
-        impl = api.IMPLEMENTATIONS[mosaic_key]
-      elif "triton" in api.IMPLEMENTATIONS and gpu_utils.has_triton_support():
-        impl = api.IMPLEMENTATIONS["triton"]
-      else:
-        impl = api.IMPLEMENTATIONS["xla"]
+      impl = api.IMPLEMENTATIONS[impl_key]
       self.assertIsInstance(args[0].op, impl.__class__)
       if getattr(impl, "vjp", None) is not None:
         vjp_args = hlo_utils.get_bound_args(vjp_fn, dout)

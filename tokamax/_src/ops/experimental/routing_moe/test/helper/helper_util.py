@@ -24,28 +24,54 @@ import jax
 from jax.experimental.pallas import tpu as pltpu
 import numpy as np
 from tokamax._src import benchmarking
+from tokamax._src import block_scaled
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 
 
 def skip_unless_supported(
     test_case: absltest.TestCase, *, min_devices: int = 1
 ) -> None:
-  """Skips `test_case` unless platform, JAX version, and device count match."""
+  """Skips `test_case` unless platform, TPU generation, and devices match."""
   if jax.default_backend() != "tpu":
     test_case.skipTest("Only supported on TPUs.")
   if pltpu.get_tpu_info().generation < 7:
-    test_case.skipTest("Only tested on TPUv7x for now.")
+    test_case.skipTest("Requires TPU generation >= 7.")
   if jax.device_count() < min_devices:
     test_case.skipTest(f"Requires at least {min_devices} devices.")
 
 
-def check_gmm_supported(case: helper_cases.Case) -> None:
-  """Skips the test if `case` uses features unsupported by `routing_gmm`."""
-  if case.local_intermediate_size % 256 != 0:
+def skip_unless_block_scaled_supported(
+    test_case: absltest.TestCase, *, min_devices: int = 1
+) -> None:
+  """Skips `test_case` unless block-scaled matmul and TPU_8T+ are available."""
+  if not block_scaled.is_available():
+    test_case.skipTest("Block-scaled matmul is not available in OSS.")
+  skip_unless_supported(test_case, min_devices=min_devices)
+  if not gmm_plan.is_block_scaled_tpu(pltpu.get_tpu_info()):
+    test_case.skipTest("Block-scaled matmul requires TPU_8T or newer.")
+
+
+def check_gmm_supported(
+    case: helper_cases.Case, *, fused_up_and_down: bool = False
+) -> None:
+  """Skips the test if `case` uses features unsupported by `routing_gmm`.
+
+  Args:
+    case: The test case.
+    fused_up_and_down: Whether the test only runs gate/up and down fused, which
+      supports intermediate sizes that aren't a multiple of 256.
+  """
+  if case.local_intermediate_size % 256 != 0 and not fused_up_and_down:
     raise absltest.SkipTest(
         "TODO: Fix gmm/plan.py raising error if intermediate is not"
         " multiple of 256 even when up & down can be fused."
     )
+  if case.shape.w_block_scaled:
+    if not block_scaled.is_available():
+      raise absltest.SkipTest("Block-scaled matmul is not available in OSS.")
+    if not gmm_plan.is_block_scaled_tpu(pltpu.get_tpu_info()):
+      raise absltest.SkipTest("Block-scaled matmul requires TPU_8T or newer.")
 
 
 def check_moe_supported(

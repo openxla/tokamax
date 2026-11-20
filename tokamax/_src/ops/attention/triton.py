@@ -393,7 +393,7 @@ def _fwd_kernel(
         qs += (q,)
         q_scales += (q_scale * sm_scale,)
       else:
-        qs += ((_dequantize(q, q_scale) * sm_scale).to(qk_dtype),)
+        qs += (_dequantize(q, q_scale).to(qk_dtype),)
 
     num_k_blocks = tl.cdiv(seq_len_k, block_k)
     # Rows past ``seq_len_q`` get fill values that are neutral for the min/max
@@ -457,6 +457,8 @@ def _fwd_kernel(
             s += triton_utils.dot(
                 qs[i_d], tl.trans(k.to(qk_dtype)), input_precision=qk_prec
             )
+        if not quantize_qk_dot:  # Else `sm_scale` is in `qk_scale`.
+          s *= sm_scale
         s = s.to(logits_dtype)
 
         if bias_ptr is not None:
@@ -992,16 +994,22 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
     devices = op.infer_devices(ba) or {backend.get_default_device()}
     is_sm80 = any(map(gpu_utils.is_sm80, devices))
 
-    if is_sm80:
-      head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
-      if head_dim_bytes >= 512:
-        num_stages = 1
+    # Unlike the VJP kernel, the forward kernel stages Q/K/V in their input
+    # dtype before casting for dot products, so shared memory scales with
+    # `q.dtype` itemsize.
+    head_dim_bytes = jnp.dtype(q.dtype).itemsize * head_dim
+    if head_dim_bytes >= (512 if is_sm80 else 1024):
+      num_stages = 1
+      # Work around a Triton bug on SM100 where `block_q=64` triggers
+      # `CUDA_ERROR_MISALIGNED_ADDRESS`.
+      if head_dim >= 512 and any(map(gpu_utils.is_sm100, devices)):
+        block_q = min(block_q, 32)
 
-      if _can_have_block_d(q, k, v):
-        block_qk = block_q * block_k
-        block_d = max(
-            16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
-        )
+    if is_sm80 and _can_have_block_d(q, k, v):
+      block_qk = block_q * block_k
+      block_d = max(
+          16, triton.next_power_of_2(min(head_dim, 64**3 // block_qk))
+      )
 
     return Config(
         block_q=block_q,

@@ -1,812 +1,1367 @@
 {
-  "{\"qkv\":\"bf16[1024,1536]\",\"b\":\"bf16[1024,8]\",\"a\":\"bf16[1024,8]\",\"conv_state\":\"bf16[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[1024,1536]\",\"b\":\"bf16[1024,8]\",\"a\":\"bf16[1024,8]\",\"conv_state\":\"f32[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 774.6831380063668,
-      "lower_time_ms": 117.21352898166515,
+      "compile_time_ms": 625.8146280888468,
+      "lower_time_ms": 122.05309607088566,
       "evaluation_times_ms": [
-        5.953,
-        5.963,
-        5.976,
-        5.96,
-        5.968
+        6.465,
+        6.453,
+        6.45,
+        6.453,
+        6.45
       ],
       "metadata": {},
-      "peak_memory_mb": 38.428704
+      "peak_memory_mb": 50.477088
     }
   },
-  "{\"qkv\":\"bf16[2048,1536]\",\"b\":\"bf16[2048,8]\",\"a\":\"bf16[2048,8]\",\"conv_state\":\"bf16[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[2048,1536]\",\"b\":\"bf16[2048,8]\",\"a\":\"bf16[2048,8]\",\"conv_state\":\"f32[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 909.0664850082248,
-      "lower_time_ms": 106.79191298549995,
+      "compile_time_ms": 742.1285670716316,
+      "lower_time_ms": 113.01270104013383,
       "evaluation_times_ms": [
-        12.037,
-        12.036,
-        12.035,
-        12.036,
-        12.036
+        13.087,
+        13.068,
+        13.08,
+        13.084,
+        13.113
       ],
       "metadata": {},
-      "peak_memory_mb": 68.298784
+      "peak_memory_mb": 99.84208
     }
   },
-  "{\"qkv\":\"bf16[4096,1536]\",\"b\":\"bf16[4096,8]\",\"a\":\"bf16[4096,8]\",\"conv_state\":\"bf16[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[4096,1536]\",\"b\":\"bf16[4096,8]\",\"a\":\"bf16[4096,8]\",\"conv_state\":\"f32[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1538.1090650043916,
-      "lower_time_ms": 104.49041301035322,
+      "compile_time_ms": 601.5153720509261,
+      "lower_time_ms": 112.48326604254544,
       "evaluation_times_ms": [
-        24.891,
-        24.896,
-        24.893,
-        24.899,
-        24.889
+        33.316,
+        33.314,
+        33.307,
+        33.286,
+        33.316
       ],
       "metadata": {},
-      "peak_memory_mb": 110.30736
+      "peak_memory_mb": 198.490144
     }
   },
-  "{\"qkv\":\"bf16[8192,1536]\",\"b\":\"bf16[8192,8]\",\"a\":\"bf16[8192,8]\",\"conv_state\":\"bf16[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[8192,1536]\",\"b\":\"bf16[8192,8]\",\"a\":\"bf16[8192,8]\",\"conv_state\":\"f32[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 658.4702669933904,
-      "lower_time_ms": 353.9024499768857,
+      "compile_time_ms": 573.5566320363432,
+      "lower_time_ms": 110.66107684746385,
       "evaluation_times_ms": [
-        65.877,
-        65.864,
-        65.875,
-        65.897,
-        65.867
+        64.268,
+        64.272,
+        64.25,
+        64.262,
+        64.25
       ],
       "metadata": {},
-      "peak_memory_mb": 269.84656
+      "peak_memory_mb": 446.101536
     }
   },
-  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"bf16[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"f32[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 584.9705419968814,
-      "lower_time_ms": 65.04941001185216,
+      "compile_time_ms": 466.52948297560215,
+      "lower_time_ms": 110.70890282280743,
       "evaluation_times_ms": [
-        0.739,
-        0.739,
-        0.738,
-        0.738,
-        0.74
+        0.855,
+        0.856,
+        0.855,
+        0.854,
+        0.856
       ],
       "metadata": {},
-      "peak_memory_mb": 70.056992
+      "peak_memory_mb": 71.844896
     }
   },
-  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"bf16[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"f32[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 832.9677990113851,
-      "lower_time_ms": 106.98336598579772,
+      "compile_time_ms": 814.6104468032718,
+      "lower_time_ms": 110.25210609659553,
       "evaluation_times_ms": [
-        2.12,
-        2.123,
-        2.123,
-        2.122,
-        2.122
+        1.888,
+        1.887,
+        1.89,
+        1.888,
+        1.891
       ],
       "metadata": {},
-      "peak_memory_mb": 104.773664
+      "peak_memory_mb": 107.674144
     }
   },
-  "{\"qkv\":\"bf16[256,1536]\",\"b\":\"bf16[256,8]\",\"a\":\"bf16[256,8]\",\"conv_state\":\"bf16[257,3,1536]\",\"recurrent_state\":\"bf16[257,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[257]\",\"state_indices\":\"i32[256]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[256]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[256,1536]\",\"b\":\"bf16[256,8]\",\"a\":\"bf16[256,8]\",\"conv_state\":\"f32[257,3,1536]\",\"recurrent_state\":\"bf16[257,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[257]\",\"state_indices\":\"i32[256]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[256]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 818.8351129938383,
-      "lower_time_ms": 104.72049098461866,
+      "compile_time_ms": 956.6747460048646,
+      "lower_time_ms": 113.67728817276657,
       "evaluation_times_ms": [
-        3.965,
-        3.967,
-        3.973,
-        3.974,
-        3.971
+        3.862,
+        3.866,
+        3.865,
+        3.864,
+        3.86
       ],
       "metadata": {},
-      "peak_memory_mb": 208.065568
+      "peak_memory_mb": 215.03184
     }
   },
-  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"bf16[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"f32[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 904.3012020119932,
-      "lower_time_ms": 105.44797501643188,
+      "compile_time_ms": 986.2661070656031,
+      "lower_time_ms": 111.30143981426954,
       "evaluation_times_ms": [
-        9.044,
-        9.039,
-        9.042,
-        9.037,
-        9.031
+        9.251,
+        9.244,
+        9.245,
+        9.246,
+        9.25
       ],
       "metadata": {},
-      "peak_memory_mb": 417.008672
+      "peak_memory_mb": 429.217824
     }
   },
-  "{\"qkv\":\"bf16[4,1536]\",\"b\":\"bf16[4,8]\",\"a\":\"bf16[4,8]\",\"conv_state\":\"bf16[5,3,1536]\",\"recurrent_state\":\"bf16[5,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[5]\",\"state_indices\":\"i32[4]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[4]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[4,1536]\",\"b\":\"bf16[4,8]\",\"a\":\"bf16[4,8]\",\"conv_state\":\"f32[5,3,1536]\",\"recurrent_state\":\"bf16[5,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[5]\",\"state_indices\":\"i32[4]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[4]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 260.2810629759915,
-      "lower_time_ms": 104.60512698045932,
+      "compile_time_ms": 229.09880406223238,
+      "lower_time_ms": 109.4406140036881,
       "evaluation_times_ms": [
-        0.05,
-        0.05,
-        0.05,
-        0.05,
-        0.05
+        0.06,
+        0.06,
+        0.06,
+        0.06,
+        0.06
       ],
       "metadata": {},
-      "peak_memory_mb": 6.542368
+      "peak_memory_mb": 6.738976
     }
   },
-  "{\"qkv\":\"bf16[8,1536]\",\"b\":\"bf16[8,8]\",\"a\":\"bf16[8,8]\",\"conv_state\":\"bf16[9,3,1536]\",\"recurrent_state\":\"bf16[9,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[8,1536]\",\"b\":\"bf16[8,8]\",\"a\":\"bf16[8,8]\",\"conv_state\":\"f32[9,3,1536]\",\"recurrent_state\":\"bf16[9,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 313.1654839962721,
-      "lower_time_ms": 106.01664998102933,
+      "compile_time_ms": 269.2863680422306,
+      "lower_time_ms": 110.14151014387608,
       "evaluation_times_ms": [
-        0.103,
-        0.104,
-        0.104,
-        0.104,
-        0.104
+        0.12,
+        0.12,
+        0.12,
+        0.12,
+        0.12
       ],
       "metadata": {},
-      "peak_memory_mb": 11.965472
+      "peak_memory_mb": 12.321824
     }
   },
-  "{\"qkv\":\"bf16[16,1536]\",\"b\":\"bf16[16,8]\",\"a\":\"bf16[16,8]\",\"conv_state\":\"bf16[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[16,1536]\",\"b\":\"bf16[16,8]\",\"a\":\"bf16[16,8]\",\"conv_state\":\"f32[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 317.4753299972508,
-      "lower_time_ms": 106.97335601435043,
+      "compile_time_ms": 298.048323020339,
+      "lower_time_ms": 112.9133568610996,
       "evaluation_times_ms": [
-        0.189,
-        0.189,
-        0.189,
-        0.189,
-        0.189
+        0.218,
+        0.217,
+        0.217,
+        0.218,
+        0.217
       ],
       "metadata": {},
-      "peak_memory_mb": 22.815776
+      "peak_memory_mb": 23.491616
     }
   },
-  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"bf16[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"f32[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 415.31621900503524,
-      "lower_time_ms": 105.98180099623278,
+      "compile_time_ms": 322.19555391930044,
+      "lower_time_ms": 110.26160209439695,
       "evaluation_times_ms": [
-        0.364,
-        0.364,
-        0.364,
-        0.365,
-        0.366
+        0.418,
+        0.418,
+        0.417,
+        0.416,
+        0.418
       ],
       "metadata": {},
-      "peak_memory_mb": 44.130336
+      "peak_memory_mb": 44.864544
     }
   },
-  "{\"qkv\":\"bf16[8192,1536]\",\"b\":\"bf16[8192,8]\",\"a\":\"bf16[8192,8]\",\"conv_state\":\"bf16[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[8192,1536]\",\"b\":\"bf16[8192,8]\",\"a\":\"bf16[8192,8]\",\"conv_state\":\"f32[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 858.1432200153358,
-      "lower_time_ms": 110.10791201260872,
+      "compile_time_ms": 726.9338679034263,
+      "lower_time_ms": 115.91372988186777,
       "evaluation_times_ms": [
-        103.275,
-        103.187,
-        103.306,
-        103.259,
-        103.241
+        114.332,
+        114.323,
+        114.285,
+        114.298,
+        114.278
       ],
       "metadata": {},
-      "peak_memory_mb": 322.001952
+      "peak_memory_mb": 483.249184
     }
   },
-  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"bf16[4,3,1536]\",\"recurrent_state\":\"bf16[4,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[4]\",\"state_indices\":\"i32[3]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[3]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"f32[4,3,1536]\",\"recurrent_state\":\"bf16[4,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[4]\",\"state_indices\":\"i32[3]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[3]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 722.9775029991288,
-      "lower_time_ms": 109.18775701429695,
+      "compile_time_ms": 829.2805440723896,
+      "lower_time_ms": 112.68416582606733,
       "evaluation_times_ms": [
-        6.03,
-        6.032,
-        6.034,
-        6.027,
-        6.033
+        6.357,
+        6.358,
+        6.365,
+        6.367,
+        6.359
       ],
       "metadata": {},
-      "peak_memory_mb": 26.38288
+      "peak_memory_mb": 37.515808
     }
   },
-  "{\"qkv\":\"bf16[520,1536]\",\"b\":\"bf16[520,8]\",\"a\":\"bf16[520,8]\",\"conv_state\":\"bf16[12,3,1536]\",\"recurrent_state\":\"bf16[12,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[12]\",\"state_indices\":\"i32[11]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[11]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[520,1536]\",\"b\":\"bf16[520,8]\",\"a\":\"bf16[520,8]\",\"conv_state\":\"f32[12,3,1536]\",\"recurrent_state\":\"bf16[12,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[12]\",\"state_indices\":\"i32[11]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[11]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 735.0581570062786,
-      "lower_time_ms": 106.76773599698208,
+      "compile_time_ms": 849.3938299361616,
+      "lower_time_ms": 114.52264315448701,
       "evaluation_times_ms": [
-        6.128,
-        6.125,
-        6.123,
-        6.121,
-        6.125
+        6.454,
+        6.459,
+        6.462,
+        6.466,
+        6.453
       ],
       "metadata": {},
-      "peak_memory_mb": 33.361952
+      "peak_memory_mb": 41.790496
     }
   },
-  "{\"qkv\":\"bf16[248,1536]\",\"b\":\"bf16[248,8]\",\"a\":\"bf16[248,8]\",\"conv_state\":\"bf16[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[248,1536]\",\"b\":\"bf16[248,8]\",\"a\":\"bf16[248,8]\",\"conv_state\":\"f32[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 700.4847619973589,
-      "lower_time_ms": 107.31041000690311,
+      "compile_time_ms": 788.6701140087098,
+      "lower_time_ms": 115.25326920673251,
       "evaluation_times_ms": [
-        2.93,
-        2.927,
-        2.931,
-        2.933,
-        2.934
+        2.765,
+        2.764,
+        2.767,
+        2.767,
+        2.766
       ],
       "metadata": {},
-      "peak_memory_mb": 24.725024
+      "peak_memory_mb": 29.75696
     }
   },
-  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"bf16[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"f32[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 746.5561730205081,
-      "lower_time_ms": 108.75705801299773,
+      "compile_time_ms": 751.013298984617,
+      "lower_time_ms": 112.82112705521286,
       "evaluation_times_ms": [
-        1.674,
-        1.671,
-        1.672,
-        1.676,
-        1.672
+        1.527,
+        1.529,
+        1.528,
+        1.529,
+        1.528
       ],
       "metadata": {},
-      "peak_memory_mb": 413.391904
+      "peak_memory_mb": 423.240224
     }
   },
-  "{\"qkv\":\"bf16[1024,6144]\",\"b\":\"bf16[1024,32]\",\"a\":\"bf16[1024,32]\",\"conv_state\":\"bf16[2,3,6144]\",\"recurrent_state\":\"bf16[2,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[1024,6144]\",\"b\":\"bf16[1024,32]\",\"a\":\"bf16[1024,32]\",\"conv_state\":\"f32[2,3,6144]\",\"recurrent_state\":\"bf16[2,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1528.2384960155468,
-      "lower_time_ms": 110.24633899796754,
+      "compile_time_ms": 603.3707000315189,
+      "lower_time_ms": 116.80834088474512,
       "evaluation_times_ms": [
-        7.72,
-        7.7,
-        7.847,
-        7.722,
-        7.752
+        10.615,
+        10.621,
+        10.619,
+        10.63,
+        10.623
       ],
       "metadata": {},
-      "peak_memory_mb": 113.608736
+      "peak_memory_mb": 202.03728
     }
   },
-  "{\"qkv\":\"bf16[2048,6144]\",\"b\":\"bf16[2048,32]\",\"a\":\"bf16[2048,32]\",\"conv_state\":\"bf16[2,3,6144]\",\"recurrent_state\":\"bf16[2,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[2048,6144]\",\"b\":\"bf16[2048,32]\",\"a\":\"bf16[2048,32]\",\"conv_state\":\"f32[2,3,6144]\",\"recurrent_state\":\"bf16[2,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 663.7844660144765,
-      "lower_time_ms": 107.30957900523208,
+      "compile_time_ms": 560.6553140096366,
+      "lower_time_ms": 112.54230001941323,
       "evaluation_times_ms": [
-        18.826,
-        18.827,
-        18.834,
-        18.833,
-        18.843
+        19.835,
+        19.873,
+        19.838,
+        19.85,
+        19.857
       ],
       "metadata": {},
-      "peak_memory_mb": 273.221664
+      "peak_memory_mb": 449.636384
     }
   },
-  "{\"qkv\":\"bf16[16,6144]\",\"b\":\"bf16[16,32]\",\"a\":\"bf16[16,32]\",\"conv_state\":\"bf16[17,3,6144]\",\"recurrent_state\":\"bf16[17,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[16,6144]\",\"b\":\"bf16[16,32]\",\"a\":\"bf16[16,32]\",\"conv_state\":\"f32[17,3,6144]\",\"recurrent_state\":\"bf16[17,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 527.4260739970487,
-      "lower_time_ms": 105.43797301943414,
+      "compile_time_ms": 464.67478410340846,
+      "lower_time_ms": 118.73800377361476,
       "evaluation_times_ms": [
-        0.278,
-        0.279,
-        0.28,
-        0.279,
-        0.28
+        0.302,
+        0.301,
+        0.301,
+        0.3,
+        0.3
       ],
       "metadata": {},
-      "peak_memory_mb": 74.458144
+      "peak_memory_mb": 78.218272
     }
   },
-  "{\"qkv\":\"bf16[32,6144]\",\"b\":\"bf16[32,32]\",\"a\":\"bf16[32,32]\",\"conv_state\":\"bf16[33,3,6144]\",\"recurrent_state\":\"bf16[33,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[32,6144]\",\"b\":\"bf16[32,32]\",\"a\":\"bf16[32,32]\",\"conv_state\":\"f32[33,3,6144]\",\"recurrent_state\":\"bf16[33,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 838.7951379991136,
-      "lower_time_ms": 107.40124501171522,
+      "compile_time_ms": 824.1098208818585,
+      "lower_time_ms": 110.74767215177417,
       "evaluation_times_ms": [
-        0.725,
-        0.724,
-        0.724,
-        0.726,
-        0.725
+        0.653,
+        0.652,
+        0.652,
+        0.652,
+        0.651
       ],
       "metadata": {},
-      "peak_memory_mb": 106.845728
+      "peak_memory_mb": 110.188576
     }
   },
-  "{\"qkv\":\"bf16[64,6144]\",\"b\":\"bf16[64,32]\",\"a\":\"bf16[64,32]\",\"conv_state\":\"bf16[65,3,6144]\",\"recurrent_state\":\"bf16[65,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[64,6144]\",\"b\":\"bf16[64,32]\",\"a\":\"bf16[64,32]\",\"conv_state\":\"f32[65,3,6144]\",\"recurrent_state\":\"bf16[65,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1680.40443607606,
-      "lower_time_ms": 114.36894093640149,
+      "compile_time_ms": 961.2038801424205,
+      "lower_time_ms": 351.04030393995345,
       "evaluation_times_ms": [
-        1.374,
-        1.375,
-        1.373,
-        1.375,
-        1.375
+        1.372,
+        1.372,
+        1.372,
+        1.372,
+        1.37
       ],
       "metadata": {},
-      "peak_memory_mb": 210.91792
+      "peak_memory_mb": 217.539104
     }
   },
-  "{\"qkv\":\"bf16[128,6144]\",\"b\":\"bf16[128,32]\",\"a\":\"bf16[128,32]\",\"conv_state\":\"bf16[129,3,6144]\",\"recurrent_state\":\"bf16[129,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,6144]\",\"b\":\"bf16[128,32]\",\"a\":\"bf16[128,32]\",\"conv_state\":\"f32[129,3,6144]\",\"recurrent_state\":\"bf16[129,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1739.3951390404254,
-      "lower_time_ms": 107.02531598508358,
+      "compile_time_ms": 1632.2110800538212,
+      "lower_time_ms": 112.16184915974736,
       "evaluation_times_ms": [
-        2.896,
-        2.892,
-        2.896,
-        2.897,
-        2.894
+        2.668,
+        2.669,
+        2.668,
+        2.667,
+        2.67
       ],
       "metadata": {},
-      "peak_memory_mb": 419.585568
+      "peak_memory_mb": 431.711264
     }
   },
-  "{\"qkv\":\"bf16[1024,6144]\",\"b\":\"bf16[1024,32]\",\"a\":\"bf16[1024,32]\",\"conv_state\":\"bf16[17,3,6144]\",\"recurrent_state\":\"bf16[17,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[1024,6144]\",\"b\":\"bf16[1024,32]\",\"a\":\"bf16[1024,32]\",\"conv_state\":\"f32[17,3,6144]\",\"recurrent_state\":\"bf16[17,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1735.1751590613276,
-      "lower_time_ms": 110.12684181332588,
+      "compile_time_ms": 674.085880862549,
+      "lower_time_ms": 116.9971211347729,
       "evaluation_times_ms": [
-        14.663,
+        16.543,
+        16.553,
+        16.559,
+        16.56,
+        16.571
+      ],
+      "metadata": {},
+      "peak_memory_mb": 236.334112
+    }
+  },
+  "{\"qkv\":\"bf16[2048,6144]\",\"b\":\"bf16[2048,32]\",\"a\":\"bf16[2048,32]\",\"conv_state\":\"f32[33,3,6144]\",\"recurrent_state\":\"bf16[33,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 721.1997129488736,
+      "lower_time_ms": 112.78683901764452,
+      "evaluation_times_ms": [
+        41.334,
+        41.329,
+        41.332,
+        41.341,
+        41.331
+      ],
+      "metadata": {},
+      "peak_memory_mb": 523.292704
+    }
+  },
+  "{\"qkv\":\"bf16[8,12288]\",\"b\":\"bf16[8,64]\",\"a\":\"bf16[8,64]\",\"conv_state\":\"f32[9,3,12288]\",\"recurrent_state\":\"bf16[9,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 456.6218410618603,
+      "lower_time_ms": 111.71330697834492,
+      "evaluation_times_ms": [
+        0.202,
+        0.201,
+        0.201,
+        0.201,
+        0.201
+      ],
+      "metadata": {},
+      "peak_memory_mb": 83.86256
+    }
+  },
+  "{\"qkv\":\"bf16[64,12288]\",\"b\":\"bf16[64,64]\",\"a\":\"bf16[64,64]\",\"conv_state\":\"f32[65,3,12288]\",\"recurrent_state\":\"bf16[65,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1524.6101710945368,
+      "lower_time_ms": 109.91770401597023,
+      "evaluation_times_ms": [
+        1.862,
+        1.863,
+        1.864,
+        1.863,
+        1.861
+      ],
+      "metadata": {},
+      "peak_memory_mb": 435.065376
+    }
+  },
+  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"f32[9,3,12288]\",\"recurrent_state\":\"bf16[9,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 645.8342440892011,
+      "lower_time_ms": 114.42027310840786,
+      "evaluation_times_ms": [
+        20.679,
+        20.668,
+        20.679,
+        20.668,
+        20.69
+      ],
+      "metadata": {},
+      "peak_memory_mb": 486.28432
+    }
+  },
+  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"f32[65,3,12288]\",\"recurrent_state\":\"bf16[65,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1592.2415270470083,
+      "lower_time_ms": 115.41466717608273,
+      "evaluation_times_ms": [
+        25.013,
+        24.989,
+        24.987,
+        24.99,
+        25.003
+      ],
+      "metadata": {},
+      "peak_memory_mb": 751.640096
+    }
+  },
+  "{\"qkv\":\"bf16[512,12288]\",\"b\":\"bf16[512,64]\",\"a\":\"bf16[512,64]\",\"conv_state\":\"f32[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 603.9856360293925,
+      "lower_time_ms": 117.22035380080342,
+      "evaluation_times_ms": [
+        6.421,
+        6.422,
+        6.425,
+        6.424,
+        6.421
+      ],
+      "metadata": {},
+      "peak_memory_mb": 206.774304
+    }
+  },
+  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"f32[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 621.2242031469941,
+      "lower_time_ms": 113.07137296535075,
+      "evaluation_times_ms": [
+        11.926,
+        11.898,
+        11.896,
+        11.929,
+        11.918
+      ],
+      "metadata": {},
+      "peak_memory_mb": 454.379552
+    }
+  },
+  "{\"qkv\":\"bf16[2048,12288]\",\"b\":\"bf16[2048,64]\",\"a\":\"bf16[2048,64]\",\"conv_state\":\"f32[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 644.5358658675104,
+      "lower_time_ms": 113.6297439225018,
+      "evaluation_times_ms": [
+        32.022,
+        32.006,
+        32.041,
+        32.053,
+        32.011
+      ],
+      "metadata": {},
+      "peak_memory_mb": 899.244064
+    }
+  },
+  "{\"qkv\":\"bf16[4096,12288]\",\"b\":\"bf16[4096,64]\",\"a\":\"bf16[4096,64]\",\"conv_state\":\"f32[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 664.3380329478532,
+      "lower_time_ms": 115.08472100831568,
+      "evaluation_times_ms": [
+        65.942,
+        65.934,
+        65.924,
+        65.934,
+        65.915
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1789.265952
+    }
+  },
+  "{\"qkv\":\"bf16[16,12288]\",\"b\":\"bf16[16,64]\",\"a\":\"bf16[16,64]\",\"conv_state\":\"f32[17,3,12288]\",\"recurrent_state\":\"bf16[17,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 782.5373620726168,
+      "lower_time_ms": 110.37016101181507,
+      "evaluation_times_ms": [
+        0.438,
+        0.438,
+        0.438,
+        0.438,
+        0.439
+      ],
+      "metadata": {},
+      "peak_memory_mb": 113.125408
+    }
+  },
+  "{\"qkv\":\"bf16[32,12288]\",\"b\":\"bf16[32,64]\",\"a\":\"bf16[32,64]\",\"conv_state\":\"f32[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 869.5794290397316,
+      "lower_time_ms": 111.95091507397592,
+      "evaluation_times_ms": [
+        0.915,
+        0.913,
+        0.915,
+        0.915,
+        0.912
+      ],
+      "metadata": {},
+      "peak_memory_mb": 220.877344
+    }
+  },
+  "{\"qkv\":\"bf16[128,12288]\",\"b\":\"bf16[128,64]\",\"a\":\"bf16[128,64]\",\"conv_state\":\"f32[129,3,12288]\",\"recurrent_state\":\"bf16[129,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1769.4609379395843,
+      "lower_time_ms": 114.37105596996844,
+      "evaluation_times_ms": [
+        3.575,
+        3.576,
+        3.575,
+        3.578,
+        3.576
+      ],
+      "metadata": {},
+      "peak_memory_mb": 863.409184
+    }
+  },
+  "{\"qkv\":\"bf16[512,12288]\",\"b\":\"bf16[512,64]\",\"a\":\"bf16[512,64]\",\"conv_state\":\"f32[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 839.8556690663099,
+      "lower_time_ms": 114.08966896124184,
+      "evaluation_times_ms": [
+        11.848,
+        11.845,
+        11.84,
+        11.838,
+        11.844
+      ],
+      "metadata": {},
+      "peak_memory_mb": 354.09616
+    }
+  },
+  "{\"qkv\":\"bf16[2048,12288]\",\"b\":\"bf16[2048,64]\",\"a\":\"bf16[2048,64]\",\"conv_state\":\"f32[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1210.2269767783582,
+      "lower_time_ms": 124.93105395697057,
+      "evaluation_times_ms": [
+        49.904,
+        49.854,
+        49.849,
+        49.865,
+        49.85
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1046.557728
+    }
+  },
+  "{\"qkv\":\"bf16[1536,1536]\",\"b\":\"bf16[1536,8]\",\"a\":\"bf16[1536,8]\",\"conv_state\":\"f32[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 719.6910551283509,
+      "lower_time_ms": 112.31476604007185,
+      "evaluation_times_ms": [
+        9.72,
+        9.722,
+        9.737,
+        9.73,
+        9.731
+      ],
+      "metadata": {},
+      "peak_memory_mb": 56.26064
+    }
+  },
+  "{\"qkv\":\"bf16[2055,1536]\",\"b\":\"bf16[2055,8]\",\"a\":\"bf16[2055,8]\",\"conv_state\":\"f32[9,3,1536]\",\"recurrent_state\":\"bf16[9,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 765.2254709973931,
+      "lower_time_ms": 116.83720094151795,
+      "evaluation_times_ms": [
+        25.411,
+        25.409,
+        25.395,
+        25.444,
+        25.418
+      ],
+      "metadata": {},
+      "peak_memory_mb": 104.184864
+    }
+  },
+  "{\"qkv\":\"bf16[2048,1024]\",\"b\":\"bf16[2048,4]\",\"a\":\"bf16[2048,4]\",\"conv_state\":\"f32[2,3,1024]\",\"recurrent_state\":\"bf16[2,4,128,128]\",\"conv_weight\":\"bf16[1024,1,4]\",\"conv_bias\":\"bf16[1024]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 689.4946831744164,
+      "lower_time_ms": 111.60864192061126,
+      "evaluation_times_ms": [
+        12.376,
+        12.378,
+        12.378,
+        12.363,
+        12.37
+      ],
+      "metadata": {},
+      "peak_memory_mb": 48.873504
+    }
+  },
+  "{\"qkv\":\"bf16[64,1024]\",\"b\":\"bf16[64,4]\",\"a\":\"bf16[64,4]\",\"conv_state\":\"f32[65,3,1024]\",\"recurrent_state\":\"bf16[65,4,128,128]\",\"conv_weight\":\"bf16[1024,1,4]\",\"conv_bias\":\"bf16[1024]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 377.771524945274,
+      "lower_time_ms": 110.89667002670467,
+      "evaluation_times_ms": [
+        0.753,
+        0.754,
+        0.755,
+        0.753,
+        0.772
+      ],
+      "metadata": {},
+      "peak_memory_mb": 44.723232
+    }
+  },
+  "{\"qkv\":\"bf16[2048,2560]\",\"b\":\"bf16[2048,16]\",\"a\":\"bf16[2048,16]\",\"conv_state\":\"f32[2,3,2560]\",\"recurrent_state\":\"bf16[2,16,128,128]\",\"conv_weight\":\"bf16[2560,1,4]\",\"conv_bias\":\"bf16[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 837.3064650222659,
+      "lower_time_ms": 111.2464249599725,
+      "evaluation_times_ms": [
+        16.12,
+        16.111,
+        16.12,
+        16.107,
+        16.103
+      ],
+      "metadata": {},
+      "peak_memory_mb": 168.165408
+    }
+  },
+  "{\"qkv\":\"bf16[64,2560]\",\"b\":\"bf16[64,16]\",\"a\":\"bf16[64,16]\",\"conv_state\":\"f32[65,3,2560]\",\"recurrent_state\":\"bf16[65,16,128,128]\",\"conv_weight\":\"bf16[2560,1,4]\",\"conv_bias\":\"bf16[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 710.1286898832768,
+      "lower_time_ms": 109.93052506819367,
+      "evaluation_times_ms": [
+        1.008,
+        1.012,
+        1.007,
+        1.012,
+        1.01
+      ],
+      "metadata": {},
+      "peak_memory_mb": 107.425824
+    }
+  },
+  "{\"qkv\":\"bf16[8192,10240]\",\"b\":\"bf16[8192,64]\",\"a\":\"bf16[8192,64]\",\"conv_state\":\"f32[2,3,10240]\",\"recurrent_state\":\"f32[2,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 754.5742499642074,
+      "lower_time_ms": 113.15513006411493,
+      "evaluation_times_ms": [
+        180.263,
+        180.264,
+        180.264,
+        180.249,
+        180.259
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3006.552096
+    }
+  },
+  "{\"qkv\":\"bf16[48,10240]\",\"b\":\"bf16[48,64]\",\"a\":\"bf16[48,64]\",\"conv_state\":\"f32[49,3,10240]\",\"recurrent_state\":\"f32[49,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[49]\",\"state_indices\":\"i32[48]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[48]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 970.1710578519851,
+      "lower_time_ms": 112.55023605190217,
+      "evaluation_times_ms": [
+        1.838,
+        1.839,
+        1.837,
+        1.839,
+        1.838
+      ],
+      "metadata": {},
+      "peak_memory_mb": 630.500896
+    }
+  },
+  "{\"qkv\":\"bf16[80,10240]\",\"b\":\"bf16[80,64]\",\"a\":\"bf16[80,64]\",\"conv_state\":\"f32[81,3,10240]\",\"recurrent_state\":\"f32[81,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[81]\",\"state_indices\":\"i32[80]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[80]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1461.6853930056095,
+      "lower_time_ms": 109.81406620703638,
+      "evaluation_times_ms": [
+        3.112,
+        3.114,
+        3.112,
+        3.11,
+        3.111
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1043.779104
+    }
+  },
+  "{\"qkv\":\"bf16[93,10240]\",\"b\":\"bf16[93,64]\",\"a\":\"bf16[93,64]\",\"conv_state\":\"f32[94,3,10240]\",\"recurrent_state\":\"f32[94,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[94]\",\"state_indices\":\"i32[93]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[93]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1166.4070880506188,
+      "lower_time_ms": 110.21725903265178,
+      "evaluation_times_ms": [
+        3.609,
+        3.608,
+        3.611,
+        3.61,
+        3.611
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1210.699296
+    }
+  },
+  "{\"qkv\":\"bf16[8192,10240]\",\"b\":\"bf16[8192,64]\",\"a\":\"bf16[8192,64]\",\"conv_state\":\"f32[50,3,10240]\",\"recurrent_state\":\"f32[50,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[50]\",\"state_indices\":\"i32[49]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[49]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1323.6102040391415,
+      "lower_time_ms": 112.89670085534453,
+      "evaluation_times_ms": [
+        229.227,
+        229.235,
+        229.302,
+        229.267,
+        229.268
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3430.083616
+    }
+  },
+  "{\"qkv\":\"bf16[8192,5120]\",\"b\":\"bf16[8192,32]\",\"a\":\"bf16[8192,32]\",\"conv_state\":\"f32[2,3,5120]\",\"recurrent_state\":\"f32[2,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 632.4798630084842,
+      "lower_time_ms": 112.94227698817849,
+      "evaluation_times_ms": [
+        128.188,
+        128.189,
+        128.177,
+        128.206,
+        128.188
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1503.184928
+    }
+  },
+  "{\"qkv\":\"bf16[65536,5120]\",\"b\":\"bf16[65536,32]\",\"a\":\"bf16[65536,32]\",\"conv_state\":\"f32[9,3,5120]\",\"recurrent_state\":\"f32[9,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 747.0723169390112,
+      "lower_time_ms": 115.2641058433801,
+      "evaluation_times_ms": [
+        1444.678,
+        1444.585,
+        1444.567,
+        1444.678,
+        1444.624
+      ],
+      "metadata": {},
+      "peak_memory_mb": 12012.30544
+    }
+  },
+  "{\"qkv\":\"bf16[111,5120]\",\"b\":\"bf16[111,32]\",\"a\":\"bf16[111,32]\",\"conv_state\":\"f32[112,3,5120]\",\"recurrent_state\":\"f32[112,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[112]\",\"state_indices\":\"i32[111]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[111]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1101.08891595155,
+      "lower_time_ms": 110.12651585042477,
+      "evaluation_times_ms": [
+        3.006,
+        3.007,
+        3.008,
+        3.006,
+        3.006
+      ],
+      "metadata": {},
+      "peak_memory_mb": 721.255968
+    }
+  },
+  "{\"qkv\":\"bf16[243,5120]\",\"b\":\"bf16[243,32]\",\"a\":\"bf16[243,32]\",\"conv_state\":\"f32[244,3,5120]\",\"recurrent_state\":\"f32[244,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[244]\",\"state_indices\":\"i32[243]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[243]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1630.7858449872583,
+      "lower_time_ms": 110.89089885354042,
+      "evaluation_times_ms": [
+        6.192,
+        6.192,
+        6.19,
+        6.194,
+        6.189
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1573.291552
+    }
+  },
+  "{\"qkv\":\"bf16[512,5120]\",\"b\":\"bf16[512,32]\",\"a\":\"bf16[512,32]\",\"conv_state\":\"f32[513,3,5120]\",\"recurrent_state\":\"f32[513,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1556.0367398429662,
+      "lower_time_ms": 109.75915007293224,
+      "evaluation_times_ms": [
+        14.185,
+        14.173,
+        14.178,
+        14.18,
+        14.185
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3309.427744
+    }
+  },
+  "{\"qkv\":\"bf16[8192,5120]\",\"b\":\"bf16[8192,32]\",\"a\":\"bf16[8192,32]\",\"conv_state\":\"f32[190,3,5120]\",\"recurrent_state\":\"f32[190,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[190]\",\"state_indices\":\"i32[189]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[189]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1201.3432441744953,
+      "lower_time_ms": 112.77972697280347,
+      "evaluation_times_ms": [
+        177.735,
+        177.694,
+        177.734,
+        177.699,
+        177.702
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2330.452512
+    }
+  },
+  "{\"qkv\":\"bf16[16384,2560]\",\"b\":\"bf16[16384,16]\",\"a\":\"bf16[16384,16]\",\"conv_state\":\"f32[3,3,2560]\",\"recurrent_state\":\"f32[3,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[3]\",\"state_indices\":\"i32[2]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[2]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 661.8290219921619,
+      "lower_time_ms": 121.56333005987108,
+      "evaluation_times_ms": [
+        294.282,
+        294.28,
+        294.231,
+        294.253,
+        294.22
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1504.050208
+    }
+  },
+  "{\"qkv\":\"bf16[178,2560]\",\"b\":\"bf16[178,16]\",\"a\":\"bf16[178,16]\",\"conv_state\":\"f32[179,3,2560]\",\"recurrent_state\":\"f32[179,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[179]\",\"state_indices\":\"i32[178]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[178]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 974.9738480895758,
+      "lower_time_ms": 110.95999903045595,
+      "evaluation_times_ms": [
+        3.312,
+        3.317,
+        3.313,
+        3.315,
+        3.317
+      ],
+      "metadata": {},
+      "peak_memory_mb": 577.005088
+    }
+  },
+  "{\"qkv\":\"bf16[328,2560]\",\"b\":\"bf16[328,16]\",\"a\":\"bf16[328,16]\",\"conv_state\":\"f32[329,3,2560]\",\"recurrent_state\":\"f32[329,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[329]\",\"state_indices\":\"i32[328]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[328]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1100.574153009802,
+      "lower_time_ms": 110.27242499403656,
+      "evaluation_times_ms": [
+        6.83,
+        6.821,
+        6.829,
+        6.822,
+        6.823
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1061.01712
+    }
+  },
+  "{\"qkv\":\"bf16[8192,2560]\",\"b\":\"bf16[8192,16]\",\"a\":\"bf16[8192,16]\",\"conv_state\":\"f32[330,3,2560]\",\"recurrent_state\":\"f32[330,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[330]\",\"state_indices\":\"i32[329]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[329]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 990.7953890506178,
+      "lower_time_ms": 114.65996992774308,
+      "evaluation_times_ms": [
+        148.312,
+        148.296,
+        148.305,
+        148.326,
+        148.306
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1473.441312
+    }
+  },
+  "{\"qkv\":\"bf16[16384,2560]\",\"b\":\"bf16[16384,16]\",\"a\":\"bf16[16384,16]\",\"conv_state\":\"f32[331,3,2560]\",\"recurrent_state\":\"f32[331,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[331]\",\"state_indices\":\"i32[330]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[330]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 993.3354030363262,
+      "lower_time_ms": 113.98427980020642,
+      "evaluation_times_ms": [
+        324.362,
+        324.442,
+        324.41,
+        324.345,
+        324.422
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2222.730784
+    }
+  },
+  "{\"qkv\":\"bf16[32768,1280]\",\"b\":\"bf16[32768,8]\",\"a\":\"bf16[32768,8]\",\"conv_state\":\"f32[5,3,1280]\",\"recurrent_state\":\"f32[5,8,128,128]\",\"conv_weight\":\"f32[1280,1,4]\",\"conv_bias\":\"f32[1280]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[5]\",\"state_indices\":\"i32[4]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[4]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 637.8718209452927,
+      "lower_time_ms": 113.70974103920162,
+      "evaluation_times_ms": [
+        648.51,
+        648.51,
+        648.604,
+        648.386,
+        648.561
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1502.494752
+    }
+  },
+  "{\"qkv\":\"bf16[57344,768]\",\"b\":\"bf16[57344,4]\",\"a\":\"bf16[57344,4]\",\"conv_state\":\"f32[8,3,768]\",\"recurrent_state\":\"f32[8,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[8]\",\"state_indices\":\"i32[7]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[7]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 633.2548118662089,
+      "lower_time_ms": 113.7268589809537,
+      "evaluation_times_ms": [
+        1119.151,
+        1119.186,
+        1119.188,
+        1119.184,
+        1119.194
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1563.856928
+    }
+  },
+  "{\"qkv\":\"bf16[257,768]\",\"b\":\"bf16[257,4]\",\"a\":\"bf16[257,4]\",\"conv_state\":\"f32[258,3,768]\",\"recurrent_state\":\"f32[258,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[258]\",\"state_indices\":\"i32[257]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[257]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 722.0026878640056,
+      "lower_time_ms": 109.4831449445337,
+      "evaluation_times_ms": [
+        4.553,
+        4.555,
+        4.567,
+        4.558,
+        4.556
+      ],
+      "metadata": {},
+      "peak_memory_mb": 209.0312
+    }
+  },
+  "{\"qkv\":\"bf16[512,768]\",\"b\":\"bf16[512,4]\",\"a\":\"bf16[512,4]\",\"conv_state\":\"f32[513,3,768]\",\"recurrent_state\":\"f32[513,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[513]\",\"state_indices\":\"i32[512]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[512]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 926.9722891040146,
+      "lower_time_ms": 109.18679693713784,
+      "evaluation_times_ms": [
+        9.811,
+        9.807,
+        9.808,
+        9.808,
+        9.809
+      ],
+      "metadata": {},
+      "peak_memory_mb": 415.690784
+    }
+  },
+  "{\"qkv\":\"bf16[8192,768]\",\"b\":\"bf16[8192,4]\",\"a\":\"bf16[8192,4]\",\"conv_state\":\"f32[514,3,768]\",\"recurrent_state\":\"f32[514,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[514]\",\"state_indices\":\"i32[513]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[513]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 703.8657879456878,
+      "lower_time_ms": 112.72451304830611,
+      "evaluation_times_ms": [
+        168.005,
+        167.996,
+        168.034,
+        168.026,
+        167.987
+      ],
+      "metadata": {},
+      "peak_memory_mb": 482.7208
+    }
+  },
+  "{\"qkv\":\"bf16[57344,768]\",\"b\":\"bf16[57344,4]\",\"a\":\"bf16[57344,4]\",\"conv_state\":\"f32[520,3,768]\",\"recurrent_state\":\"f32[520,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[520]\",\"state_indices\":\"i32[519]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[519]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1279.084341833368,
+      "lower_time_ms": 112.48660506680608,
+      "evaluation_times_ms": [
+        1089.472,
+        1088.871,
+        1089.094,
+        1089.029,
+        1089.083
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1845.877792
+    }
+  },
+  "{\"qkv\":\"bf16[188,5120]\",\"b\":\"bf16[188,32]\",\"a\":\"bf16[188,32]\",\"conv_state\":\"f32[189,3,5120]\",\"recurrent_state\":\"f32[189,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[189]\",\"state_indices\":\"i32[188]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[188]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1603.6813880782574,
+      "lower_time_ms": 110.91081495396793,
+      "evaluation_times_ms": [
+        4.944,
+        4.94,
+        4.941,
+        4.937,
+        4.942
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1218.20112
+    }
+  },
+  "{\"qkv\":\"bf16[448,1280]\",\"b\":\"bf16[448,8]\",\"a\":\"bf16[448,8]\",\"conv_state\":\"f32[449,3,1280]\",\"recurrent_state\":\"f32[449,8,128,128]\",\"conv_weight\":\"f32[1280,1,4]\",\"conv_bias\":\"f32[1280]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[449]\",\"state_indices\":\"i32[448]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[448]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 915.2535279281437,
+      "lower_time_ms": 110.09316705167294,
+      "evaluation_times_ms": [
+        9.37,
+        9.358,
+        9.362,
+        9.361,
+        9.361
+      ],
+      "metadata": {},
+      "peak_memory_mb": 724.121632
+    }
+  },
+  "{\"qkv\":\"bf16[120,10240]\",\"b\":\"bf16[120,64]\",\"a\":\"bf16[120,64]\",\"conv_state\":\"f32[121,3,10240]\",\"recurrent_state\":\"f32[121,64,128,128]\",\"conv_weight\":\"f32[10240,1,4]\",\"conv_bias\":\"f32[10240]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[121]\",\"state_indices\":\"i32[120]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[120]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1208.7986909318715,
+      "lower_time_ms": 111.29892920143902,
+      "evaluation_times_ms": [
+        4.71,
+        4.708,
+        4.71,
+        4.706,
+        4.711
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1560.366624
+    }
+  },
+  "{\"qkv\":\"bf16[332,5120]\",\"b\":\"bf16[332,32]\",\"a\":\"bf16[332,32]\",\"conv_state\":\"f32[333,3,5120]\",\"recurrent_state\":\"f32[333,32,128,128]\",\"conv_weight\":\"f32[5120,1,4]\",\"conv_bias\":\"f32[5120]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[333]\",\"state_indices\":\"i32[332]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[332]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":4,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1776.533885858953,
+      "lower_time_ms": 109.52376294881105,
+      "evaluation_times_ms": [
+        9.06,
+        9.06,
+        9.055,
+        9.06,
+        9.063
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2147.489312
+    }
+  },
+  "{\"qkv\":\"bf16[528,2560]\",\"b\":\"bf16[528,16]\",\"a\":\"bf16[528,16]\",\"conv_state\":\"f32[529,3,2560]\",\"recurrent_state\":\"f32[529,16,128,128]\",\"conv_weight\":\"f32[2560,1,4]\",\"conv_bias\":\"f32[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[529]\",\"state_indices\":\"i32[528]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[528]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 1081.4560188446194,
+      "lower_time_ms": 111.74561898224056,
+      "evaluation_times_ms": [
+        10.964,
+        10.971,
+        10.974,
+        10.973,
+        10.979
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1706.366496
+    }
+  },
+  "{\"qkv\":\"bf16[704,1280]\",\"b\":\"bf16[704,8]\",\"a\":\"bf16[704,8]\",\"conv_state\":\"f32[705,3,1280]\",\"recurrent_state\":\"f32[705,8,128,128]\",\"conv_weight\":\"f32[1280,1,4]\",\"conv_bias\":\"f32[1280]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[705]\",\"state_indices\":\"i32[704]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[704]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
+    "{}": {
+      "compile_time_ms": 961.8439928162843,
+      "lower_time_ms": 112.7267349511385,
+      "evaluation_times_ms": [
+        14.628,
         14.636,
-        14.621,
-        14.619,
-        14.641
+        14.636,
+        14.627,
+        14.632
       ],
       "metadata": {},
-      "peak_memory_mb": 189.57008
+      "peak_memory_mb": 1137.1464
     }
   },
-  "{\"qkv\":\"bf16[2048,6144]\",\"b\":\"bf16[2048,32]\",\"a\":\"bf16[2048,32]\",\"conv_state\":\"bf16[33,3,6144]\",\"recurrent_state\":\"bf16[33,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[800,768]\",\"b\":\"bf16[800,4]\",\"a\":\"bf16[800,4]\",\"conv_state\":\"f32[801,3,768]\",\"recurrent_state\":\"f32[801,4,128,128]\",\"conv_weight\":\"f32[768,1,4]\",\"conv_bias\":\"f32[768]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[801]\",\"state_indices\":\"i32[800]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[800]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 891.8781920801848,
-      "lower_time_ms": 109.74712390452623,
+      "compile_time_ms": 836.4253069739789,
+      "lower_time_ms": 109.81162404641509,
       "evaluation_times_ms": [
-        38.901,
-        38.914,
-        38.905,
-        38.914,
-        38.921
+        14.819,
+        14.824,
+        14.82,
+        14.826,
+        14.824
       ],
       "metadata": {},
-      "peak_memory_mb": 342.55568
+      "peak_memory_mb": 649.126432
     }
   },
-  "{\"qkv\":\"bf16[8,12288]\",\"b\":\"bf16[8,64]\",\"a\":\"bf16[8,64]\",\"conv_state\":\"bf16[9,3,12288]\",\"recurrent_state\":\"bf16[9,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[896,512]\",\"b\":\"bf16[896,2]\",\"a\":\"bf16[896,2]\",\"conv_state\":\"f32[897,3,512]\",\"recurrent_state\":\"f32[897,2,128,128]\",\"conv_weight\":\"f32[512,1,4]\",\"conv_bias\":\"f32[512]\",\"a_log\":\"f32[2]\",\"dt_bias\":\"bf16[2]\",\"query_start_loc\":\"i32[897]\",\"state_indices\":\"i32[896]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[896]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":1,\"n_v\":2,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 536.7383549455553,
-      "lower_time_ms": 110.3379197884351,
+      "compile_time_ms": 889.3223321065307,
+      "lower_time_ms": 119.89490105770528,
       "evaluation_times_ms": [
-        0.188,
-        0.187,
-        0.188,
-        0.188,
-        0.188
+        15.95,
+        15.9,
+        15.911,
+        15.936,
+        15.92
       ],
       "metadata": {},
-      "peak_memory_mb": 78.898208
+      "peak_memory_mb": 366.947872
     }
   },
-  "{\"qkv\":\"bf16[64,12288]\",\"b\":\"bf16[64,64]\",\"a\":\"bf16[64,64]\",\"conv_state\":\"bf16[65,3,12288]\",\"recurrent_state\":\"bf16[65,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[14,20480]\",\"b\":\"bf16[14,128]\",\"a\":\"bf16[14,128]\",\"conv_state\":\"f32[15,3,20480]\",\"recurrent_state\":\"f32[15,128,128,128]\",\"conv_weight\":\"f32[20480,1,4]\",\"conv_bias\":\"f32[20480]\",\"a_log\":\"f32[128]\",\"dt_bias\":\"bf16[128]\",\"query_start_loc\":\"i32[15]\",\"state_indices\":\"i32[14]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[14]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":128,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"float32\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1711.9473579805344,
-      "lower_time_ms": 105.17191095277667,
+      "compile_time_ms": 1142.4672049470246,
+      "lower_time_ms": 109.38742198050022,
       "evaluation_times_ms": [
-        2.09,
-        2.09,
-        2.09,
-        2.09,
-        2.087
+        0.9,
+        0.9,
+        0.9,
+        0.899,
+        0.898
       ],
       "metadata": {},
-      "peak_memory_mb": 556.042784
+      "peak_memory_mb": 380.145184
     }
   },
-  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"bf16[9,3,12288]\",\"recurrent_state\":\"bf16[9,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[16,1536]\",\"b\":\"bf16[16,8]\",\"a\":\"bf16[16,8]\",\"conv_state\":\"f32[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[5]\",\"state_indices\":\"i32[4]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[4]\",\"read_state_indices\":null,\"read_offsets\":\"i32[4]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 722.2765570040792,
-      "lower_time_ms": 107.87071287631989,
+      "compile_time_ms": 300.2640090417117,
+      "lower_time_ms": 118.2798370718956,
       "evaluation_times_ms": [
-        17.246,
-        17.239,
-        17.245,
-        17.244,
-        17.247
+        0.214,
+        0.215,
+        0.215,
+        0.214,
+        0.214
       ],
       "metadata": {},
-      "peak_memory_mb": 308.35408
+      "peak_memory_mb": 20.346912
     }
   },
-  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"bf16[65,3,12288]\",\"recurrent_state\":\"bf16[65,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"f32[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":\"i32[8]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1924.7294329106808,
-      "lower_time_ms": 109.83556904830039,
+      "compile_time_ms": 322.97980203293264,
+      "lower_time_ms": 114.16142620146275,
       "evaluation_times_ms": [
-        24.479,
-        24.493,
-        24.491,
-        24.501,
-        24.483
+        0.414,
+        0.416,
+        0.415,
+        0.416,
+        0.414
       ],
       "metadata": {},
-      "peak_memory_mb": 619.18672
+      "peak_memory_mb": 38.574112
     }
   },
-  "{\"qkv\":\"bf16[512,12288]\",\"b\":\"bf16[512,64]\",\"a\":\"bf16[512,64]\",\"conv_state\":\"bf16[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"f32[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 939.7703709546477,
-      "lower_time_ms": 109.25024491734803,
+      "compile_time_ms": 448.69972206652164,
+      "lower_time_ms": 116.54481291770935,
       "evaluation_times_ms": [
-        4.32,
-        4.319,
-        4.317,
-        4.324,
-        4.32
+        0.811,
+        0.813,
+        0.813,
+        0.812,
+        0.811
       ],
       "metadata": {},
-      "peak_memory_mb": 118.003744
+      "peak_memory_mb": 75.765792
     }
   },
-  "{\"qkv\":\"bf16[1024,12288]\",\"b\":\"bf16[1024,64]\",\"a\":\"bf16[1024,64]\",\"conv_state\":\"bf16[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"f32[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":\"i32[32]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 684.9072049371898,
-      "lower_time_ms": 106.6720001399517,
+      "compile_time_ms": 785.5459630955011,
+      "lower_time_ms": 115.75190187431872,
       "evaluation_times_ms": [
-        10.456,
-        10.457,
-        10.456,
-        10.457,
-        10.447
+        1.66,
+        1.661,
+        1.66,
+        1.661,
+        1.66
       ],
       "metadata": {},
-      "peak_memory_mb": 277.723168
+      "peak_memory_mb": 90.375712
     }
   },
-  "{\"qkv\":\"bf16[2048,12288]\",\"b\":\"bf16[2048,64]\",\"a\":\"bf16[2048,64]\",\"conv_state\":\"bf16[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[256,1536]\",\"b\":\"bf16[256,8]\",\"a\":\"bf16[256,8]\",\"conv_state\":\"f32[257,3,1536]\",\"recurrent_state\":\"bf16[257,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 898.4936430351809,
-      "lower_time_ms": 109.56341295968741,
+      "compile_time_ms": 930.8433581609279,
+      "lower_time_ms": 114.11608709022403,
       "evaluation_times_ms": [
-        19.334,
-        19.33,
-        19.336,
-        19.323,
-        19.328
+        3.288,
+        3.291,
+        3.292,
+        3.293,
+        3.29
       ],
       "metadata": {},
-      "peak_memory_mb": 697.41776
+      "peak_memory_mb": 171.013664
     }
   },
-  "{\"qkv\":\"bf16[4096,12288]\",\"b\":\"bf16[4096,64]\",\"a\":\"bf16[4096,64]\",\"conv_state\":\"bf16[2,3,12288]\",\"recurrent_state\":\"bf16[2,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"f32[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":1,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 913.5491009801626,
-      "lower_time_ms": 109.12856599316001,
+      "compile_time_ms": 327.71673100069165,
+      "lower_time_ms": 114.31871284730732,
       "evaluation_times_ms": [
-        44.082,
-        44.097,
-        44.09,
-        44.102,
-        44.091
+        0.413,
+        0.414,
+        0.413,
+        0.414,
+        0.414
       ],
       "metadata": {},
-      "peak_memory_mb": 1385.957408
+      "peak_memory_mb": 40.671264
     }
   },
-  "{\"qkv\":\"bf16[16,12288]\",\"b\":\"bf16[16,64]\",\"a\":\"bf16[16,64]\",\"conv_state\":\"bf16[17,3,12288]\",\"recurrent_state\":\"bf16[17,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"f32[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":1,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 846.5449420036748,
-      "lower_time_ms": 114.57478901138529,
+      "compile_time_ms": 784.7773460671306,
+      "lower_time_ms": 112.42861184291542,
       "evaluation_times_ms": [
-        0.526,
-        0.526,
-        0.528,
-        0.526,
-        0.526
+        1.744,
+        1.74,
+        1.74,
+        1.74,
+        1.742
       ],
       "metadata": {},
-      "peak_memory_mb": 142.944288
+      "peak_memory_mb": 90.904608
     }
   },
-  "{\"qkv\":\"bf16[32,12288]\",\"b\":\"bf16[32,64]\",\"a\":\"bf16[32,64]\",\"conv_state\":\"bf16[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"f32[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":7,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1399.823107989505,
-      "lower_time_ms": 108.10215497622266,
+      "compile_time_ms": 792.638432001695,
+      "lower_time_ms": 113.16669406369328,
       "evaluation_times_ms": [
-        1.049,
-        1.049,
-        1.051,
-        1.047,
-        1.048
+        1.785,
+        1.79,
+        1.789,
+        1.787,
+        1.785
       ],
       "metadata": {},
-      "peak_memory_mb": 279.988768
+      "peak_memory_mb": 86.771232
     }
   },
-  "{\"qkv\":\"bf16[128,12288]\",\"b\":\"bf16[128,64]\",\"a\":\"bf16[128,64]\",\"conv_state\":\"bf16[129,3,12288]\",\"recurrent_state\":\"bf16[129,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[129]\",\"state_indices\":\"i32[128]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[128]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"f32[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":7,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 2391.547918028664,
-      "lower_time_ms": 110.72633898584172,
+      "compile_time_ms": 1092.546414816752,
+      "lower_time_ms": 114.50100387446582,
       "evaluation_times_ms": [
-        4.153,
-        4.15,
-        4.145,
-        4.151,
-        4.153
+        7.386,
+        7.372,
+        7.378,
+        7.384,
+        7.378
       ],
       "metadata": {},
-      "peak_memory_mb": 1106.546208
+      "peak_memory_mb": 322.308128
     }
   },
-  "{\"qkv\":\"bf16[512,12288]\",\"b\":\"bf16[512,64]\",\"a\":\"bf16[512,64]\",\"conv_state\":\"bf16[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[64,6144]\",\"b\":\"bf16[64,32]\",\"a\":\"bf16[64,32]\",\"conv_state\":\"f32[65,3,6144]\",\"recurrent_state\":\"bf16[65,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1536.34944697842,
-      "lower_time_ms": 339.337273966521,
+      "compile_time_ms": 859.9233538843691,
+      "lower_time_ms": 116.14157306030393,
       "evaluation_times_ms": [
-        11.678,
-        11.685,
-        11.681,
-        11.68,
-        11.68
+        1.113,
+        1.113,
+        1.115,
+        1.114,
+        1.114
       ],
       "metadata": {},
-      "peak_memory_mb": 312.347168
+      "peak_memory_mb": 175.329824
     }
   },
-  "{\"qkv\":\"bf16[2048,12288]\",\"b\":\"bf16[2048,64]\",\"a\":\"bf16[2048,64]\",\"conv_state\":\"bf16[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,6144]\",\"b\":\"bf16[128,32]\",\"a\":\"bf16[128,32]\",\"conv_state\":\"f32[129,3,6144]\",\"recurrent_state\":\"bf16[129,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":\"i32[32]\",\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1694.9837469728664,
-      "lower_time_ms": 110.77379697235301,
+      "compile_time_ms": 901.336541865021,
+      "lower_time_ms": 116.92446190863848,
       "evaluation_times_ms": [
-        47.377,
-        47.387,
-        47.389,
-        47.411,
-        47.384
+        2.232,
+        2.219,
+        2.221,
+        2.221,
+        2.223
       ],
       "metadata": {},
-      "peak_memory_mb": 836.211744
+      "peak_memory_mb": 334.45072
     }
   },
-  "{\"qkv\":\"bf16[1536,1536]\",\"b\":\"bf16[1536,8]\",\"a\":\"bf16[1536,8]\",\"conv_state\":\"bf16[2,3,1536]\",\"recurrent_state\":\"bf16[2,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[32,12288]\",\"b\":\"bf16[32,64]\",\"a\":\"bf16[32,64]\",\"conv_state\":\"f32[33,3,12288]\",\"recurrent_state\":\"bf16[33,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":\"i32[8]\",\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 857.3317969567142,
-      "lower_time_ms": 109.3455069931224,
+      "compile_time_ms": 846.128016943112,
+      "lower_time_ms": 117.06016585230827,
       "evaluation_times_ms": [
-        9.001,
-        8.996,
-        8.996,
-        9.004,
-        8.995
+        0.696,
+        0.694,
+        0.697,
+        0.693,
+        0.696
       ],
       "metadata": {},
-      "peak_memory_mb": 42.12688
+      "peak_memory_mb": 178.926112
     }
   },
-  "{\"qkv\":\"bf16[2055,1536]\",\"b\":\"bf16[2055,8]\",\"a\":\"bf16[2055,8]\",\"conv_state\":\"bf16[9,3,1536]\",\"recurrent_state\":\"bf16[9,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[128,12288]\",\"b\":\"bf16[128,64]\",\"a\":\"bf16[128,64]\",\"conv_state\":\"f32[129,3,12288]\",\"recurrent_state\":\"bf16[129,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":\"i32[32]\",\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 949.414717964828,
-      "lower_time_ms": 109.56160700879991,
+      "compile_time_ms": 933.360607130453,
+      "lower_time_ms": 115.83754513412714,
       "evaluation_times_ms": [
-        24.32,
-        24.321,
-        24.3,
-        24.312,
-        24.324
+        3.113,
+        3.106,
+        3.109,
+        3.109,
+        3.11
       ],
       "metadata": {},
-      "peak_memory_mb": 72.383008
+      "peak_memory_mb": 662.082592
     }
   },
-  "{\"qkv\":\"bf16[2048,1024]\",\"b\":\"bf16[2048,4]\",\"a\":\"bf16[2048,4]\",\"conv_state\":\"bf16[2,3,1024]\",\"recurrent_state\":\"bf16[2,4,128,128]\",\"conv_weight\":\"bf16[1024,1,4]\",\"conv_bias\":\"bf16[1024]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[256,12288]\",\"b\":\"bf16[256,64]\",\"a\":\"bf16[256,64]\",\"conv_state\":\"f32[257,3,12288]\",\"recurrent_state\":\"bf16[257,64,128,128]\",\"conv_weight\":\"bf16[12288,1,4]\",\"conv_bias\":\"bf16[12288]\",\"a_log\":\"f32[64]\",\"dt_bias\":\"bf16[64]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":16,\"n_v\":64,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 827.2753530181944,
-      "lower_time_ms": 108.90509595628828,
+      "compile_time_ms": 1343.5281030833721,
+      "lower_time_ms": 116.17454700171947,
       "evaluation_times_ms": [
-        12.046,
-        12.045,
-        12.04,
-        12.046,
-        12.046
+        6.27,
+        6.266,
+        6.264,
+        6.254,
+        6.268
       ],
       "metadata": {},
-      "peak_memory_mb": 40.754208
+      "peak_memory_mb": 1342.838304
     }
   },
-  "{\"qkv\":\"bf16[64,1024]\",\"b\":\"bf16[64,4]\",\"a\":\"bf16[64,4]\",\"conv_state\":\"bf16[65,3,1024]\",\"recurrent_state\":\"bf16[65,4,128,128]\",\"conv_weight\":\"bf16[1024,1,4]\",\"conv_bias\":\"bf16[1024]\",\"a_log\":\"f32[4]\",\"dt_bias\":\"bf16[4]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":4,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[16,1536]\",\"b\":\"bf16[16,8]\",\"a\":\"bf16[16,8]\",\"conv_state\":\"f32[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 508.27106001088396,
-      "lower_time_ms": 106.51647200575098,
+      "compile_time_ms": 290.64386105164886,
+      "lower_time_ms": 111.80028389208019,
       "evaluation_times_ms": [
-        0.709,
-        0.708,
-        0.709,
-        0.708,
-        0.711
+        0.24,
+        0.24,
+        0.24,
+        0.24,
+        0.239
       ],
       "metadata": {},
-      "peak_memory_mb": 43.707424
+      "peak_memory_mb": 75.22512
     }
   },
-  "{\"qkv\":\"bf16[2048,2560]\",\"b\":\"bf16[2048,16]\",\"a\":\"bf16[2048,16]\",\"conv_state\":\"bf16[2,3,2560]\",\"recurrent_state\":\"bf16[2,16,128,128]\",\"conv_weight\":\"bf16[2560,1,4]\",\"conv_bias\":\"bf16[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[2]\",\"state_indices\":\"i32[1]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[1]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
+  "{\"qkv\":\"bf16[2048,1536]\",\"b\":\"bf16[2048,8]\",\"a\":\"bf16[2048,8]\",\"conv_state\":\"f32[17,3,1536]\",\"recurrent_state\":\"f32[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"compute_precision\":\"float32\",\"kernel_act_dtype\":\"float32\",\"kernel_conv_weight_dtype\":\"bfloat16\",\"return_residuals\":false}": {
     "{}": {
-      "compile_time_ms": 1333.9885110035539,
-      "lower_time_ms": 116.51896499097347,
+      "compile_time_ms": 712.3990589752793,
+      "lower_time_ms": 116.16583005525172,
       "evaluation_times_ms": [
-        12.907,
-        12.925,
-        12.914,
-        12.917,
-        12.903
+        26.517,
+        26.471,
+        26.432,
+        26.458,
+        26.426
       ],
       "metadata": {},
-      "peak_memory_mb": 84.127776
-    }
-  },
-  "{\"qkv\":\"bf16[64,2560]\",\"b\":\"bf16[64,16]\",\"a\":\"bf16[64,16]\",\"conv_state\":\"bf16[65,3,2560]\",\"recurrent_state\":\"bf16[65,16,128,128]\",\"conv_weight\":\"bf16[2560,1,4]\",\"conv_bias\":\"bf16[2560]\",\"a_log\":\"f32[16]\",\"dt_bias\":\"bf16[16]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":null,\"n_kq\":2,\"n_v\":16,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":0,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 798.1555809965357,
-      "lower_time_ms": 105.1807799958624,
-      "evaluation_times_ms": [
-        1.202,
-        1.201,
-        1.201,
-        1.203,
-        1.202
-      ],
-      "metadata": {},
-      "peak_memory_mb": 104.885792
-    }
-  },
-  "{\"qkv\":\"bf16[16,1536]\",\"b\":\"bf16[16,8]\",\"a\":\"bf16[16,8]\",\"conv_state\":\"bf16[17,3,1536]\",\"recurrent_state\":\"bf16[17,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[5]\",\"state_indices\":\"i32[4]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[4]\",\"read_state_indices\":null,\"read_offsets\":\"i32[4]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 282.78805600712076,
-      "lower_time_ms": 112.52300499472767,
-      "evaluation_times_ms": [
-        0.187,
-        0.187,
-        0.186,
-        0.186,
-        0.186
-      ],
-      "metadata": {},
-      "peak_memory_mb": 19.879968
-    }
-  },
-  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"bf16[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[9]\",\"state_indices\":\"i32[8]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[8]\",\"read_state_indices\":null,\"read_offsets\":\"i32[8]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 360.9735160134733,
-      "lower_time_ms": 108.20152499945834,
-      "evaluation_times_ms": [
-        0.358,
-        0.359,
-        0.359,
-        0.359,
-        0.358
-      ],
-      "metadata": {},
-      "peak_memory_mb": 38.107168
-    }
-  },
-  "{\"qkv\":\"bf16[64,1536]\",\"b\":\"bf16[64,8]\",\"a\":\"bf16[64,8]\",\"conv_state\":\"bf16[65,3,1536]\",\"recurrent_state\":\"bf16[65,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 532.3507389985025,
-      "lower_time_ms": 112.02052695443854,
-      "evaluation_times_ms": [
-        0.706,
-        0.707,
-        0.706,
-        0.704,
-        0.707
-      ],
-      "metadata": {},
-      "peak_memory_mb": 74.905632
-    }
-  },
-  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"bf16[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[33]\",\"state_indices\":\"i32[32]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[32]\",\"read_state_indices\":null,\"read_offsets\":\"i32[32]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 816.8950719991699,
-      "lower_time_ms": 108.11108403140679,
-      "evaluation_times_ms": [
-        2.029,
-        2.029,
-        2.033,
-        2.031,
-        2.039
-      ],
-      "metadata": {},
-      "peak_memory_mb": 87.737376
-    }
-  },
-  "{\"qkv\":\"bf16[256,1536]\",\"b\":\"bf16[256,8]\",\"a\":\"bf16[256,8]\",\"conv_state\":\"bf16[257,3,1536]\",\"recurrent_state\":\"bf16[257,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 747.6019139867276,
-      "lower_time_ms": 108.741954958532,
-      "evaluation_times_ms": [
-        3.775,
-        3.773,
-        3.774,
-        3.774,
-        3.773
-      ],
-      "metadata": {},
-      "peak_memory_mb": 158.51984
-    }
-  },
-  "{\"qkv\":\"bf16[32,1536]\",\"b\":\"bf16[32,8]\",\"a\":\"bf16[32,8]\",\"conv_state\":\"bf16[33,3,1536]\",\"recurrent_state\":\"bf16[33,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":1,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 369.7382819955237,
-      "lower_time_ms": 109.50881900498644,
-      "evaluation_times_ms": [
-        0.361,
-        0.363,
-        0.362,
-        0.361,
-        0.361
-      ],
-      "metadata": {},
-      "peak_memory_mb": 40.20432
-    }
-  },
-  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"bf16[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":1,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 830.7942969840951,
-      "lower_time_ms": 107.78208199189976,
-      "evaluation_times_ms": [
-        2.066,
-        2.063,
-        2.064,
-        2.061,
-        2.065
-      ],
-      "metadata": {},
-      "peak_memory_mb": 88.00464
-    }
-  },
-  "{\"qkv\":\"bf16[128,1536]\",\"b\":\"bf16[128,8]\",\"a\":\"bf16[128,8]\",\"conv_state\":\"bf16[129,3,1536]\",\"recurrent_state\":\"bf16[129,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":7,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 849.1992689669132,
-      "lower_time_ms": 109.34325697598979,
-      "evaluation_times_ms": [
-        2.03,
-        2.032,
-        2.033,
-        2.033,
-        2.032
-      ],
-      "metadata": {},
-      "peak_memory_mb": 79.348768
-    }
-  },
-  "{\"qkv\":\"bf16[512,1536]\",\"b\":\"bf16[512,8]\",\"a\":\"bf16[512,8]\",\"conv_state\":\"bf16[513,3,1536]\",\"recurrent_state\":\"bf16[513,8,128,128]\",\"conv_weight\":\"bf16[1536,1,4]\",\"conv_bias\":\"bf16[1536]\",\"a_log\":\"f32[8]\",\"dt_bias\":\"bf16[8]\",\"query_start_loc\":\"i32[65]\",\"state_indices\":\"i32[64]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[64]\",\"read_state_indices\":null,\"read_offsets\":\"i32[64]\",\"n_kq\":2,\"n_v\":8,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":7,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 940.5888019828126,
-      "lower_time_ms": 109.15301699424163,
-      "evaluation_times_ms": [
-        8.281,
-        8.276,
-        8.279,
-        8.276,
-        8.276
-      ],
-      "metadata": {},
-      "peak_memory_mb": 307.964448
-    }
-  },
-  "{\"qkv\":\"bf16[64,6144]\",\"b\":\"bf16[64,32]\",\"a\":\"bf16[64,32]\",\"conv_state\":\"bf16[65,3,6144]\",\"recurrent_state\":\"bf16[65,32,128,128]\",\"conv_weight\":\"bf16[6144,1,4]\",\"conv_bias\":\"bf16[6144]\",\"a_log\":\"f32[32]\",\"dt_bias\":\"bf16[32]\",\"query_start_loc\":\"i32[17]\",\"state_indices\":\"i32[16]\",\"distribution\":\"i32[3]\",\"seq_lens\":\"i32[16]\",\"read_state_indices\":null,\"read_offsets\":\"i32[16]\",\"n_kq\":8,\"n_v\":32,\"d_k\":128,\"d_v\":128,\"kernel_size\":4,\"num_spec_tokens\":3,\"return_residuals\":false}": {
-    "{}": {
-      "compile_time_ms": 744.3517310312018,
-      "lower_time_ms": 112.81655199127272,
-      "evaluation_times_ms": [
-        1.226,
-        1.23,
-        1.227,
-        1.224,
-        1.226
-      ],
-      "metadata": {},
-      "peak_memory_mb": 160.60624
+      "peak_memory_mb": 126.241824
     }
   }
 }

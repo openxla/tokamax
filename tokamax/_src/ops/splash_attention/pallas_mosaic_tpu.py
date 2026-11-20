@@ -56,6 +56,7 @@ class Config:
   qk_diag_skip: bool = False
   qk_diag_grid: int = 2
   sv_diag_skip: bool = False
+  diag_band_skip: bool = False
 
   def __post_init__(self):
     if self.block_kv % self.block_kv_compute:
@@ -79,11 +80,13 @@ class Config:
           "qk_diag_skip requires block_q == block_kv "
           f"({self.block_q=}, {self.block_kv=})."
       )
-    if self.sv_diag_skip and not (
+    if self.diag_band_skip and not self.qk_diag_skip:
+      raise ValueError("diag_band_skip requires qk_diag_skip=True.")
+    if (self.sv_diag_skip or self.diag_band_skip) and not (
         self.block_q == self.block_kv == self.block_kv_compute
     ):
       raise ValueError(
-          "sv_diag_skip requires square forward blocks "
+          "sv_diag_skip and diag_band_skip require square forward blocks "
           f"({self.block_q=}, {self.block_kv=}, {self.block_kv_compute=})."
       )
     if self.qk_diag_grid < 2 or (self.qk_diag_grid & (self.qk_diag_grid - 1)):
@@ -94,6 +97,14 @@ class Config:
       raise ValueError(
           f"{self.block_kv_compute=} must be a multiple of"
           f" {self.qk_diag_grid=}."
+      )
+    if (
+        self.diag_band_skip
+        and (self.block_kv_compute // self.qk_diag_grid) % NUM_LANES != 0
+    ):
+      raise ValueError(
+          f"{self.block_kv_compute=} // {self.qk_diag_grid=} must be a "
+          f"multiple of {NUM_LANES=} when diag_band_skip=True."
       )
 
 
@@ -413,6 +424,27 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
                   qk_diag_grid=qk_grid_size,
               )
           )
+          if (
+              bq == bkv == bkv_c
+              and dropout_rate == 0.0
+              and (bq // qk_grid_size) % NUM_LANES == 0
+          ):
+            configs.add(
+                Config(
+                    block_q=bq,
+                    block_kv=bkv,
+                    block_kv_compute=bkv_c,
+                    dropout_block_q=dbq,
+                    dropout_block_kv=dbkv,
+                    q_layout=ql,
+                    k_layout=kl,
+                    v_layout=vl,
+                    use_experimental_scheduler=sched,
+                    qk_diag_skip=True,
+                    qk_diag_grid=qk_grid_size,
+                    diag_band_skip=True,
+                )
+            )
     if not configs:
       configs.add(self._get_heuristics_config(ba))
     return configs

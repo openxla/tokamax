@@ -144,8 +144,8 @@ class GatedLinearUnitTestBase(parameterized.TestCase):
         elif activation is None:
           activation = "sigmoid"
 
-      if batch:
-        self.skipTest("Batch not supported for MosaicGpuGatedLinearUnit")
+        if batch:
+          self.skipTest("Batch not supported for MosaicGpuGatedLinearUnit")
 
     self._run_test(
         batch=batch,

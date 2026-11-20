@@ -696,6 +696,48 @@ class AutotuningTableTest(DepsTestCase):
     self.assert_full_run(self.TABLE, 'no class')
 
 
+class OpsListTest(DepsTestCase):
+
+  def setUp(self):
+    super().setUp()
+    # Like the real test, it walks the ops tree rather than importing the ops.
+    self.add(deps.OPS_LIST_TEST, 'import pathlib\n')
+
+  def test_a_new_op_selects_the_ops_list_test(self):
+    self.add('tokamax/_src/ops/new_op/base.py', 'import jax\n')
+    tests, reason = self.affected('tokamax/_src/ops/new_op/base.py')
+    self.assertIsNone(reason)
+    self.assertEqual(tests, {deps.OPS_LIST_TEST})
+
+  def test_an_op_edit_also_selects_the_ops_list_test(self):
+    tests, reason = self.affected('tokamax/_src/ops/ragged.py')
+    self.assertIsNone(reason)
+    self.assertEqual(
+        tests, {'tokamax/_src/ops/ragged_test.py', deps.OPS_LIST_TEST}
+    )
+
+  def test_a_deleted_op_file_selects_the_ops_list_test(self):
+    self.remove('tokamax/_src/ops/triton.py')
+    tests, _ = self.affected('tokamax/_src/ops/triton.py')
+    self.assertIn(deps.OPS_LIST_TEST, tests)
+
+  def test_a_public_ops_export_change_selects_the_ops_list_test(self):
+    self.add('tokamax/ops/experimental/tpu.py', 'import jax\n')
+    tests, _ = self.affected('tokamax/ops/experimental/tpu.py')
+    self.assertIn(deps.OPS_LIST_TEST, tests)
+
+  def test_a_doc_under_ops_does_not_select_it(self):
+    tests, reason = self.affected('tokamax/_src/ops/ragged/README.md')
+    self.assertIsNone(reason)
+    self.assertEqual(tests, set())
+
+  def test_a_change_outside_ops_does_not_select_it(self):
+    self.add('tokamax/_src/helper.py', 'import jax\n')
+    tests, reason = self.affected('tokamax/_src/helper.py')
+    self.assertIsNone(reason)
+    self.assertNotIn(deps.OPS_LIST_TEST, tests)
+
+
 class CiBuildWorkflowTest(unittest.TestCase):
   """Keeps `deps.CI_BUILD_WORKFLOW` the only workflow CI-Build depends on."""
 
@@ -745,6 +787,10 @@ class LoaderAgreementTest(unittest.TestCase):
 
   def test_the_cache_test_exists(self):
     rel = deps.AUTOTUNING_CACHE_TEST.removeprefix(f'{deps.PACKAGE_ROOT}/')
+    self.assertTrue(os.path.isfile(os.path.join(self.pkg, rel)))
+
+  def test_the_ops_list_test_exists(self):
+    rel = deps.OPS_LIST_TEST.removeprefix(f'{deps.PACKAGE_ROOT}/')
     self.assertTrue(os.path.isfile(os.path.join(self.pkg, rel)))
 
   def test_every_resolved_table_reaches_an_op_test(self):

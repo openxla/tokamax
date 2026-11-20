@@ -2356,6 +2356,128 @@ def test_native_qkv_conv_rejects_wrong_do_shape():
     )
 
 
+def _varlen_trailing_padding_loss(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    gate: jax.Array,
+    beta: jax.Array,
+    a_log: jax.Array,
+    delta_time_bias: jax.Array,
+    segment_ids: jax.Array,
+    dout: jax.Array,
+    max_num_segments: int,
+    implementation: api.Implementation,
+) -> jax.Array:
+  output, _ = api.kimi_delta_attention(
+      query,
+      key,
+      value,
+      gate,
+      beta,
+      a_log=a_log,
+      delta_time_bias=delta_time_bias,
+      output_final_state=False,
+      use_qk_l2norm=True,
+      use_gate_in_kernel=True,
+      per_channel_gate=True,
+      segment_ids=segment_ids,
+      lower_bound=-5.0,
+      max_num_segments=max_num_segments,
+      implementation=implementation,
+  )
+  return jnp.sum(output.astype(jnp.float32) * dout)
+
+
+def test_varlen_trailing_padding_chunks_backward():
+  """Verifies finite, accurate grads with trailing padding chunks."""
+  if jax.default_backend() != "tpu":
+    pytest.skip("TPU required")
+
+  num_heads = 8
+  batch_size = 1
+  seq_len = 1024
+  head_dim = 128
+  max_num_segments = 6
+  segment_ids = _make_segment_ids(((60, 80, 100),), seq_len)
+
+  rng_keys = jax.random.split(jax.random.key(0), 8)
+  qk_shape = (num_heads, batch_size, seq_len, head_dim)
+  beta_shape = (num_heads, batch_size, seq_len)
+
+  query = jax.random.uniform(rng_keys[0], qk_shape, dtype=jnp.bfloat16)
+  key = jax.random.uniform(rng_keys[1], qk_shape, dtype=jnp.bfloat16)
+  value = jax.random.uniform(rng_keys[2], qk_shape, dtype=jnp.bfloat16)
+  gate = jax.random.uniform(rng_keys[3], qk_shape, dtype=jnp.bfloat16)
+  beta = jax.nn.sigmoid(
+      jax.random.normal(rng_keys[4], beta_shape, dtype=jnp.float32)
+  ).astype(jnp.bfloat16)
+  a_log = jax.random.normal(rng_keys[5], (num_heads,), dtype=jnp.float32)
+  delta_time_bias = jax.random.normal(
+      rng_keys[6], (num_heads * head_dim,), dtype=jnp.float32
+  )
+  valid = segment_ids > 0
+  dout = jnp.where(
+      valid[None, :, :, None],
+      jax.random.normal(rng_keys[7], qk_shape, dtype=jnp.float32),
+      0.0,
+  )
+
+  grad_fn = jax.grad(_varlen_trailing_padding_loss, argnums=(0, 1, 2, 3, 4, 5, 6))
+  actual_grads = grad_fn(
+      query,
+      key,
+      value,
+      gate,
+      beta,
+      a_log,
+      delta_time_bias,
+      segment_ids,
+      dout,
+      max_num_segments,
+      "mosaic",
+  )
+  expected_grads = grad_fn(
+      query,
+      key,
+      value,
+      gate,
+      beta,
+      a_log,
+      delta_time_bias,
+      segment_ids,
+      dout,
+      max_num_segments,
+      "xla",
+  )
+  jax.block_until_ready((actual_grads, expected_grads))
+
+  grad_names = ("dq", "dk", "dv", "dg", "dbeta", "da_log", "ddelta_time_bias")
+  token_mask_np = np.asarray(valid)
+  for name, actual, expected in zip(
+      grad_names, actual_grads, expected_grads, strict=True
+  ):
+    assert bool(jnp.all(jnp.isfinite(actual))), f"Non-finite gradient for {name}"
+    actual_np = np.asarray(actual, dtype=np.float32)
+    expected_np = np.asarray(expected, dtype=np.float32)
+    if name in ("dq", "dk", "dv", "dg"):
+      mask = np.broadcast_to(token_mask_np[None, :, :, None], actual_np.shape)
+      actual_np = actual_np[mask]
+      expected_np = expected_np[mask]
+    elif name == "dbeta":
+      mask = np.broadcast_to(token_mask_np[None, :, :], actual_np.shape)
+      actual_np = actual_np[mask]
+      expected_np = expected_np[mask]
+    assert compare_tensor(
+        name,
+        expected_np,
+        actual_np,
+        atol=0.05,
+        rtol=0.05,
+        dtype=np.float32,
+    ), f"Gradient mismatch for {name}"
+
+
 class _ShardPlugin:
 
   def pytest_collection_modifyitems(self, items):

@@ -42,6 +42,7 @@ from tokamax._src import shape
 from tokamax._src import utils
 from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
+from tokamax._src.ops import fuser_adapter
 
 AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
@@ -162,6 +163,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   # instances in array shapes.
   supports_symbolic_shapes: ClassVar[bool] = True
   supports_batched_args_capture: ClassVar[bool] = True
+  fusible_argnames: ClassVar[tuple[str, ...] | None] = None
 
   config: C | None = None
   _: dataclasses.KW_ONLY
@@ -218,6 +220,16 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         if not self.supported_on(device):
           raise NotImplementedError(f"Not supported on {device.device_kind}.")
 
+    if fuser_adapter.in_op_fusion_context():
+      if type(self)._fusible_fwd is Op._fusible_fwd:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support kernel fusion"
+            " (@op_fusion.fuse)."
+        )
+      return fuser_adapter.call_fusible_op(
+          self, ba, return_residuals=return_residuals
+      )
+
     args_flat, args_tree = jax.tree.flatten((ba.args, ba.kwargs))
     is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
     arrays, other, merge = utils.split_merge(is_array, args_flat)
@@ -236,11 +248,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       config = ba.default_config
 
       # Serialize args into the HLO to allow for, e.g., offline autotuning.
-      json_op = self.replace(config=config, vjp=None)
-      json_ba = BoundArguments(json_op, _abstractify(dict(ba.arguments)))
-      json_data = str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
-
-      with _tokamax_metadata(json_data):
+      with ba._tokamax_metadata(config):  # pylint: disable=protected-access
         if fwd_res and self.vjp is None and batched_args is not None:
 
           def fwd_flat(*arrays):
@@ -265,8 +273,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out, residuals = self._fwd(*args, config=config, **kwargs)
 
       ret = (out, residuals) if return_residuals else out
-      full_residuals = Residuals(args, kwargs, out, residuals)
-      return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      if self.vjp is None:
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
+      return ret, (out, residuals)
 
     def f(*arrays):
       return fwd(*arrays, fwd_res=False)[0]
@@ -278,12 +288,20 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       # We must wrap the op in a `custom_vjp`, even if no `vjp` function is
       # provided, as we use `custom_batching` to capture the batched arguments,
       # and `custom_batching` doesn't support `jax.vjp`.
+      fwd_vjp = fwd
+
       @self._capture_batched_args
       def bwd(f_vjp, dout, batched_args):
         del batched_args  # Unused.
         return f_vjp(dout[0] if return_residuals else dout)
-
     else:
+
+      def fwd_vjp(*arrays):
+        ret, (out, residuals) = fwd(*arrays, fwd_res=True)
+        args, kwargs = args_tree.unflatten(merge(arrays, other))
+        kwargs["return_residuals"] = True
+        full_residuals = Residuals(args, kwargs, out, residuals)
+        return ret, _FlatTree(*jax.tree.flatten(full_residuals))
 
       def bwd(residuals, dout):  # pylint: disable=function-redefined
         residuals = residuals.tree.unflatten(residuals.values)
@@ -293,6 +311,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         out = residuals.out
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
+        assert self.vjp is not None
         grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
@@ -317,7 +336,7 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         return list(filter(is_array, jax.tree.leaves((dargs, grads_ba.kwargs))))
 
     f = jax.custom_vjp(f)
-    f.defvjp(fwd, bwd, optimize_remat=True)
+    f.defvjp(fwd_vjp, bwd, optimize_remat=True)
     return f(*arrays)
 
   def bind(
@@ -357,6 +376,20 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       logging.warning("Ignoring autotuning cache for %s", self_no_vjp)
 
     return final_cache
+
+  def _fusible_fwd(
+      self,
+      *args,
+      out_fusions: fuser_adapter.OutputFusion | None = None,
+      config: C,
+      **kwargs,
+  ) -> T:
+    """Fusible forward pass invoked inside `@op_fusion.fuse`."""
+    del args, out_fusions, config, kwargs
+    raise NotImplementedError(
+        f"{type(self).__name__} does not support kernel fusion"
+        " (@op_fusion.fuse)."
+    )
 
   @abc.abstractmethod
   def _fwd(self, *args, **kwargs) -> tuple[T, R | None]:
@@ -470,6 +503,15 @@ class BoundArguments[C, K: Hashable]:
   @property
   def vmap_axis_sizes(self) -> tuple[int, ...]:
     return batching.get_vmap_axis_sizes(dict(self.arguments))
+
+  def _tokamax_metadata(
+      self, config: C
+  ) -> contextlib.AbstractContextManager[None]:
+    json_op = self.op.replace(config=config, vjp=None)
+    json_ba = BoundArguments(json_op, _abstractify(dict(self.arguments)))
+    return _tokamax_metadata(
+        str(BOUND_ARGS_ADAPTER.dump_json(json_ba), "utf-8")
+    )
 
   @property
   def default_config(self) -> C:

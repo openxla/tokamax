@@ -96,7 +96,7 @@ EXCLUDED_TESTS = ()
 
 # JAX versions tested in CI: `latest_jax()` for the shard jobs, `older_jaxs()`
 # for compat-tests. The oldest must match the floor in pyproject.toml.
-JAX_VERSIONS = ('0.12.0', '0.11.2')
+JAX_VERSIONS = ('0.12.1', '0.12.0')
 
 # TODO: Enable the backward compatibility test for GPU kernels by
 # adding 'linux-x86-a3-8g-h100-1gpu' to COMPAT_RUNNERS.
@@ -253,6 +253,11 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     # -- gmm ---------------------------------------------------------------
+    'gmm-v2-fuser': Spec(
+        paths=('tokamax/_src/ops/gmm_v2/gmm_fuser_test.py',),
+        minutes=1,
+        compat_minutes=1,
+    ),
     'gmm-v2-kernel': Spec(
         paths=('tokamax/_src/ops/gmm_v2/gmm_v2_test.py',),
         minutes=4,
@@ -299,6 +304,7 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/normalization/api_test.py',
             'tokamax/_src/ops/normalization/base_test.py',
+            'tokamax/_src/ops/normalization/mosaic_test.py',
             'tokamax/_src/ops/normalization/triton_test.py',
         ),
         minutes=3,
@@ -367,6 +373,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/routing_moe/test/common/out_format_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/common/quant_util_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/config_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_block_scaled_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/metadata_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/plan_unit_test.py',
@@ -374,6 +381,18 @@ SHARDS: ShardMap = {
             'tokamax/_src/ops/experimental/routing_moe/test/helper/helper_inputs_unit_test.py',
         ),
         minutes=12,
+    ),
+    'experimental-batched-rpa-correctness': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_test.py',),
+        minutes=12,
+        compat_minutes=4,
+    ),
+    'experimental-batched-rpa-quant': Spec(
+        paths=(
+            'tokamax/_src/ops/batched_rpa/correctness_per_token_quantization_test.py',
+        ),
+        minutes=12,
+        compat_minutes=4,
     ),
     'experimental-masked-dense-mla': Spec(
         paths=(
@@ -390,6 +409,8 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-layer-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_block_scaled_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_config_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_plan_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/monolithic_unit_test.py',
         ),
@@ -413,19 +434,28 @@ SHARDS: ShardMap = {
         compat_minutes=3,
     ),
     'experimental-batched-rpa': Spec(
-        paths=(
-            'tokamax/_src/ops/batched_rpa/base_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/configs_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/seq_along_lane_parity_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/speculative_decode_test.py',
-            'tokamax/_src/ops/batched_rpa/kernel/stacked_rpa_kv_writeback_test.py',
-            'tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',
-        ),
-        minutes=6,
+        paths=('tokamax/_src/ops/batched_rpa/base_test.py',),
+        minutes=3,
+        compat_minutes=1,
+    ),
+    'experimental-batched-rpa-cp': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_cp_test.py',),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    'experimental-batched-rpa-mtp': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/correctness_mtp_test.py',),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    'experimental-batched-rpa-pallas': Spec(
+        paths=('tokamax/_src/ops/batched_rpa/pallas_mosaic_tpu_test.py',),
+        minutes=5,
         compat_minutes=2,
     ),
     'experimental-mla': Spec(
         paths=(
+            'tokamax/_src/ops/experimental/mla/api_test.py',
             'tokamax/_src/ops/experimental/mla/base_test.py',
             'tokamax/_src/ops/experimental/mla/kernel/transpose_test.py',
             'tokamax/_src/ops/experimental/mla/pallas_mosaic_tpu_test.py',

@@ -392,7 +392,14 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
   x, scales = lhs.qvalue, lhs.scale
   expected_d = k_x // tile_k
 
-  if is_fp8 and scales.shape[1] == 2 * expected_d:
+  # The packed [scale | x_sum] layout is float32. A plain lhs whose subchannel
+  # is half the weight subchannel has the same shape, so plain float32 scales
+  # at that ratio are ambiguous and take this branch.
+  if (
+      is_fp8
+      and scales.dtype == jnp.float32
+      and scales.shape[1] == 2 * expected_d
+  ):
     tile_xk = k_x // expected_d
     scales = scales.mT
     x_scales, x_sum = jnp.split(scales, 2, axis=0)
@@ -523,7 +530,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             @pl.loop(0, num_k_iters)
             def _x_tma_loop(ki):
               global_ki = ki + local_index * num_k_iters
-              slot = lax.rem(global_ki, data_stages)
+              slot = mgpu_lib.urem(global_ki, data_stages)
 
               @pl.when(global_ki >= data_stages)
               def _wait_x_consumed():
@@ -537,7 +544,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             @pl.loop(0, num_k_iters)
             def loop_body(ki):
               global_ki = ki + local_index * num_k_iters
-              slot = lax.rem(global_ki, data_stages)
+              slot = mgpu_lib.urem(global_ki, data_stages)
 
               @pl.when(global_ki >= data_stages)
               def _wait_w_consumed():
@@ -557,7 +564,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
               plgpu.copy_gmem_to_smem(
                   w_scales_gmem.at[
                       group_id,
-                      lax.div((ki * block_k), tile_k),
+                      mgpu_lib.udiv(ki, tile_k // block_k),
                       slice_n,
                   ],
                   ws_smem.at[slot],
@@ -567,7 +574,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             def do_tma_xs(ki, slot):
               plgpu.copy_gmem_to_smem(
                   x_scales_gmem.at[
-                      lax.div(block_k * ki, tile_xk),
+                      mgpu_lib.udiv(ki, tile_xk // block_k),
                       pl.ds(block_start, max(cluster_block_m, 64)),
                   ],
                   xs_smem.at[slot],
@@ -576,7 +583,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
               if is_fp8:
                 plgpu.copy_gmem_to_smem(
                     x_sum_gmem.at[
-                        lax.div(block_k * ki, tile_xk),
+                        mgpu_lib.udiv(ki, tile_xk // block_k),
                         pl.ds(block_start, max(cluster_block_m, 64)),
                     ],
                     x_sum_smem.at[slot],
@@ -586,7 +593,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             @pl.loop(0, num_k_iters)
             def _tma_ws_loop(ki):
               global_ki = ki + local_index * num_k_iters
-              slot = lax.rem(global_ki, scale_stages)
+              slot = mgpu_lib.urem(global_ki, scale_stages)
 
               @pl.when(global_ki >= scale_stages)
               def _():
@@ -601,9 +608,9 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             @pl.loop(0, num_k_iters)
             def do_mma(ki):
               global_ki = ki + local_index * num_k_iters
-              x_slot = lax.rem(global_ki, data_stages)
-              w_slot = lax.rem(global_ki, deq_stages)
-              acc_slot = lax.rem(global_ki, acc_stages)
+              x_slot = mgpu_lib.urem(global_ki, data_stages)
+              w_slot = mgpu_lib.urem(global_ki, deq_stages)
+              acc_slot = mgpu_lib.urem(global_ki, acc_stages)
 
               @pl.when(global_ki >= acc_stages)
               def _():
@@ -639,12 +646,23 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
       def _deq_wg():
         kernel_config.set_max_registers(kernel_config.deq_wg_regs)
 
-        @pl.loop(wg, num_k_iters, step=_DEQ_WG)
+        tile_offset = local_index * num_k_iters
+        # Barrier phases are tracked per thread, so each barrier slot must
+        # always be waited on by the same warpgroup. Warpgroup `wg` takes the
+        # iterations with global_ki % _DEQ_WG == wg.
+        ki_start = wg
+        if num_k_iters % _DEQ_WG:
+          # (wg - tile_offset) mod _DEQ_WG, written with non-negative operands.
+          ki_start = lax.rem(
+              wg + (-num_k_iters % _DEQ_WG) * local_index, _DEQ_WG
+          )
+
+        @pl.loop(ki_start, num_k_iters, step=_DEQ_WG)
         def _dequantize(ki):
           with jax.named_scope("indices"):
-            global_ki = ki + local_index * num_k_iters
-            data_slot = lax.rem(global_ki, data_stages)
-            w_slot = lax.rem(global_ki, deq_stages)
+            global_ki = ki + tile_offset
+            data_slot = mgpu_lib.urem(global_ki, data_stages)
+            w_slot = mgpu_lib.urem(global_ki, deq_stages)
           with jax.named_scope("wait_w_tma"):
             plgpu.barrier_wait(w_barrier.at[data_slot])
 
@@ -694,8 +712,8 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
 
         def _loop_body(ki, acc_carry):
           global_ki = ki + local_index * num_k_iters
-          scale_slot = lax.rem(global_ki, scale_stages)
-          acc_slot = lax.rem(global_ki, acc_stages)
+          scale_slot = mgpu_lib.urem(global_ki, scale_stages)
+          acc_slot = mgpu_lib.urem(global_ki, acc_stages)
 
           with jax.named_scope("wait_scales"):
             plgpu.barrier_wait(xws_barrier.at[scale_slot])
@@ -727,7 +745,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             if is_fp8:
               assert x_sum is not None
               k_iters_per_subchannel = tile_xk // block_k
-              apply_bias = (ki % k_iters_per_subchannel) == 0
+              apply_bias = mgpu_lib.urem(ki, k_iters_per_subchannel) == 0
               apply_bias_coef = lax.broadcast_in_dim(
                   apply_bias.astype(x_sum.dtype), x_sum.shape, ()
               )
@@ -787,7 +805,7 @@ def ragged_dot_gpu_quant_x8_blackwell_kernel(
             assert out_scales_gmem is not None
             assert out_scales_smem is not None
             # Scatter scales before value TMA to overlap GMEM stores.
-            scale_col = lax.div(
+            scale_col = mgpu_lib.udiv(
                 tid_n * cluster_block_n + cluster_idx * block_n,
                 epilogue_quant_subchannel_size,
             )

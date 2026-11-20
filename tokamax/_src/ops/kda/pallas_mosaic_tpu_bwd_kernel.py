@@ -1195,13 +1195,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   _, batch_idx, rev_c = step.index
   chunk_id = NT - 1 - rev_c
   if is_varlen:
-    _, _, _, is_first_chunk, is_last_chunk = _chunk_segment_metadata(
+    _, _, is_valid, is_first_chunk, is_last_chunk = _chunk_segment_metadata(
         chunk_seg_ids_smem_ref,
         batch_idx,
         chunk_id,
         NT,
     )
   else:
+    is_valid = jnp.bool_(True)
     is_last_chunk = rev_c == 0
     is_first_chunk = rev_c == NT - 1
   precision = (
@@ -1209,6 +1210,10 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       if q_ref.dtype == jnp.bfloat16
       else jax.lax.Precision.HIGHEST
   )
+
+  @pl.when(~is_valid)
+  def _():
+    dh_scratch[:] = jnp.zeros_like(dh_scratch)
 
   @pl.when(is_last_chunk)
   def _():

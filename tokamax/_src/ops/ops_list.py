@@ -717,6 +717,11 @@ OPS: tuple[Op, ...] = (
                 module="_src/ops/normalization/base.py",
             ),
             Impl(
+                name="mosaic",
+                backend=MOSAIC_GPU,
+                module="_src/ops/normalization/mosaic.py",
+            ),
+            Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/normalization/triton.py",
@@ -775,12 +780,37 @@ OPS: tuple[Op, ...] = (
             Impl(
                 name="xla",
                 backend=XLA,
-                module="_src/ops/experimental/mhc_lite/mhc_xla.py",
+                module="_src/ops/experimental/mhc_lite/base.py",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
-                module="_src/ops/experimental/mhc_lite/mhc_kernels_fwd.py",
+                module="_src/ops/experimental/mhc_lite/pallas_mosaic_tpu.py",
+            ),
+        ),
+    ),
+    Op(
+        name="ssd_scan",
+        apis=(),
+        impls=(
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/ssd_scan/ssd_scan.py",
+            ),
+        ),
+    ),
+    Op(
+        name="ragged_causal_conv1d",
+        apis=(),
+        impls=(
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module=(
+                    "_src/ops/experimental/ragged_causal_conv1d/"
+                    "causal_conv1d.py"
+                ),
             ),
         ),
     ),

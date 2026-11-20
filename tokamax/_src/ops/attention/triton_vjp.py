@@ -230,7 +230,6 @@ def _bwd_kernel(
   slice_n2: tl.constexpr = tl.constexpr(
       1 if block_n2 < min_sliced_block else _MASK_BLOCK_SLICE_FACTOR
   )
-  qk_compute_dtype = tl.float64 if qk_dtype == tl.float64 else tl.float32
 
   start_n = pid * block_n1
   if start_n < seq_len_k:
@@ -246,7 +245,6 @@ def _bwd_kernel(
         mask=k_mask1,
         other=None if k_mask1 is None else 0.0,
     )
-    k1 = (k1.to(qk_compute_dtype) * sm_scale).to(qk_dtype)
 
     v_mask1 = triton_utils.mask_2d(
         offs_n1, seq_len_k, offs_d_out, head_dim_out, check_n1, check_d_out
@@ -310,7 +308,8 @@ def _bwd_kernel(
             mask=mask_m1_1d,
             other=None if mask_m1_1d is None else _F32_TINY,
         )
-        sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype).to(logits_dtype)
+        sT = _dot(k1, tl.trans(q1), qk_prec, qk_dtype) * sm_scale
+        sT = sT.to(logits_dtype)
 
         if bias_ptr is not None:
           b1 = triton_utils.load_2d_bcast(
@@ -433,7 +432,6 @@ def _bwd_kernel(
         mask=q_mask2,
         other=None if q_mask2 is None else 0.0,
     )
-    q2 = (q2.to(qk_compute_dtype) * sm_scale).to(qk_dtype)
 
     do_mask2 = triton_utils.mask_2d(
         offs_m2, seq_len_q, offs_d_out, head_dim_out, check_m2, check_d_out
@@ -522,7 +520,8 @@ def _bwd_kernel(
             mask=v_mask2,
             other=None if v_mask2 is None else 0.0,
         )
-        s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype).to(logits_dtype)
+        s = _dot(q2, tl.trans(k2), qk_prec, qk_dtype) * sm_scale
+        s = s.to(logits_dtype)
 
         if bias_ptr is not None:
           s += triton_utils.load_2d_bcast(

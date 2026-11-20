@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import memory_ref
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
@@ -51,7 +52,8 @@ def _weight_ref(
 ) -> memory_ref.SingleWeightRef[jax.Array]:
   """Unwraps a `SingleWeightWrapper` into a `SingleWeightRef`."""
   w_scale = wrapper.scale
-  if w_scale is not None:
+  if isinstance(wrapper.spec.quant, tensor_spec.SubchannelQuantSpec):
+    assert w_scale is not None
     w_scale = w_scale.astype(jnp.float32)
   return memory_ref.SingleWeightRef(
       weight=wrapper.weight, scale=w_scale, bias=wrapper.bias
@@ -78,14 +80,14 @@ def _prepare_kernel_args(
   """Preprocesses XLA inputs and binds memory-space constraints."""
   if group_offset is None:
     group_offset = jnp.array([0], dtype=jnp.int32)
-  elif jnp.isscalar(group_offset):
-    group_offset = group_offset[None]
-  group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+  else:
+    group_offset = jnp.atleast_1d(group_offset).astype(jnp.int32)
 
   # Wrap inputs in the pipeline's parameter object. emit_pipeline needs HBM
   # refs and VMEM allocations to share one pytree structure, so the API
   # wrappers are reduced to their data here.
-  pad_size = cfg.plan.tile_m_idx
+  smem_indices = cfg.plan.smem_indices
+  pad_size = 0 if smem_indices else cfg.plan.tile_m_idx
   inputs = memory_ref.PipelineInputs[jax.Array](
       x=x.data,
       w=_weight_ref(w),
@@ -96,10 +98,11 @@ def _prepare_kernel_args(
 
   row_group_i32 = None if row_group is None else row_group.astype(jnp.int32)
   metadata_in, metadata_scratch = metadata.create_metadata(
-      group_cum_sum, group_offset, cfg, row_group=row_group_i32
+      group_sizes.astype(jnp.int32), group_offset, cfg, row_group=row_group_i32
   )
 
-  inputs = memory_ref.map_memory_constraint(inputs, pltpu.HBM)
+  idx_space = pltpu.SMEM if smem_indices else pltpu.HBM
+  inputs = inputs.with_memory_constraints(idx_space=idx_space)
   metadata_in = memory_ref.map_memory_constraint(metadata_in, pltpu.SMEM)
   out = pltpu.HBM(cfg.out.spec.physical_compact_shape, cfg.out.spec.dtype)
   return metadata_in, metadata_scratch, inputs, out

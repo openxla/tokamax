@@ -1,0 +1,47 @@
+{
+  "{\"residuals\":[\"f32[1024,32]\",\"f32[512,4]\"],\"out\":[\"bf16[512,256]\",\"bf16[512,1024]\",\"f32[512,4]\",\"bf16[512,16]\"],\"dout\":[\"bf16[512,256]\",\"bf16[512,1024]\",\"f32[512,4]\",\"bf16[512,16]\"],\"x\":\"bf16[512,1024]\",\"weights\":{\"norm_scale\":\"bf16[1024]\",\"w_pre\":\"bf16[1024,4]\",\"b_pre\":\"bf16[4]\",\"alpha_pre\":\"bf16[1]\",\"w_post\":\"bf16[1024,4]\",\"b_post\":\"bf16[4]\",\"alpha_post\":\"bf16[1]\",\"w_res\":\"bf16[1024,24]\",\"b_res\":\"bf16[24]\",\"alpha_res\":\"bf16[1]\"},\"permutations\":\"f32[24,4,4]\",\"rms_epsilon\":1e-6,\"pre_mapping_epsilon\":1e-6,\"return_residuals\":false}": {
+    "{\"bwd_block_size\":256,\"bwd_num_chunks\":1}": {
+      "compile_time_ms": 3346.406491007656,
+      "lower_time_ms": 1773.7636347301304,
+      "evaluation_times_ms": [
+        0.035,
+        0.035,
+        0.035,
+        0.035,
+        0.035
+      ],
+      "metadata": {},
+      "peak_memory_mb": 6.79072
+    }
+  },
+  "{\"residuals\":[\"f32[2048,32]\",\"f32[8192,4]\"],\"out\":[\"bf16[8192,512]\",\"bf16[8192,2048]\",\"f32[8192,4]\",\"bf16[8192,16]\"],\"dout\":[\"bf16[8192,512]\",\"bf16[8192,2048]\",\"f32[8192,4]\",\"bf16[8192,16]\"],\"x\":\"bf16[8192,2048]\",\"weights\":{\"norm_scale\":\"bf16[2048]\",\"w_pre\":\"bf16[2048,4]\",\"b_pre\":\"bf16[4]\",\"alpha_pre\":\"bf16[1]\",\"w_post\":\"bf16[2048,4]\",\"b_post\":\"bf16[4]\",\"alpha_post\":\"bf16[1]\",\"w_res\":\"bf16[2048,24]\",\"b_res\":\"bf16[24]\",\"alpha_res\":\"bf16[1]\"},\"permutations\":\"f32[24,4,4]\",\"rms_epsilon\":1e-6,\"pre_mapping_epsilon\":1e-6,\"return_residuals\":false}": {
+    "{\"bwd_block_size\":1024,\"bwd_num_chunks\":1}": {
+      "compile_time_ms": 20282.92816085741,
+      "lower_time_ms": 3191.522574983537,
+      "evaluation_times_ms": [
+        0.129,
+        0.13,
+        0.13,
+        0.129,
+        0.129
+      ],
+      "metadata": {},
+      "peak_memory_mb": 165.072448
+    }
+  },
+  "{\"residuals\":[\"f32[2048,32]\",\"f32[196608,4]\"],\"out\":[\"bf16[196608,512]\",\"bf16[196608,2048]\",\"f32[196608,4]\",\"bf16[196608,16]\"],\"dout\":[\"bf16[196608,512]\",\"bf16[196608,2048]\",\"f32[196608,4]\",\"bf16[196608,16]\"],\"x\":\"bf16[196608,2048]\",\"weights\":{\"norm_scale\":\"bf16[2048]\",\"w_pre\":\"bf16[2048,4]\",\"b_pre\":\"bf16[4]\",\"alpha_pre\":\"bf16[1]\",\"w_post\":\"bf16[2048,4]\",\"b_post\":\"bf16[4]\",\"alpha_post\":\"bf16[1]\",\"w_res\":\"bf16[2048,24]\",\"b_res\":\"bf16[24]\",\"alpha_res\":\"bf16[1]\"},\"permutations\":\"f32[24,4,4]\",\"rms_epsilon\":1e-6,\"pre_mapping_epsilon\":1e-6,\"return_residuals\":false}": {
+    "{\"bwd_block_size\":1024,\"bwd_num_chunks\":1}": {
+      "compile_time_ms": 31691.285545006394,
+      "lower_time_ms": 5923.312473110855,
+      "evaluation_times_ms": [
+        2.113,
+        2.113,
+        2.115,
+        2.113,
+        2.113
+      ],
+      "metadata": {},
+      "peak_memory_mb": 3900.231232
+    }
+  }
+}

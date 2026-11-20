@@ -1754,14 +1754,15 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
         self.assertLess(_rel_l2(g, g_ref), 3e-5)
 
   @parameterized.product(
-      diag_band_skip=(False, True),
+      band_and_dq=((False, 1), (True, 1), (True, None), (True, 3)),
       scaled_q=(False, True),
       qk_dtype=("bfloat16", "float8_e4m3fn"),
   )
   def test_diag_band_skip_and_vmem_dq_reduction(
-      self, diag_band_skip, scaled_q, qk_dtype
+      self, band_and_dq, scaled_q, qk_dtype
   ):
     """Row-band diagonal skip and VMEM dq reduction match the stock bwd."""
+    diag_band_skip, dq_reduction_steps = band_and_dq
     seq_len, num_heads, head_dim_qk, block = 2048, 2, 192, 512
     k1, k2, k3, k4 = random.split(random.key(0), 4)
     q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
@@ -1795,7 +1796,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
           q_prescaled_log2e=scaled_q,
           qk_diag_skip=optimized,
           diag_band_skip=optimized and diag_band_skip,
-          dq_reduction_steps=1 if optimized else None,
+          dq_reduction_steps=dq_reduction_steps if optimized else None,
       )
       attn = splash.make_splash_mha_single_device(mask, config=config)
 
@@ -1807,6 +1808,69 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
 
     for r, g in zip(grads(False), grads(True)):
       self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
+  @parameterized.parameters(False, True)
+  def test_sublane_residuals_bit_exact(self, fuse_reciprocal):
+    """Residual rows (block_q % 128 == 0) match lane-broadcast residuals.
+
+    block_q=64 keeps the forward residuals lane-broadcast; 128 stores them as
+    sublane rows. The output, stats, dq, dk and dv are bit-identical.
+    """
+    seq_len, num_heads = 1024, 2
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    q = random.normal(k1, (num_heads, seq_len, 128), jnp.bfloat16)
+    k = random.normal(k2, (num_heads, seq_len, 128), jnp.bfloat16)
+    v = random.normal(k3, (num_heads, seq_len, 128), jnp.bfloat16)
+    do = random.normal(k4, (num_heads, seq_len, 128), jnp.bfloat16)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def run(bq):
+      config = splash.SplashConfig(
+          block_q=bq,
+          block_kv=256,
+          block_kv_compute=256,
+          block_q_dkv=256,
+          block_kv_dkv=256,
+          block_kv_dkv_compute=256,
+          use_fused_bwd_kernel=True,
+          residual_checkpoint_name="context",
+          fuse_reciprocal=fuse_reciprocal,
+          interpret=self.INTERPRET,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+      attn_stats = splash.make_splash_mha_single_device(
+          mask, config=config, save_residuals=True
+      )
+
+      def fwd_bwd(q, k, v, do):
+        out, vjp = jax.vjp(attn, q, k, v)
+        _, stats = attn_stats(q, k, v)
+        return out, stats["logsumexp"], stats["max_logits"], *vjp(do)
+
+      # The forward kernel's residual outputs (logsumexp or l, and max logits)
+      # use the row layout only when bq is a multiple of 128.
+      jaxpr = jax.make_jaxpr(lambda q, k, v: jax.vjp(attn, q, k, v)[0])(q, k, v)
+      pallas_eqns = [
+          sub_e
+          for e in jaxpr.jaxpr.eqns
+          if e.primitive.name == "jit"
+          for sub_e in e.params["jaxpr"].eqns
+          if sub_e.primitive.name == "pallas_call"
+      ]
+      expected_residual_shape = (
+          (num_heads, splash.NUM_SUBLANES, seq_len)
+          if bq % splash.NUM_LANES == 0
+          else (num_heads, seq_len, splash.NUM_LANES)
+      )
+      self.assertEqual(
+          [x.aval.shape for x in pallas_eqns[0].outvars[1:]],
+          [expected_residual_shape, expected_residual_shape],
+      )
+
+      return jax.jit(fwd_bwd)(q, k, v, do)
+
+    for r, o in zip(run(64), run(128)):
+      np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
 
   @parameterized.product(
       mask_kind=("causal", "local", "full"),
@@ -2000,6 +2064,173 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
       grads_contig_1 = jax.jit(bwd_contig_1)(q, k, v, do)
       for r, g in zip(grads_contig_ref, grads_contig_1):
         self._assert_allclose(g, r, atol=atol, rtol=atol)
+
+  @parameterized.product(
+      dq_reduction_steps=(None, 3),
+      qk_diag_grid=(2, 4),
+      q_layout=(
+          splash.QKVLayout.HEAD_DIM_MINOR,
+          splash.QKVLayout.SEQ_MINOR,
+      ),
+      is_mqa=(False, True),
+      use_segments=(False, True),
+  )
+  def test_diag_band_skip_multi_block_without_vmem_dq(
+      self, dq_reduction_steps, qk_diag_grid, q_layout, is_mqa, use_segments
+  ):
+    """Row-band diagonal skip matches stock bwd when q_steps > 2."""
+    seq_len, num_q_heads, block = 2048, 2, 512
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(1), 4)
+    q = (random.normal(k1, (num_q_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    kv_shape = (
+        (seq_len, head_dim_qk)
+        if is_mqa
+        else (num_q_heads, seq_len, head_dim_qk)
+    )
+    v_shape = (
+        (seq_len, head_dim_v) if is_mqa else (num_q_heads, seq_len, head_dim_v)
+    )
+    k = (random.normal(k2, kv_shape) * 0.5).astype(jnp.bfloat16)
+    v = (random.normal(k3, v_shape) * 0.5).astype(jnp.bfloat16)
+    do = (random.normal(k4, (num_q_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    segment_ids = None
+    if use_segments:
+      seg = jnp.concatenate([
+          jnp.zeros(700, dtype=jnp.int32),
+          jnp.ones(seq_len - 700, dtype=jnp.int32),
+      ])
+      segment_ids = splash.SegmentIds(q=seg, kv=seg)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+    make_fn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+
+    def grads(optimized: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          q_layout=q_layout,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          qk_diag_grid=qk_diag_grid,
+          interpret=self.INTERPRET,
+          qk_diag_skip=optimized,
+          diag_band_skip=optimized,
+          dq_reduction_steps=dq_reduction_steps if optimized else None,
+      )
+      attn = make_fn(mask, config=config)
+
+      def bwd(q, k, v, do):
+        _, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids),
+            q,
+            k,
+            v,
+        )
+        return vjp(do)
+
+      return jax.jit(bwd)(q, k, v, do)
+
+    for r, g in zip(grads(False), grads(True)):
+      self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
+
+  @parameterized.product(
+      qk_diag_grid=(2, 4),
+      q_layout=(
+          splash.QKVLayout.HEAD_DIM_MINOR,
+          splash.QKVLayout.SEQ_MINOR,
+      ),
+      kv_layout=(
+          splash.QKVLayout.HEAD_DIM_MINOR,
+          splash.QKVLayout.SEQ_MINOR,
+      ),
+      qk_dtype=("bfloat16", "float8_e4m3fn"),
+      extra=("none", "segments", "sinks_and_softcap"),
+  )
+  def test_diag_band_skip_square_forward(
+      self, qk_diag_grid, q_layout, kv_layout, qk_dtype, extra
+  ):
+    """Row-band diagonal skip matches stock on square forward causal blocks."""
+    seq_len, num_heads, block = 1024, 2, 512
+    head_dim_qk, head_dim_v = 192, 128
+    k1, k2, k3, k4 = random.split(random.key(2), 4)
+    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
+        qk_dtype
+    )
+    v = (random.normal(k3, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    do = (random.normal(k4, (num_heads, seq_len, head_dim_v)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    segment_ids = None
+    if extra == "segments":
+      seg = jnp.concatenate([
+          jnp.zeros(300, dtype=jnp.int32),
+          jnp.ones(seq_len - 300, dtype=jnp.int32),
+      ])
+      segment_ids = splash.SegmentIds(q=seg, kv=seg)
+    sinks = (
+        jnp.array([0.3, -0.4], dtype=jnp.float32)
+        if extra == "sinks_and_softcap"
+        else None
+    )
+    soft_cap = 15.0 if extra == "sinks_and_softcap" else None
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len))
+
+    def run(optimized: bool):
+      config = splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          q_layout=q_layout,
+          k_layout=kv_layout,
+          v_layout=kv_layout,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          attn_logits_soft_cap=soft_cap,
+          qk_diag_grid=qk_diag_grid,
+          interpret=self.INTERPRET,
+          qk_diag_skip=optimized,
+          diag_band_skip=optimized,
+          dq_reduction_steps=3 if optimized else None,
+      )
+      attn = splash.make_splash_mha_single_device(mask, config=config)
+
+      def fwd_and_bwd(q, k, v, do):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(
+                q_, k_, v_, segment_ids=segment_ids, sinks=sinks
+            ),
+            q,
+            k,
+            v,
+        )
+        return out, *vjp(do)
+
+      return jax.jit(fwd_and_bwd)(q, k, v, do)
+
+    ref_vals = run(False)
+    opt_vals = run(True)
+    for r, g in zip(ref_vals, opt_vals):
+      self._assert_allclose(g, r, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

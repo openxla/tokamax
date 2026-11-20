@@ -198,12 +198,16 @@ class MhcBenchmarkTest(absltest.TestCase):
         w_post=initializer(key_post, (streams, 1), DTYPE),
         w_res=jnp.eye(streams, dtype=DTYPE),
     )
-    config = mhc_common.MhcKernelConfig(
-        block_size=256,
-        fwd_pipeline_blocks=2,
-        bwd_block_size=256,
-        rms_epsilon=EPS,
+    config = mhc_common.MhcKernelConfig(rms_epsilon=EPS)
+    heuristic_cfg = mhc_common.resolve_config(
+        config,
+        tokens=tokens,
+        streams=streams,
+        embedding=embedding,
+        num_permutations=num_permutations,
+        dtype=DTYPE,
     )
+    print(f"Resolved default config: {heuristic_cfg}", flush=True)
 
     hc_variant = _compile_variant(
         "hc_xla",

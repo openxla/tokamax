@@ -86,6 +86,14 @@ class SingleWeightWrapper[T]:
             f"Weight scale must have shape {self.spec.scale_shape}. Got"
             f" {self.scale.shape}."
         )
+      if (
+          isinstance(self.spec.quant, spec_lib.BlockScaledQuantSpec)
+          and self.scale.dtype != jnp.float8_e8m0fnu
+      ):
+        raise ValueError(
+            "Block-scaled weight scale must have dtype float8_e8m0fnu. Got"
+            f" {self.scale.dtype}."
+        )
     if (self.bias is not None) != self.spec.has_bias:
       raise ValueError(
           "Weight bias must be present iff spec.has_bias is set. Got"
@@ -103,16 +111,28 @@ class SingleWeightWrapper[T]:
   def create(
       cls,
       weight: jax.Array,  # [group, in, out]
-      scale: jax.Array | None = None,  # [group, num_blocks, 1, out]
+      # [group, num_blocks, 1, out] or [group, scale_rows, out]
+      scale: jax.Array | None = None,
       bias: jax.Array | None = None,  # [group, 1, out]
       *,
+      quant: spec_lib.WeightQuantSpec | None = None,
       fused_gate_up: bool = False,
   ) -> Self:
     """Builds a weight wrapper whose spec is derived from the given arrays."""
     group_size, in_size, out_size = weight.shape
-    quant = None
-    if scale is not None:
-      quant = spec_lib.SubchannelQuantSpec(block_size=in_size // scale.shape[1])
+    if quant is None and scale is not None:
+      match scale.ndim:
+        case 3:
+          quant = spec_lib.BlockScaledQuantSpec(scale_rows=scale.shape[1])
+        case 4:
+          num_blocks = scale.shape[1]
+          block_size = 0 if num_blocks == 0 else in_size // num_blocks
+          quant = spec_lib.SubchannelQuantSpec(block_size=block_size)
+        case _:
+          raise ValueError(
+              "Weight scale must be 3D (block-scaled) or 4D (subchannel) when"
+              f" quant is not specified. Got shape {scale.shape}."
+          )
     weight_spec = spec_lib.WeightSpec(
         group_size=group_size,
         in_size=in_size,

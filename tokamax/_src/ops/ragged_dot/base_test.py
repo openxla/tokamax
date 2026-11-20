@@ -82,6 +82,19 @@ class RaggedDotWithExplicitVjpTest(test_base.RaggedDotTestBase):
     # `drhs` follows user-stet `preferred_element_type` if set
     self.assertEqual(drhs.dtype, expected_dtype)
 
+  def test_vjp_zero_initialize(self):
+    num_groups, m, k, n = 4, 128, 64, 128
+    lhs, rhs, _ = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+    group_sizes = jnp.array([16, 24, 0, 24], dtype=jnp.int32)
+    f = functools.partial(
+        self._dot_fn, group_sizes=group_sizes, zero_initialize=True
+    )
+    out, f_vjp = jax.vjp(f, lhs, rhs)
+    dlhs, drhs = f_vjp(jnp.ones_like(out))
+    self.assertEqual(dlhs.shape, lhs.shape)
+    self.assertEqual(drhs.shape, rhs.shape)
+    self.assertEqual(float(jnp.max(jnp.abs(dlhs[64:]))), 0.0)
+
 
 class GenerateGroupSizesTest(parameterized.TestCase):
 

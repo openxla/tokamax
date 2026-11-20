@@ -80,15 +80,22 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
   return report
 
 
+def pytest_configure(config: pytest.Config) -> None:
+  del config  # Unused.
+  # XLA reads XLA_FLAGS once, when the first backend is created, and some test
+  # classes query the devices while they are collected. A session fixture runs
+  # after collection, so the flags must be set here.
+  os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + (
+      ' --xla_gpu_deterministic_ops=True '
+      ' --xla_gpu_exclude_nondeterministic_ops=True'
+      ' --xla_gpu_enable_triton_gemm=False'
+  )
+
+
 @pytest.fixture(scope='session', autouse=True)
 def tokamax_testing_setup():
   """Parse absl flags and disable x64 for JAX."""
   # TODO: Remove this once x64 is supported.
   jax.config.update('jax_enable_x64', False)
   flags.FLAGS(sys.argv[:1])
-  os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + (
-      ' --xla_gpu_deterministic_ops=True '
-      ' --xla_gpu_exclude_nondeterministic_ops=True'
-      ' --xla_gpu_enable_triton_gemm=False'
-  )
   yield

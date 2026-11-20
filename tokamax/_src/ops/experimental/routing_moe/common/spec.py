@@ -105,6 +105,27 @@ type QuantSpec = SubchannelQuantSpec | LaneStridedQuantSpec
 
 @dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
+class BlockScaledQuantSpec:
+  """Strided block-scaled weights with 3D `[group, scale_rows, out]` scales.
+
+  Unlike contiguous `SubchannelQuantSpec` or single-element
+  `LaneStridedQuantSpec`, each `float8_e8m0fnu` scale groups strided
+  multi-element segments along `in_size`, and `scale_rows` may include hardware
+  alignment padding.
+  """
+
+  scale_rows: int
+
+  def __post_init__(self) -> None:
+    if self.scale_rows <= 0:
+      raise ValueError(f"scale_rows must be positive. Got {self.scale_rows}.")
+
+
+type WeightQuantSpec = SubchannelQuantSpec | BlockScaledQuantSpec
+
+
+@dataclass_util.require_no_default
+@dataclasses.dataclass(frozen=True)
 class ActivationSpec:
   """Static shape, dtype, and quantization spec of a compact activation."""
 
@@ -185,17 +206,28 @@ class WeightSpec:
   in_size: int
   out_size: int
   dtype: jnp.dtype
-  quant: SubchannelQuantSpec | None
+  quant: WeightQuantSpec | None
   has_bias: bool
   # Columns hold the gate and up weights concatenated, each out_size // 2 wide.
   fused_gate_up: bool
 
   def __post_init__(self) -> None:
-    if self.quant is not None and self.in_size % self.quant.block_size != 0:
-      raise ValueError(
-          f"quant block_size ({self.quant.block_size}) must divide in_size"
-          f" ({self.in_size})."
-      )
+    match self.quant:
+      case None:
+        pass
+      case SubchannelQuantSpec(block_size=block_size):
+        if self.in_size % block_size != 0:
+          raise ValueError(
+              f"quant block_size ({block_size}) must divide in_size"
+              f" ({self.in_size})."
+          )
+      case BlockScaledQuantSpec():
+        fp8_dtypes = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
+        if self.dtype not in fp8_dtypes:
+          raise ValueError(
+              f"BlockScaledQuantSpec requires dtype in {fp8_dtypes}. Got"
+              f" {self.dtype}."
+          )
     if self.fused_gate_up and self.out_size % 2 != 0:
       raise ValueError(
           f"Fused gate/up weight needs an even out_size. Got {self.out_size}."
@@ -210,10 +242,23 @@ class WeightSpec:
     return (self.group_size, self.in_size, self.out_size)
 
   @property
-  def scale_shape(self) -> tuple[int, int, int, int]:
+  def scale_dtype(self) -> jnp.dtype:
     assert self.quant is not None
-    num_blocks = self.in_size // self.quant.block_size
-    return (self.group_size, num_blocks, 1, self.out_size)
+    match self.quant:
+      case SubchannelQuantSpec():
+        return jnp.dtype(jnp.float32)
+      case BlockScaledQuantSpec():
+        return jnp.dtype(jnp.float8_e8m0fnu)
+
+  @property
+  def scale_shape(self) -> tuple[int, int, int] | tuple[int, int, int, int]:
+    assert self.quant is not None
+    match self.quant:
+      case SubchannelQuantSpec(block_size=block_size):
+        num_blocks = self.in_size // block_size
+        return (self.group_size, num_blocks, 1, self.out_size)
+      case BlockScaledQuantSpec(scale_rows=scale_rows):
+        return (self.group_size, scale_rows, self.out_size)
 
   @property
   def bias_shape(self) -> tuple[int, int, int]:

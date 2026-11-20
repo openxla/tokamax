@@ -241,8 +241,15 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
     )
 
-  def test_custom_config_nonsquare_fwd_and_band_skip_vjp(self):
-    q_seq_len, kv_seq_len, head_dim = 512, 512, 64
+  @parameterized.parameters(
+      (512, 128, False, 1),
+      (1024, 128, False, 3),
+      (1024, 256, True, 3),
+  )
+  def test_custom_config_diag_band_skip(
+      self, seq_len, bkv_compute, fwd_band_skip, dq_reduction_steps
+  ):
+    q_seq_len, kv_seq_len, head_dim = seq_len, seq_len, 64
     num_heads = 2
     dtype = jnp.float32
 
@@ -258,7 +265,7 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     config = pallas_mosaic_tpu.Config(
         block_q=256,
         block_kv=256,
-        block_kv_compute=128,
+        block_kv_compute=bkv_compute,
         q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
         k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
         v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
@@ -266,13 +273,14 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
         qk_diag_skip=True,
         qk_diag_grid=2,
         sv_diag_skip=False,
+        diag_band_skip=fwd_band_skip,
     )
     vjp_config = sp_vjp.Config(
         block_q_dkv=256,
         block_kv_dkv=256,
         block_kv_dkv_compute=256,
         use_base2_exp=True,
-        dq_reduction_steps=1,
+        dq_reduction_steps=dq_reduction_steps,
         qk_diag_skip=True,
         qk_diag_grid=2,
         diag_band_skip=True,
@@ -280,6 +288,47 @@ class PallasMosaicTpuSplashAttentionTest(parameterized.TestCase):
     self._test_attention(
         q, k, v, do, mask=mask, config=config, vjp_config=vjp_config
     )
+
+  def test_fwd_diag_band_skip_config_validation(self):
+    base_kwargs = dict(
+        block_q=256,
+        block_kv=256,
+        q_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        k_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        v_layout=pallas_mosaic_tpu.QKVLayout.HEAD_DIM_MINOR,
+        use_experimental_scheduler=True,
+    )
+    with self.assertRaisesRegex(ValueError, "qk_diag_skip=True"):
+      pallas_mosaic_tpu.Config(
+          **base_kwargs,
+          block_kv_compute=256,
+          qk_diag_skip=False,
+          diag_band_skip=True,
+      )
+    with self.assertRaisesRegex(ValueError, "square forward blocks"):
+      pallas_mosaic_tpu.Config(
+          **base_kwargs,
+          block_kv_compute=128,
+          qk_diag_skip=True,
+          diag_band_skip=True,
+      )
+    with self.assertRaisesRegex(ValueError, "multiple of NUM_LANES"):
+      pallas_mosaic_tpu.Config(
+          **base_kwargs,
+          block_kv_compute=256,
+          qk_diag_skip=True,
+          qk_diag_grid=4,
+          diag_band_skip=True,
+      )
+    with self.assertRaisesRegex(ValueError, "multiple of NUM_LANES"):
+      sp_vjp.Config(
+          block_q_dkv=256,
+          block_kv_dkv=256,
+          block_kv_dkv_compute=256,
+          qk_diag_skip=True,
+          qk_diag_grid=4,
+          diag_band_skip=True,
+      )
 
   def test_autotune_configs(self):
     head_dim = 64

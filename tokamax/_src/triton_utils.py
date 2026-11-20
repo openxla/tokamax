@@ -15,9 +15,11 @@
 """Triton utilities."""
 
 from collections.abc import Callable
+import functools
 import math
 
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import precision as precision_lib
 import triton
@@ -59,6 +61,7 @@ def vmap_kernel(launch_fn, batch_shape=(), batched=()):
 def batch_offset(pid_b, batch_shape, batch_strides):
   """Unravels `pid_b` over `batch_shape` and dots with `batch_strides`."""
   offset = tl.full((), 0, tl.int64)
+  pid_b = pid_b + offset
   for i in tl.static_range(len(batch_shape) - 1, 0, -1):
     offset += (pid_b % batch_shape[i]) * batch_strides[i]
     pid_b //= batch_shape[i]
@@ -91,6 +94,10 @@ def _get_grid_pids_n(
   return pid_m, pid_n
 
 
+def _num_sms() -> int:
+  return getattr(backend.get_default_device(), 'core_count', 1)
+
+
 def _get_group_size_cost(
     group_size_m: int,
     grid_m: int,
@@ -99,7 +106,7 @@ def _get_group_size_cost(
     block_n_cost: int,
 ) -> int:
   """Returns the total cost for the given group size."""
-  num_live_groups = triton.cdiv(jax.devices()[0].core_count, group_size_m)
+  num_live_groups = triton.cdiv(_num_sms(), group_size_m)
   num_live_blocks_m = triton.cdiv(num_live_groups, grid_n) * group_size_m
   num_live_blocks_m = min(num_live_blocks_m, grid_m)
   num_live_blocks_n = min(num_live_groups, grid_n)
@@ -114,7 +121,7 @@ def get_cheapest_grid_grouping(
     block_n_cost: int,
 ) -> tuple[int, bool]:
   """Returns (group_size, group_by_m) that minimizes total cache cost."""
-  num_live_progs = jax.devices()[0].core_count
+  num_live_progs = _num_sms()
 
   def group_size_m_usage(group_size_m):
     return _get_group_size_cost(
@@ -166,11 +173,21 @@ def _relu(x):
   return tl.maximum(x, 0.0)
 
 
+@triton.jit
+def _gelu_approx(x):
+  return 0.5 * x * (1.0 + libdevice.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+
+
+@triton.jit
+def _gelu_exact(x):
+  return 0.5 * x * libdevice.erfc(-0.7071067811865475 * x)
+
+
 def get_triton_activation(
     activation: Callable[[jax.Array], jax.Array] | None,
 ) -> Callable[..., tl.tensor] | None:
   """Returns the Triton device function corresponding to a JAX activation."""
-  if activation is None:
+  if activation is None or activation == jax.nn.identity:
     return None
   if isinstance(activation, triton.runtime.jit.JITFunction):
     return activation
@@ -182,6 +199,19 @@ def get_triton_activation(
     return libdevice.tanh
   if activation == jax.nn.relu:
     return _relu
+  if activation == jax.nn.gelu:
+    return _gelu_approx
+  if (
+      isinstance(activation, functools.partial)
+      and activation.func == jax.nn.gelu
+      and not activation.args
+      and set(activation.keywords) <= {'approximate'}
+  ):
+    return (
+        _gelu_approx
+        if activation.keywords.get('approximate', True)
+        else _gelu_exact
+    )
   raise NotImplementedError(
       f'Unsupported activation for Triton kernel: {activation}'
   )
@@ -211,23 +241,50 @@ def jnp_to_tl_dtype(dtype: jax.typing.DTypeLike) -> tl.dtype:
   return _JNP_TO_TL_DTYPES[jnp.dtype(dtype).type]
 
 
+_SUPPORTED_TRITON_PRESETS = frozenset({
+    jax.lax.DotAlgorithmPreset.DEFAULT,
+    jax.lax.DotAlgorithmPreset.F16_F16_F32,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+    jax.lax.DotAlgorithmPreset.TF32_TF32_F32,
+    jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3,
+    jax.lax.DotAlgorithmPreset.F32_F32_F32,
+})
+
+
 def get_input_precision(
     precision: precision_lib.CanonicalPrecision, dtype: jnp.dtype
 ) -> str | None:
   """Returns the Triton `tl.dot` `input_precision` string for a given precision."""
+  if isinstance(precision, jax.lax.DotAlgorithm):
+    raise NotImplementedError('`DotAlgorithm` is not supported by Triton.')
+  if (
+      isinstance(precision, jax.lax.DotAlgorithmPreset)
+      and precision not in _SUPPORTED_TRITON_PRESETS
+  ):
+    raise NotImplementedError(
+        f'Unsupported precision for Triton kernel: {precision}'
+    )
   if dtype != jnp.float32:
     return None
   if isinstance(precision, tuple):
-    p = precision[0]
-    if p in (jax.lax.Precision.DEFAULT, jax.lax.Precision.HIGH):
-      return 'tf32'
-    return 'ieee'
+    if jax.lax.Precision.HIGHEST in precision:
+      return 'ieee'
+    return 'tf32'
   if isinstance(precision, jax.lax.DotAlgorithmPreset):
     match precision:
-      case jax.lax.DotAlgorithmPreset.TF32_TF32_F32:
+      case (
+          jax.lax.DotAlgorithmPreset.DEFAULT
+          | jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+      ):
         return 'tf32'
       case jax.lax.DotAlgorithmPreset.TF32_TF32_F32_X3:
         return 'tf32x3'
+      case jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3:
+        return 'bf16x3'
+      case jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6:
+        return 'bf16x6'
       case jax.lax.DotAlgorithmPreset.F32_F32_F32:
         return 'ieee'
       case _:

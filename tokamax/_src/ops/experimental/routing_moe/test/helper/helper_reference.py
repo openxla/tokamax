@@ -92,12 +92,24 @@ def _apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
       raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
 
+def _dequantize_block_scaled(
+    w: jax.Array, scale: jax.Array, dtype: jax.typing.DTypeLike
+) -> jax.Array:
+  """Dequantizes block-scaled `w` with `float8_e8m0fnu` `scale`."""
+  del w, scale, dtype
+  raise NotImplementedError(
+      "Block-scaled matmul is not available in this build."
+  )
+
+
 def _dequantize(
     w: jax.Array, scale: jax.Array | None, dtype: jax.typing.DTypeLike
 ) -> jax.Array:
-  """Dequantizes `w` with `[groups, num_blocks, 1, out]` scales to `dtype`."""
+  """Dequantizes `w` with subchannel or block-scaled `scale` to `dtype`."""
   if scale is None:
     return w.astype(dtype)
+  if scale.dtype == jnp.float8_e8m0fnu:
+    return _dequantize_block_scaled(w, scale, dtype)
   g, num_blocks, _, n = scale.shape
   w_f32 = w.astype(jnp.float32).reshape(g, num_blocks, -1, n)
   return (w_f32 * scale.astype(jnp.float32)).reshape(g, -1, n).astype(dtype)
@@ -214,9 +226,12 @@ def compute_topk(
 
 
 def _matmul(x: jax.Array, w: jax.Array, scale: jax.Array | None) -> jax.Array:
-  """Computes `x @ w[0]` in `float32`, applying sub-channel `scale` if set."""
+  """Computes `x @ w[0]` in `float32`, applying `scale` if set."""
   if scale is None:
     return jnp.matmul(x, w[0], preferred_element_type=jnp.float32)
+  if scale.dtype == jnp.float8_e8m0fnu:
+    w_deq = _dequantize_block_scaled(w[0], scale[0], x.dtype)
+    return jnp.matmul(x, w_deq, preferred_element_type=jnp.float32)
   num_blocks = scale.shape[1]
   x_blocks = x.reshape(x.shape[0], num_blocks, -1).swapaxes(0, 1)
   w_blocks = w.reshape(num_blocks, -1, w.shape[-1])

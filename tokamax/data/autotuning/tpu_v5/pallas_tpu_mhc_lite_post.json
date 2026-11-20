@@ -1,0 +1,47 @@
+{
+  "{\"layer_output\":\"bf16[512,256]\",\"x\":\"bf16[512,1024]\",\"h_post\":\"f32[512,4]\",\"residual\":\"bf16[512,16]\",\"return_residuals\":false}": {
+    "{\"block_size\":128,\"fwd_pipeline_blocks\":2,\"fwd_sub_tokens\":16}": {
+      "compile_time_ms": 660.19815672189,
+      "lower_time_ms": 5068.801247980446,
+      "evaluation_times_ms": [
+        0.006,
+        0.006,
+        0.006,
+        0.007,
+        0.007
+      ],
+      "metadata": {},
+      "peak_memory_mb": 2.777088
+    }
+  },
+  "{\"layer_output\":\"bf16[8192,512]\",\"x\":\"bf16[8192,2048]\",\"h_post\":\"f32[8192,4]\",\"residual\":\"bf16[8192,16]\",\"return_residuals\":false}": {
+    "{\"block_size\":512,\"fwd_pipeline_blocks\":2,\"fwd_sub_tokens\":8}": {
+      "compile_time_ms": 2600.1228569075465,
+      "lower_time_ms": 14911.151136271656,
+      "evaluation_times_ms": [
+        0.048,
+        0.047,
+        0.047,
+        0.047,
+        0.047
+      ],
+      "metadata": {},
+      "peak_memory_mb": 82.182144
+    }
+  },
+  "{\"layer_output\":\"bf16[196608,512]\",\"x\":\"bf16[196608,2048]\",\"h_post\":\"f32[196608,4]\",\"residual\":\"bf16[196608,16]\",\"return_residuals\":false}": {
+    "{\"block_size\":768,\"fwd_pipeline_blocks\":2,\"fwd_sub_tokens\":8}": {
+      "compile_time_ms": 3854.031916242093,
+      "lower_time_ms": 35324.01938410476,
+      "evaluation_times_ms": [
+        0.911,
+        0.911,
+        0.912,
+        0.911,
+        0.913
+      ],
+      "metadata": {},
+      "peak_memory_mb": 1972.371456
+    }
+  }
+}

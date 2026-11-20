@@ -17,7 +17,7 @@
 
 from typing import Final
 
-TOKAMAX_VERSION: Final[str] = "0.0.17"
+TOKAMAX_VERSION: Final[str] = "0.0.18"
 
 # Stamped at build time by the release workflow; empty in a source checkout.
 TOKAMAX_GIT_REVISION: Final[str] = ""

@@ -390,7 +390,12 @@ def ragged_conv1d_decode_only(
 
   token_idx = jnp.arange(num_tokens)
   req_state_indices = state_indices[token_idx]
-  gathered_state = conv_state[req_state_indices]
+  raw_state = conv_state[req_state_indices]
+  gathered_state = jnp.where(
+      has_initial_state[token_idx, None, None],
+      raw_state,
+      jnp.zeros_like(raw_state),
+  )
 
   lhs = jnp.concatenate(
       [
@@ -425,7 +430,7 @@ def ragged_conv1d_decode_only(
   states_to_set = jnp.where(
       valid_mask[:, jnp.newaxis, jnp.newaxis],
       new_state_extracted,
-      gathered_state,
+      raw_state,
   )
 
   updated_conv_state = conv_state.at[req_state_indices].set(states_to_set)

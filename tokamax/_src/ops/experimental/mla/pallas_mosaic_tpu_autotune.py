@@ -41,7 +41,9 @@ from tokamax._src.ops.experimental.mla import arg_specs
 from tokamax._src.ops.experimental.mla import pallas_mosaic_tpu
 
 # The fastest config must beat the heuristic by this fraction to replace it.
-_MIN_GAIN = 0.04
+# Run-to-run variation is about 1 us, which is 0.5% of the fastest spec (about
+# 0.2 ms), so a 1% gain is not noise.
+_MIN_GAIN = 0.01
 
 _Config = pallas_mosaic_tpu.Config
 _FIELDS = [f.name for f in dataclasses.fields(_Config)]
@@ -56,8 +58,8 @@ def _knobs(config: _Config, fields: list[str]) -> tuple[int, ...]:
 def _pick(timings, heuristic: _Config, candidates) -> _Config:
   """The fastest candidate, unless the heuristic is within `_MIN_GAIN` of it.
 
-  Smaller margins are within the noise of the end-to-end A/B runs that
-  validated the heuristics.
+  A difference smaller than `_MIN_GAIN` may be measurement noise, so the
+  heuristic is kept.
   """
   ms = lambda c: timings[c].median_evaluation_time_ms
   candidates = [c for c in candidates if c in timings]

@@ -51,6 +51,7 @@ def reference_gmm(
     rhs_bias: jax.Array | None = None,
     partial_sum: jax.Array | None = None,  # [m, n]
     group_offset: jax.Array | None = None,  # int32[1]
+    lhs_scale: jax.Array | None = None,
 ):
   num_tokens = lhs.shape[0]
   num_groups, in_size, out_size = rhs.shape
@@ -93,6 +94,8 @@ def reference_gmm(
         if rhs_scale is not None:
           acc *= rhs_scale[group][block]
         out += acc
+      if lhs_scale is not None:
+        out *= lhs_scale
       if rhs_bias is not None:
         out = out + rhs_bias[group]
       if partial_sum is not None:
@@ -187,6 +190,24 @@ def assert_arrays_all_close(actual, desired, *, atol=None, rtol=None):
   if rtol is None:
     rtol = max(_lookup_tol(actual.dtype), _lookup_tol(desired.dtype))
   chex.assert_trees_all_close(actual, desired, atol=atol, rtol=rtol)
+
+
+def _poison_vmem_all_cores(num_rows: int = 8192) -> None:
+  """Fills VMEM scratch across all cores with NaNs to expose stale reads."""
+  num_cores = pltpu.get_tpu_info().num_cores
+
+  def _kernel(out_ref, scratch_ref):
+    scratch_ref[...] = jnp.full(scratch_ref.shape, jnp.nan, jnp.float32)
+    core_id = jax.lax.axis_index("core")
+    pltpu.sync_copy(scratch_ref.at[:8, :], out_ref.at[core_id])
+
+  out = pl.kernel(
+      _kernel,
+      out_type=pltpu.HBM((num_cores, 8, 128), jnp.float32),
+      scratch_types=[pltpu.VMEM((num_rows, 128), jnp.float32)],
+      mesh=pltpu.TensorCoreMesh(axis_name="core"),
+  )()
+  jax.block_until_ready(out)
 
 
 class GmmTest(parameterized.TestCase):
@@ -473,42 +494,50 @@ class GmmTest(parameterized.TestCase):
           lhs, rhs, group_sizes, partial_sum=partial_sum.astype(jnp.float32)
       )
 
-  def test_partial_sum_is_accumulated_in_place(self):
+  @parameterized.parameters(500, 512)
+  def test_partial_sum_is_accumulated_in_place(self, n):
     """The partial sum must be aliased to the output rather than copied.
 
     Removing the extra HBM round-trip is the point of the feature. If the
     aliasing silently stops being emitted the numerics still pass, so assert it
     directly.
     """
-    m, k, n, num_groups = 512, 512, 512, 8
+    m, k, num_groups = 512, 512, 8
     k0, k1 = jax.random.split(jax.random.key(0), 2)
     lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
     rhs = jax.random.normal(k1, (num_groups, k, n), dtype=jnp.bfloat16)
     group_sizes = get_group_sizes(m, num_groups)
     partial_sum = jnp.zeros((m, n), jnp.bfloat16)
 
-    fused = jax.jit(lambda l, r, g, p: gmm_v2.gmm_v2(l, r, g, partial_sum=p))
     plain = jax.jit(gmm_v2.gmm_v2)
-
-    fused_text = (
-        fused.lower(lhs, rhs, group_sizes, partial_sum).compile().as_text()
-    )
     plain_text = plain.lower(lhs, rhs, group_sizes).compile().as_text()
     # `as_text` is typed as optional; an empty program would make the control
     # below pass vacuously, so fail loudly instead of defaulting to "".
-    assert fused_text is not None and plain_text is not None
-
+    assert plain_text is not None
     self.assertEqual(
         plain_text.count("output_to_operand_aliasing"),
         0,
         "control failed: a GMM with no partial sum has nothing to alias, so "
         "the counter is not measuring what this test claims",
     )
-    self.assertGreater(
-        fused_text.count("output_to_operand_aliasing"),
-        0,
-        "the partial sum was not aliased to the output",
-    )
+
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        fused = jax.jit(
+            lambda l, r, g, p: gmm_v2.gmm_v2(l, r, g, partial_sum=p)
+        )
+        fused_text = (
+            fused.lower(lhs, rhs, group_sizes, partial_sum).compile().as_text()
+        )
+      assert fused_text is not None
+      self.assertGreater(
+          fused_text.count("output_to_operand_aliasing"),
+          0,
+          "the partial sum was not aliased to the output",
+      )
+      if has_pad_ref:
+        self.assertNotIn("pad(", fused_text)
 
   @parameterized.product(
       batch_size=[128],
@@ -1199,17 +1228,20 @@ class GmmTest(parameterized.TestCase):
         out_dtype=jnp.bfloat16,  # pyrefly: ignore[bad-argument-type]
     )
     tgmm_v2.validate_tgmm_inputs(group_sizes, num_groups)
-    actual = tgmm_v2.tgmm_v2(
-        lhs,
-        grad_q,
-        group_sizes,
-        num_groups,
-        rhs_scale=grad_scale,
-        tile_info=tile_info,
-        preferred_element_type=jnp.bfloat16,
-    )
-    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
-    chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        actual = tgmm_v2.tgmm_v2(
+            lhs,
+            grad_q,
+            group_sizes,
+            num_groups,
+            rhs_scale=grad_scale,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+      self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+      chex.assert_trees_all_close(actual, expected, rtol=1e-2, atol=4e-1)
 
   @parameterized.product(
       batch_size=[128, 512],
@@ -1415,43 +1447,54 @@ class GmmTest(parameterized.TestCase):
           preferred_element_type=jnp.bfloat16,
       )
 
-  def test_tgmm_partial_sum_is_accumulated_in_place(self):
+  @parameterized.parameters(500, 512)
+  def test_tgmm_partial_sum_is_accumulated_in_place(self, n):
     """The partial sum must be aliased to the output rather than copied."""
-    m, k, n, num_groups = 512, 512, 512, 8
+    m, k, num_groups = 512, 512, 8
     k0, k1 = jax.random.split(jax.random.key(0), 2)
     lhs = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
     grad = jax.random.normal(k1, (m, n), dtype=jnp.bfloat16)
     group_sizes = get_group_sizes(m, num_groups)
     partial_sum = jnp.zeros((num_groups, k, n), jnp.bfloat16)
 
-    fused = jax.jit(
-        lambda l, g, gs, p: tgmm_v2.tgmm_v2(
-            l, g, gs, num_groups, partial_sum=p,
-            preferred_element_type=jnp.bfloat16,
-        )
-    )
     plain = jax.jit(
         lambda l, g, gs: tgmm_v2.tgmm_v2(
             l, g, gs, num_groups, preferred_element_type=jnp.bfloat16
         )
     )
-    fused_text = (
-        fused.lower(lhs, grad, group_sizes, partial_sum).compile().as_text()
-    )
     plain_text = plain.lower(lhs, grad, group_sizes).compile().as_text()
-    assert fused_text is not None and plain_text is not None
-
+    assert plain_text is not None
     self.assertEqual(
         plain_text.count("output_to_operand_aliasing"),
         0,
         "control failed: a TGMM with no partial sum has nothing to alias, so "
         "the counter is not measuring what this test claims",
     )
-    self.assertGreater(
-        fused_text.count("output_to_operand_aliasing"),
-        0,
-        "the partial sum was not aliased to the output",
-    )
+
+    for has_pad_ref in sorted({gmm_v2.HAS_PAD_REF, False}):
+      jax.clear_caches()
+      with mock.patch.object(gmm_v2, "HAS_PAD_REF", has_pad_ref):
+        fused = jax.jit(
+            lambda l, g, gs, p: tgmm_v2.tgmm_v2(
+                l,
+                g,
+                gs,
+                num_groups,
+                partial_sum=p,
+                preferred_element_type=jnp.bfloat16,
+            )
+        )
+        fused_text = (
+            fused.lower(lhs, grad, group_sizes, partial_sum).compile().as_text()
+        )
+      assert fused_text is not None
+      self.assertGreater(
+          fused_text.count("output_to_operand_aliasing"),
+          0,
+          "the partial sum was not aliased to the output",
+      )
+      if has_pad_ref:
+        self.assertNotIn("pad(", fused_text)
 
   @parameterized.product(
       batch_size=[128],
@@ -2370,6 +2413,353 @@ class GmmTest(parameterized.TestCase):
     assert actual.shape == (batch_size, out_size)
     chex.assert_trees_all_close(actual, expected, atol=3e-1, rtol=3e-1)
 
+  @parameterized.product(
+      rhs_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      in_size_and_blocks=[(1536, 3), (1280, 5)],
+      maybe_quantize_lhs=[False, True],
+  )
+  def test_partial_k_tile_skips_stale_rhs_scale(
+      self, rhs_dtype, in_size_and_blocks, maybe_quantize_lhs
+  ):
+    """Partial K tail tiles skip uninitialized rhs_scale blocks (b/576348326)."""
+    if (
+        rhs_dtype == jnp.float8_e4m3fn
+        and pltpu.get_tpu_info().generation <= 5
+    ):
+      self.skipTest("FP8 is only supported after TPU generation 5")
+    in_size, num_scale_blocks = in_size_and_blocks
+    batch_size, out_size, num_groups = 256, 256, 4
+    k0, k1, k2 = jax.random.split(jax.random.key(42), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), jnp.bfloat16)
+    rhs = (
+        jax.random.normal(k1, (num_groups, in_size, out_size), jnp.float32)
+        * 4.0
+    ).astype(rhs_dtype)
+    rhs_scale = (
+        jnp.abs(
+            jax.random.normal(
+                k2, (num_groups, num_scale_blocks, 1, out_size), jnp.float32
+            )
+        )
+        * 0.02
+    )
+    group_sizes = jnp.array([64, 64, 64, 64], dtype=jnp.int32)
+    # tile_k=1024 does not divide in_size (valid_k=512 or 256 on final K step),
+    # leaving trailing sub-blocks in rhs_scale VMEM uninitialized on step 1.
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=1024, tile_n=256, bucket_base=128
+    )
+
+    _poison_vmem_all_cores()
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        preferred_element_type=jnp.bfloat16,
+    )
+    self.assertFalse(bool(jnp.any(jnp.isnan(actual))))
+    expected = reference_gmm(
+        lhs, rhs, group_sizes, rhs_scale=rhs_scale
+    ).astype(jnp.bfloat16)
+    if maybe_quantize_lhs:
+      chex.assert_trees_all_close(actual, expected, atol=6e-1, rtol=6e-1)
+    else:
+      assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      has_rhs_scale=[False, True],
+      has_bias=[False, True],
+      group_offset=[0, 2],
+  )
+  def test_gmm_prequantized_lhs_with_lhs_scale(
+      self, has_rhs_scale, has_bias, group_offset
+  ):
+    """Pre-quantized int8 lhs with per-tensor post-matmul lhs_scale."""
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 8
+    num_local_groups = num_groups - group_offset
+    k0, k1, k2 = jax.random.split(jax.random.key(7), 3)
+    lhs_f = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    lhs_q, lhs_scale = quantize_tensor(
+        lhs_f.reshape(1, -1),
+        jnp.dtype(jnp.int8),
+        axis=1,
+        block_size=lhs_f.size,
+    )
+    lhs_q = lhs_q.reshape(lhs_f.shape)
+    lhs_scale = lhs_scale.reshape(1, 1)
+
+    rhs_q, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(jnp.int8), axis=1, block_size=256
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2) if has_rhs_scale else None
+
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.uniform(
+          k2, (num_local_groups, 1, out_size), jnp.float32, -1, 1
+      )
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array(group_offset, dtype=jnp.int32)
+
+    actual = gmm_v2.gmm_v2(
+        lhs_q,
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_offset=group_offset_arr,
+        lhs_scale=lhs_scale,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = reference_gmm(
+        lhs_q.astype(jnp.float32),
+        rhs_q,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        group_offset=group_offset_arr,
+        lhs_scale=lhs_scale,
+    )
+    assert_arrays_all_close(actual, expected)
+
+  def test_int8_lhs_rejects_pre_matmul_rhs_dequant(self):
+    """Integer lhs with sub-MXU rhs quant blocks raises ValueError."""
+    batch_size, in_size, out_size, num_groups = 128, 256, 256, 4
+    lhs = jnp.zeros((batch_size, in_size), dtype=jnp.int8)
+    rhs = jnp.zeros((num_groups, in_size, out_size), dtype=jnp.int8)
+    # quant_block_size = 256 // 8 = 32 < mxu_column_size (128 or 256).
+    rhs_scale = jnp.ones((num_groups, 8, 1, out_size), dtype=jnp.float32)
+    group_sizes = jnp.array([32, 32, 32, 32], dtype=jnp.int32)
+    with self.assertRaisesRegex(ValueError, "integer lhs"):
+      gmm_v2.gmm_v2(
+          lhs,
+          rhs,
+          group_sizes,
+          rhs_scale=rhs_scale,
+          maybe_quantize_lhs=False,
+          preferred_element_type=jnp.float32,
+      )
+
+  @parameterized.product(
+      has_rhs_scale=[False, True],
+      group_offset=[0, 2],
+  )
+  def test_tgmm_int8(self, has_rhs_scale, group_offset):
+    """tgmm_v2 uses int32 accumulation for int8 x int8 dots."""
+    batch_size, in_size, out_size, num_groups = 256, 256, 256, 8
+    num_local_groups = num_groups - group_offset
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs_f = jax.random.uniform(key1, (batch_size, in_size), jnp.float32, -1, 1)
+    grad_f = jax.random.uniform(
+        key2, (batch_size, out_size), jnp.float32, -1, 1
+    )
+    lhs_q, lhs_scale = quantize_tensor(
+        lhs_f, jnp.dtype(jnp.int8), axis=1, block_size=in_size
+    )
+    # Fold per-token lhs_scale into grad before quantizing grad per-channel
+    # along out_size (matching how MaxText prepares tgmm_v2 inputs).
+    grad_q, grad_scale = quantize_tensor(
+        grad_f * lhs_scale,
+        jnp.dtype(jnp.int8),
+        axis=0,
+        block_size=batch_size,
+    )
+    grad_scale = jnp.expand_dims(grad_scale, axis=1)  # [1, 1, out_size]
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    group_offset_arr = jnp.array([group_offset], dtype=jnp.int32)
+
+    expected = reference_tgmm(
+        lhs_f.swapaxes(0, 1),
+        grad_f,
+        group_sizes,
+        num_local_groups,
+        group_offset=group_offset_arr,
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs_q,
+        grad_q,
+        group_sizes,
+        num_local_groups,
+        rhs_scale=grad_scale if has_rhs_scale else None,
+        group_offset=group_offset_arr,
+        preferred_element_type=jnp.float32,
+    )
+    if not has_rhs_scale:
+      actual = actual * grad_scale
+    chex.assert_trees_all_close(actual, expected, atol=2e-1, rtol=5e-2)
+
+  @parameterized.product(
+      dtype=[jnp.bfloat16, jnp.int8, jnp.float8_e4m3fn],
+      has_scale=[False, True],
+      has_bias=[False, True],
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_with_scale_bias_and_fuse_act(
+      self, dtype, has_scale, has_bias, fuse_act
+  ):
+    """Native transpose_rhs matches swapped-axes 2D gmm_v2 across epilogues.
+
+    This test sets maybe_quantize_lhs=False, so lhs must already be in a dtype
+    compatible with rhs (`dtype`) for the TPU MXU.
+    """
+    if dtype == jnp.float8_e4m3fn and pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 5")
+    if dtype == jnp.bfloat16 and has_scale:
+      self.skipTest("rhs_scale only applies to quantized rhs")
+
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1, k2 = jax.random.split(jax.random.key(11), 3)
+    lhs_f = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    lhs_scale = None
+    rhs_scale = None
+    if dtype == jnp.bfloat16:
+      lhs = lhs_f
+      rhs = rhs_f
+    elif dtype == jnp.float8_e4m3fn:
+      lhs = lhs_f.astype(jnp.float8_e4m3fn)
+      if has_scale:
+        rhs, rhs_scale_q = quantize_tensor(
+            rhs_f, jnp.dtype(dtype), axis=1, block_size=256
+        )
+        rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+      else:
+        rhs = rhs_f.astype(jnp.float8_e4m3fn)
+    else:
+      lhs, lhs_scale_q = quantize_tensor(
+          lhs_f.reshape(1, -1),
+          jnp.dtype(dtype),
+          axis=1,
+          block_size=lhs_f.size,
+      )
+      lhs = lhs.reshape(lhs_f.shape)
+      lhs_scale = lhs_scale_q.reshape(1, 1)
+      rhs, rhs_scale_q = quantize_tensor(
+          rhs_f, jnp.dtype(dtype), axis=1, block_size=256
+      )
+      rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2) if has_scale else None
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+
+    rhs_bias = None
+    if has_bias:
+      rhs_bias = jax.random.uniform(
+          k2, (num_groups, 1, rhs_n), jnp.bfloat16, -1, 1
+      )
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        lhs_scale=lhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      rhs_dtype=[jnp.int8, jnp.float8_e4m3fn],
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_with_lhs_quantization(self, rhs_dtype, fuse_act):
+    """Native transpose_rhs matches 2D gmm_v2 with in-kernel lhs quantization."""
+    if rhs_dtype == jnp.float8_e4m3fn and pltpu.get_tpu_info().generation <= 5:
+      self.skipTest("FP8 is only supported after TPU generation 5")
+
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1 = jax.random.split(jax.random.key(13), 2)
+    lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    rhs, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(rhs_dtype), axis=1, block_size=256
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=True,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  @parameterized.product(
+      fuse_act=[None, "silu"],
+  )
+  def test_transpose_rhs_pre_matmul_dequant(self, fuse_act):
+    """Native transpose_rhs matches 2D gmm_v2 for sub-MXU rhs quant blocks."""
+    batch_size, in_size, out_size, num_groups = 256, 512, 256, 4
+    rhs_n = out_size * 2 if fuse_act is not None else out_size
+    k0, k1 = jax.random.split(jax.random.key(15), 2)
+    lhs = jax.random.uniform(k0, (batch_size, in_size), jnp.bfloat16, -1, 1)
+    rhs_f = jax.random.uniform(
+        k1, (num_groups, in_size, rhs_n), jnp.bfloat16, -1, 1
+    )
+    # block_size=64 < mxu_column_size (128 or 256) triggers pre-matmul dequant.
+    rhs, rhs_scale_q = quantize_tensor(
+        rhs_f, jnp.dtype(jnp.int8), axis=1, block_size=64
+    )
+    rhs_scale = jnp.expand_dims(rhs_scale_q, axis=2)
+    rhs_t = jnp.swapaxes(rhs, 1, 2)
+    group_sizes = jnp.array([60, 0, 100, 50], dtype=jnp.int32)
+    tiles = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=128, bucket_base=128
+    )
+
+    common = dict(
+        rhs_scale=rhs_scale,
+        tile_info=tiles,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+        preferred_element_type=jnp.float32,
+    )
+    expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes, **common)
+    actual = gmm_v2.gmm_v2(
+        lhs, rhs_t, group_sizes, transpose_rhs=True, **common
+    )
+    assert_arrays_all_close(actual, expected)
+
+  def test_transpose_rhs_shape_mismatch_raises(self):
+    """validate_inputs raises ValueError when rhs K disagrees with lhs K."""
+    lhs = jnp.zeros((128, 256), dtype=jnp.bfloat16)
+    rhs_wrong_k = jnp.zeros((4, 128, 512), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([32, 32, 32, 32], dtype=jnp.int32)
+    with self.assertRaisesRegex(ValueError, "rhs shape mismatch"):
+      gmm_v2.gmm_v2(lhs, rhs_wrong_k, group_sizes, transpose_rhs=True)
+    with self.assertRaisesRegex(ValueError, "rhs shape mismatch"):
+      gmm_v2.gmm_v2(lhs, rhs_wrong_k, group_sizes, transpose_rhs=False)
+
 
 _VMEM_LIMIT_BYTES = int(64 * 1024 * 1024 * 0.9)
 
@@ -2644,6 +3034,22 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           fuse_act=None,
           expected_tile_n=1024,
       ),
+      dict(
+          testcase_name="odd_lane_multiple_fwd",
+          size_k=1408,
+          size_n=1664,
+          is_transposed=False,
+          fuse_act=None,
+          expected_tile_n=896,
+      ),
+      dict(
+          testcase_name="odd_lane_multiple_dlhs",
+          size_k=1664,
+          size_n=1408,
+          is_transposed=True,
+          fuse_act=None,
+          expected_tile_n=768,
+      ),
   )
   def test_calculate_tiling_megacore_splits_n(
       self,
@@ -2685,16 +3091,19 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           )
         self.assertEqual(tiles.tile_n, want_tile_n)
         self.assertEqual(tiles.tile_k, size_k)
-        self.assertEqual(size_n_per_rhs % tiles.tile_n, 0)
+        self.assertEqual(tiles.tile_n % 128, 0)
+        if num_cores > 1 and not disable_multi_core_mode:
+          self.assertEqual(pl.cdiv(size_n_per_rhs, tiles.tile_n) % num_cores, 0)
 
   @parameterized.named_parameters(
-      # A split into 2 tiles of 256 would not cover 384 exactly.
-      dict(testcase_name="indivisible", size_n=384),
       # Tiles of 128 would be below the MXU-stall floor of 256.
-      dict(testcase_name="below_tile_n_floor", size_n=256),
+      dict(testcase_name="below_tile_n_floor", size_n=256, is_out_fused=False),
+      # Fused outputs require exact tile_n divisibility, so odd lane multiples
+      # cannot use a padded MegaCore split.
+      dict(testcase_name="fused_output_odd_lanes", size_n=384, is_out_fused=True),
   )
   def test_calculate_tiling_megacore_keeps_unsplittable_n(
-      self, size_n: int
+      self, size_n: int, is_out_fused: bool
   ) -> None:
     dims = _make_dims(size_m=4096, size_k=1024, size_n=size_n)
     with (
@@ -2708,6 +3117,7 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
           lhs_cfgs=_bf16_input_configs(),
           rhs_cfgs=_bf16_input_configs(is_transposed=False),
           vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+          is_out_fused=is_out_fused,
       )
     self.assertEqual(tiles.tile_n, size_n)
 
@@ -2817,28 +3227,42 @@ class GmmV2CalculateTilingTest(parameterized.TestCase):
 class SplitForCoresTest(parameterized.TestCase):
 
   @parameterized.parameters(
-      dict(size=1280, num_tiles=1, min_tile=256, expected=(2, 640)),
-      dict(size=2048, num_tiles=1, min_tile=256, expected=(2, 1024)),
-      dict(size=4096, num_tiles=3, min_tile=256, expected=(4, 1024)),
+      dict(size=1280, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 640)),
+      dict(size=2048, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 1024)),
+      dict(size=4096, num_tiles=3, min_tile=256, allow_padding=True, expected=(4, 1024)),
       # 1536 / 2 = 768 is lane-aligned.
-      dict(size=1536, num_tiles=1, min_tile=256, expected=(2, 768)),
-      # 640 is 5 lanes, which cannot be split into an even number of equal
-      # lane-aligned tiles.
-      dict(size=640, num_tiles=1, min_tile=256, expected=None),
-      dict(size=640, num_tiles=1, min_tile=128, expected=None),
-      dict(size=384, num_tiles=1, min_tile=128, expected=None),
-      dict(size=100, num_tiles=1, min_tile=100, expected=None),
+      dict(size=1536, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 768)),
+      # Odd multiples of 128 lanes fall back to the fewest padded lane-aligned
+      # tiles when allow_padding=True, and return None when allow_padding=False.
+      dict(size=1408, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 768)),
+      dict(size=1664, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 896)),
+      dict(size=640, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 384)),
+      dict(size=384, num_tiles=1, min_tile=256, allow_padding=True, expected=(2, 256)),
+      dict(size=1408, num_tiles=1, min_tile=256, allow_padding=False, expected=None),
+      dict(size=640, num_tiles=1, min_tile=256, allow_padding=False, expected=None),
+      dict(size=640, num_tiles=1, min_tile=128, allow_padding=False, expected=None),
+      dict(size=384, num_tiles=1, min_tile=128, allow_padding=False, expected=None),
+      # Guard against cand where cdiv(size, tile) != cand (640 / 256 -> 3 != 4).
+      dict(size=640, num_tiles=3, min_tile=256, allow_padding=True, expected=None),
+      dict(size=256, num_tiles=1, min_tile=256, allow_padding=True, expected=None),
+      dict(size=100, num_tiles=1, min_tile=100, allow_padding=True, expected=None),
   )
   def test_split_for_cores(
       self,
       size: int,
       num_tiles: int,
       min_tile: int,
+      allow_padding: bool,
       expected: tuple[int, int] | None,
   ) -> None:
     self.assertEqual(
         gmm_v2.split_for_cores(
-            size, num_tiles, num_cores=2, num_lanes=128, min_tile=min_tile
+            size,
+            num_tiles,
+            num_cores=2,
+            num_lanes=128,
+            min_tile=min_tile,
+            allow_padding=allow_padding,
         ),
         expected,
     )
@@ -2847,7 +3271,12 @@ class SplitForCoresTest(parameterized.TestCase):
 class TgmmV2CalculateTilingTest(parameterized.TestCase):
 
   def _calculate_tgmm_tiling(
-      self, size_k: int, size_n: int, num_cores: int, size_m: int = 98304
+      self,
+      size_k: int,
+      size_n: int,
+      num_cores: int,
+      size_m: int = 98304,
+      is_out_fused: bool = False,
   ) -> gmm_v2.TileSizes:
     dims = _make_dims(size_m=size_m, size_k=size_k, size_n=size_n)
     with (
@@ -2866,6 +3295,7 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
           out_dtype=jnp.dtype(jnp.bfloat16),
           acc_dtype=jnp.dtype(jnp.float32),
           target_zero_ref_bytes=2 * 1024 * 1024,
+          is_out_fused=is_out_fused,
       )
 
   @parameterized.named_parameters(
@@ -2885,13 +3315,37 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
           expected_tile_k=1280,
           expected_tile_n=1024,
       ),
-      # 640 cannot be split into lane-aligned halves, so split n instead.
+      # 640 cannot be split evenly, so prefer the exact split on n (512 -> 256).
       dict(
           testcase_name="split_n_when_k_is_unsplittable",
           size_k=640,
           size_n=512,
           expected_tile_k=640,
           expected_tile_n=256,
+      ),
+      # When both dims are odd multiples of 128, fall back to a padded split on
+      # n, which avoids padding the output along k.
+      dict(
+          testcase_name="padded_split_n_odd_lanes",
+          size_k=1408,
+          size_n=1664,
+          expected_tile_k=1408,
+          expected_tile_n=896,
+      ),
+      dict(
+          testcase_name="padded_split_n_odd_lanes_larger_k",
+          size_k=1664,
+          size_n=1408,
+          expected_tile_k=1664,
+          expected_tile_n=768,
+      ),
+      # n is too small to split, so fall back to a padded split on k.
+      dict(
+          testcase_name="padded_split_k_when_n_is_unsplittable",
+          size_k=1408,
+          size_n=128,
+          expected_tile_k=768,
+          expected_tile_n=128,
       ),
   )
   def test_calculate_tgmm_tiling_megacore(
@@ -2908,13 +3362,33 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
     tiles = self._calculate_tgmm_tiling(size_k, size_n, 2)
     self.assertEqual(tiles.tile_k, expected_tile_k)
     self.assertEqual(tiles.tile_n, expected_tile_n)
-    num_parallel_tiles = (size_k // tiles.tile_k) * (size_n // tiles.tile_n)
+    num_parallel_tiles = pl.cdiv(size_k, tiles.tile_k) * pl.cdiv(
+        size_n, tiles.tile_n
+    )
     self.assertEqual(num_parallel_tiles % 2, 0)
 
-  def test_calculate_tgmm_tiling_megacore_keeps_unsplittable(self) -> None:
-    tiles = self._calculate_tgmm_tiling(256, 256, 2)
-    self.assertEqual(tiles.tile_k, 256)
-    self.assertEqual(tiles.tile_n, 256)
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="below_floor",
+          size_k=256,
+          size_n=256,
+          is_out_fused=False,
+      ),
+      dict(
+          testcase_name="fused_output_odd_lanes",
+          size_k=1408,
+          size_n=1664,
+          is_out_fused=True,
+      ),
+  )
+  def test_calculate_tgmm_tiling_megacore_keeps_unsplittable(
+      self, size_k: int, size_n: int, is_out_fused: bool
+  ) -> None:
+    tiles = self._calculate_tgmm_tiling(
+        size_k, size_n, 2, is_out_fused=is_out_fused
+    )
+    self.assertEqual(tiles.tile_k, size_k)
+    self.assertEqual(tiles.tile_n, size_n)
 
   @parameterized.named_parameters(
       dict(testcase_name="avg_32_clamped_to_base", size_m=4096, want_tile_m=256),
@@ -3157,6 +3631,168 @@ class GmmV2VmapTest(parameterized.TestCase):
         for i in range(vmap_size)
     ])
     assert_arrays_all_close(actual, expected)
+
+
+class GmmV2OddLaneMultipleMegaCoreTest(parameterized.TestCase):
+  """Hardware tests for odd-lane-multiple dimensions under MegaCore splitting."""
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().generation < 5:
+      self.skipTest("Only supported on TPU gen 5+.")
+    super().setUp()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="fwd_1408x1664_f32_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=False,
+          rhs_dtype=jnp.float32,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="fwd_1664x1408_f32_rhs",
+          in_size=1664,
+          out_size=1408,
+          transpose_rhs=False,
+          rhs_dtype=jnp.float32,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="dlhs_1664x1408_f32_rhs",
+          in_size=1664,
+          out_size=1408,
+          transpose_rhs=True,
+          rhs_dtype=jnp.float32,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="dlhs_1408x1664_f32_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=True,
+          rhs_dtype=jnp.float32,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="fwd_1408x1664_bf16_rhs",
+          in_size=1408,
+          out_size=1664,
+          transpose_rhs=False,
+          rhs_dtype=jnp.bfloat16,
+          tile_n=896,
+      ),
+  )
+  def test_gmm_odd_lane_multiple_padded_tile_n(
+      self,
+      in_size: int,
+      out_size: int,
+      transpose_rhs: bool,
+      rhs_dtype: jnp.dtype,
+      tile_n: int,
+  ):
+    batch_size = 512
+    num_groups = 8
+    k0, k1 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs_shape = (
+        (num_groups, out_size, in_size)
+        if transpose_rhs
+        else (num_groups, in_size, out_size)
+    )
+    rhs = jax.random.normal(k1, rhs_shape, dtype=rhs_dtype)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    rhs_ref = rhs.swapaxes(1, 2) if transpose_rhs else rhs
+    expected = reference_gmm(lhs, rhs_ref, group_sizes)
+
+    # Test both explicit padded tile_n and the default MegaCore heuristic.
+    for tile_info in (
+        gmm_v2.TileSizes(
+            tile_m=256, tile_k=in_size, tile_n=tile_n, bucket_base=128
+        ),
+        gmm_v2.calculate_tiling_from_request,
+    ):
+      with self.subTest(tile_info=tile_info):
+        actual = gmm_v2.gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            transpose_rhs=transpose_rhs,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+        self.assertEqual(actual.shape, (batch_size, out_size))
+        assert_arrays_all_close(actual, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="split_n_1408x1664",
+          in_size=1408,
+          out_size=1664,
+          tile_k=1408,
+          tile_n=896,
+      ),
+      dict(
+          testcase_name="split_k_1408x1664",
+          in_size=1408,
+          out_size=1664,
+          tile_k=768,
+          tile_n=1664,
+      ),
+      dict(
+          testcase_name="split_k_1664x1408",
+          in_size=1664,
+          out_size=1408,
+          tile_k=896,
+          tile_n=1408,
+      ),
+      dict(
+          testcase_name="split_n_1664x1408",
+          in_size=1664,
+          out_size=1408,
+          tile_k=1664,
+          tile_n=768,
+      ),
+      dict(
+          testcase_name="split_k_1408x128",
+          in_size=1408,
+          out_size=128,
+          tile_k=768,
+          tile_n=128,
+      ),
+  )
+  def test_tgmm_odd_lane_multiple_padded_tiles(
+      self, in_size: int, out_size: int, tile_k: int, tile_n: int
+  ):
+    batch_size = 512
+    num_groups = 8
+    k0, k1 = jax.random.split(jax.random.key(1), 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(k1, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    expected = reference_tgmm(lhs.swapaxes(0, 1), rhs, group_sizes, num_groups)
+
+    for tile_info in (
+        gmm_v2.TileSizes(
+            tile_m=256, tile_k=tile_k, tile_n=tile_n, bucket_base=256
+        ),
+        tgmm_v2.calculate_tgmm_tiling_from_request,
+    ):
+      with self.subTest(tile_info=tile_info):
+        actual = tgmm_v2.tgmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            num_actual_groups=num_groups,
+            tile_info=tile_info,
+            preferred_element_type=jnp.bfloat16,
+        )
+        self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+        assert_arrays_all_close(actual, expected)
 
 
 if __name__ == "__main__":

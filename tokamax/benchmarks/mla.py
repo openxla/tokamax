@@ -41,44 +41,6 @@ _SKIP_IMPLEMENTATIONS = flags.DEFINE_list(
 )
 
 
-def mla_op_wrapper(
-    ql_nope: jax.Array,
-    q_pe: jax.Array,
-    new_kv_c: jax.Array,
-    new_k_pe: jax.Array,
-    cache_kv: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
-    *,
-    implementation: str | None = None,
-    **kwargs,
-) -> tuple[jax.Array, jax.Array]:
-  """Wrapper for MLA implementations to match standard benchmark API."""
-  if implementation == 'mosaic':
-    implementation = 'mosaic_tpu'
-  elif implementation is None:
-    implementation = 'xla'
-
-  if implementation not in mla_api.IMPLEMENTATIONS:
-    raise NotImplementedError(f'Implementation {implementation} not found.')
-
-  impl = mla_api.IMPLEMENTATIONS[implementation]
-  return impl(
-      ql_nope=ql_nope,
-      q_pe=q_pe,
-      new_kv_c=new_kv_c,
-      new_k_pe=new_k_pe,
-      cache_kv=cache_kv,
-      kv_lens=kv_lens,
-      page_indices=page_indices,
-      cu_q_lens=cu_q_lens,
-      distribution=distribution,
-      **kwargs,
-  )
-
-
 EXAMPLES = immutabledict.immutabledict({
     spec.name: spec.args
     for spec in mla_specs.ARG_SPECS
@@ -126,12 +88,16 @@ class MlaBenchmark(parameterized.TestCase):
           ' --skip_implementations flag.'
       )
 
-    if jax.default_backend() != 'tpu' and implementation == 'mosaic':
-      self.skipTest('Mosaic TPU implementation is only supported on TPU.')
+    if implementation == 'mosaic':
+      if jax.default_backend() != 'tpu':
+        self.skipTest('Mosaic TPU implementation is only supported on TPU.')
+      mosaic_impl = mla_api.IMPLEMENTATIONS.get('mosaic_tpu')
+      if mosaic_impl is None or not mosaic_impl.supported_on(jax.devices()[0]):
+        self.skipTest('Mosaic TPU implementation is only supported on TPU v7+.')
 
     example = EXAMPLES[args_spec_name] | {'implementation': implementation}
     fn, args = tokamax.standardize_function(
-        mla_op_wrapper,
+        mla_api.multi_head_latent_attention,
         kwargs=example,
         mode=benchmark_mode,
     )

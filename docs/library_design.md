@@ -201,6 +201,14 @@ suboptimal performance.
 
 ### Advanced Topics
 
+#### Operator Fusion
+
+Fusible Pallas TPU operators support fusing surrounding JAX prologues and
+epilogues directly into the kernel via `@tokamax.ops.op_fusion.fuse`. See the
+[Operator Fusion](https://openxla.org/tokamax/op_fusion) guide for usage
+examples and instructions on authoring fusion-compatible kernels and `Op`
+subclasses.
+
 #### Serialization
 
 Kernels can be serialized to [StableHLO](https://openxla.org/stablehlo). Kernel

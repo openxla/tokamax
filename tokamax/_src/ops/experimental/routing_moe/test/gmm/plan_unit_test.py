@@ -28,6 +28,7 @@ from absl.testing import parameterized
 import jax
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.common import spec
@@ -47,19 +48,30 @@ def _make_spec(
     quantized: bool = True,
     with_down: bool = False,
     size_n: int = 1280,
+    size_k2: int = 768,
+    size_k: int = 2560,
+    num_experts: int = 512,
+    ep_size: int = 4,
+    top_k: int = 10,
     w_dtype: jnp.dtype | None = None,
     row_group: bool = True,
     with_scatter: bool = True,
+    remote_scatter: bool = False,
     has_bias: bool = False,
     num_w_q_blocks: int = 1,
+    w_q_block_size: int | None = None,
+    routed: bool = True,
+    with_gather: bool = True,
+    fused_gate_up: bool | None = None,
 ) -> gmm_spec_lib.RoutingGmmSpec:
-  """Builds a RoutingGmmSpec for a 512-expert, top-10 MoE layer."""
-  num_experts, ep_size, top_k, size_k = 512, 4, 10, 2560
+  """Builds a RoutingGmmSpec, by default for a 512-expert, top-10 MoE layer."""
   if with_down:
-    # The fused kernel needs the intermediate size to be a multiple of 256.
-    size_n = 1536
+    size_n = 2 * size_k2
+  if fused_gate_up is None:
+    fused_gate_up = with_down
+  routed_rows = num_tokens * top_k
   x = spec.ActivationSpec(
-      row_size=num_tokens,
+      row_size=num_tokens if with_gather else routed_rows,
       col_size=size_k,
       dtype=jnp.dtype(jnp.bfloat16),
       quant=None,
@@ -73,37 +85,43 @@ def _make_spec(
   def weight_spec(
       in_size: int, out_size: int, *, fused_gate_up: bool = False
   ) -> spec.WeightSpec:
+    quant = None
+    if quantized:
+      quant = spec.SubchannelQuantSpec(
+          block_size=w_q_block_size or in_size // num_w_q_blocks
+      )
     return spec.WeightSpec(
         group_size=num_experts // ep_size,
         in_size=in_size,
         out_size=out_size,
         dtype=w_dtype,
-        quant=spec.SubchannelQuantSpec(block_size=in_size // num_w_q_blocks)
-        if quantized
-        else None,
+        quant=quant,
         has_bias=has_bias,
         fused_gate_up=fused_gate_up,
     )
 
   # Gate/up projection, and optionally the down projection, which takes the
   # activation of the gate/up output (half its width).
-  w = weight_spec(size_k, size_n, fused_gate_up=with_down)
+  w = weight_spec(size_k, size_n, fused_gate_up=fused_gate_up)
   w2 = weight_spec(size_n // 2, size_k) if with_down else None
-  routed_rows = num_tokens * top_k
-  scatter_spec = (
-      spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
-      if with_scatter
-      else None
-  )
+  gather = scatter = None
+  if routed:
+    if with_gather:
+      gather = spec.RoutingSpec(num_indices=routed_rows, remote_axis=None)
+    if with_scatter:
+      scatter = spec.RoutingSpec(
+          num_indices=routed_rows,
+          remote_axis="ep" if remote_scatter else None,
+      )
   return gmm_spec_lib.RoutingGmmSpec(
       x=x,
       w=w,
       w2=w2,
-      gather=spec.RoutingSpec(num_indices=routed_rows, remote_axis=None),
-      scatter=scatter_spec,
+      gather=gather,
+      scatter=scatter,
       num_global_groups=num_experts,
       fuse_act="silu" if with_down else None,
-      size_ep=1,
+      size_ep=ep_size if remote_scatter else 1,
       size_row_group=routed_rows if row_group else 0,
   )
 
@@ -119,7 +137,9 @@ def _resolve(
     tpu_info: pltpu.TpuInfo | None = None,
     w_dtype: jnp.dtype | None = None,
     row_group: bool = True,
+    **spec_kwargs: Any,
 ) -> gmm_plan.ResolvedGmmPlan:
+  """Resolves the plan of `_make_spec(num_tokens, ...)`."""
   gmm_spec = _make_spec(
       num_tokens,
       quantized=quantized,
@@ -127,6 +147,7 @@ def _resolve(
       size_n=size_n,
       w_dtype=w_dtype,
       row_group=row_group,
+      **spec_kwargs,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       out_format,
@@ -151,14 +172,16 @@ def _make_config(
     row_group: bool = True,
     with_down: bool = False,
     with_scatter: bool = True,
+    num_experts: int = 512,
 ) -> gmm_config.RoutingGmmConfig:
-  """Builds a RoutingGmmConfig for a 512-expert, top-10 MoE layer."""
+  """Builds a RoutingGmmConfig, by default for a 512-expert, top-10 MoE layer."""
   gmm_spec = _make_spec(
       num_tokens,
       quantized=quantized,
       row_group=row_group,
       with_down=with_down,
       with_scatter=with_scatter,
+      num_experts=num_experts,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       None,
@@ -195,21 +218,299 @@ class TileMTest(parameterized.TestCase):
     self.assertEqual(resolved.tile_m, min_tile_m)
     self.assertEqual(resolved.bucket_rows, [min_tile_m])
 
+  @parameterized.product(quantized=[True, False])
+  def test_zero_tokens_uses_one_sublane_tile(self, quantized: bool):
+    min_tile_m = _tpu_info().num_sublanes
+    self.assertEqual(_resolve(0, quantized=quantized).tile_m, min_tile_m)
+
+  def test_zero_or_unspecified_load_uses_token_cap(self):
+    base = _make_spec(128, quantized=False, row_group=False)
+    no_rows = spec.RoutingSpec(num_indices=0, remote_axis=None)
+    spec_zero_m = dataclasses.replace(base, gather=no_rows, scatter=no_rows)
+    spec_zero_groups = dataclasses.replace(
+        base, w=dataclasses.replace(base.w, group_size=0), num_global_groups=0
+    )
+    default_plan = gmm_plan.RoutingGmmPlan()
+    for gmm_spec in (spec_zero_m, spec_zero_groups):
+      self.assertEqual(
+          gmm_plan._max_group_rows(
+              default_plan, spec=gmm_spec, tpu_info=_tpu_info()
+          ),
+          128,
+      )
+
   @parameterized.parameters(12, 64, 200)
   def test_tile_is_capped_at_tokens(self, num_tokens: int):
     min_tile_m = _tpu_info().num_sublanes
     self.assertEqual(
-        _resolve(num_tokens).tile_m,
+        _resolve(num_tokens, num_experts=16).tile_m,
         min_tile_m * math.ceil(num_tokens / min_tile_m),
     )
 
-  @parameterized.parameters(256, 4096)
-  def test_tile_is_unchanged_from_256_tokens(self, num_tokens: int):
-    self.assertEqual(_resolve(num_tokens).tile_m, 256)
+  @parameterized.parameters(
+      (256, True, 48),
+      (256, False, 48),
+      (2048, True, 64),
+      (2048, False, 64),
+      (4096, True, 128),
+      (4096, False, 128),
+  )
+  def test_intermediate_batch_scales_with_expected_group_rows(
+      self, num_tokens: int, quantized: bool, expected_tile_m: int
+  ):
+    # With 512 experts and top_k=10, with_down=True (size_k2=768, dma_floor=48).
+    resolved = _resolve(num_tokens, quantized=quantized, with_down=True)
+    self.assertEqual(resolved.tile_m, expected_tile_m)
+
+  @parameterized.parameters(
+      (1088, 32),
+      (1100, 64),
+  )
+  def test_skew_headroom_boundary_selects_power_of_2_tile(
+      self, num_tokens: int, expected_tile_m: int
+  ):
+    # With 512 experts, top_k=10, with_down=True, size_k2=256 (dma_floor=16):
+    # - 1088 tokens -> expected_rows=21.25, 1.5 * 21.25 = 31.875 -> tile_m=32.
+    # - 1100 tokens -> expected_rows=21.484375, 1.5 * 21.484375 = 32.2265625 ->
+    #   tile_m=64.
+    resolved = _resolve(num_tokens, with_down=True, size_k2=256)
+    self.assertEqual(resolved.tile_m, expected_tile_m)
+
+  @parameterized.parameters(
+      (0.5, 16),
+      (2.0, 64),
+  )
+  def test_skew_headroom_scales_tile(
+      self, skew_headroom: float, expected_tile_m: int
+  ):
+    # With 1088 tokens, 512 experts, top_k=10, size_k2=256: expected_rows=21.25
+    # and dma_floor=16, so 10.625 -> 16 and 42.5 -> 64 (the default gives 32).
+    custom_plan = gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
+    resolved = _resolve(1088, custom_plan, with_down=True, size_k2=256)
+    self.assertEqual(resolved.tile_m, expected_tile_m)
+
+  @parameterized.parameters(0.0, -1.5)
+  def test_non_positive_skew_headroom_raises(self, skew_headroom: float):
+    with self.assertRaisesRegex(ValueError, "skew_headroom must be positive"):
+      gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
+
+  @parameterized.parameters(
+      (8, 128),
+      (32, 32),
+  )
+  def test_dma_floor_divisor_scales_tile(
+      self, dma_floor_divisor: int, expected_tile_m: int
+  ):
+    # With 256 tokens and size_k2=1024: skew_rows=8, so the floor
+    # 1024 // divisor binds (the default 16 gives 64).
+    custom_plan = gmm_plan.RoutingGmmPlan(dma_floor_divisor=dma_floor_divisor)
+    resolved = _resolve(256, custom_plan, with_down=True, size_k2=1024)
+    self.assertEqual(resolved.tile_m, expected_tile_m)
+
+  @parameterized.parameters(0, -16)
+  def test_non_positive_dma_floor_divisor_raises(self, dma_floor_divisor: int):
+    with self.assertRaisesRegex(
+        ValueError, "dma_floor_divisor must be positive"
+    ):
+      gmm_plan.RoutingGmmPlan(dma_floor_divisor=dma_floor_divisor)
+
+  def test_wide_intermediate_dma_floor(self):
+    # At num_tokens=256, num_experts=512:
+    # Fused with_down=True, size_k2=1024 -> dma_floor=64.
+    self.assertEqual(_resolve(256, with_down=True, size_k2=1024).tile_m, 64)
+    # Fused with_down=True, size_k2=2048 -> dma_floor=128.
+    self.assertEqual(_resolve(256, with_down=True, size_k2=2048).tile_m, 128)
+    # Unfused gated w1 (with_down=False, fused_gate_up=True, size_n=2048):
+    # i_local=1024, dma_floor=64.
+    self.assertEqual(
+        _resolve(256, with_down=False, fused_gate_up=True, size_n=2048).tile_m,
+        64,
+    )
+    # Unaligned dma_floor (with_down=False, size_n=1280): i_local=1280,
+    # dma_floor=80.
+    self.assertEqual(
+        _resolve(256, quantized=True, with_down=False, size_n=1280).tile_m,
+        80,
+    )
+    self.assertEqual(
+        _resolve(256, quantized=False, with_down=False, size_n=1280).tile_m,
+        80,
+    )
+    # Unfused down-projection where I_local > H (size_k=3072 > size_n=2048).
+    self.assertEqual(
+        _resolve(
+            256,
+            with_down=False,
+            with_gather=False,
+            with_scatter=True,
+            size_k=3072,
+            size_n=2048,
+        ).tile_m,
+        192,
+    )
+
+  @parameterized.product(
+      num_tokens=[256, 2048, 4096],
+      quantized=[True, False],
+      with_down=[True, False],
+  )
+  def test_small_tile_keeps_tile_table_bounded(
+      self, num_tokens: int, quantized: bool, with_down: bool
+  ):
+    # A tile_m sized by expected rows is at least 1.5x the mean group load, so
+    # one group spans at most 2/3 * num_global_groups tiles.
+    gmm_spec = _make_spec(num_tokens, quantized=quantized, with_down=with_down)
+    resolved = _resolve(num_tokens, quantized=quantized, with_down=with_down)
+    self.assertLessEqual(
+        math.ceil(gmm_spec.size_out_m / resolved.tile_m),
+        math.ceil(2 * gmm_spec.num_global_groups / 3) + 1,
+    )
+
+  @parameterized.parameters(8192, 16384)
+  def test_large_prefill_reaches_max_tile_m(self, num_tokens: int):
+    self.assertEqual(_resolve(num_tokens, with_down=True).tile_m, 256)
+    self.assertEqual(_resolve(num_tokens, with_down=False).tile_m, 256)
 
   def test_explicit_tile_m_is_kept(self):
     custom_plan = gmm_plan.RoutingGmmPlan(tile_m=128)
     self.assertEqual(_resolve(8, custom_plan).tile_m, 128)
+    fused_plan = gmm_plan.RoutingGmmPlan(tile_m=256)
+    self.assertEqual(_resolve(256, fused_plan, with_down=True).tile_m, 256)
+
+  @parameterized.named_parameters(
+      ("tpu_7x_overlay_reserve", pltpu.ChipVersion.TPU_7X, 64 * 1024),
+      ("tpu_8i_sc_spmem_reserve", pltpu.ChipVersion.TPU_8I, 2 * 1024 * 1024),
+      ("tpu_8t_sc_spmem_reserve", pltpu.ChipVersion.TPU_8T, 8 * 1024 * 1024),
+  )
+  def test_default_vmem_limit_reserves_xla_headroom(
+      self, chip: pltpu.ChipVersion, expected_reserve: int
+  ):
+    tpu_info = pltpu.get_tpu_info_for_chip(chip, 1)
+    expected = tpu_info.vmem_capacity_bytes - expected_reserve
+    self.assertEqual(gmm_plan.vmem_budget_bytes(tpu_info), expected)
+    self.assertEqual(_resolve(8, tpu_info=tpu_info).vmem_limit_bytes, expected)
+    oversized = gmm_plan.RoutingGmmPlan(
+        vmem_limit_bytes=tpu_info.vmem_capacity_bytes
+    )
+    self.assertEqual(
+        _resolve(8, oversized, tpu_info=tpu_info).vmem_limit_bytes, expected
+    )
+
+  def test_forced_fusion_steps_tile_m_down_to_fit_vmem(self):
+    # At 16,384 tokens, unquantized bf16 fused weights need tile_m stepped down
+    # under a 32 MiB budget when fusion is forced, while default plan unfuses.
+    tight_budget = dict(
+        vmem_limit_bytes=32 * 1024 * 1024, vmem_usage_fraction=1.0
+    )
+    default_plan = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(**tight_budget),
+        quantized=False,
+        with_down=True,
+    )
+    forced_fused = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(fuse_up_and_down=True, **tight_budget),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertFalse(default_plan.fuse_up_and_down)
+    self.assertEqual(default_plan.tile_m, 256)
+    self.assertTrue(forced_fused.fuse_up_and_down)
+    self.assertEqual(forced_fused.tile_m, 128)
+    self.assertEqual(forced_fused.bucket_rows, [128])
+
+  def test_forced_fusion_step_down_aligns_non_power_of_two_tile_m(self):
+    # At 200 tokens, default tile_m is clamped to 200 (25 * 8, ~30.1 MiB);
+    # stepping down under a 28 MiB budget must stay a multiple of num_sublanes
+    # (128 at ~27.4 MiB, not 200 // 2 = 100). 16 experts give 125 expected rows
+    # per group so the expected-load bound does not shrink tile_m below 200.
+    cfg = _make_config(
+        200,
+        gmm_plan.RoutingGmmPlan(
+            fuse_up_and_down=True,
+            vmem_limit_bytes=28 * 1024 * 1024,
+            vmem_usage_fraction=1.0,
+        ),
+        quantized=False,
+        with_down=True,
+        num_experts=16,
+    )
+    self.assertTrue(cfg.plan.fuse_up_and_down)
+    self.assertEqual(cfg.plan.tile_m, 128)
+    self.assertEqual(cfg.plan.bucket_rows, [128])
+
+  def test_forced_fusion_step_down_respects_explicit_bucket_base(self):
+    # Under a 26 MiB budget, tile_m=128 (~27.4 MiB) does not fit while tile_m=64
+    # (~25.0 MiB) does; an explicit bucket_base=128 bounds the step-down so
+    # RoutingGmmConfig validation never sees tile_m < bucket_base.
+    tighter_budget = dict(
+        vmem_limit_bytes=26 * 1024 * 1024, vmem_usage_fraction=1.0
+    )
+    unbounded = _resolve(
+        16384,
+        gmm_plan.RoutingGmmPlan(fuse_up_and_down=True, **tighter_budget),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertEqual(unbounded.tile_m, 64)
+    self.assertEqual(unbounded.bucket_rows, [64])
+
+    cfg = _make_config(
+        16384,
+        gmm_plan.RoutingGmmPlan(
+            fuse_up_and_down=True, bucket_base=128, **tighter_budget
+        ),
+        quantized=False,
+        with_down=True,
+    )
+    self.assertEqual(cfg.plan.bucket_base, 128)
+    self.assertGreaterEqual(cfg.plan.tile_m, cfg.plan.bucket_base)
+
+
+class FusedK2SlicingTest(parameterized.TestCase):
+  """Checks when the fused kernel slices the intermediate (k2) dim."""
+
+  def test_fits_whole_k2_when_vmem_allows(self):
+    # A layer that fits fused with the whole k2 dim is never sliced.
+    resolved = _resolve(8, with_down=True)
+    self.assertTrue(resolved.fuse_up_and_down)
+    # `_resolve(with_down=True)` uses an intermediate size of 1536 // 2.
+    self.assertEqual(resolved.tile_k2, 768)
+
+  def test_remote_scatter_selects_split_k2_plan(self):
+    # With a remote unpermute the planner keeps tile_m=256 and slices k2.
+    resolved = _resolve(
+        256,
+        with_down=True,
+        size_k=7168,
+        size_k2=3072,
+        num_experts=384,
+        ep_size=8,
+        top_k=6,
+        w_q_block_size=512,
+        remote_scatter=True,
+    )
+    self.assertTrue(resolved.fuse_up_and_down)
+    self.assertEqual(resolved.tile_m, 256)
+    self.assertEqual(resolved.tile_k2, 512)
+    self.assertEqual(resolved.tile_n, 7168)
+    self.assertEqual(resolved.num_w_buffers, 2)
+
+  def test_local_scatter_falls_back_to_unfused(self):
+    # Without a remote unpermute, slicing k2 is not worth it: run unfused.
+    resolved = _resolve(
+        256,
+        with_down=True,
+        size_k=7168,
+        size_k2=3072,
+        num_experts=384,
+        ep_size=8,
+        top_k=6,
+        w_q_block_size=512,
+        remote_scatter=False,
+    )
+    self.assertFalse(resolved.fuse_up_and_down)
 
 
 class MatmulDtypeTest(parameterized.TestCase):
@@ -224,6 +525,20 @@ class MatmulDtypeTest(parameterized.TestCase):
     ):
       _resolve(8, tpu_info=tpu_info, w_dtype=jnp.dtype(jnp.float8_e4m3fn))
 
+  def test_small_w_blocks_keep_x_unquantized(self):
+    # size_k=2560 in 20 blocks gives 128-wide blocks, below the MXU width so we
+    # dequant weight before the matmul for better mxu utilization.
+    # In this case, we don't quantize the activations. Otherwise, fp8 @ bf16
+    # costs precision and buys no speed.
+    resolved = _resolve(8, num_w_q_blocks=20)
+    self.assertEqual(resolved.matmul_dtype, jnp.bfloat16)
+    self.assertIsNone(resolved.x_quant_block_size)
+
+  def test_small_w_blocks_keep_explicit_matmul_dtype(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, num_w_q_blocks=20)
+    self.assertEqual(resolved.matmul_dtype, jnp.float8_e4m3fn)
+
 
 class NumWBuffersTest(parameterized.TestCase):
   """Checks the number of weight buffers the planner picks."""
@@ -231,38 +546,103 @@ class NumWBuffersTest(parameterized.TestCase):
   @parameterized.product(
       num_tokens=[1, 8, 128, 256, 4096], quantized=[True, False]
   )
-  def test_spare_vmem_grows_weight_buffers_to_three(
+  def test_spare_vmem_grows_weight_buffers_to_default_max(
       self, num_tokens: int, quantized: bool
   ):
     resolved = _resolve(num_tokens, quantized=quantized)
-    self.assertEqual(resolved.num_w_buffers, 3)
+    self.assertEqual(resolved.num_w_buffers, 8)
 
-  @parameterized.parameters(2, 4)
+  @parameterized.parameters(2, 4, 6)
   def test_max_num_w_buffers_caps_growth(self, max_num_w_buffers: int):
     custom_plan = gmm_plan.RoutingGmmPlan(max_num_w_buffers=max_num_w_buffers)
     resolved = _resolve(8, custom_plan)
     self.assertEqual(resolved.num_w_buffers, max_num_w_buffers)
 
-  @parameterized.parameters(2, 4)
+  @parameterized.parameters(2, 4, 6)
   def test_explicit_num_w_buffers_is_kept(self, num_w_buffers: int):
     custom_plan = gmm_plan.RoutingGmmPlan(num_w_buffers=num_w_buffers)
     self.assertEqual(_resolve(8, custom_plan).num_w_buffers, num_w_buffers)
 
-  def test_extra_weight_buffers_do_not_break_fusion(self):
+  def test_extra_weight_buffers_step_down_smoothly_for_fusion(self):
     resolved = _resolve(8, with_down=True)
     self.assertTrue(resolved.fuse_up_and_down)
-    self.assertEqual(resolved.num_w_buffers, 3)
-    # This VMEM limit fits the fused kernel with 2 weight buffers but not with
-    # 3, so the default 2 is kept and the projections stay fused.
-    for fuse_up_and_down in (None, True):
-      with self.subTest(fuse_up_and_down=fuse_up_and_down):
-        custom_plan = gmm_plan.RoutingGmmPlan(
-            vmem_limit_bytes=16 * 1024 * 1024,
-            fuse_up_and_down=fuse_up_and_down,
-        )
-        resolved = _resolve(8, custom_plan, with_down=True)
-        self.assertTrue(resolved.fuse_up_and_down)
-        self.assertEqual(resolved.num_w_buffers, 2)
+    self.assertEqual(resolved.num_w_buffers, 8)
+    # 32 MiB fits 7 buffers for w alone, and steps down smoothly to 5 buffers
+    # once w2 is included; 16 MiB steps all the way down to 2 buffers.
+    for vmem_mib, expected_buffers in ((32, 5), (16, 2)):
+      for fuse_up_and_down in (None, True):
+        with self.subTest(vmem_mib=vmem_mib, fuse_up_and_down=fuse_up_and_down):
+          custom_plan = gmm_plan.RoutingGmmPlan(
+              vmem_limit_bytes=vmem_mib * 1024 * 1024,
+              fuse_up_and_down=fuse_up_and_down,
+          )
+          resolved = _resolve(8, custom_plan, with_down=True)
+          self.assertTrue(resolved.fuse_up_and_down)
+          self.assertEqual(resolved.num_w_buffers, expected_buffers)
+
+
+class W2MatmulDtypeTest(parameterized.TestCase):
+  """Checks automatic mixed-precision selection for the down projection."""
+
+  def test_small_tile_uses_unquantized_lhs_when_hw_supports_mixed_matmul(self):
+    resolved = _resolve(8, with_down=True)
+    self.assertEqual(resolved.matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.bfloat16))
+
+  def test_large_tile_uses_quantized_lhs(self):
+    resolved = _resolve(512, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_explicit_matmul_dtype_overrides_w2(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_explicit_w2_matmul_dtype_is_kept(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(w2_matmul_dtype=jnp.float8_e4m3fn)
+    resolved = _resolve(8, custom_plan, with_down=True)
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
+
+  def test_w2_matmul_dtype_without_down_projection_raises(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(w2_matmul_dtype=jnp.bfloat16)
+    with self.assertRaisesRegex(ValueError, "w2_matmul_dtype requires w2"):
+      _resolve(8, custom_plan, with_down=False)
+
+  def test_w2_matmul_dtype_without_fusion_raises(self):
+    custom_plan = gmm_plan.RoutingGmmPlan(
+        fuse_up_and_down=False, w2_matmul_dtype=jnp.bfloat16
+    )
+    with self.assertRaisesRegex(
+        ValueError, "w2_matmul_dtype requires fuse_up_and_down=True"
+    ):
+      _resolve(8, custom_plan, with_down=True)
+
+  def test_w2_matmul_dtype_is_none_without_down_projection(self):
+    self.assertIsNone(_resolve(8, with_down=False).w2_matmul_dtype)
+
+  def test_falls_back_to_quantized_lhs_without_mixed_matmul_support(self):
+    # TPU 7x has no native bf16 x int8 matmul.
+    resolved = _resolve(8, with_down=True, w_dtype=jnp.dtype(jnp.int8))
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.int8))
+
+  def test_small_w2_quant_block_uses_quantized_lhs(self):
+    gmm_spec = _make_spec(8, with_down=True)
+    assert gmm_spec.w2 is not None
+    small_block_w2 = dataclasses.replace(
+        gmm_spec.w2, quant=spec.SubchannelQuantSpec(block_size=128)
+    )
+    gmm_spec = dataclasses.replace(gmm_spec, w2=small_block_w2)
+    out_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=gmm_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=gmm_spec, out_format=out_fmt, tpu_info=_tpu_info()
+    )
+    self.assertEqual(resolved.w2_matmul_dtype, jnp.dtype(jnp.float8_e4m3fn))
 
 
 class QuantStashPlanTest(parameterized.TestCase):
@@ -308,19 +688,22 @@ class QuantStashPlanTest(parameterized.TestCase):
         dtype=jnp.float8_e4m3fn, quant=out_format_lib.auto_quant
     )
     # 13.5 MB fits tile_m=256 with 2 bf16 stash buffers (13,377,536 bytes), but
-    # overflows to tile_m=128 with 3 buffers or f32 stash dtype.
+    # overflows to tile_m=128 with 3 buffers or f32 stash dtype. 16 experts
+    # give 160 expected rows per group so the expected-load bound allows 256.
     single_budget = dict(vmem_limit_bytes=13_500_000, vmem_usage_fraction=1.0)
     default_single = _resolve(
         256,
         gmm_plan.RoutingGmmPlan(**single_budget),
         out_format=fmt,
         size_n=1024,
+        num_experts=16,
     )
     larger_stash_single = _resolve(
         256,
         dataclasses.replace(extra_plan, **single_budget),
         out_format=fmt,
         size_n=1024,
+        num_experts=16,
     )
     self.assertEqual(default_single.tile_m, 256)
     self.assertEqual(larger_stash_single.tile_m, 128)
@@ -359,7 +742,7 @@ def _traced_smem_allocations(
     inputs: Any = None,
 ) -> dict[str, int]:
   """Logical bytes of each SMEM allocation."""
-  if jax.typeof(metadata_in.group_cum_sum).memory_space != pltpu.SMEM:
+  if jax.typeof(metadata_in.group_sizes).memory_space != pltpu.SMEM:
     raise ValueError(
         "smem_allocations must be called under jit, where SMEM constraints are"
         " active."
@@ -394,11 +777,11 @@ def _weight_wrapper(
 ) -> arg.SingleWeightWrapper | None:
   if weight_spec is None:
     return None
-  scale = (
-      None
-      if weight_spec.quant is None
-      else jax.ShapeDtypeStruct(weight_spec.scale_shape, jnp.float32)
-  )
+  scale = None
+  if weight_spec.quant is not None:
+    scale = jax.ShapeDtypeStruct(
+        weight_spec.scale_shape, weight_spec.scale_dtype
+    )
   return arg.SingleWeightWrapper(
       weight=jax.ShapeDtypeStruct(weight_spec.shape, weight_spec.dtype),
       scale=scale,
@@ -511,14 +894,18 @@ class SmemBudgetTest(parameterized.TestCase):
       _traced_smem_allocations(cfg, metadata_in, scratch, inputs)
 
   def test_smem_total_is_derived_from_kernel_args(self):
-    cfg = _make_config(4096, gmm_plan.RoutingGmmPlan(live_group_walk=True))
+    # Streamed indices, so the gather and scatter tables are HBM ring buffers.
+    custom_plan = gmm_plan.RoutingGmmPlan(
+        live_group_walk=True, smem_indices=False
+    )
+    cfg = _make_config(4096, custom_plan)
     allocs = _kernel_smem(cfg)
     self.assertEqual(allocs["row_group"], 4 * 40960)
     self.assertEqual(
         sum(allocs.values()),
-        # group_cum_sum, group_offset, row_group, tile tables, num_gm, and the
+        # group_sizes, group_offset, row_group, tile tables, num_gm, and the
         # gather and scatter index buffers.
-        4 * 513
+        4 * 512
         + 4
         + 4 * 40960
         + 3 * (4 * cfg.max_num_gm)
@@ -662,9 +1049,165 @@ class SmemEstimateMatchesKernelTest(parameterized.TestCase):
     self.assertIn("scatter_idx", est_smem)
     assert cfg.spec.gather is not None and cfg.spec.scatter is not None
     num_idx = cfg.spec.gather.num_indices
-    tile_m_idx = cfg.plan.tile_m_idx
-    self.assertEqual(est_smem["gather_idx"], 4 * (num_idx + tile_m_idx))
-    self.assertEqual(est_smem["scatter_idx"], 4 * (num_idx + tile_m_idx))
+    # SMEM index tables are unpadded; dead rows are clamped in the kernel.
+    self.assertEqual(est_smem["gather_idx"], 4 * num_idx)
+    self.assertEqual(est_smem["scatter_idx"], 4 * num_idx)
+
+
+class SmemIndicesTest(parameterized.TestCase):
+  """Checks the smem_indices heuristic."""
+
+  @parameterized.named_parameters(
+      # Default uses SMEM whenever worst-case SMEM estimate fits budget
+      # (596,377 B on 1 MiB TPU v7x SMEM).
+      dict(testcase_name="decode_1", num_tokens=1, top_k=10, expected=True),
+      dict(
+          testcase_name="prefill_4k_top10",
+          num_tokens=4096,
+          top_k=10,
+          expected=True,
+      ),
+      dict(
+          testcase_name="at_threshold", num_tokens=62398, top_k=1, expected=True
+      ),
+      dict(
+          testcase_name="above_threshold",
+          num_tokens=62399,
+          top_k=1,
+          expected=False,
+      ),
+  )
+  def test_smem_indices_default(
+      self, num_tokens: int, top_k: int, expected: bool
+  ):
+    self.assertEqual(_resolve(num_tokens, top_k=top_k).smem_indices, expected)
+
+  def test_smem_indices_accounts_for_row_group_under_live_group_walk(self):
+    self.assertTrue(
+        _resolve(
+            50000, gmm_plan.RoutingGmmPlan(live_group_walk=False), top_k=1
+        ).smem_indices
+    )
+    self.assertFalse(
+        _resolve(
+            50000, gmm_plan.RoutingGmmPlan(live_group_walk=True), top_k=1
+        ).smem_indices
+    )
+
+  def test_smem_indices_default_with_gather_only(self):
+    self.assertTrue(_resolve(8, with_scatter=False).smem_indices)
+    self.assertTrue(_resolve(65000, top_k=1, with_scatter=False).smem_indices)
+
+  def test_smem_indices_default_is_off_in_direct_mode(self):
+    self.assertFalse(_resolve(8, routed=False).smem_indices)
+
+  def test_smem_indices_default_is_off_when_empty(self):
+    self.assertFalse(_resolve(0, top_k=10).smem_indices)
+
+  @parameterized.parameters(True, False)
+  def test_explicit_smem_indices_is_kept(self, smem_indices: bool):
+    custom_plan = gmm_plan.RoutingGmmPlan(smem_indices=smem_indices)
+    self.assertEqual(
+        _resolve(6500, custom_plan, top_k=10).smem_indices, smem_indices
+    )
+
+  def _block_scaled_spec_and_fmt(self):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    base = _make_spec(8, with_down=True)
+    w = dataclasses.replace(
+        base.w,
+        quant=spec.BlockScaledQuantSpec(
+            scale_rows=block_scaled.scale_rows(base.w.in_size)
+        ),
+    )
+    assert base.w2 is not None
+    w2 = dataclasses.replace(
+        base.w2,
+        quant=spec.BlockScaledQuantSpec(
+            scale_rows=block_scaled.scale_rows(base.w2.in_size)
+        ),
+    )
+    bs_spec = dataclasses.replace(base, w=w, w2=w2)
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=bs_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    return bs_spec, resolved_fmt
+
+  @parameterized.named_parameters(
+      dict(testcase_name="default_matmul_dtype", custom_plan=None),
+      dict(
+          testcase_name="explicit_matmul_dtype",
+          custom_plan=gmm_plan.RoutingGmmPlan(matmul_dtype=jnp.float8_e4m3fn),
+      ),
+  )
+  def test_block_scaled_plan_rejects_unsupported_chip(
+      self, custom_plan: gmm_plan.RoutingGmmPlan | None
+  ):
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt()
+    with self.assertRaisesRegex(NotImplementedError, "requires TPU_8T"):
+      gmm_plan.ResolvedGmmPlan.create(
+          custom_plan,
+          spec=bs_spec,
+          out_format=resolved_fmt,
+          tpu_info=_tpu_info(),
+      )
+
+  def test_block_scaled_tpu_8t_plan_and_smem(self):
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    bs_spec, resolved_fmt = self._block_scaled_spec_and_fmt()
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=bs_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    self.assertEqual(resolved.tile_m, 16)
+    self.assertEqual(resolved.bucket_rows, [16])
+    self.assertIsNone(resolved.x_quant_block_size)
+    self.assertTrue(resolved.fuse_up_and_down)
+    cfg = gmm_config.RoutingGmmConfig.create(
+        spec=bs_spec,
+        out_format=resolved_fmt,
+        plan=resolved,
+        tpu_info=tpu_8t,
+    )
+    self.assertEqual(
+        gmm_plan.smem_estimate(cfg.spec, cfg.plan), _kernel_smem(cfg)
+    )
+
+  def test_block_scaled_mixed_w2_quant_disables_fusion(self):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    chip_8t = getattr(pltpu.ChipVersion, "TPU_8T", None)
+    if chip_8t is None:
+      self.skipTest("TPU_8T is not available in this JAX version.")
+    tpu_8t = pltpu.get_tpu_info_for_chip(chip_8t, 1)
+    base = _make_spec(8, with_down=True)
+    mixed_spec = dataclasses.replace(
+        base,
+        w=dataclasses.replace(
+            base.w,
+            quant=spec.BlockScaledQuantSpec(
+                scale_rows=block_scaled.scale_rows(base.w.in_size)
+            ),
+        ),
+    )
+    resolved_fmt = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=mixed_spec.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
+    resolved = gmm_plan.ResolvedGmmPlan.create(
+        None, spec=mixed_spec, out_format=resolved_fmt, tpu_info=tpu_8t
+    )
+    self.assertFalse(resolved.fuse_up_and_down)
 
 
 class VmemEstimateTest(parameterized.TestCase):
@@ -743,6 +1286,149 @@ class VmemEstimateTest(parameterized.TestCase):
     self.assertEqual(
         estimate(2) - estimate(1),
         num_w_buffers * scale_cols * bytes_per_f32,
+    )
+
+  def test_vmem_estimate_dequantized_w(self):
+    num_w_buffers = 3
+
+    def estimate(num_w_q_blocks: int) -> int:
+      gmm_spec = _make_spec(8, num_w_q_blocks=num_w_q_blocks)
+      return gmm_plan._vmem_estimate(
+          x=gmm_spec.x,
+          w=gmm_spec.w,
+          matmul_dtype=gmm_spec.x.dtype,
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=gmm_spec.x.dtype,
+          tile_m=128,
+          tile_k=gmm_spec.size_k,
+          tile_n=gmm_spec.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    # 128-wide blocks are below the MXU width, so the estimate adds a bf16
+    # copy of the dequantized w tile on top of the extra scale rows.
+    gmm_spec = _make_spec(8)
+    size_k, size_n = gmm_spec.size_k, gmm_spec.size_out_n
+    bytes_per_f32, bytes_per_bf16 = 4, 2
+    self.assertEqual(
+        estimate(20) - estimate(1),
+        num_w_buffers * 19 * size_n * bytes_per_f32
+        + size_k * size_n * bytes_per_bf16,
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="single", with_down=False),
+      dict(testcase_name="up_down", with_down=True),
+  )
+  def test_vmem_estimate_block_scaled_scale(self, with_down: bool):
+    if not block_scaled.is_available():
+      self.skipTest("Block-scaled matmul is not available in this build.")
+    num_w_buffers = 3
+    tile_m = 64
+
+    def estimate(use_block_scaled: bool) -> int:
+      base = _make_spec(8, with_down=with_down)
+      quant = (
+          spec.BlockScaledQuantSpec(scale_rows=64) if use_block_scaled else None
+      )
+      w = dataclasses.replace(base.w, quant=quant)
+      w2 = None
+      if base.w2 is not None:
+        w2 = dataclasses.replace(base.w2, quant=quant)
+      return gmm_plan._vmem_estimate(
+          x=base.x,
+          w=w,
+          w2=w2,
+          is_fused_act=base.is_fused_act,
+          matmul_dtype=jnp.dtype(jnp.float8_e4m3fn),
+          acc_dtype=jnp.dtype(jnp.bfloat16),
+          out_dtype=base.x.dtype,
+          tile_m=tile_m,
+          tile_k=base.size_k,
+          tile_k2=base.size_k2,
+          tile_n=base.size_out_n,
+          num_xo_buffers=2,
+          num_w_buffers=num_w_buffers,
+          tpu_info=_tpu_info(),
+      )
+
+    # Each weight adds its kernel scales per buffer plus one tile of in-kernel
+    # activation scales.
+    base = _make_spec(8, with_down=with_down)
+    weights = [(base.w, base.size_k)]
+    if base.w2 is not None:
+      weights.append((base.w2, base.w2.in_size))
+    expected = sum(
+        num_w_buffers * block_scaled.kernel_scale_rows(k) * w.out_size
+        + block_scaled.activation_scale_vmem_bytes(tile_m, k)
+        for w, k in weights
+    )
+    self.assertEqual(estimate(True) - estimate(False), expected)
+
+
+class BufferingAndLookaheadTest(parameterized.TestCase):
+  """Checks weight buffering and lookahead heuristics."""
+
+  def test_large_fused_tile_caps_default_weight_buffers_at_four(self):
+    self.assertEqual(_resolve(32, with_down=True).num_w_buffers, 8)
+    self.assertEqual(_resolve(2048, with_down=True).num_w_buffers, 4)
+    self.assertEqual(_resolve(2048, with_down=False).num_w_buffers, 8)
+    override = gmm_plan.RoutingGmmPlan(max_num_w_buffers=6)
+    self.assertEqual(_resolve(2048, override, with_down=True).num_w_buffers, 6)
+
+  def test_large_expert_weights_cap_buffers_and_keep_lookahead(self):
+    # 2,560 x 5,120 fp8 weights are 12.5 MiB per expert (>= 12 MiB): 3 buffers
+    # fit in VMEM, and fewer than 4 buffers keep lookahead enabled above tile_m.
+    decode = _resolve(8, size_n=5120)
+    prefill = _resolve(4096, size_n=5120)
+    self.assertEqual(decode.num_w_buffers, 3)
+    self.assertFalse(decode.weight_lookahead)
+    self.assertEqual(prefill.num_w_buffers, 3)
+    self.assertTrue(prefill.weight_lookahead)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="decode", num_tokens=8, routed=True, expected=False),
+      dict(
+          testcase_name="prefill_4k_routed",
+          num_tokens=4096,
+          routed=True,
+          expected=False,
+      ),
+      dict(
+          testcase_name="prefill_64k_routed",
+          num_tokens=65536,
+          routed=True,
+          expected=True,
+      ),
+      dict(
+          testcase_name="direct_at_tile_m",
+          num_tokens=64,
+          routed=False,
+          expected=False,
+      ),
+      dict(
+          testcase_name="direct_above_tile_m",
+          num_tokens=512,
+          routed=False,
+          expected=True,
+      ),
+  )
+  def test_weight_lookahead_default(
+      self, num_tokens: int, routed: bool, expected: bool
+  ):
+    self.assertEqual(
+        _resolve(num_tokens, routed=routed).weight_lookahead, expected
+    )
+
+  @parameterized.parameters((8, True), (65536, False))
+  def test_explicit_weight_lookahead_is_kept(
+      self, num_tokens: int, weight_lookahead: bool
+  ):
+    custom_plan = gmm_plan.RoutingGmmPlan(weight_lookahead=weight_lookahead)
+    self.assertEqual(
+        _resolve(num_tokens, custom_plan).weight_lookahead, weight_lookahead
     )
 
 

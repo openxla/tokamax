@@ -20,12 +20,15 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import fuser
 from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import batching
 from tokamax._src import config as config_lib
 from tokamax._src import hlo_utils
 from tokamax._src import utils
+from tokamax._src.ops import fuser_adapter
 from tokamax._src.ops import op as op_lib
 from tokamax._src.ops.attention import arg_specs as attn_arg_specs
 from tokamax._src.ops.attention import base as attn_base
@@ -36,6 +39,7 @@ from tokamax._src.ops.normalization import base as norm_base
 from tokamax._src.ops.ragged_dot import api
 from tokamax._src.ops.ragged_dot import arg_specs as ragged_dot_arg_specs
 from tokamax._src.ops.ragged_dot import base as ragged_dot_base
+from tokamax.ops import op_fusion
 
 try:
   from tokamax._src.ops.attention import triton as triton_attn  # pylint: disable=g-import-not-at-top
@@ -114,6 +118,50 @@ class _DeviceRestrictedOp(_FakeOp):
     return False
 
 
+class NonFusibleOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+
+  def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config):
+    del config
+    assert not return_residuals
+    assert x.shape == y.shape, f"{x.shape} != {y.shape}"
+    return x + y, None
+
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+    del ba  # Unused.
+    return _HEURISTICS_CONFIG
+
+
+class FusibleOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+  fusible_argnames: ClassVar[tuple[str, ...]] = ("x",)
+
+  def _fwd(
+      self,
+      x: jax.Array,
+      y: jax.Array | ragged_dot_base.GroupSizes,
+      *,
+      return_residuals: bool,
+      config,
+  ):
+    del config
+    assert not return_residuals
+    y_arr = jnp.asarray(y)
+    assert x.shape == y_arr.shape, f"{x.shape} != {y_arr.shape}"
+    return x + y_arr, None
+
+  def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+    del ba  # Unused.
+    return _HEURISTICS_CONFIG
+
+  def _fusible_fwd(self, x_f, y, *, out_fusions=None, config):
+    assert isinstance(x_f, fuser.Fusion)
+    assert isinstance(y, jax.Array)
+    assert config == _HEURISTICS_CONFIG
+    out = x_f() + y
+    return out if out_fusions is None else out_fusions(out)
+
+
 class OpTest(parameterized.TestCase):
 
   def test_bind(self):
@@ -153,6 +201,240 @@ class OpTest(parameterized.TestCase):
     with config_lib.cross_compile(True):
       out = _DeviceRestrictedOp()(x, y)
     self.assertTrue(jnp.array_equal(out, x + y))
+
+  def test_fuser_unsupported_op_raises(self):
+    x = jnp.ones((2, 2))
+    y = jnp.ones((2, 2))
+    op = NonFusibleOp()
+
+    @fuser_adapter.fuse
+    def fused(x, y):
+      return op(x * 2, y)
+
+    with self.assertRaisesRegex(
+        NotImplementedError, "does not support kernel fusion"
+    ):
+      fused(x, y)
+
+  def test_fuser_fusible_op(self):
+    self.assertIs(op_fusion.fuse, fuser_adapter.fuse)
+    x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
+    y = jnp.ones((2, 2), dtype=jnp.float32)
+    op = FusibleOp()
+    self.assertTrue(jnp.array_equal(op(x, y), x + y))
+
+    @op_fusion.fuse
+    def fused(x, y):
+      return op(x * 2.0, y) - 1.0
+
+    self.assertTrue(jnp.array_equal(fused(x, y), (x * 2.0 + y) - 1.0))
+
+  def test_fuser_fusible_argnames_materializes_non_fusible_args(self):
+    x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
+    y = jnp.ones((2, 2), dtype=jnp.float32)
+    op = FusibleOp()
+
+    @fuser_adapter.fuse
+    def fused(x, y):
+      return op(x * 2.0, y + 3.0) - 1.0
+
+    self.assertTrue(jnp.array_equal(fused(x, y), (x * 2.0 + (y + 3.0)) - 1.0))
+
+  def test_fuser_fusible_op_unwraps_group_sizes(self):
+    x = jnp.array([1, 2], dtype=jnp.int32)
+    y = jnp.array([10, 20], dtype=jnp.int32)
+    op = FusibleOp()
+
+    @fuser_adapter.fuse
+    def fused(x, y):
+      gs = ragged_dot_base.GroupSizes(y, (1, 1))
+      return op(x * 2, gs)
+
+    self.assertTrue(jnp.array_equal(fused(x, y), x * 2 + y))
+
+  def test_fuser_adapter_materialize(self):
+    arr = jnp.array([1.0, 2.0], dtype=jnp.float32)
+    fusion_leaf = fuser.Fusion(
+        func=lambda: arr * 3.0,
+        in_type=((), {}),
+        out_type=jax.ShapeDtypeStruct(arr.shape, arr.dtype),
+    )
+    out = fuser_adapter.materialize({"f": fusion_leaf, "a": arr, "n": None})
+    self.assertTrue(jnp.array_equal(out["f"], arr * 3.0))
+    self.assertTrue(jnp.array_equal(out["a"], arr))
+    self.assertIsNone(out["n"])
+
+  def test_fuser_adapter_push_pull_block_spec(self):
+    raw_type = jax.ShapeDtypeStruct((32, 32), jnp.float32)
+
+    def capture_out_fusion(epilogue):
+      captured = {}
+
+      def body(x_f, out_fusions=None):
+        captured["out"] = fuser_adapter.unpack_output_fusion(
+            out_fusions, raw_type
+        )
+        out = x_f()
+        return out if out_fusions is None else out_fusions(out)
+
+      fusible_fn = fuser.fusible(body, output_fusion_prefix=True)
+      fuser.fuse(lambda x: epilogue(fusible_fn(x)))(
+          jnp.ones((32, 32), jnp.float32)
+      )
+      return captured["out"]
+
+    # Layout-changing epilogue pushes transposed block_shape.
+    blocked_spec = pl.BlockSpec((16, 32), lambda i, j: (i, j))
+    out_fn, _, out_vals_type, _ = capture_out_fusion(lambda out: out.mT)
+    assert out_fn is not None and out_vals_type is not None
+    _, val_specs, final_spec = fuser_adapter.push_pull_block_spec(
+        out_fn, blocked_spec, out_vals_type, raw_type, grid_len=2
+    )
+    self.assertEqual(val_specs, ())
+    self.assertEqual(final_spec.block_shape, (32, 16))
+
+    # Reconvergent RMSNorm epilogue with BoundedSlice succeeds and matches ref.
+    bounded_spec = pl.BlockSpec(
+        (pl.BoundedSlice(16), 32), lambda i, j: (pl.ds(i * 16, 16), j)
+    )
+    w = jnp.arange(32, dtype=jnp.float32).reshape((1, 32))
+    rms_fn = lambda out: (
+        out
+        * jax.lax.rsqrt(jnp.mean(jnp.square(out), axis=-1, keepdims=True) + 1.0)
+        * w
+    )
+    out_fn, out_vals, out_vals_type, _ = capture_out_fusion(rms_fn)
+    assert out_fn is not None
+    assert out_vals is not None and out_vals_type is not None
+    pulled_fn, val_specs, final_spec = fuser_adapter.push_pull_block_spec(
+        out_fn, bounded_spec, out_vals_type, raw_type, grid_len=2
+    )
+    self.assertLen(val_specs, 1)
+    self.assertEqual(final_spec.block_shape, (pl.BoundedSlice(16), 32))
+    tile = jnp.full((16, 32), 2.0, dtype=jnp.float32)
+    self.assertTrue(
+        jnp.allclose(pulled_fn((0, 0), (), out_vals, tile), rms_fn(tile))
+    )
+
+    # Simulate pre-0.12.1 JAX rejecting unreduced full-axis strict DAG pulls.
+    orig_pull = fuser.pull_block_spec
+
+    def legacy_pull(fn, out_block_specs, *, strict_mode=True, **kwargs):
+      first_spec = (
+          out_block_specs[0]
+          if isinstance(out_block_specs, tuple)
+          else out_block_specs
+      )
+      if strict_mode and first_spec in (bounded_spec, spec_3d):
+        raise ValueError("Fusion contains a DAG, cannot uniquely pull")
+      return orig_pull(fn, out_block_specs, strict_mode=strict_mode, **kwargs)
+
+    raw_3d = jax.ShapeDtypeStruct((16, 32, 32), jnp.float32)
+    spec_3d = pl.BlockSpec((16, 16, 16), lambda i, j, k: (i, j, k))
+    captured_3d = {}
+
+    def body_3d(x_f, out_fusions=None):
+      captured_3d["out"] = fuser_adapter.unpack_output_fusion(
+          out_fusions, raw_3d
+      )
+      out = x_f()
+      return out if out_fusions is None else out_fusions(out)
+
+    fusible_3d = fuser.fusible(body_3d, output_fusion_prefix=True)
+    fuser.fuse(lambda x: (lambda y: y + jnp.swapaxes(y, 1, 2))(fusible_3d(x)))(
+        jnp.ones((16, 32, 32), jnp.float32)
+    )
+    swap_out_fn, _, swap_vals_type, _ = captured_3d["out"]
+    assert swap_out_fn is not None and swap_vals_type is not None
+
+    with mock.patch.object(fuser, "pull_block_spec", side_effect=legacy_pull):
+      fb_fn, fb_val_specs, fb_spec = fuser_adapter.push_pull_block_spec(
+          out_fn, bounded_spec, out_vals_type, raw_type, grid_len=2
+      )
+      self.assertLen(fb_val_specs, 1)
+      self.assertEqual(fb_spec.block_shape, (pl.BoundedSlice(16), 32))
+      self.assertTrue(
+          jnp.allclose(fb_fn((0, 0), (), out_vals, tile), rms_fn(tile))
+      )
+
+      with self.assertRaises(ValueError):
+        fuser_adapter.push_pull_block_spec(
+            swap_out_fn, spec_3d, swap_vals_type, raw_3d, grid_len=3
+        )
+
+    # Unsound same-shape epilogues raise ValueError rather than falling back.
+    v_type = (jax.ShapeDtypeStruct((16, 16), jnp.float32),)
+    sub_spec = pl.BlockSpec((16, 16), lambda i, j: (i, j))
+    dus_out_fn = lambda vals, out: (
+        jax.lax.dynamic_update_slice(out, vals[0], (0, 0)),
+    )
+    with self.assertRaisesRegex(ValueError, "Inconsistent block specs"):
+      fuser_adapter.push_pull_block_spec(
+          dus_out_fn, sub_spec, v_type, raw_type, grid_len=2
+      )
+
+    bad_out_fn, _, bad_vals_type, _ = capture_out_fusion(
+        lambda out: out + out.T
+    )
+    assert bad_out_fn is not None and bad_vals_type is not None
+    with self.assertRaises(ValueError):
+      fuser_adapter.push_pull_block_spec(
+          bad_out_fn, sub_spec, bad_vals_type, raw_type, grid_len=2
+      )
+
+  def test_op_fusion_context_nested_and_inner_unfused_op(self):
+    x = jnp.arange(4, dtype=jnp.float32).reshape((2, 2))
+    y = jnp.ones((2, 2), dtype=jnp.float32)
+
+    class CompositeFusibleOp(
+        op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]
+    ):
+      config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+
+      def _fwd(
+          self, x: jax.Array, y: jax.Array, *, return_residuals: bool, config
+      ):
+        del config
+        assert not return_residuals
+        assert x.shape == y.shape, f"{x.shape} != {y.shape}"
+        return x + y, None
+
+      def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+        del ba  # Unused.
+        return _HEURISTICS_CONFIG
+
+      def _fusible_fwd(self, x_f, y_f, *, out_fusions=None, config):
+        del config
+        assert not fuser_adapter.in_op_fusion_context()
+        assert isinstance(x_f, fuser.Fusion)
+        assert isinstance(y_f, fuser.Fusion)
+        # Calling an unfused helper `Op` inside `_fusible_fwd` must run its
+        # normal `_fwd` path rather than treating it as a nested fusible.
+        out = NonFusibleOp()(x_f(), y_f())
+        return out if out_fusions is None else out_fusions(out)
+
+    op = CompositeFusibleOp()
+    self.assertFalse(fuser_adapter.in_op_fusion_context())
+
+    @fuser_adapter.fuse(static_argnames=("scale",))
+    def inner_fused(x, y, *, scale: float):
+      self.assertTrue(fuser_adapter.in_op_fusion_context())
+      return op(x * scale, y)
+
+    @fuser_adapter.fuse
+    def outer_fused(x, y):
+      self.assertTrue(fuser_adapter.in_op_fusion_context())
+      out = inner_fused(x, y, scale=2.0) - 1.0
+      self.assertTrue(fuser_adapter.in_op_fusion_context())
+      return out
+
+    self.assertTrue(
+        jnp.array_equal(outer_fused(x, y), (x * 2.0 + y) - 1.0)
+    )
+    self.assertTrue(
+        jnp.array_equal(jax.jit(outer_fused)(x, y), (x * 2.0 + y) - 1.0)
+    )
+    self.assertFalse(fuser_adapter.in_op_fusion_context())
 
 
 class BoundArgumentsTest(parameterized.TestCase):

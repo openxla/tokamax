@@ -19,9 +19,12 @@ from typing import Any, override
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 from tokamax._src import jaxtyping
 from tokamax._src.ops import op
 from tokamax._src.ops.masked_dense_mla import reference
+
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 
 class MaskedDenseMla[C](op.Op[Any, jax.Array, None, C, Any]):
@@ -30,21 +33,21 @@ class MaskedDenseMla[C](op.Op[Any, jax.Array, None, C, Any]):
   @jaxtyping.jaxtyped
   def bind(
       self,
-      q: Float[Array, "T H D"],
-      cache_kv_nope: UInt8[Array, "P S 4 128"],
-      cache_kv_rope: UInt8[Array, "P R 4 128"],
-      kv_lens: Int[Array, "M"],
-      topk_indices: Int[Array, "T K"],
-      page_indices: Int[Array, "N"],
-      cu_q_lens: Int[Array, "B"],
-      distribution: Int[Array, "3"],
+      q: Float[Array | AbstractArray, "T H D"],
+      cache_kv_nope: UInt8[Array | AbstractArray, "P S 4 128"],
+      cache_kv_rope: UInt8[Array | AbstractArray, "P R 4 128"],
+      kv_lens: Int[Array | np.ndarray | AbstractArray, "M"],
+      topk_indices: Int[Array | AbstractArray, "T K"],
+      page_indices: Int[Array | np.ndarray | AbstractArray, "N"],
+      cu_q_lens: Int[Array | np.ndarray | AbstractArray, "B"],
+      distribution: Int[Array | np.ndarray | AbstractArray, "3"],
       *,
       sm_scale: float = 1.0,
       k_scale: float = 1.0,
       mask_value: float | None = None,
       max_kv_len: int | None = None,
       chunk_prefill_size: int | None = None,
-      sequence_start: Int[Array, ""] | None = None,
+      sequence_start: Int[Array | AbstractArray, ""] | None = None,
       return_residuals: bool = False,
   ) -> op.BoundArguments:
     if cache_kv_nope.dtype != jnp.uint8 or cache_kv_rope.dtype != jnp.uint8:

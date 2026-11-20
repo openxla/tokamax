@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.autotuning import arg_spec
+from tokamax._src.ops.batched_rpa.kernel import configs
 
 
 class HashableNPArray(np.ndarray):
@@ -64,8 +65,6 @@ def _make_rpa_spec(
   Generates inputs and metadata arrays from sequence length and mode,
   following the approach in batched RPA microbenchmarks.
   """
-  head_dim_aligned = _cdiv(head_dim, 128) * 128
-
   if mode == "decode":
     total_q_len = num_seqs
     cu_q_lens_list = list(range(num_seqs + 1))
@@ -124,9 +123,7 @@ def _make_rpa_spec(
   total_num_pages = max(num_pages, page_count)
 
   # Tensor shapes.
-  queries = jax.ShapeDtypeStruct(
-      (total_q_len, num_q_heads, head_dim), q_dtype
-  )
+  queries = jax.ShapeDtypeStruct((total_q_len, num_q_heads, head_dim), q_dtype)
   keys = jax.ShapeDtypeStruct(
       (total_q_len, num_kv_heads, head_dim), kv_cache_dtype
   )
@@ -134,13 +131,20 @@ def _make_rpa_spec(
       (total_q_len, num_kv_heads, head_dim), kv_cache_dtype
   )
   kv_packing = 32 // jax.dtypes.itemsize_bits(kv_cache_dtype)
+  num_folds = configs.num_lane_folds_in_head_dim(
+      head_dim,
+      jnp.dtype(kv_cache_dtype),
+      configs.KVLayout.HEAD_ALONG_SUBLANE,
+      128,
+  )
+  folded_head_dim = _cdiv(head_dim // num_folds, 128) * 128
   kv_cache = jax.ShapeDtypeStruct(
       (
           total_num_pages,
           page_size,
-          _cdiv(num_kv_heads * 2, kv_packing),
+          _cdiv(num_kv_heads * 2 * num_folds, kv_packing),
           kv_packing,
-          head_dim_aligned,
+          folded_head_dim,
       ),
       kv_cache_dtype,
   )

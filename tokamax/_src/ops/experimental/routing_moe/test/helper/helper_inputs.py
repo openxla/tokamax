@@ -22,6 +22,7 @@ from typing import Self
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src import block_scaled as block_scaled_lib
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
@@ -186,6 +187,34 @@ def sub_channel_quantize(
   return jnp.concat(w_lst, axis=1), jnp.concat(scale_lst, axis=1)[:, :, None]
 
 
+@jax.jit(static_argnames=("quant_dtype", "k_shards"))
+def block_scaled_quantize(
+    x: jax.Array,
+    quant_dtype: jax.typing.DTypeLike,
+    *,
+    k_shards: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+  """Quantizes `x` into strided block-scaled FP8 data and `e8m0` scales."""
+  if k_shards < 1 or x.shape[-2] % k_shards != 0:
+    raise ValueError(
+        f"k_shards={k_shards} must be >= 1 and divide k={x.shape[-2]}."
+    )
+  if k_shards == 1:
+    return block_scaled_lib.quantize(x, quant_dtype)
+  q_parts, scale_parts = zip(
+      *(
+          block_scaled_lib.quantize(part, quant_dtype)
+          for part in jnp.split(x, k_shards, axis=-2)
+      ),
+      strict=True,
+  )
+  return (
+      jnp.concatenate(q_parts, axis=-2),
+      jnp.concatenate(scale_parts, axis=-2),
+  )
+
+
+@jax.jit(static_argnames=("shape", "dtype"))
 def _random_normal(
     key: jax.Array,
     shape: tuple[int, ...],
@@ -204,8 +233,10 @@ class MoEInputs:
     gating_output: `[num_tokens, num_experts]` router logits.
     w1: `[num_experts, hidden, 2 * intermediate]` gate and up weights.
     w2: `[num_experts, intermediate, hidden]` down weights.
-    w1_scale: `[num_experts, num_blocks, 1, 2 * intermediate]` scales of `w1`.
-    w2_scale: `[num_experts, num_blocks, 1, hidden]` scales of `w2`.
+    w1_scale: `[num_experts, num_blocks, 1, 2 * intermediate]` or block-scaled
+      `[num_experts, scale_rows, 2 * intermediate]` scales of `w1`.
+    w2_scale: `[num_experts, num_blocks, 1, hidden]` or block-scaled
+      `[num_experts, scale_rows, hidden]` scales of `w2`.
     w1_bias: `[num_experts, 1, 2 * intermediate]`.
     w2_bias: `[num_experts, 1, hidden]`.
     w1_shared: `[1, hidden, 2 * intermediate]` shared expert gate/up.
@@ -287,21 +318,35 @@ class MoEInputs:
         w2_shared=None,
     )
 
-  def quantize(self, w_dtype: jnp.dtype, block_size: int | None) -> Self:
+  def quantize(
+      self,
+      w_dtype: jnp.dtype,
+      block_size: int | None = None,
+      *,
+      block_scaled: bool = False,
+      w2_k_shards: int = 1,
+      shared_w2_k_shards: int = 1,
+  ) -> Self:
     """Quantizes every weight to `w_dtype` with attached scales."""
+    if block_scaled and block_size is not None:
+      raise ValueError("block_size cannot be set when block_scaled is True.")
 
-    def _quant(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def _quant(w: jax.Array, k_shards: int = 1) -> tuple[jax.Array, jax.Array]:
+      if block_scaled:
+        return block_scaled_quantize(w, w_dtype, k_shards=k_shards)
       return sub_channel_quantize(w, w_dtype, block_size)
 
     def _maybe_quant(
-        w: jax.Array | None,
+        w: jax.Array | None, k_shards: int = 1
     ) -> tuple[jax.Array | None, jax.Array | None]:
-      return (None, None) if w is None else _quant(w)
+      return (None, None) if w is None else _quant(w, k_shards=k_shards)
 
     w1, w1_scale = _quant(self.w1)
-    w2, w2_scale = _quant(self.w2)
+    w2, w2_scale = _quant(self.w2, k_shards=w2_k_shards)
     w1_shared, w1_shared_scale = _maybe_quant(self.w1_shared)
-    w2_shared, w2_shared_scale = _maybe_quant(self.w2_shared)
+    w2_shared, w2_shared_scale = _maybe_quant(
+        self.w2_shared, k_shards=shared_w2_k_shards
+    )
     return dataclasses.replace(
         self,
         w1=w1,

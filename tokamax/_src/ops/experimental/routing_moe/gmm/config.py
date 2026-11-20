@@ -29,6 +29,7 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
@@ -55,13 +56,38 @@ class MatmulMode(enum.StrEnum):
 
   # x and w are both passed in unquantized.
   UNQUANTIZED = enum.auto()
-  # w is passed in quantized with scales. x is passed in unquantized, and the
-  # kernel quantizes it before the matmul. The output is scaled by both x and w
-  # scales.
+  # w is passed in quantized with subchannel scales. x is passed in unquantized,
+  # and the kernel quantizes it before the matmul. The output is scaled by both
+  # x and w scales.
   QUANTIZED = enum.auto()
+  # w is passed in quantized with float8_e8m0fnu block scales. x is passed in
+  # unquantized and block-scaled dynamically before the matmul.
+  BLOCK_SCALED = enum.auto()
   # w is passed in quantized with scales. x is passed in unquantized and stays
   # unquantized. The output is scaled by w scales.
   WEIGHT_ONLY_SCALE_AFTER = enum.auto()
+  # Like WEIGHT_ONLY_SCALE_AFTER, but w is dequantized before the matmul. Used
+  # when w quant blocks are narrower than the MXU.
+  WEIGHT_ONLY_SCALE_BEFORE = enum.auto()
+
+
+@dataclass_util.require_no_default
+@dataclasses.dataclass(frozen=True)
+class IndexWindow:
+  """Layout of a routing index table in SMEM.
+
+  The index of global row `m` at N tile `n` is read from
+  `(n % num_buffers) * buffer_size + m % ring_size`.
+
+  Attributes:
+    num_buffers: Number of buffers, alternated by N tile.
+    buffer_size: Words per buffer.
+    ring_size: Rows of the table addressable within one buffer.
+  """
+
+  num_buffers: int
+  buffer_size: int
+  ring_size: int
 
 
 @dataclass_util.require_no_default
@@ -74,6 +100,85 @@ class ComputeConfig:
   acc_dtype: jnp.dtype
   tpu_info: pltpu.TpuInfo
   dynamic_quant: tensor_spec.SubchannelQuantSpec | None
+  w_quant: tensor_spec.WeightQuantSpec | None
+
+
+def _make_compute_config(
+    x_dtype: jnp.dtype,
+    matmul_dtype: jnp.dtype,
+    *,
+    w: tensor_spec.WeightSpec,
+    acc_dtype: jnp.dtype,
+    block_size: int | None,
+    tpu_info: pltpu.TpuInfo,
+) -> ComputeConfig:
+  """Builds the `ComputeConfig` for one projection from its LHS dtype."""
+  match w.quant:
+    case None:
+      if matmul_dtype != x_dtype:
+        raise NotImplementedError("Quantizing x requires a quantized w.")
+      matmul_mode = MatmulMode.UNQUANTIZED
+      dynamic_quant = None
+    case tensor_spec.BlockScaledQuantSpec():
+      matmul_mode = MatmulMode.BLOCK_SCALED
+      dynamic_quant = None
+    case tensor_spec.SubchannelQuantSpec():
+      if matmul_dtype == x_dtype:
+        is_scale_before = plan_lib.dequantizes_w_before_matmul(
+            x_dtype=x_dtype,
+            matmul_dtype=matmul_dtype,
+            w=w,
+            tpu_info=tpu_info,
+        )
+        matmul_mode = (
+            MatmulMode.WEIGHT_ONLY_SCALE_BEFORE
+            if is_scale_before
+            else MatmulMode.WEIGHT_ONLY_SCALE_AFTER
+        )
+        dynamic_quant = None
+      else:
+        if block_size is None:
+          raise ValueError(
+              "plan.x_quant_block_size is required for subchannel dynamic"
+              " quantization."
+          )
+        matmul_mode = MatmulMode.QUANTIZED
+        dynamic_quant = tensor_spec.SubchannelQuantSpec(block_size=block_size)
+
+  return ComputeConfig(
+      matmul_mode=matmul_mode,
+      matmul_dtype=matmul_dtype,
+      acc_dtype=acc_dtype,
+      tpu_info=tpu_info,
+      dynamic_quant=dynamic_quant,
+      w_quant=w.quant,
+  )
+
+
+def _check_lhs_not_narrower(lhs_dtype: jnp.dtype, w_dtype: jnp.dtype) -> None:
+  if jax.dtypes.itemsize_bits(lhs_dtype) < jax.dtypes.itemsize_bits(w_dtype):
+    raise ValueError(
+        f"matmul_dtype ({lhs_dtype}) must not be narrower than w dtype"
+        f" ({w_dtype})."
+    )
+
+
+def _validate_block_scaled_weight(
+    w_spec: tensor_spec.WeightSpec, lhs_dtype: jnp.dtype
+) -> None:
+  """Validates contracting size and scale_rows for a block-scaled weight."""
+  assert isinstance(w_spec.quant, tensor_spec.BlockScaledQuantSpec)
+  block_scaled.check_contracting_size(w_spec.in_size, lhs_dtype)
+  compact_rows = block_scaled.scale_rows(w_spec.in_size, dtype=lhs_dtype)
+  padded_rows = block_scaled.kernel_scale_rows(
+      w_spec.in_size, dtype=lhs_dtype
+  )
+  if w_spec.quant.scale_rows not in (compact_rows, padded_rows):
+    expected = " or ".join(map(str, dict.fromkeys((compact_rows, padded_rows))))
+    raise ValueError(
+        f"Block-scaled weight scale_rows must be {expected} for"
+        f" in_size={w_spec.in_size}. Got {w_spec.quant.scale_rows}."
+    )
 
 
 def _resolve_mode(routing: tensor_spec.RoutingSpec | None) -> RoutingMode:
@@ -147,33 +252,33 @@ class RoutingGmmConfig:
     if spec.x.quant is not None:
       # TODO: Load pre-computed scales in compute.
       raise NotImplementedError("Pre-quantized x is not supported yet.")
+    if spec.w2 is not None and (
+        spec.w2.dtype != spec.w.dtype
+        or type(spec.w2.quant) is not type(spec.w.quant)
+    ):
+      raise NotImplementedError("w2 must match the precision of w.")
 
     # Because x only states the input storage dtype while plan states the MXU
     # execution dtype, neither alone defines whether dynamic quantization runs.
     # Config reconciles both into ComputeConfig.
-    x_quant = None
-    if plan.matmul_dtype != spec.x.dtype:
-      assert plan.x_quant_block_size is not None
-      x_quant = tensor_spec.SubchannelQuantSpec(
-          block_size=plan.x_quant_block_size
-      )
-
-    if x_quant is not None and spec.w.quant is not None:
-      matmul_mode = MatmulMode.QUANTIZED
-    elif x_quant is None and spec.w.quant is not None:
-      matmul_mode = MatmulMode.WEIGHT_ONLY_SCALE_AFTER
-    elif x_quant is None and spec.w.quant is None:
-      matmul_mode = MatmulMode.UNQUANTIZED
-    else:
-      raise NotImplementedError("Quantizing x requires a quantized w.")
-
-    compute_cfg = ComputeConfig(
-        matmul_mode=matmul_mode,
-        matmul_dtype=plan.matmul_dtype,
+    compute_cfg = _make_compute_config(
+        spec.x.dtype,
+        plan.matmul_dtype,
+        w=spec.w,
         acc_dtype=plan.acc_dtype,
+        block_size=plan.x_quant_block_size,
         tpu_info=tpu_info,
-        dynamic_quant=x_quant,
     )
+    compute2_cfg = None
+    if spec.w2 is not None and plan.w2_matmul_dtype is not None:
+      compute2_cfg = _make_compute_config(
+          spec.x.dtype,
+          plan.w2_matmul_dtype,
+          w=spec.w2,
+          acc_dtype=plan.acc_dtype,
+          block_size=plan.x_quant_block_size,
+          tpu_info=tpu_info,
+      )
     out_spec = _resolve_out_spec(spec=spec, plan=plan, out_format=out_format)
 
     cfg = cls(
@@ -181,7 +286,7 @@ class RoutingGmmConfig:
         plan=plan,
         x=ActivationConfig(spec=spec.x, mode=_resolve_mode(spec.gather)),
         compute=compute_cfg,
-        compute2=None if spec.w2 is None else compute_cfg,
+        compute2=compute2_cfg,
         out=ActivationConfig(spec=out_spec, mode=_resolve_mode(spec.scatter)),
         tpu_info=tpu_info,
     )
@@ -194,29 +299,67 @@ class RoutingGmmConfig:
   def _validate_dtypes(self) -> None:
     """Validates precision and quantization invariants."""
     w, w2 = self.spec.w, self.spec.w2
+    if (w2 is None) != (self.plan.w2_matmul_dtype is None):
+      raise ValueError("w2 and plan.w2_matmul_dtype must be set together.")
     if w2 is not None and (
-        w2.dtype != w.dtype or (w2.quant is None) != (w.quant is None)
+        w2.dtype != w.dtype or type(w2.quant) is not type(w.quant)
     ):
       # The intermediate is fed to the second matmul in x's execution dtype,
       # which is only valid when both weights share a precision.
       raise NotImplementedError("w2 must match the precision of w.")
-    if (
+    w2_quant = None if self.compute2 is None else self.compute2.dynamic_quant
+    if self.compute.matmul_mode == MatmulMode.BLOCK_SCALED:
+      self._validate_block_scaled_dtypes()
+    elif (
         self.compute.dynamic_quant is None
+        and w2_quant is None
         and self.plan.x_quant_block_size is not None
     ):
       raise ValueError(
-          "plan.x_quant_block_size has no effect when x is not quantized."
+          "plan.x_quant_block_size has no effect when neither x nor the w2"
+          " input is quantized."
       )
     if self.plan.acc_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype):
       raise ValueError(
           f"acc_dtype must be bfloat16 or float32. Got {self.plan.acc_dtype}."
       )
-    x_bits = jax.dtypes.itemsize_bits(self.plan.matmul_dtype)
-    if x_bits < jax.dtypes.itemsize_bits(w.dtype):
+    _check_lhs_not_narrower(self.plan.matmul_dtype, w.dtype)
+    if w2 is not None and self.plan.w2_matmul_dtype is not None:
+      _check_lhs_not_narrower(self.plan.w2_matmul_dtype, w2.dtype)
+
+  def _validate_block_scaled_dtypes(self) -> None:
+    """Validates block-scaled precision and chip invariants."""
+    if self.plan.x_quant_block_size is not None:
       raise ValueError(
-          f"matmul_dtype ({self.plan.matmul_dtype}) must not be narrower"
-          f" than w dtype ({w.dtype})."
+          "plan.x_quant_block_size is not supported with BlockScaledQuantSpec."
       )
+    if not plan_lib.is_block_scaled_tpu(self.tpu_info):
+      raise NotImplementedError(
+          "Block-scaled quantization requires TPU_8T or newer. Got"
+          f" {self.tpu_info.chip_version}."
+      )
+    if self.x.spec.dtype != jnp.bfloat16.dtype:
+      raise NotImplementedError(
+          "Block-scaled dynamic quantization requires bfloat16 x. Got"
+          f" {self.x.spec.dtype}."
+      )
+    if self.plan.matmul_dtype not in block_scaled.FP8_DTYPES:
+      raise ValueError(
+          f"Block-scaled matmul_dtype must be in {block_scaled.FP8_DTYPES}."
+          f" Got {self.plan.matmul_dtype}."
+      )
+    if (
+        self.plan.w2_matmul_dtype is not None
+        and self.plan.w2_matmul_dtype not in block_scaled.FP8_DTYPES
+    ):
+      raise ValueError(
+          "Block-scaled w2_matmul_dtype must be in"
+          f" {block_scaled.FP8_DTYPES}. Got {self.plan.w2_matmul_dtype}."
+      )
+    _validate_block_scaled_weight(self.spec.w, self.plan.matmul_dtype)
+    if self.spec.w2 is not None:
+      assert self.plan.w2_matmul_dtype is not None
+      _validate_block_scaled_weight(self.spec.w2, self.plan.w2_matmul_dtype)
 
   def _validate_out(self) -> None:
     """Validates output dtype, quantization, and chunk alignment."""
@@ -278,14 +421,70 @@ class RoutingGmmConfig:
 
   def _validate_tiling(self) -> None:
     """Validates tile sizes and sublane alignment."""
-    if self.plan.tile_k != self.spec.size_k:
+    self._validate_k_tiling()
+    self._validate_w2_tiling()
+    self._validate_n_tiling()
+    self._validate_m_tiling()
+
+  def _validate_k_tiling(self) -> None:
+    """Validates that the K dim is not tiled."""
+    is_k_tiled = self.plan.tile_k != self.spec.size_k
+    if is_k_tiled and self.num_k2 > 1:
+      raise NotImplementedError(
+          "K dim tiling is not supported together with k2 tiling."
+      )
+    if is_k_tiled:
       raise NotImplementedError("K dim tiling is not supported yet.")
-    if self.spec.w2 is not None and self.plan.tile_k2 != self.spec.size_k2:
-      raise NotImplementedError("K2 dim tiling is not supported yet.")
-    if self.spec.w2 is not None and self.plan.tile_n != self.spec.size_out_n:
+    x_chunk_cols = (
+        layout_util.get_packing(self.x.spec.dtype) * self.tpu_info.num_lanes
+    )
+    if self.plan.tile_k % x_chunk_cols != 0:
+      raise ValueError(
+          f"tile_k ({self.plan.tile_k}) must be a multiple of the input's"
+          f" compact chunk width ({x_chunk_cols})."
+      )
+
+  def _validate_w2_tiling(self) -> None:
+    """Validates the k2 tiling of the fused w2."""
+    if self.spec.w2 is None:
+      return
+    size_k2 = self.spec.size_k2
+    assert size_k2 is not None and self.plan.tile_k2 is not None
+    if size_k2 % self.plan.tile_k2 != 0:
+      raise ValueError(
+          f"tile_k2 ({self.plan.tile_k2}) must divide size_k2 ({size_k2})."
+      )
+    if self.plan.tile_k2 % self.tpu_info.num_lanes != 0:
+      raise ValueError(
+          f"tile_k2 ({self.plan.tile_k2}) must be a multiple of"
+          f" {self.tpu_info.num_lanes}."
+      )
+    w2_quant = self.spec.w2.quant
+    if w2_quant is not None:
+      if isinstance(w2_quant, tensor_spec.BlockScaledQuantSpec):
+        if self.num_k2 > 1:
+          raise NotImplementedError(
+              "k2 tiling is not supported with BlockScaledQuantSpec."
+          )
+      elif isinstance(w2_quant, tensor_spec.SubchannelQuantSpec):
+        sizes = (self.plan.tile_k2, w2_quant.block_size)
+        if max(sizes) % min(sizes) != 0:
+          raise ValueError(
+              f"tile_k2 ({self.plan.tile_k2}) and the w2 quantization block"
+              f" size ({w2_quant.block_size}) must divide one"
+              " another."
+          )
+      else:
+        raise NotImplementedError(
+            f"Fused w2 does not support {type(w2_quant).__name__}."
+        )
+    if self.plan.tile_n != self.spec.size_out_n:
       raise NotImplementedError(
           "N dim tiling is not supported when w2 is fused."
       )
+
+  def _validate_n_tiling(self) -> None:
+    """Validates that tile_n evenly splits the output."""
     if self.spec.size_out_n % self.plan.tile_n != 0:
       raise ValueError(
           f"tile_n ({self.plan.tile_n}) must divide the output width"
@@ -296,6 +495,9 @@ class RoutingGmmConfig:
           f"tile_n ({self.plan.tile_n}) must be a multiple of the output's"
           " compact chunk width."
       )
+
+  def _validate_m_tiling(self) -> None:
+    """Validates tile_m and bucket_base sizes and sublane alignment."""
     if not 0 < self.plan.bucket_base <= self.plan.tile_m:
       raise ValueError(
           f"bucket_base ({self.plan.bucket_base}) must be in (0, tile_m="
@@ -312,13 +514,36 @@ class RoutingGmmConfig:
       )
 
   def _validate_buffers(self) -> None:
-    """Validates pipeline buffer counts."""
+    """Validates pipeline buffer counts and routing index placement."""
     if self.plan.num_xo_buffers < 3:
       raise ValueError(
           "To overlap DMA SALU, activation buffer counts must be at least 3."
       )
     if self.plan.num_w_buffers < 2:
       raise ValueError("Buffer counts must be at least 2.")
+    has_routed_io = (
+        self.spec.gather is not None or self.spec.scatter is not None
+    )
+    if self.plan.smem_indices and (
+        not has_routed_io or self.spec.size_out_m <= 0
+    ):
+      raise ValueError(
+          "smem_indices=True requires gather or scatter and size_out_m > 0."
+      )
+
+  @property
+  def idx_window(self) -> IndexWindow:
+    """SMEM layout of the routing index tables read by the pipeline."""
+    if self.plan.smem_indices:
+      # The whole table is resident, so global and local addresses match.
+      return IndexWindow(
+          num_buffers=1, buffer_size=0, ring_size=self.spec.size_out_m
+      )
+    return IndexWindow(
+        num_buffers=self.plan.num_idx_buffers,
+        buffer_size=self.plan.idx_buffer_size,
+        ring_size=self.plan.idx_ring_size,
+    )
 
   @property
   def max_num_gm(self) -> int:
@@ -338,11 +563,32 @@ class RoutingGmmConfig:
     return num_k
 
   @property
+  def num_k2(self) -> int:
+    """Number of intermediate (k2) slices the fused down projection runs."""
+    size_k2 = self.spec.size_k2
+    if size_k2 is None:
+      return 1
+    assert self.plan.tile_k2 is not None
+    return pl.cdiv(size_k2, self.plan.tile_k2)
+
+  @property
+  def contiguous_fused_w(self) -> bool:
+    """Whether fused gate and up weights are fetched as one `[K, 2*N]` block."""
+    return self.spec.is_fused_act and self.num_n == 1 and self.num_k2 == 1
+
+  @property
   def kernel_name(self) -> str:
+    """Kernel name encoding the modes, shapes and tiling."""
     name = f"routing_gmm-{self.x.mode}-{self.out.mode}"
     name += f"-g{self.spec.size_local_groups}-m{self.spec.size_out_m}"
-    name += f"-k{self.spec.size_k}-n{self.spec.size_out_n}"
-    name += f"-tm{self.plan.tile_m}-tn{self.plan.tile_n}"
+    name += f"-k{self.spec.size_k}"
+    if self.spec.size_k2 is not None:
+      name += f"-k2{self.spec.size_k2}"
+    name += f"-n{self.spec.size_out_n}"
+    name += f"-tm{self.plan.tile_m}"
+    if self.plan.tile_k2 is not None:
+      name += f"-tk2{self.plan.tile_k2}"
+    name += f"-tn{self.plan.tile_n}"
     return name
 
   @property

@@ -14,7 +14,9 @@
 # ==============================================================================
 """Ragged dot Pallas-Mosaic-TPU implementation."""
 
+from collections.abc import Callable
 import dataclasses
+import functools
 import itertools
 from typing import ClassVar, override
 
@@ -24,7 +26,9 @@ import jax.numpy as jnp
 from jax.sharding import ManualAxisType
 import pydantic
 from tokamax._src import quantization
+from tokamax._src.ops import fuser_adapter
 from tokamax._src.ops import op
+from tokamax._src.ops.gmm_v2 import gmm_fuser
 from tokamax._src.ops.gmm_v2 import gmm_v2 as gmm_backend
 from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.ragged_dot import base
@@ -33,6 +37,9 @@ from tokamax._src.ops.ragged_dot import base
 QArray = base.QArray
 AsQArray = base.AsQArray
 Residuals = None
+type FusibleOperand = (
+    jax.Array | QArray | AsQArray | fuser_adapter.InputFusion
+)
 
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
@@ -88,6 +95,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
   """
 
   config_cls: ClassVar[type[Config]] = Config
+  fusible_argnames: ClassVar[tuple[str, ...]] = ("lhs", "rhs")
   qdtype: jax.typing.DTypeLike | None = None
   # Local weight group count for the drhs (tgmm) path. Under expert
   # parallelism this differs from `group_sizes.shape[0]` (which is global).
@@ -164,6 +172,75 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
       zero_initialize: bool = False,
       fuse_gateup_activation: str | None = None,
   ) -> tuple[jax.Array, base.Residuals]:
+    return self._run_fwd(
+        lhs,
+        rhs,
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+        return_residuals=return_residuals,
+        config=config,
+        group_offset=group_offset,
+        activation=activation,
+        manual_axis_type=manual_axis_type,
+        zero_initialize=zero_initialize,
+        fuse_gateup_activation=fuse_gateup_activation,
+    )
+
+  @override
+  def _fusible_fwd(
+      self,
+      lhs: FusibleOperand,
+      rhs: FusibleOperand,
+      *,
+      out_fusions: fuser_adapter.OutputFusion | None = None,
+      config: Config,
+      **kwargs,
+  ) -> jax.Array:
+    if isinstance(lhs, QArray):
+      lhs = fuser_adapter.materialize(lhs)
+    if isinstance(rhs, (QArray, AsQArray)):
+      rhs = fuser_adapter.materialize(rhs)
+    out, _ = self._run_fwd(
+        lhs,
+        rhs,
+        return_residuals=False,
+        config=config,
+        gmm_fn=functools.partial(
+            gmm_fuser.gmm_v2_fusible, out_fusions=out_fusions
+        ),
+        tgmm_fn=functools.partial(
+            gmm_fuser.tgmm_v2_fusible, out_fusions=out_fusions
+        ),
+        **kwargs,
+    )
+    return out
+
+  def _run_fwd(
+      self,
+      lhs: FusibleOperand,
+      rhs: FusibleOperand,
+      *,
+      group_sizes: jax.Array | base.GroupSizes,
+      ragged_dot_dimension_numbers: jax.lax.RaggedDotDimensionNumbers,
+      precision: base.CanonicalPrecision,
+      preferred_element_type: jax.typing.DTypeLike | None,
+      return_residuals: bool = False,
+      config: Config,
+      group_offset: jax.Array | None = None,
+      activation: base.ActivationFunction | None = None,
+      manual_axis_type: ManualAxisType | None = None,
+      zero_initialize: bool = False,
+      fuse_gateup_activation: str | None = None,
+      gmm_fn: Callable[..., jax.Array] | None = None,
+      tgmm_fn: Callable[..., jax.Array] | None = None,
+  ) -> tuple[jax.Array, base.Residuals]:
+    """Dispatches forward or VJP ragged dot shapes to `gmm_fn` or `tgmm_fn`."""
+    if gmm_fn is None:
+      gmm_fn = gmm_backend.gmm_v2
+    if tgmm_fn is None:
+      tgmm_fn = tgmm_backend.tgmm_v2
     if _has_manual_axes(manual_axis_type):
       raise NotImplementedError(
           "v2 does not support manual_axis_type yet. But got"
@@ -316,7 +393,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         lhs_scale = None
         lhs_quant_dtype = None
 
-      out = gmm_backend.gmm_v2(
+      out = gmm_fn(
           lhs_val,
           rhs_val,
           group_sizes,
@@ -356,9 +433,13 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         lhs_scale = None
         lhs_quant_dtype = None
 
-      rhs_val = quantization.as_array(rhs)
+      rhs_val = (
+          quantization.as_array(rhs)
+          if isinstance(rhs, (QArray, AsQArray))
+          else rhs
+      )
 
-      out = gmm_backend.gmm_v2(
+      out = gmm_fn(
           lhs_val,  # [m, n]
           rhs_val,  # [num_groups, k, n]
           group_sizes,
@@ -393,7 +474,11 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         )
       num_actual_groups = self.num_actual_groups
 
-      lhs_val = quantization.as_array(lhs)
+      lhs_val = (
+          quantization.as_array(lhs)
+          if isinstance(lhs, (QArray, AsQArray))
+          else lhs
+      )
 
       if isinstance(rhs, AsQArray):
         rhs = rhs.as_qarray()
@@ -406,7 +491,7 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         rhs_val = rhs
         rhs_scale = None
 
-      out = tgmm_backend.tgmm_v2(
+      out = tgmm_fn(
           lhs_val,  # [m, k]
           rhs_val,  # [m, n]
           group_sizes,
@@ -466,8 +551,14 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
     else:
       raise NotImplementedError(UNSUPPORTED_DIMENSIONS_MSG.format(dims))
 
-    k_ = ((k + 128 - 1) // 128) * 128
-    n_ = ((n + 128 - 1) // 128) * 128
+    def _tile_candidates(dim: int) -> set[int]:
+      aligned = ((dim + 128 - 1) // 128) * 128
+      num_lanes = aligned // 128
+      return (
+          {128 * (2**i) for i in range(8) if 128 * (2**i) <= aligned}
+          | {((num_lanes + (2**i) - 1) // (2**i)) * 128 for i in range(6)}
+          | {aligned}
+      )
 
     try:
       tpu_gen = getattr(pltpu.get_tpu_info(), "generation", 0)
@@ -479,24 +570,8 @@ class PallasMosaicTpuV2RaggedDot(base.RaggedDot[Config, None]):
         for i in range(8)
         if 128 * (2**i) <= m and 128 * (2**i) <= max_tile_m
     ]
-    tile_k_range = (
-        {128 * (2**i) for i in range(8) if 128 * (2**i) <= k_}
-        | {
-            k_ // (2**i)
-            for i in range(6)
-            if k_ // (2**i) >= 128 and (k_ // (2**i)) % 128 == 0
-        }
-        | {k_}
-    )
-    tile_n_range = (
-        {128 * (2**i) for i in range(8) if 128 * (2**i) <= n_}
-        | {
-            n_ // (2**i)
-            for i in range(6)
-            if n_ // (2**i) >= 128 and (n_ // (2**i)) % 128 == 0
-        }
-        | {n_}
-    )
+    tile_k_range = _tile_candidates(k)
+    tile_n_range = _tile_candidates(n)
     lhs_buffer_count_range = (
         [None]
         if dims == DRHS_RAGGED_DOT_DIM_NUMS

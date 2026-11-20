@@ -17,8 +17,10 @@
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 
 
@@ -94,7 +96,7 @@ def _quantized_block_matmul(
     preferred_element_type: jnp.dtype,
 ) -> jax.Array:
   """Computes one dynamically quantized K-block matmul over weight blocks."""
-  assert cfg.dynamic_quant is not None
+  assert isinstance(cfg.dynamic_quant, tensor_spec.SubchannelQuantSpec)
   x_q_dtype = cfg.matmul_dtype
   block_k = block_x.shape[1]
 
@@ -145,7 +147,7 @@ def _quantized_matmul(
     w_scale: jax.Array,
 ) -> jax.Array:
   """Computes dynamically quantized matrix multiplication for a single tile."""
-  assert cfg.dynamic_quant is not None
+  assert isinstance(cfg.dynamic_quant, tensor_spec.SubchannelQuantSpec)
   mxu_size = cfg.tpu_info.mxu_column_size
   tile_k, tile_n = w.shape
   num_w_blocks = w_scale.shape[0]
@@ -244,19 +246,43 @@ def _scale_after_matmul(
   return jnp.concat(list_acc, axis=1)
 
 
+def _scale_before_matmul(
+    cfg: config.ComputeConfig,
+    x: jax.Array,
+    w: jax.Array,
+    w_scale: jax.Array,
+) -> jax.Array:
+  """Computes unquantized x @ quantized_w by dequantizing w first.
+
+  Args:
+    cfg: Compute config. `cfg.dynamic_quant` must be None.
+    x: Activation tile of shape (tile_m, tile_k), not quantized.
+    w: Quantized weight tile of shape (tile_k, tile_n).
+    w_scale: Weight scale of shape (num_w_blocks, 1, tile_n).
+
+  Returns:
+    The product of shape (tile_m, tile_n) in `cfg.acc_dtype`.
+  """
+  assert cfg.dynamic_quant is None
+  tile_k, tile_n = w.shape
+  num_w_blocks = w_scale.shape[0]
+  assert tile_k % num_w_blocks == 0, f"{num_w_blocks=} must divide {tile_k=}."
+  w_q_block_size = tile_k // num_w_blocks
+  w = w.astype(cfg.matmul_dtype).reshape(num_w_blocks, w_q_block_size, tile_n)
+  w = (w * w_scale.astype(cfg.matmul_dtype)).reshape(tile_k, tile_n)
+  return jnp.matmul(x, w, preferred_element_type=jnp.float32).astype(
+      cfg.acc_dtype
+  )
+
+
 def matmul(
     cfg: config.ComputeConfig,
     x: jax.Array,
     w: jax.Array,
     w_scale: jax.Array | None,
     w_bias: jax.Array | None,
-    *,
-    is_last_k_step: bool = True,
-    is_first_k_step: bool = True,
 ) -> jax.Array:
   """Performs stateless matrix multiplication for a single tile."""
-  # TODO: Support multiple N/K tiles.
-  assert is_last_k_step and is_first_k_step
 
   match cfg.matmul_mode:
     case config.MatmulMode.UNQUANTIZED:
@@ -266,9 +292,21 @@ def matmul(
     case config.MatmulMode.QUANTIZED:
       assert w_scale is not None
       acc = _quantized_matmul(cfg, x, w, w_scale)
+    case config.MatmulMode.BLOCK_SCALED:
+      assert w_scale is not None
+      acc = block_scaled.matmul(
+          x,
+          w,
+          w_scale,
+          matmul_dtype=cfg.matmul_dtype,
+          acc_dtype=cfg.acc_dtype,
+      )
     case config.MatmulMode.WEIGHT_ONLY_SCALE_AFTER:
       assert w_scale is not None
       acc = _scale_after_matmul(cfg, x, w, w_scale)
+    case config.MatmulMode.WEIGHT_ONLY_SCALE_BEFORE:
+      assert w_scale is not None
+      acc = _scale_before_matmul(cfg, x, w, w_scale)
     case _:
       raise NotImplementedError(f"Unsupported matmul mode: {cfg.matmul_mode}")
 

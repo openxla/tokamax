@@ -236,4 +236,43 @@ ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         num_heads=12,
         seq_len=2048,
     ),
+    # Kimi K3 InferenceX decode shapes (DCP=32 -> 3 heads/core, DP=2 x DCP=16
+    # -> 6 heads/core; plain 1-token decode up to 64 seqs/worker and DSpark
+    # speculative decode with 1+7=8 tokens at 1 seq or 1+3=4 tokens at 16 seqs):
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_decode_b1_t1_n1_bf16",
+        num_heads=3,
+        seq_len=1,
+        num_segments=1,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_dspark_decode_b1_t8_n1_bf16",
+        num_heads=3,
+        seq_len=8,
+        num_segments=1,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_dspark_decode_b1_t64_n16_bf16",
+        num_heads=3,
+        seq_len=64,
+        num_segments=16,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp32_decode_b1_t64_n64_bf16",
+        num_heads=3,
+        seq_len=64,
+        num_segments=64,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp16_dp2_dspark_decode_b1_t64_n16_bf16",
+        num_heads=6,
+        seq_len=64,
+        num_segments=16,
+    ),
+    _kimi_k3_2p8t_inference_spec(
+        name="tp16_dp2_decode_b1_t64_n64_bf16",
+        num_heads=6,
+        seq_len=64,
+        num_segments=64,
+    ),
 )

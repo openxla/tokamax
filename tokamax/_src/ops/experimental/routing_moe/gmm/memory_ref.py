@@ -27,13 +27,17 @@ from jax.experimental import hijax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from tokamax._src import block_scaled
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import config
 from tokamax._src.ops.experimental.routing_moe.gmm import metadata
 
-type GridIndices = tuple[jax.Array | int, jax.Array | int, jax.Array | int]
+# Grid coordinates `(n_id, gm_id, k2_id, k1_id)`.
+type GridIndices = tuple[
+    jax.Array | int, jax.Array | int, jax.Array | int, jax.Array | int
+]
 
 
 def map_memory_constraint[T](obj: T, memory_space: pltpu.MemorySpace) -> T:
@@ -111,6 +115,28 @@ class FusedWeightsRef[T](AbstractWeightRef):
     return layout_util.large_interleave_lane(b_gate, b_up)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class ContiguousFusedWeightRef[T](SingleWeightRef[T]):
+  """Fused gate and up weights fetched together in one `[K, 2*N]` buffer."""
+
+  @override
+  def get_weight(self) -> jax.Array:
+    w_gate, w_up = jnp.split(super().get_weight(), 2, axis=1)
+    return layout_util.large_interleave_lane(w_gate, w_up)
+
+  @override
+  def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+    # Split along last axis: subchannel scales are 3D, block scales are 2D.
+    s_gate, s_up = jnp.split(super().get_scale(replicate_size), 2, axis=-1)
+    return layout_util.large_interleave_lane(s_gate, s_up)
+
+  @override
+  def get_bias(self) -> jax.Array:
+    b_gate, b_up = jnp.split(super().get_bias(), 2, axis=1)
+    return layout_util.large_interleave_lane(b_gate, b_up)
+
+
 class _BypassBufferedRef(pltpu.BufferedRef):
 
   # NOTE: This is extremely hacky and only here until JAX version update
@@ -137,14 +163,16 @@ class RoutingBufferedRef(_BypassBufferedRef):
   metadata_ref: metadata.AbstractMetadataRef = dataclasses.field(
       metadata=dict(static=True)
   )
-  idx_ref: Any = dataclasses.field(default=None, metadata=dict(static=True))
+  idx_ref: jax.Ref | hijax.TransformedRef | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
   cfg: config.RoutingGmmConfig = dataclasses.field(metadata=dict(static=True))
   act_cfg: config.ActivationConfig = dataclasses.field(
       metadata=dict(static=True)
   )
 
-  def bind_idx_ref(self, idx_bref: pltpu.BufferedRef) -> Self:
-    return dataclasses.replace(self, idx_ref=idx_bref.window_ref)
+  def bind_idx_ref(self, idx_ref: jax.Ref | hijax.TransformedRef) -> Self:
+    return dataclasses.replace(self, idx_ref=idx_ref)
 
   @classmethod
   @override
@@ -184,7 +212,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
 
     Args:
       vmem_ref: VMEM slot reference for the tile's active rows.
-      grid_indices: Grid coordinates `(n_id, gm_id, k_id)` of the tile.
+      grid_indices: Grid coordinates `(n_id, gm_id, k2_id, k1_id)` of the tile.
 
     Returns:
       The loaded activation tile in `[rows, tile_k]` large layout.
@@ -206,7 +234,7 @@ class RoutingBufferedRef(_BypassBufferedRef):
     Args:
       vmem_ref: VMEM slot reference for the tile's `value.shape[0]` active rows.
       value: Computed tile result in `[rows, tile_n]` large layout.
-      grid_indices: Grid coordinates `(n_id, gm_id, k_id)` of the tile.
+      grid_indices: Grid coordinates `(n_id, gm_id, k2_id, k1_id)` of the tile.
     """
     del grid_indices
     assert self.is_output
@@ -350,19 +378,15 @@ class IndexBufferedRef(pltpu.BufferedRef):
     )
 
   def _aligned_range(
-      self,
-      n_id: jax.Array | int,
-      gm_id: jax.Array | int,
-      k_id: jax.Array | int,
+      self, grid_indices: GridIndices
   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (hbm start, local start, size) aligned to tile_m_idx."""
     block_size = jnp.uint32(self.cfg.plan.tile_m_idx)
-    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
-    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
+    window = self.cfg.idx_window
+    ring_size = jnp.uint32(window.ring_size)
+    idx_buffer_size = jnp.uint32(window.buffer_size)
     buffer_count = jnp.uint32(self.buffer_count)
-    n_id, gm_id, _ = self.metadata_ref.resolve(
-        n_id, gm_id, k_id, dtype=jnp.uint32
-    )
+    n_id, gm_id, *_ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
     # Calculate hbm address.
     m_start = self.metadata_ref.gm_id_to_m_offset[gm_id].astype(jnp.uint32)
     m_size = self.metadata_ref.gm_id_to_num_rows[gm_id].astype(jnp.uint32)
@@ -383,16 +407,16 @@ class IndexBufferedRef(pltpu.BufferedRef):
       self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
   ) -> None:
     assert self.is_input
-    assert len(grid_indices) == 3
+    assert len(grid_indices) == 4
     sem_recvs = self.sem_recvs
     window_ref = self.window_ref
     assert sem_recvs is not None
     assert window_ref is not None
-    n_id, gm_id, k_id = grid_indices
-    slot = self.metadata_ref.slot(n_id, gm_id, k_id, self.buffer_count)
+    n_id, gm_id, k2_id, k1_id = grid_indices
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
 
     aligned_start, local_start, aligned_size = self._aligned_range(
-        n_id, gm_id + self.fetch_offset, k_id
+        (n_id, gm_id + self.fetch_offset, k2_id, k1_id)
     )
     pltpu.make_async_copy(
         src_ref=idx_hbm_ref.at[pl.ds(aligned_start, aligned_size)],
@@ -405,17 +429,17 @@ class IndexBufferedRef(pltpu.BufferedRef):
       self, idx_hbm_ref: hijax.TransformedRef, grid_indices: GridIndices
   ) -> None:
     assert self.is_input
-    assert len(grid_indices) == 3
+    assert len(grid_indices) == 4
     sem_recvs = self.sem_recvs
     window_ref = self.window_ref
     assert sem_recvs is not None
     assert window_ref is not None
-    n_id, gm_id, k_id = grid_indices
-    slot = self.metadata_ref.slot(n_id, gm_id, k_id, self.buffer_count)
+    n_id, gm_id, k2_id, k1_id = grid_indices
+    slot = self.metadata_ref.slot(*grid_indices, self.buffer_count)
 
-    aligned_size = self._aligned_range(n_id, gm_id + self.fetch_offset, k_id)[
-        -1
-    ]
+    aligned_size = self._aligned_range(
+        (n_id, gm_id + self.fetch_offset, k2_id, k1_id)
+    )[-1]
     copied = window_ref.at[pl.ds(0, aligned_size)]
     pltpu.make_async_copy(copied, copied, sem_recvs.at[slot]).wait()
 
@@ -425,7 +449,7 @@ class IndexBufferedRef(pltpu.BufferedRef):
       # ends at (num_gm - 1) - fetch_offset. Therefore, we have to manually
       # perform fetch for the last gm_id.
       assert self.fetch_offset == -1
-      step = self.metadata_ref.step(n_id, gm_id, k_id)
+      step = self.metadata_ref.step(*grid_indices)
       is_last_step = step == self.metadata_ref.num_steps - 1
 
       # This can probably be done with branchless DMA but unlikely to be worth
@@ -434,11 +458,11 @@ class IndexBufferedRef(pltpu.BufferedRef):
       @pl.when(is_last_step)
       def _():
         next_slot = self.metadata_ref.slot(
-            n_id, gm_id + 1, k_id, self.buffer_count
+            n_id, gm_id + 1, k2_id, k1_id, self.buffer_count
         )
 
         aligned_start, local_start, aligned_size = self._aligned_range(
-            n_id, gm_id, k_id
+            grid_indices
         )
         # NOTE: Because this copy_in is manually triggered at the last step,
         # the caller MUST trigger corresponding wait_in at the epilogue.
@@ -604,15 +628,23 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       self, grid_indices: GridIndices, rows_ds: pl.Slice
   ) -> jax.Array:
     """SMEM offset that accounts for N tile dim buffering."""
-    idx_buffer_size = jnp.uint32(self.cfg.plan.idx_buffer_size)
-    ring_size = jnp.uint32(self.cfg.plan.idx_ring_size)
-    num_idx_buffers = jnp.uint32(self.cfg.plan.num_idx_buffers)
-    n_id, _, _ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
+    window = self.cfg.idx_window
+    n_id, *_ = self.metadata_ref.resolve(*grid_indices, dtype=jnp.uint32)
     # Buffer is divided into two where only even/odd n_id can use to avoid
     # first step of n_id oveerwriting value of last step at n_id - 1.
-    n_offset = lax.rem(n_id, num_idx_buffers) * idx_buffer_size
+    n_offset = lax.rem(n_id, jnp.uint32(window.num_buffers)) * jnp.uint32(
+        window.buffer_size
+    )
     rows_ds_start = jnp.uint32(rows_ds.start)
-    return n_offset + lax.rem(rows_ds_start, ring_size)
+    return n_offset + lax.rem(rows_ds_start, jnp.uint32(window.ring_size))
+
+  def _read_idx(self, offset: jax.Array, row_in_tile: int) -> jax.Array:
+    """Loads row index `offset + row_in_tile`, clamping dead rows in SMEM."""
+    assert self.idx_ref is not None
+    idx = offset + row_in_tile
+    if self.cfg.plan.smem_indices:
+      idx = jnp.minimum(idx, jnp.uint32(self.cfg.spec.size_out_m - 1))
+    return self.idx_ref[idx]
 
   @override
   def write_vmem(
@@ -642,7 +674,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
 
     for r in range(self.cfg.plan.tile_m):
       size = jnp.where(r < rows_ds.size, 1, 0)
-      row = self.idx_ref[offset + r]
+      row = self._read_idx(offset, r)
       pltpu.make_async_copy(
           src_ref=src_ref.at[pl.ds(row, size), cols_ds],
           dst_ref=vmem_dst.at[pl.ds(r, size), pl.ds(0, cols_ds.size)],
@@ -685,7 +717,7 @@ class BranchlessBufferedRef(RoutingBufferedRef):
       live = r < rows_ds.size
       size = jnp.where(live, 1, 0)
       src = vmem_src.at[pl.ds(r, size), pl.ds(0, cols_ds.size)]
-      row = self.idx_ref[offset + r]
+      row = self._read_idx(offset, r)
       self._copy_out_row(src, dst_ref, row, size, cols_ds, live, sem)
 
   def _copy_out_row(
@@ -848,54 +880,103 @@ class PipelineIndexMaps:
       self,
       n_id: jax.Array | int,
       gm_id: jax.Array | int,
-      k_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
       *,
       hbm_shape: tuple[int, int, int, int],
   ) -> tuple[pl.Slice, pl.Slice, int, int]:
     """Returns the block index tuple for the input activation."""
     chunks = hbm_shape[1] // self.cfg.num_k
-    _, gm_id, k_id = self.metadata_ref.resolve(n_id, gm_id, k_id)
-    return (self._rows(gm_id), pl.ds(k_id * chunks, chunks), 0, 0)
+    _, gm_id, *_ = self.metadata_ref.resolve(n_id, gm_id, k2_id, k1_id)
+    # The whole K width stays resident, so x does not move across k2 or k1.
+    return (self._rows(gm_id), pl.ds(0, chunks), 0, 0)
 
   def out_index(
       self,
       n_id: jax.Array | int,
       gm_id: jax.Array | int,
-      k_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
       *,
       hbm_shape: tuple[int, int, int, int],
   ) -> tuple[pl.Slice, pl.Slice, int, int]:
     """Returns the block index tuple for the output activation."""
     chunks = hbm_shape[1] // self.cfg.num_n
-    n_id, gm_id, _ = self.metadata_ref.resolve(n_id, gm_id, k_id)
+    n_id, gm_id, *_ = self.metadata_ref.resolve(n_id, gm_id, k2_id, k1_id)
     return (self._rows(gm_id), pl.ds(n_id * chunks, chunks), 0, 0)
 
   def weight_index(
-      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
-  ) -> tuple[jax.Array, int, jax.Array | int]:
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
+      *,
+      is_w2: bool = False,
+  ) -> tuple[jax.Array, jax.Array | int, jax.Array | int]:
     """Returns the block index tuple for an expert weight tensor."""
-    del k_id
-    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, n_id)
+    group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    if self.cfg.spec.w2 is None:
+      return (group_id, k1_id, n_id)
+    # With a fused w2, w is sliced along its output columns (k2) and w2 along
+    # its input rows (k2).
+    if not is_w2:
+      return (group_id, k1_id, k2_id)
+    return (group_id, k2_id, n_id)
 
   def scale_index(
-      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
-  ) -> tuple[jax.Array, int, int, jax.Array | int]:
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
+      *,
+      is_w2: bool = False,
+  ) -> tuple[jax.Array, jax.Array | int, int, jax.Array | int]:
     """Returns the block index tuple for a quantization scale tensor."""
-    del k_id
-    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, 0, n_id)
+    group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    if self.cfg.spec.w2 is None:
+      return (group_id, k1_id, 0, n_id)
+    if not is_w2:
+      return (group_id, k1_id, 0, k2_id)
+    # w2 is sliced along its input rows (k2). When the slice is smaller than
+    # the scale block, several slices share one block (one per-channel block
+    # covers every slice); otherwise each slice owns tile_k2 // block_size
+    # whole blocks. The planner keeps slices from straddling blocks.
+    w2_quant = self.cfg.spec.w2.quant
+    tile_k2 = self.cfg.plan.tile_k2
+    assert isinstance(w2_quant, spec_lib.SubchannelQuantSpec)
+    assert tile_k2 is not None
+    if tile_k2 < w2_quant.block_size:
+      return (group_id, k2_id * tile_k2 // w2_quant.block_size, 0, n_id)
+    return (group_id, k2_id, 0, n_id)
 
   def bias_index(
-      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
+      *,
+      is_w2: bool = False,
   ) -> tuple[jax.Array, int, jax.Array | int]:
     """Returns the block index tuple for a bias tensor."""
-    del k_id
-    return (self.metadata_ref.gm_id_to_group_id[gm_id], 0, n_id)
+    del k1_id
+    group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+    # With a fused w2, w's bias follows w's output columns (k2 slices).
+    if self.cfg.spec.w2 is not None and not is_w2:
+      return (group_id, 0, k2_id)
+    return (group_id, 0, n_id)
 
   def idx_index(
-      self, n_id: jax.Array | int, gm_id: jax.Array | int, k_id: jax.Array | int
+      self,
+      n_id: jax.Array | int,
+      gm_id: jax.Array | int,
+      k2_id: jax.Array | int,
+      k1_id: jax.Array | int,
   ) -> jax.Array:
     """Returns an index that changes every step so copy_* always triggers."""
-    return self.metadata_ref.step(n_id, gm_id, k_id)
+    return self.metadata_ref.step(n_id, gm_id, k2_id, k1_id)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -912,6 +993,10 @@ class PipelineBlockSpecs:
 
   cfg: config.RoutingGmmConfig
   index_map_provider: PipelineIndexMaps
+
+  # Weight lookahead may not be helpful in all cases.
+  # In some cases, it may result in extra overhead.
+  # TODO: Make weight_use_lookahead configurable.
 
   def _act_spec(
       self,
@@ -954,52 +1039,94 @@ class PipelineBlockSpecs:
         self.index_map_provider.out_index,
     )
 
-  def get_weight_spec(self, tile_k: int, tile_n: int) -> pl.BlockSpec:
+  def _weight_index_map(self, *, is_w2: bool) -> Callable[..., Any]:
+    if is_w2:
+      return functools.partial(self.index_map_provider.weight_index, is_w2=True)
+    return self.index_map_provider.weight_index
+
+  def get_weight_spec(
+      self, tile_k: int, tile_n: int, *, is_w2: bool = False
+  ) -> pl.BlockSpec:
     """Returns the BlockSpec for an expert weight tensor."""
     block_shape = (None, tile_k, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=self.index_map_provider.weight_index,
+        index_map=self._weight_index_map(is_w2=is_w2),
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
   def get_scale_spec(
-      self, w_spec: spec_lib.WeightSpec, tile_k: int, tile_n: int
+      self,
+      w_spec: spec_lib.WeightSpec,
+      tile_k: int,
+      tile_n: int,
+      *,
+      is_w2: bool = False,
   ) -> pl.BlockSpec:
     """Returns the BlockSpec for a quantization scale tensor."""
     assert w_spec.quant is not None
-    num_blocks = tile_k // w_spec.quant.block_size
-    block_shape = (None, num_blocks, 1, tile_n)
+    match w_spec.quant:
+      case spec_lib.SubchannelQuantSpec(block_size=block_size):
+        # A per-channel scale (one block over the full K) also covers a k2
+        # slice of w2 that is smaller than the block.
+        num_blocks = max(1, tile_k // block_size)
+        block_shape = (None, num_blocks, 1, tile_n)
+        index_map = functools.partial(
+            self.index_map_provider.scale_index, is_w2=is_w2
+        )
+      case spec_lib.BlockScaledQuantSpec(scale_rows=scale_rows):
+        block_scaled.check_tile_k(tile_k, w_spec.in_size, w_spec.dtype)
+        if tile_k != w_spec.in_size:
+          raise NotImplementedError(
+              "Block-scaled sub-K tiling is not supported yet. Got"
+              f" tile_k={tile_k}, in_size={w_spec.in_size}."
+          )
+        block_shape = (
+            None,
+            scale_rows,
+            tile_n,
+        )
+        index_map = self._weight_index_map(is_w2=is_w2)
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=self.index_map_provider.scale_index,
+        index_map=index_map,
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
   def get_bias_spec(
-      self, w_spec: spec_lib.WeightSpec, _: int, tile_n: int
+      self,
+      w_spec: spec_lib.WeightSpec,
+      _: int,
+      tile_n: int,
+      *,
+      is_w2: bool = False,
   ) -> pl.BlockSpec:
     """Returns the BlockSpec for a bias tensor."""
     assert w_spec.has_bias
     block_shape = (None, 1, tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
-        index_map=self.index_map_provider.bias_index,
+        index_map=functools.partial(
+            self.index_map_provider.bias_index, is_w2=is_w2
+        ),
         memory_space=pltpu.VMEM,
         # TODO: This is redundant in later JAX versions, remove this
         # after JAX version update.
         pipeline_mode=pl.Buffered(
-            buffer_count=self.cfg.plan.num_w_buffers, use_lookahead=True
+            buffer_count=self.cfg.plan.num_w_buffers,
+            use_lookahead=self.cfg.plan.weight_lookahead,
         ),
     )
 
@@ -1043,17 +1170,119 @@ class PipelineInputs[T]:
   gather_idx: T | None = None
   scatter_idx: T | None = None
 
+  def with_memory_constraints(
+      self, *, idx_space: pltpu.MemorySpace = pltpu.HBM
+  ) -> Self:
+    """Applies HBM constraints to operands and `idx_space` to index tables."""
+    return dataclasses.replace(
+        self,
+        x=map_memory_constraint(self.x, pltpu.HBM),
+        w=map_memory_constraint(self.w, pltpu.HBM),
+        w2=map_memory_constraint(self.w2, pltpu.HBM),
+        gather_idx=map_memory_constraint(self.gather_idx, idx_space),
+        scatter_idx=map_memory_constraint(self.scatter_idx, idx_space),
+    )
+
   def transform_for_pipeline(self, cfg: config.RoutingGmmConfig) -> Self:
     """Returns inputs with weights sliced for fused gate/up activation."""
     if not cfg.spec.is_fused_act:
       return self
     assert isinstance(self.w, SingleWeightRef)
+    if cfg.contiguous_fused_w:
+      w_fused = ContiguousFusedWeightRef(
+          weight=self.w.weight, scale=self.w.scale, bias=self.w.bias
+      )
+      return dataclasses.replace(self, w=w_fused)
     n = cfg.spec.w.out_size // 2
     w_fused = FusedWeightsRef(
         gate=self.w,
         up=jax.tree.map(lambda ref: ref.at[..., n:], self.w),
     )
     return dataclasses.replace(self, w=w_fused)
+
+
+def _make_weight_bref(
+    w_hbm_ref: AbstractWeightRef,
+    w_spec: spec_lib.WeightSpec,
+    tile_k: int,
+    tile_n: int,
+    *,
+    block_specs: PipelineBlockSpecs,
+    cfg: config.RoutingGmmConfig,
+    fuse_act: bool = False,
+    contiguous_fused: bool = False,
+    is_w2: bool = False,
+) -> AbstractWeightRef:
+  """Allocates `BufferedRef`s for one expert weight projection."""
+  assert isinstance(w_hbm_ref, SingleWeightRef)
+  dma_tile_n = tile_n * 2 if contiguous_fused else tile_n
+  scale_bref = None
+  if w_spec.has_scale:
+    assert w_hbm_ref.scale is not None
+    scale_bref = pltpu.BufferedRef.input(
+        spec=block_specs.get_scale_spec(
+            w_spec, tile_k, dma_tile_n, is_w2=is_w2
+        ),
+        dtype_or_type=w_hbm_ref.scale.dtype,
+        buffer_count=cfg.plan.num_w_buffers,
+        use_lookahead=cfg.plan.weight_lookahead,
+        grid_rank=4,
+    )
+  weight_bref = pltpu.BufferedRef.input(
+      spec=block_specs.get_weight_spec(tile_k, dma_tile_n, is_w2=is_w2),
+      dtype_or_type=w_hbm_ref.weight.dtype,
+      buffer_count=cfg.plan.num_w_buffers,
+      use_lookahead=cfg.plan.weight_lookahead,
+      grid_rank=4,
+  )
+  bias_bref = None
+  if w_spec.has_bias:
+    assert w_hbm_ref.bias is not None
+    bias_bref = pltpu.BufferedRef.input(
+        spec=block_specs.get_bias_spec(w_spec, tile_k, dma_tile_n, is_w2=is_w2),
+        dtype_or_type=w_hbm_ref.bias.dtype,
+        buffer_count=cfg.plan.num_w_buffers,
+        use_lookahead=cfg.plan.weight_lookahead,
+        grid_rank=4,
+    )
+  if contiguous_fused:
+    return ContiguousFusedWeightRef(
+        weight=weight_bref, scale=scale_bref, bias=bias_bref
+    )
+  w_bref = SingleWeightRef(weight=weight_bref, scale=scale_bref, bias=bias_bref)
+  if fuse_act:
+    return FusedWeightsRef(gate=w_bref, up=w_bref)
+  return w_bref
+
+
+def _make_index_bref(
+    idx_ref: hijax.TransformedRef | None,
+    *,
+    block_specs: PipelineBlockSpecs,
+    metadata_ref: metadata.AbstractMetadataRef,
+    cfg: config.RoutingGmmConfig,
+    fetch_offset: int,
+) -> IndexBufferedRef | None:
+  """Allocates an `IndexBufferedRef` when streaming indices from HBM."""
+  if idx_ref is None or cfg.plan.smem_indices:
+    return None
+  return IndexBufferedRef.input(
+      spec=block_specs.get_index_spec(),
+      dtype_or_type=idx_ref.dtype,
+      # IndexBufferedRef alternates two buffers by n. This ensures first tile
+      # of n + 1 never overwrites the last tile's n.
+      buffer_count=cfg.plan.num_idx_buffers,
+      cfg=cfg,
+      metadata_ref=metadata_ref,
+      fetch_offset=fetch_offset,
+  )
+
+
+def _as_index_bref(bref: pltpu.BufferedRef | None) -> IndexBufferedRef | None:
+  if bref is None:
+    return None
+  assert isinstance(bref, IndexBufferedRef)
+  return bref
 
 
 @jax.tree_util.register_dataclass
@@ -1067,10 +1296,29 @@ class PipelineAllocs:
   Attributes:
     inputs: Pipelined input BufferedRef bundle.
     out: Output activation BufferedRef.
+    out_acc: Optional VMEM accumulator of the output tile across intermediate
+      (k2) slices. Allocated only when the fused down projection is sliced.
   """
 
-  inputs: PipelineInputs[RoutingBufferedRef]
+  inputs: PipelineInputs[pltpu.BufferedRef]
   out: RoutingBufferedRef
+  out_acc: hijax.TransformedRef | None = None
+
+  @property
+  def x_bref(self) -> RoutingBufferedRef:
+    """The input activation RoutingBufferedRef."""
+    assert isinstance(self.inputs.x, RoutingBufferedRef)
+    return self.inputs.x
+
+  @property
+  def gather_bref(self) -> IndexBufferedRef | None:
+    """The optional gather IndexBufferedRef when streamed from HBM."""
+    return _as_index_bref(self.inputs.gather_idx)
+
+  @property
+  def scatter_bref(self) -> IndexBufferedRef | None:
+    """The optional scatter IndexBufferedRef when streamed from HBM."""
+    return _as_index_bref(self.inputs.scatter_idx)
 
   @classmethod
   def create(
@@ -1083,56 +1331,16 @@ class PipelineAllocs:
     pipeline_index_maps = PipelineIndexMaps(metadata_ref, cfg)
     pipeline_block_specs = PipelineBlockSpecs(cfg, pipeline_index_maps)
 
-    def _make_weight_bref(
-        w_hbm_ref: AbstractWeightRef,
-        w_spec: spec_lib.WeightSpec,
-        tile_k: int,
-        tile_n: int,
-        *,
-        fuse_act: bool = False,
-    ) -> AbstractWeightRef:
-      assert isinstance(w_hbm_ref, SingleWeightRef)
-      scale_bref = None
-      if w_spec.has_scale:
-        assert w_hbm_ref.scale is not None
-        scale_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_scale_spec(w_spec, tile_k, tile_n),
-            dtype_or_type=w_hbm_ref.scale.dtype,
-            buffer_count=cfg.plan.num_w_buffers,
-            use_lookahead=True,
-            grid_rank=3,
-        )
-      weight_bref = pltpu.BufferedRef.input(
-          spec=pipeline_block_specs.get_weight_spec(tile_k, tile_n),
-          dtype_or_type=w_hbm_ref.weight.dtype,
-          buffer_count=cfg.plan.num_w_buffers,
-          use_lookahead=True,
-          grid_rank=3,
-      )
-      bias_bref = None
-      if w_spec.has_bias:
-        assert w_hbm_ref.bias is not None
-        bias_bref = pltpu.BufferedRef.input(
-            spec=pipeline_block_specs.get_bias_spec(w_spec, tile_k, tile_n),
-            dtype_or_type=w_hbm_ref.bias.dtype,
-            buffer_count=cfg.plan.num_w_buffers,
-            use_lookahead=True,
-            grid_rank=3,
-        )
-      w_bref = SingleWeightRef(
-          weight=weight_bref, scale=scale_bref, bias=bias_bref
-      )
-      if fuse_act:
-        w_bref = FusedWeightsRef(gate=w_bref, up=w_bref)
-      return w_bref
-
     w_tile_n = cfg.plan.tile_n if cfg.plan.tile_k2 is None else cfg.plan.tile_k2
     w_bref = _make_weight_bref(
         in_hbm_ref.w,
         cfg.spec.w,
         cfg.plan.tile_k,
         w_tile_n,
+        block_specs=pipeline_block_specs,
+        cfg=cfg,
         fuse_act=cfg.spec.is_fused_act,
+        contiguous_fused=cfg.contiguous_fused_w,
     )
     w2_bref = None
     if cfg.spec.w2 is not None:
@@ -1142,13 +1350,16 @@ class PipelineAllocs:
           cfg.spec.w2,
           cfg.plan.tile_k2,
           cfg.plan.tile_n,
+          block_specs=pipeline_block_specs,
+          cfg=cfg,
+          is_w2=True,
       )
 
     x_bref = _get_buffered_ref(cfg.x.mode).input(
         spec=pipeline_block_specs.get_x_spec(),
         dtype_or_type=cfg.x.spec.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
-        grid_rank=3,
+        grid_rank=4,
         cfg=cfg,
         act_cfg=cfg.x,
         metadata_ref=metadata_ref,
@@ -1157,38 +1368,33 @@ class PipelineAllocs:
         spec=pipeline_block_specs.get_out_spec(),
         dtype_or_type=cfg.out.spec.dtype,
         buffer_count=cfg.plan.num_xo_buffers,
-        grid_rank=3,
+        grid_rank=4,
         cfg=cfg,
         act_cfg=cfg.out,
         metadata_ref=metadata_ref,
     )
 
-    # TODO: Support use case when indices are not stream from HBM and
-    # instead entirely stored in SMEM.
-    gather_bref = scatter_bref = None
-    if in_hbm_ref.gather_idx is not None:
-      # At step i the inner_pipeline gathers tile i + (num_xo_buffers - 1).
-      fetch_offset = cfg.plan.num_xo_buffers - 1
-      gather_bref = IndexBufferedRef.input(
-          spec=pipeline_block_specs.get_index_spec(),
-          dtype_or_type=in_hbm_ref.gather_idx.dtype,
-          # IndexBufferedRef alternates two buffers by n. This ensures first
-          # tile of n + 1 never overwrites the last tile's n.
-          buffer_count=cfg.plan.num_idx_buffers,
-          cfg=cfg,
-          metadata_ref=metadata_ref,
-          fetch_offset=fetch_offset,
-      )
-    if in_hbm_ref.scatter_idx is not None:
-      # At step i the inner_pipeline scatters tile i - 1.
-      fetch_offset = -1
-      scatter_bref = IndexBufferedRef.input(
-          spec=pipeline_block_specs.get_index_spec(),
-          dtype_or_type=in_hbm_ref.scatter_idx.dtype,
-          buffer_count=cfg.plan.num_idx_buffers,
-          cfg=cfg,
-          metadata_ref=metadata_ref,
-          fetch_offset=fetch_offset,
+    # At step i the inner_pipeline gathers tile i + (num_xo_buffers - 1) and
+    # scatters tile i - 1.
+    gather_bref = _make_index_bref(
+        in_hbm_ref.gather_idx,
+        block_specs=pipeline_block_specs,
+        metadata_ref=metadata_ref,
+        cfg=cfg,
+        fetch_offset=cfg.plan.num_xo_buffers - 1,
+    )
+    scatter_bref = _make_index_bref(
+        in_hbm_ref.scatter_idx,
+        block_specs=pipeline_block_specs,
+        metadata_ref=metadata_ref,
+        cfg=cfg,
+        fetch_offset=-1,
+    )
+
+    out_acc = None
+    if cfg.num_k2 > 1:
+      out_acc = pltpu.VMEM(
+          (cfg.plan.tile_m, cfg.spec.size_out_n), cfg.plan.acc_dtype
       )
 
     return cls(
@@ -1200,12 +1406,37 @@ class PipelineAllocs:
             scatter_idx=scatter_bref,
         ),
         out=out_bref,
+        out_acc=out_acc,
     )
+
+  def bind_idx_refs(
+      self,
+      in_ref: PipelineInputs[hijax.TransformedRef],
+  ) -> Self:
+    """Binds buffered or direct SMEM index refs onto `inputs.x` and `out`."""
+
+    def _idx_ref(
+        idx_bref: IndexBufferedRef | None,
+        raw_ref: hijax.TransformedRef | None,
+    ) -> jax.Ref | hijax.TransformedRef | None:
+      return raw_ref if idx_bref is None else idx_bref.window_ref
+
+    inputs = self.inputs
+    out = self.out
+    gather_ref = _idx_ref(self.gather_bref, in_ref.gather_idx)
+    if gather_ref is not None:
+      inputs = dataclasses.replace(
+          inputs, x=self.x_bref.bind_idx_ref(gather_ref)
+      )
+    scatter_ref = _idx_ref(self.scatter_bref, in_ref.scatter_idx)
+    if scatter_ref is not None:
+      out = out.bind_idx_ref(scatter_ref)
+    return dataclasses.replace(self, inputs=inputs, out=out)
 
   @property
   def all_tree(
       self,
-  ) -> tuple[PipelineInputs[RoutingBufferedRef], RoutingBufferedRef]:
+  ) -> tuple[PipelineInputs[pltpu.BufferedRef], RoutingBufferedRef]:
     """The tuple of (inputs, out) BufferedRefs for pipeline allocation."""
     return (self.inputs, self.out)
 

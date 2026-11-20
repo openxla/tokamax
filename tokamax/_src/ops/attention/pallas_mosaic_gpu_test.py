@@ -14,6 +14,7 @@
 # ==============================================================================
 import dataclasses
 import functools
+import math
 from types import UnionType  # pylint: disable=g-importing-member
 from typing import Union, cast, get_origin, override
 from unittest import mock
@@ -276,6 +277,52 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         expect_supported=self._supports_bias and self._supports_mask,
     )
 
+  # Not a multiple of `block_kv`, and less than it.
+  @parameterized.parameters(160, 48)
+  def test_sm90_unaligned_seq_kv_not_padded(self, seq_len_k):
+    if (
+        not gpu_utils.is_sm90()
+        or type(self._attention_fn) is not fa.PallasMosaicGpuFlashAttention
+    ):
+      self.skipTest("SM90-specific test.")
+    block_kv = 128
+    padded_len = block_kv * math.ceil(seq_len_k / block_kv)
+    shapes = dict(
+        q_shape=(2, seq_len_k, 4, 64),
+        bias_shape=(2, 4, seq_len_k, seq_len_k),
+        mask_shape=(2, 4, seq_len_k, seq_len_k),
+        dtype=jnp.bfloat16,
+    )
+    self._run_test(**shapes, atol=0.02, atol_grads=0.04)
+
+    q, k, v, bias, mask, _ = test_base._create_inputs(**shapes)
+    impl = fa.PallasMosaicGpuFlashAttention(
+        config=fa.ConfigSM90(block_q=64, block_kv=block_kv, num_stages=2)
+    )
+
+    def attn(q, k, v, bias, mask, k_end=None):
+      return impl(q, k, v, bias=bias, mask=base.Mask(mask, k_end=k_end))
+
+    hlo = jax.jit(attn).lower(q, k, v, bias, mask).as_text()
+    self.assertNotIn(f"tensor<2x{padded_len}x4x64xbf16>", hlo)  # Padded K/V.
+    # Bias padded to a multiple of `block_kv`.
+    self.assertNotIn(f"x{seq_len_k}x{padded_len}xbf16>", hlo)
+
+    # Same result as padding K/V, bias and mask, and masking with `k_end`.
+    def pad(x, axis):
+      pad_width = [(0, 0)] * x.ndim
+      pad_width[axis] = (0, padded_len - x.shape[axis])
+      return jnp.pad(x, pad_width)
+
+    k_end = jnp.full((1, 1), seq_len_k, jnp.int32)
+    padded = (pad(k, -3), pad(v, -3), pad(bias, -1), pad(mask, -1), k_end)
+    test_base.test_utils.assert_trees_all_close(
+        jax.jit(attn)(q, k, v, bias, mask),
+        jax.jit(attn)(q, *padded),
+        rtol=0.0,
+        atol=0.0,
+    )
+
   def test_unaligned_seq_q_vjp(self):
     if not self._supports_vjp:
       self.skipTest("VJP unsupported for this implementation.")
@@ -294,6 +341,33 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
         atol=0.02,
         atol_grads=0.04,
         expect_supported=self._supports_bias,
+    )
+
+  @parameterized.parameters(1, 300)
+  def test_single_key(self, seq_len_q):
+    self._run_test(
+        (2, seq_len_q, 4, 64),
+        kv_shape=(2, 1, 4, 64),
+        dtype=jnp.bfloat16,
+        atol=0.02,
+    )
+
+  @parameterized.parameters(256, 128)
+  def test_sm100_block_kv_64_mask(self, kv_seq_len):
+    if not gpu_utils.is_sm100() or not isinstance(
+        self._attention_fn, fa.PallasMosaicGpuFlashAttention
+    ):
+      self.skipTest("SM100-specific test.")
+    config = fa.ConfigSM100(block_q=256, block_kv=64, collective=True)
+    impl = fa.PallasMosaicGpuFlashAttention(config=config)
+    self._run_test(
+        (2, 256, 4, 128),
+        kv_shape=(2, kv_seq_len, 4, 128),
+        mask_shape=(2, 1, 256, kv_seq_len),
+        dtype=jnp.bfloat16,
+        impl=impl,
+        atol=0.02,
+        test_vjp=False,
     )
 
   def test_unaligned_fp16_and_fully_masked_vjp(self):

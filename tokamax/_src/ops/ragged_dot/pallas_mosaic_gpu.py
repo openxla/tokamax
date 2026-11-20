@@ -28,7 +28,6 @@ from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
-import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_x8 as sm100_quant_x8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm80 as sm80
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm90 as sm90
@@ -68,15 +67,28 @@ def _input_quant_bits(x) -> int:
     return jnp.finfo(qtype).bits
 
 
-def _input_subchannel(x) -> int | None:
+def _input_subchannel(x, contracting_dim: int = 1) -> int | None:
+  """Scale tile size of `x` along `contracting_dim`, or None if unquantized."""
   if isinstance(x, AsQArray):
     x_flat, x_tree = jax.tree.flatten(x)
     x = jax.eval_shape(lambda xs: x_tree.unflatten(xs).as_qarray(), x_flat)
   if isinstance(x, QArray):
-    return x.scale_tile_shape[1]  # contraction-axis (index 1) tile
+    return x.scale_tile_shape[contracting_dim]
   if x.__class__.__name__ == "PreQuantizedInputFusionGPU":
     return x.subchannel_size
   return None
+
+
+def _rhs_contracting_dim(ba: op.BoundArguments) -> int:
+  """Contracting axis of the bound rhs (before `_fwd` normalises TRANS_RHS)."""
+  dims = ba.kwargs["ragged_dot_dimension_numbers"]
+  (_, rhs_contract), _ = dims.dot_dimension_numbers
+  return int(rhs_contract[0])
+
+
+# On sm90, bf16 x int8 ragged dots with at least this many lhs rows use the
+# large-M configs in `_get_heuristics_config`; smaller M keeps the default.
+_SM90_INT8_LARGE_M_MIN_ROWS = 16384
 
 
 # TODO: Natively support mk,ekn->mn.
@@ -202,10 +214,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
             # dequantize lhs to fallback to non-lhs-quantized kernel
             lhs = quantization.as_array(lhs)
         if isinstance(lhs, jax.Array):
-          if config.post_scale:
-            fn = sm100_quant_post_scale.ragged_dot_gpu_quant_post_scale_blackwell_kernel  # pylint: disable=line-too-long
-          else:
-            fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
+          fn = sm100_quant.ragged_dot_gpu_quant_blackwell_kernel
       else:
         fn = sm100.ragged_dot_gpu_non_quant_blackwell_kernel
     elif gpu_utils.is_sm80():
@@ -305,7 +314,8 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     _is_int8 = lambda x: _input_qtype(x) == jnp.int8
 
     # avoid OOMs by having too large block_k
-    rhs_subchannel = _input_subchannel(rhs)
+    rhs_cdim = _rhs_contracting_dim(ba)
+    rhs_subchannel = _input_subchannel(rhs, rhs_cdim)
     block_k = min(rhs_subchannel, 256) if rhs_subchannel is not None else 128
     if gpu_utils.is_sm100():
       # Clamp to the activation subchannel so a finer lhs (e.g. fp8 output of a
@@ -315,6 +325,41 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         block_k = min(block_k, lhs_subchannel)
 
     if gpu_utils.is_sm90():
+      # For large-M bf16 x int8 ragged dots, autotuning found `block_m=128`
+      # faster than the default below, with the best remaining parameters
+      # depending on whether the rhs is wide (K < N) or tall (K >= N). Other
+      # cases (quantized lhs, non-int8 rhs, small or symbolic M) keep the
+      # default.
+      m = lhs.shape[0]
+      if (
+          isinstance(rhs, (QArray, AsQArray))
+          and _is_int8(rhs)
+          and not _is_quantized_input(lhs)
+          and isinstance(m, int)
+          and m >= _SM90_INT8_LARGE_M_MIN_ROWS
+      ):
+        k, n = rhs.shape[rhs_cdim], rhs.shape[3 - rhs_cdim]
+        if k < n:
+          return Config(
+              block_m=128,
+              block_n=64,
+              block_k=min(block_k, 128),
+              num_stages=4,
+              split_k=1,
+              persistent=True,
+              grid_minor_dim=common.MatmulDimension.M,
+              grid_tile_width=1,
+          )
+        return Config(
+            block_m=128,
+            block_n=64,
+            block_k=block_k,
+            num_stages=2,
+            split_k=1,
+            persistent=False,
+            grid_minor_dim=common.MatmulDimension.M,
+            grid_tile_width=1,
+        )
       return Config(
           block_m=64,
           block_n=64,
@@ -390,7 +435,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if _is_quantized_input(rhs):
       rhs_dtype_bits = _input_quant_bits(rhs)
-      scale_tile_shape = _input_subchannel(rhs) or 0
+      scale_tile_shape = _input_subchannel(rhs, _rhs_contracting_dim(ba)) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0
@@ -435,7 +480,7 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
     lhs_dtype_bits = jnp.finfo(lhs.dtype).bits
     if _is_quantized_input(rhs):
       rhs_dtype_bits = _input_quant_bits(rhs)
-      scale_tile_shape = _input_subchannel(rhs) or 0
+      scale_tile_shape = _input_subchannel(rhs, _rhs_contracting_dim(ba)) or 0
     else:
       rhs_dtype_bits = jnp.finfo(rhs.dtype).bits
       scale_tile_shape = 0

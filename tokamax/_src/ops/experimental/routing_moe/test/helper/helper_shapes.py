@@ -34,6 +34,8 @@ class MoEShape:
     w_dtype: Weight quantization dtype, or None for unquantized bfloat16.
     w_quant_block_size: Weight sub-channel quantization block size along the
       input dimension, or None for per-channel quantization.
+    w_block_scaled: Whether weights use block-scaled FP8 (`float8_e8m0fnu`
+      scales) instead of `sub_channel_quantize`.
     has_bias: Whether expert projections include bias terms.
     has_shared_expert: Whether the layer includes a shared expert.
   """
@@ -47,6 +49,7 @@ class MoEShape:
   renormalize: bool = True
   w_dtype: jnp.dtype | None = None
   w_quant_block_size: int | None = None
+  w_block_scaled: bool = False
   has_bias: bool = False
   has_shared_expert: bool = False
 
@@ -77,6 +80,16 @@ MISTRAL_3_LARGE = MoEShape(
     7168,
     4096,
     w_dtype=jnp.dtype(jnp.float8_e4m3fn),
+)
+GLM_5_3 = MoEShape(
+    "glm_5_3",
+    256,
+    8,
+    6144,
+    2048,
+    w_dtype=jnp.dtype(jnp.float8_e4m3fn),
+    w_quant_block_size=512,
+    has_shared_expert=True,
 )
 QWEN_35_397B = MoEShape(
     "qwen_35_397b",

@@ -132,7 +132,7 @@ class RoutingGmmProdTest(parameterized.TestCase):
   @parameterized.product(case_spec=helper_cases.PROD_CASES)
   def test_gather_gmm_gmm_scatter(self, case_spec: helper_cases.Case):
     """Times gather, gate/up, down, and scatter in one call."""
-    case = gmm_test_lib.GmmCase.make_case(case_spec)
+    case = gmm_test_lib.GmmCase.make_case(case_spec, fused_up_and_down=True)
     routing = case.routing
     helper_util.log_expert_load(
         case_spec.name, routing.group_sizes, ep=case_spec.sharding.ep

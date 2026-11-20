@@ -14,9 +14,10 @@
 # ==============================================================================
 # """TGMM kernel."""
 
+from collections.abc import Callable
 import dataclasses
 import functools
-from typing import Any, Callable, Tuple
+from typing import Protocol, Tuple
 
 import jax
 from jax import lax
@@ -29,8 +30,8 @@ from tokamax._src.ops.gmm_v2 import gmm_v2
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class OperandRef:
-  """Bundles a kernel operand with its optional per-N scale.
+class OperandRef[T]:
+  """Bundles an unfused kernel operand (or BlockSpec) with optional per-N scale.
 
   Registered as a pytree so it can be passed as a single 'pl.pallas_call' /
   'emit_pipeline' operand (and in_spec). When 'scale' is None it contributes no
@@ -38,8 +39,20 @@ class OperandRef:
   scale is present; the kernel just reads 'rhs_ref.scale' (None or a ref).
   """
 
-  value: Any
-  scale: Any | None = None
+  value: T
+  scale: T | None = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class FusedOperandRef[T]:
+  """Bundles prologue-fused operand inputs (or BlockSpecs) and optional scale."""
+
+  values: tuple[T, ...]
+  scale: T | None = None
+
+  def get_values(self: "FusedOperandRef[jax.Array]") -> tuple[jax.Array, ...]:
+    return tuple(v[...] for v in self.values)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,9 +71,68 @@ class TgmmTilingRequest:
   acc_dtype: jnp.dtype
   target_zero_ref_bytes: int
   has_partial_sum: bool = False
+  is_out_fused: bool = False
 
 
 TileTgmmFn = Callable[[TgmmTilingRequest], gmm_v2.TileSizes]
+
+type PrologueRefs = tuple[jax.Array, ...]
+type PrologueSpecs = tuple[pl.BlockSpec, ...]
+type OperandSpec = OperandRef[pl.BlockSpec]
+type FusedOperandSpec = FusedOperandRef[pl.BlockSpec]
+
+
+class TgmmSpecTransformFn(Protocol):
+  """Transforms TGMM BlockSpecs and extracts pulled/pushed fusion functions."""
+
+  def __call__(
+      self,
+      *,
+      lhs_ref: jax.Array | PrologueRefs,
+      rhs_ref: OperandRef[jax.Array] | FusedOperandRef[jax.Array],
+      lhs_spec: pl.BlockSpec,
+      rhs_spec: OperandSpec,
+      out_specs: pl.BlockSpec,
+      cfgs: gmm_v2.GmmConfigs,
+  ) -> tuple[
+      jax.Array | PrologueRefs,
+      OperandRef[jax.Array] | FusedOperandRef[jax.Array],
+      pl.BlockSpec | PrologueSpecs,
+      OperandSpec | FusedOperandSpec,
+      gmm_v2.OutFusionInputSpecs,
+      pl.BlockSpec,
+      gmm_v2.PrologueFn | None,
+      gmm_v2.PrologueFn | None,
+      gmm_v2.EpilogueFn | None,
+  ]:
+    ...
+
+
+class TgmmFusionSpecProtocol(Protocol):
+  """Protocol for TGMM v2 Pallas fuser specifications."""
+
+  @property
+  def is_out_fused(self) -> bool:
+    """Returns whether the output carries a fused epilogue."""
+    ...
+
+  def prepare(
+      self,
+      *,
+      lhs: jax.Array,
+      rhs: jax.Array,
+      rhs_scale: jax.Array | None,
+      cfgs: gmm_v2.GmmConfigs,
+      raw_out_type: jax.ShapeDtypeStruct,
+  ) -> tuple[
+      jax.Array | PrologueRefs,
+      OperandRef[jax.Array] | FusedOperandRef[jax.Array],
+      gmm_v2.OutFusionInputRefs,
+      jax.ShapeDtypeStruct,
+      TgmmSpecTransformFn,
+  ]:
+    """Prepares fused operands, output type, and BlockSpec transform."""
+    ...
 
 
 def get_scope_name(cfgs: gmm_v2.GmmConfigs) -> str:
@@ -100,6 +172,7 @@ def calculate_tgmm_tiling_from_request(
       req.acc_dtype,
       req.target_zero_ref_bytes,
       req.has_partial_sum,
+      req.is_out_fused,
   )
 
 
@@ -112,6 +185,7 @@ def calculate_tgmm_tiling(
     acc_dtype: jnp.dtype,
     target_zero_ref_bytes: int,
     has_partial_sum: bool = False,
+    is_out_fused: bool = False,
 ) -> gmm_v2.TileSizes:
   """Calculate optimal tile sizes for TGMM kernel."""
   # In tgmm, we calculate lhs.T @ dout which doesn't require quantization.
@@ -208,22 +282,59 @@ def calculate_tgmm_tiling(
   # `tgmm_kernel_main`), and the grid is split across TensorCores along the
   # first of them whose tile count is a multiple of `num_cores`. If neither is,
   # split the larger of k and n, so that each core re-reads only the operand of
-  # the smaller one. Splitting only shrinks tiles, so VMEM usage stays in limit.
+  # the smaller one. Exact splits are preferred over padded splits (e.g. when
+  # both k and n are odd multiples of `num_lanes`), which fused outputs don't
+  # support. Splitting only shrinks tiles, so VMEM usage stays in limit.
   num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
   if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
     tile_k_lower_bound = min(
         pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
     )
     split_k = gmm_v2.split_for_cores(
-        dims.size_k, num_k_tiles, num_cores, num_lanes, tile_k_lower_bound
+        dims.size_k,
+        num_k_tiles,
+        num_cores,
+        num_lanes,
+        tile_k_lower_bound,
+        allow_padding=False,
     )
     split_n = gmm_v2.split_for_cores(
-        dims.size_n, num_n_tiles, num_cores, num_lanes, tile_n_lower_bound
+        dims.size_n,
+        num_n_tiles,
+        num_cores,
+        num_lanes,
+        tile_n_lower_bound,
+        allow_padding=False,
     )
     if split_k is not None and (dims.size_k >= dims.size_n or split_n is None):
       num_k_tiles, tile_k = split_k
     elif split_n is not None:
       num_n_tiles, tile_n = split_n
+    elif not is_out_fused:
+      # Prefer a padded n split: the output is padded along k to a multiple of
+      # `tile_k`, so a padded k split forces an extra HBM slice copy of the
+      # output, while n is only padded to `num_lanes`.
+      split_n = gmm_v2.split_for_cores(
+          dims.size_n,
+          num_n_tiles,
+          num_cores,
+          num_lanes,
+          tile_n_lower_bound,
+          allow_padding=True,
+      )
+      if split_n is not None:
+        num_n_tiles, tile_n = split_n
+      else:
+        split_k = gmm_v2.split_for_cores(
+            dims.size_k,
+            num_k_tiles,
+            num_cores,
+            num_lanes,
+            tile_k_lower_bound,
+            allow_padding=True,
+        )
+        if split_k is not None:
+          num_k_tiles, tile_k = split_k
 
   # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
   # full-tile int32 masks alongside the accumulator in VREGs, causing severe
@@ -259,6 +370,7 @@ def make_tgmm_configs(
     out_dtype: jnp.dtype,
     acc_dtype: jnp.dtype | None,
     target_zero_ref_bytes: int,
+    is_out_fused: bool = False,
 ):
   """Fills the GMM config for the TGMM kernel."""
   assert out_dtype, "out_dtype cannot be None"
@@ -344,6 +456,7 @@ def make_tgmm_configs(
             acc_dtype=acc_dtype,
             target_zero_ref_bytes=target_zero_ref_bytes,
             has_partial_sum=partial_sum is not None,
+            is_out_fused=is_out_fused,
         )
     )
   assert tiles.tile_m % tiles.bucket_base == 0, (
@@ -369,19 +482,23 @@ def make_tgmm_configs(
 
 def tgmm_inner_kernel(
     step: pltpu.PipelineStep,
-    tiled_lhs_ref: jax.Array,
+    tiled_lhs_ref: jax.Array | PrologueRefs,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
-    tiled_rhs_ref: OperandRef,
+    tiled_rhs_ref: OperandRef[jax.Array] | FusedOperandRef[jax.Array],
     # .value: [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     # .scale: [1, 1, tile_n] or None
     tiled_partial_sum_ref: jax.Array | None,
     # [None, tile_k, tile_n]
+    tiled_out_fusion_input_refs: gmm_v2.OutFusionInputRefs,
     tiled_out_ref: jax.Array,
     acc_ref: jax.Array,
     metadata_ref: gmm_v2.MetadataRef,
     *,
     num_gm: jax.Array,
     cfgs: gmm_v2.GmmConfigs,
+    lhs_fn: gmm_v2.PrologueFn | None = None,
+    rhs_fn: gmm_v2.PrologueFn | None = None,
+    out_fn: gmm_v2.EpilogueFn | None = None,
 ):
   """Inner kernel for TGMM computation.
 
@@ -391,22 +508,25 @@ def tgmm_inner_kernel(
 
   Args:
     step: Current pipeline step.
-    tiled_lhs_ref: Reference to the tiled LHS data.
-    tiled_rhs_ref: OperandRef bundling the tiled RHS data ('.value') and its
-      optional per-N scale ('.scale', None when there is no scale).
+    tiled_lhs_ref: Reference to the tiled LHS data (or tuple of fused prologue
+      value references).
+    tiled_rhs_ref: OperandRef (or FusedOperandRef) bundling the tiled RHS data
+      and its optional per-N scale ('.scale', None when there is no scale).
     tiled_partial_sum_ref: Reference to the tiled partial sum
       [None, tile_k, tile_n], or None if there is no partial sum.
+    tiled_out_fusion_input_refs: Tiled VMEM refs for arrays closed over by the
+      output fusion, or `()` when unfused.
     tiled_out_ref: Reference to the tiled output buffer [None, tile_k, tile_n].
     acc_ref: Scratch memory for accumulation [tile_k, tile_n].
     metadata_ref: Contains metadata like group offsets and group IDs.
     num_gm: Total number of group-major tiles.
     cfgs: GmmConfigs object containing kernel configurations.
+    lhs_fn: Optional pulled prologue function for fused lhs inputs.
+    rhs_fn: Optional pulled prologue function for fused rhs inputs.
+    out_fn: Optional pulled epilogue function for fused outputs.
   """
   # NB: grid=(num_n, num_k, num_gm)
   tiled_rhs_scale_ref = tiled_rhs_ref.scale
-
-  tiled_lhs_ref = tiled_lhs_ref.reshape(-1, tiled_lhs_ref.shape[-1])
-  tiled_rhs_ref = tiled_rhs_ref.value.reshape(-1, tiled_rhs_ref.value.shape[-1])
   gm_id = step.index[2]
 
   # Mask out invalid rows in the LHS/RHS tiles.
@@ -419,30 +539,47 @@ def tgmm_inner_kernel(
   m_end_local = m_end - m_offset
 
   def _matmul(is_new_group: bool, is_group_changing: bool, bucket_m: int):
-    lhs_iota = lax.broadcasted_iota(
-        jnp.int32, (bucket_m, tiled_lhs_ref.shape[-1]), 0
-    )
+    pids = step.index
+    if isinstance(tiled_lhs_ref, tuple):
+      assert lhs_fn is not None
+      lhs_vals = tuple(r[...] for r in tiled_lhs_ref)
+      tiled_lhs = lhs_fn(pids, (), lhs_vals)[:bucket_m]
+    else:
+      tiled_lhs = tiled_lhs_ref.reshape(-1, tiled_lhs_ref.shape[-1])[:bucket_m]
+
+    if isinstance(tiled_rhs_ref, FusedOperandRef):
+      assert rhs_fn is not None
+      tiled_rhs = rhs_fn(pids, (), tiled_rhs_ref.get_values())[:bucket_m]
+    else:
+      tiled_rhs_val_ref = tiled_rhs_ref.value
+      tiled_rhs = tiled_rhs_val_ref.reshape(-1, tiled_rhs_val_ref.shape[-1])[
+          :bucket_m
+      ]
+
+    lhs_iota = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 0)
     lhs_mask = jnp.logical_and(
         m_start_local <= lhs_iota, lhs_iota < m_end_local
     )
-    lhs_masked = jnp.where(lhs_mask, tiled_lhs_ref[:bucket_m], 0)
+    lhs_masked = jnp.where(lhs_mask, tiled_lhs, 0)
     # If there are no NaNs, masking both lhs and rhs shouldn't be necessary.
     # But without masking both, we sometimes see the result contain NaNs so we
     # decide to mask both to be safe.
-    rhs_iota = lax.broadcasted_iota(
-        jnp.int32, (bucket_m, tiled_rhs_ref.shape[-1]), 0  # pyrefly: ignore[missing-attribute]
-    )
+    rhs_iota = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0)
     rhs_mask = jnp.logical_and(
         m_start_local <= rhs_iota, rhs_iota < m_end_local
     )
-    rhs_masked = jnp.where(rhs_mask, tiled_rhs_ref[:bucket_m], 0)  # pyrefly: ignore[bad-index]
+    rhs_masked = jnp.where(rhs_mask, tiled_rhs, 0)
 
+    is_int_dot = jnp.issubdtype(lhs_masked.dtype, jnp.integer) and (
+        jnp.issubdtype(rhs_masked.dtype, jnp.integer)
+    )
+    pref_dtype = jnp.int32 if is_int_dot else jnp.float32
     acc = jax.lax.dot_general(
         lhs_masked,
         rhs_masked,
         (((0,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
+        preferred_element_type=pref_dtype,
+    ).astype(acc_ref.dtype)
 
     if not is_new_group:
       acc += acc_ref[...]
@@ -457,6 +594,9 @@ def tgmm_inner_kernel(
             "cfgs.has_partial_sum is True but no partial-sum ref was passed"
         )
         acc += tiled_partial_sum_ref[...].astype(acc.dtype)
+      if out_fn is not None:
+        out_vals = tuple(r[...] for r in tiled_out_fusion_input_refs)
+        acc = out_fn(pids, (), out_vals, acc.astype(cfgs.out_dtype))
       tiled_out_ref[...] = acc.astype(tiled_out_ref.dtype)
     else:
       acc_ref[...] = acc
@@ -564,7 +704,7 @@ class TgmmIndexMaps:
 
 def generate_tgmm_block_specs(
     metadata_ref: gmm_v2.MetadataRef, cfgs: gmm_v2.GmmConfigs
-) -> Tuple[Tuple[pl.BlockSpec, OperandRef, pl.BlockSpec | None], pl.BlockSpec]:
+) -> Tuple[Tuple[pl.BlockSpec, OperandSpec, pl.BlockSpec | None], pl.BlockSpec]:
   """Generates block specs for the given lhs, rhs, and out refs."""
   index_map = TgmmIndexMaps(metadata_ref, cfgs)
   # NB: in tgmm, LHS is reshaped from (M, K) to (-1, size_lhs_sublane, K) so
@@ -666,8 +806,9 @@ def zero_out_end(
 def tgmm_kernel_main(
     lhs_group_sizes_ref,  # int32[size_lhs_group]
     group_offset_ref,  # int32[1]
-    lhs_ref,  # [m, k]
-    rhs_ref,  # OperandRef: .value [m, n], .scale [1, 1, n] or None
+    lhs_ref: jax.Array | PrologueRefs,  # [m, k]
+    rhs_ref: OperandRef[jax.Array] | FusedOperandRef[jax.Array],
+    out_fusion_input_refs: gmm_v2.OutFusionInputRefs,
     out_ref,  # [num_actual_groups, k, n]
     # Scratch memory
     acc_ref: jax.Array,  # [tile_k, tile_n]
@@ -675,23 +816,35 @@ def tgmm_kernel_main(
     zero_ref: jax.Array,  # [tile_zero_k, num_lanes]
     semaphore_ref: jax.Array,  # [1]
     *,
-    cfgs,
+    cfgs: gmm_v2.GmmConfigs,
+    spec_transform_fn: TgmmSpecTransformFn | None = None,
 ):
   """Main kernel function for TGMM computation.
 
   Args:
     lhs_group_sizes_ref: Reference to the group sizes of lhs.
     group_offset_ref: Reference to the group offset.
-    lhs_ref: Reference to the LHS array [m, k].
-    rhs_ref: OperandRef bundling the RHS array ('.value' [m, n]) and its
-      optional per-N scale ('.scale' [1, 1, n], None when there is no scale).
+    lhs_ref: Reference to the LHS array [m, k] (or prologue-fused LHS refs).
+    rhs_ref: OperandRef (or FusedOperandRef) bundling the RHS array ('.value'
+      [m, n]) and its optional per-N scale ('.scale' [1, 1, n], None when there
+      is no scale).
+    out_fusion_input_refs: References to HBM arrays closed over by the output
+      fusion, or `()` when unfused.
     out_ref: Reference to the output array [num_groups, k, n].
     acc_ref: Scratch memory reference for accumulation [tile_k, tile_n].
     metadata_ref: Reference to the metadata structure.
     zero_ref: Scratch buffer for zeroing empty groups' output.
     semaphore_ref: DMA semaphore for the zeroing copies.
     cfgs: GmmConfigs object containing kernel configurations.
+    spec_transform_fn: Optional callback transforming BlockSpecs and
+      pulled/pushed fusion functions when running under `@op_fusion.fuse`.
   """
+  out_ref = gmm_v2.pad_lanes(out_ref)
+  if rhs_ref.scale is not None:
+    rhs_ref = dataclasses.replace(
+        rhs_ref, scale=gmm_v2.pad_lanes(rhs_ref.scale)
+    )
+
   # With a partial sum, `out_ref` is initialized with it and accumulated into in
   # place, so empty groups already hold their result and must not be zeroed.
   num_groups_to_zero = None
@@ -713,7 +866,40 @@ def tgmm_kernel_main(
       cfgs=cfgs,
   )
 
-  in_specs, out_specs = generate_tgmm_block_specs(metadata_ref, cfgs)
+  (lhs_spec, rhs_spec, partial_sum_spec), out_specs = generate_tgmm_block_specs(
+      metadata_ref, cfgs
+  )
+  if spec_transform_fn is not None:
+    (
+        lhs_in,
+        rhs_operand,
+        lhs_spec,
+        rhs_spec,
+        out_fusion_input_specs,
+        out_specs,
+        pulled_lhs_fn,
+        pulled_rhs_fn,
+        pulled_out_fn,
+    ) = spec_transform_fn(
+        lhs_ref=lhs_ref,
+        rhs_ref=rhs_ref,
+        lhs_spec=lhs_spec,
+        rhs_spec=rhs_spec,
+        out_specs=out_specs,
+        cfgs=cfgs,
+    )
+  else:
+    assert not isinstance(lhs_ref, tuple)
+    assert isinstance(rhs_ref, OperandRef)
+    pulled_lhs_fn = pulled_rhs_fn = pulled_out_fn = None
+    out_fusion_input_specs: gmm_v2.OutFusionInputSpecs = ()
+    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    rhs_value = rhs_ref.value
+    rhs_in = rhs_value.reshape(
+        -1, cfgs.dims.size_lhs_sublane, rhs_value.shape[-1]
+    )
+    rhs_operand = OperandRef(value=rhs_in, scale=rhs_ref.scale)
+
   # Partition output tiles across TCs in MegaCore mode over both N and K
   # dimensions.
   # TODO: Revert temporary fallback to unblock vmap on older JAX.
@@ -726,25 +912,31 @@ def tgmm_kernel_main(
       else (pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY)
   )
   pipeline_fn = pltpu.emit_pipeline(
-      functools.partial(tgmm_inner_kernel, num_gm=num_gm, cfgs=cfgs),
+      functools.partial(
+          tgmm_inner_kernel,
+          num_gm=num_gm,
+          cfgs=cfgs,
+          lhs_fn=pulled_lhs_fn,
+          rhs_fn=pulled_rhs_fn,
+          out_fn=pulled_out_fn,
+      ),
       grid=(num_n, num_k, num_gm),
-      in_specs=in_specs,
+      in_specs=(lhs_spec, rhs_spec, partial_sum_spec, out_fusion_input_specs),
       out_specs=out_specs,
       core_axis_name=core_axis_name,
       dimension_semantics=dimension_semantics,
       _explicit_indices=True,
   )
-  lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
-  rhs_value = rhs_ref.value
-  rhs_in = rhs_value.reshape(
-      -1, cfgs.dims.size_lhs_sublane, rhs_value.shape[-1]
-  )
-  rhs_operand = OperandRef(value=rhs_in, scale=rhs_ref.scale)
   partial_sum_in = out_ref if cfgs.has_partial_sum else None
   scratches = [acc_ref, metadata_ref]
 
   pipeline_fn(
-      lhs_in, rhs_operand, partial_sum_in, out_ref, scratches=scratches
+      lhs_in,
+      rhs_operand,
+      partial_sum_in,
+      out_fusion_input_refs,
+      out_ref,
+      scratches=scratches,
   )
   if not cfgs.has_partial_sum:
     zero_out_end(
@@ -808,6 +1000,7 @@ def tgmm_v2(
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
+    fusion_spec: TgmmFusionSpecProtocol | None = None,
 ):
   """Computes a transposed grouped matrix multiplication.
 
@@ -834,6 +1027,8 @@ def tgmm_v2(
     precision: Unused. Exists for compatibility reasons.
     preferred_element_type: Optional jnp.dtype for the output matrix.
     acc_dtype: Optional jnp.dtype for the accumulator.
+    fusion_spec: Optional `TgmmFusionSpec` describing fused prologue/epilogue
+      functions when invoked via `@op_fusion.fuse`.
 
   Returns:
     The result of the transposed grouped matrix multiplication, with shape
@@ -868,6 +1063,7 @@ def tgmm_v2(
       out_dtype=preferred_element_type,
       acc_dtype=acc_dtype,
       target_zero_ref_bytes=target_zero_ref_bytes,
+      is_out_fused=fusion_spec is not None and fusion_spec.is_out_fused,
   )
   dims = cfgs.dims
   tiles = cfgs.tiles
@@ -878,9 +1074,40 @@ def tgmm_v2(
   # stays in-bounds, and (b) the zero-init path can slice in sublane-aligned
   # chunks. tile_k is num_lanes-aligned, which is also sublane-tile-aligned.
   aligned_k = gmm_v2.align_to(dims.size_k, tiles.tile_k)
-  out_init = jax.ShapeDtypeStruct(
+
+  if rhs_scale is not None:
+    rhs_scale = rhs_scale.astype(jnp.float32)
+    pad_n = 0 if gmm_v2.HAS_PAD_REF else aligned_n - dims.size_n
+    if pad_n > 0:
+      rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
+
+  raw_out_type = jax.ShapeDtypeStruct(
       (num_actual_groups, aligned_k, aligned_n), cfgs.out_dtype
   )
+  # `out_fusion_input_values` holds external arrays closed over by an output
+  # fusion (e.g. epilogue bias or residual), passed as HBM kernel inputs so
+  # `emit_pipeline` prefetches their tiles into VMEM for `out_fn`.
+  if fusion_spec is not None:
+    (
+        lhs_in,
+        rhs_operand,
+        out_fusion_input_values,
+        out_init,
+        spec_transform_fn,
+    ) = fusion_spec.prepare(
+        lhs=lhs,
+        rhs=rhs,
+        rhs_scale=rhs_scale,
+        cfgs=cfgs,
+        raw_out_type=raw_out_type,
+    )
+  else:
+    lhs_in = lhs
+    rhs_operand = OperandRef(value=rhs, scale=rhs_scale)
+    out_fusion_input_values: gmm_v2.OutFusionInputRefs = ()
+    out_init = raw_out_type
+    spec_transform_fn = None
+
   max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
   scratch_shapes = [
       # acc_ref
@@ -893,24 +1120,20 @@ def tgmm_v2(
   ]
 
   # Prepare zero initializing the drhs[i, :, :] where the group_size[i] is 0.
-  out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
+  out_bytes = jnp.dtype(out_init.dtype).itemsize
   tile_zero_k = target_zero_ref_bytes // num_lanes // out_bytes
-  tile_zero_k = min(tile_zero_k, dims.size_k)
-  size_out_sublane = pltpu.get_tpu_info().get_sublane_tiling(cfgs.out_dtype)
+  tile_zero_k = min(tile_zero_k, out_init.shape[1])
+  size_out_sublane = pltpu.get_tpu_info().get_sublane_tiling(out_init.dtype)
   tile_zero_k = (tile_zero_k // size_out_sublane) * size_out_sublane
   assert tile_zero_k > 0
   scratch_shapes += [
-      pltpu.VMEM((tile_zero_k, num_lanes), cfgs.out_dtype),
+      pltpu.VMEM((tile_zero_k, num_lanes), out_init.dtype),
       pltpu.SemaphoreType.DMA((1,)),
   ]
 
-  if rhs_scale is not None:
-    rhs_scale = rhs_scale.astype(jnp.float32)
-    pad_n = aligned_n - dims.size_n
-    if pad_n > 0:
-      rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, 0), (0, pad_n)))
-  # pyrefly: ignore[bad-assignment]
-  rhs = OperandRef(value=rhs, scale=rhs_scale)
+  kernel_fn = functools.partial(
+      tgmm_kernel_main, cfgs=cfgs, spec_transform_fn=spec_transform_fn
+  )
 
   if partial_sum is not None and config.disable_multi_core_mode.value:
     raise NotImplementedError(
@@ -923,13 +1146,14 @@ def tgmm_v2(
   if config.disable_multi_core_mode.value:
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     in_specs = [
-        hbm_spec,  # lhs
+        jax.tree.map(lambda _: hbm_spec, lhs_in),
         # the tree.map build a
         # OperandRef(value=hbm_spec, scale=None if scale is None else hbm_spec.
-        jax.tree.map(lambda _: hbm_spec, rhs),  # rhs
+        jax.tree.map(lambda _: hbm_spec, rhs_operand),
+        jax.tree.map(lambda _: hbm_spec, out_fusion_input_values),
     ]
-    return pl.pallas_call(
-        functools.partial(tgmm_kernel_main, cfgs=cfgs),
+    out = pl.pallas_call(
+        kernel_fn,
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -948,7 +1172,19 @@ def tgmm_v2(
         # It does not affect the kernel's computation.
         # pyrefly: ignore[bad-argument-type]
         metadata=gmm_v2.get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs)[:, : dims.size_k, : dims.size_n]
+    )(
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_operand,
+        out_fusion_input_values,
+    )
+    # When output is fused, the epilogue already ran inside the kernel on
+    # tile-aligned (size_k, size_n) tiles (so there is no padding to trim) and
+    # may have changed `out`'s shape.
+    if fusion_spec is not None and fusion_spec.is_out_fused:
+      return out
+    return out[:, : dims.size_k, : dims.size_n]
 
   group_sizes = pltpu.with_memory_space_constraint(group_sizes, pltpu.SMEM)
   group_offset = pltpu.with_memory_space_constraint(group_offset, pltpu.SMEM)
@@ -956,7 +1192,7 @@ def tgmm_v2(
   # Configure per-core execution over TensorCore mesh for MegaCore scaling.
   tgmm_kernel = functools.partial(
       pl.kernel,
-      functools.partial(tgmm_kernel_main, cfgs=cfgs),
+      kernel_fn,
       mesh=pltpu.TensorCoreMesh(axis_name="core"),
       # pyrefly: ignore[bad-argument-type]
       scratch_types=scratch_shapes,
@@ -973,15 +1209,31 @@ def tgmm_v2(
   )
 
   if partial_sum is None:
-    out = tgmm_kernel(out_type=out_init)(group_sizes, group_offset, lhs, rhs)
+    out = tgmm_kernel(out_type=out_init)(
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_operand,
+        out_fusion_input_values,
+    )
   else:
-    # Match the tile-aligned output shape so the partial sum and output blocks
-    # line up exactly. The kernel accumulates into this buffer in place.
     pad_k = aligned_k - dims.size_k
-    pad_n = aligned_n - dims.size_n
+    pad_n = 0 if gmm_v2.HAS_PAD_REF else aligned_n - dims.size_n
     if pad_k or pad_n:
       partial_sum = jnp.pad(partial_sum, ((0, 0), (0, pad_k), (0, pad_n)))
     out_ref = jax.new_ref(partial_sum)
-    tgmm_kernel(out_type=())(group_sizes, group_offset, lhs, rhs, out_ref)
+    tgmm_kernel(out_type=())(
+        group_sizes,
+        group_offset,
+        lhs_in,
+        rhs_operand,
+        out_fusion_input_values,
+        out_ref,
+    )
     out = jax.freeze(out_ref)
+  # When output is fused, the epilogue already ran inside the kernel on
+  # tile-aligned (size_k, size_n) tiles (so there is no padding to trim) and
+  # may have changed `out`'s shape.
+  if fusion_spec is not None and fusion_spec.is_out_fused:
+    return out
   return out[:, : dims.size_k, : dims.size_n]

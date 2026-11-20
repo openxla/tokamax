@@ -24,6 +24,7 @@ from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
+from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
 from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
@@ -100,9 +101,10 @@ class GmmCase:
       num_skipped: int = 0,
       balanced_ep: int | None = None,
       has_bias: bool = False,
+      fused_up_and_down: bool = False,
   ) -> Self:
     """Builds the layer inputs of `case` for the shard at `group_offset`."""
-    helper_util.check_gmm_supported(case)
+    helper_util.check_gmm_supported(case, fused_up_and_down=fused_up_and_down)
     shape = dataclasses.replace(
         case.shape, intermediate_size=case.local_intermediate_size
     )
@@ -206,6 +208,7 @@ def dequantize_rows(x: jax.Array) -> jax.Array:
         "remote_scatter",
         "all_to_all",
         "out_dtype",
+        "custom_plan",
     )
 )
 def sharded_gmm_unpermute(
@@ -219,6 +222,7 @@ def sharded_gmm_unpermute(
     remote_scatter: bool = True,
     all_to_all: bool = False,
     out_dtype: jax.typing.DTypeLike | None = None,
+    custom_plan: gmm_plan.RoutingGmmPlan | None = None,
 ) -> jax.Array:
   """Runs EP-sharded `routing_gmm` scatter, with fused or unfused all-to-all."""
   axis = helper_cases.EP_AXIS
@@ -251,6 +255,7 @@ def sharded_gmm_unpermute(
             scatter_indices, remote_axis=remote_axis
         ),
         out_format=out_format,
+        custom_plan=custom_plan,
     ).data
     if remote_scatter or not all_to_all:
       return out

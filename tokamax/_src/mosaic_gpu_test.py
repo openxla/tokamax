@@ -150,6 +150,60 @@ class PallasMosaicGpuUtilsTest(parameterized.TestCase):
     expected = jnp.array([10, 11, 12, 13, 24, 25, 26, 27], dtype=jnp.int32)
     np.testing.assert_array_equal(actual, expected)
 
+  def test_udiv_urem_ucdiv_kernel(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((6, 3), jnp.int32),
+        grid=(6,),
+        grid_names=("i",),
+    )
+    def kernel(out_ref):
+      i = lax.axis_index("i")
+      out_ref[i, 0] = common.udiv(i, 3)
+      out_ref[i, 1] = common.urem(i, 3)
+      out_ref[i, 2] = common.ucdiv(i, 3)
+
+    actual = kernel()
+    expected = jnp.array(
+        [[0, 0, 0], [0, 1, 1], [0, 2, 1], [1, 0, 1], [1, 1, 2], [1, 2, 2]],
+        dtype=jnp.int32,
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+class UnsignedDivRemTest(parameterized.TestCase):
+
+  def test_python_ints(self):
+    q = common.udiv(17, 5)
+    r = common.urem(17, 5)
+    c1 = common.ucdiv(17, 5)
+    c2 = common.ucdiv(15, 5)
+    c0 = common.ucdiv(0, 5)
+    self.assertIsInstance(q, int)
+    self.assertIsInstance(r, int)
+    self.assertIsInstance(c1, int)
+    self.assertEqual(q, 3)
+    self.assertEqual(r, 2)
+    self.assertEqual(c1, 4)
+    self.assertEqual(c2, 3)
+    self.assertEqual(c0, 0)
+
+  @parameterized.parameters(jnp.int32, jnp.uint32)
+  def test_jax_arrays(self, dtype):
+    a = jnp.array([0, 1, 4, 5, 6, 17], dtype=dtype)
+    b = jnp.full_like(a, 5)
+
+    for divisor in (b, 5):
+      q = common.udiv(a, divisor)
+      r = common.urem(a, divisor)
+      c = common.ucdiv(a, divisor)
+      self.assertEqual(q.dtype, dtype)
+      self.assertEqual(r.dtype, dtype)
+      self.assertEqual(c.dtype, dtype)
+      np.testing.assert_array_equal(q, [0, 0, 0, 1, 1, 3])
+      np.testing.assert_array_equal(r, [0, 1, 4, 0, 1, 2])
+      np.testing.assert_array_equal(c, [0, 1, 1, 1, 2, 4])
+
 
 if __name__ == "__main__":
   absltest.main()
