@@ -1553,6 +1553,10 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   )
 
   # --- Intra backward + reverse cumsum ---
+  # The intra-chunk dots run at HIGHEST for both input dtypes. With a
+  # per-channel gate, q and k enter them rescaled by exp2 (not bf16-exact), and
+  # the diagonal sub-block terms of dg_intra cancel only when both products are
+  # exact (docs/ops/kda/chunk_kda_bwd_design_doc.md, section 3.2).
   dq_total, dk_total, db_total, dg_total = compute_intra_backward(
       bq,
       bk,
@@ -1564,7 +1568,7 @@ def _fused_dhu_wy_intra_cumsum_kernel(
       dk_acc,
       db_acc,
       dg_acc,
-      precision=precision,
+      precision=jax.lax.Precision.HIGHEST,
       per_channel_gate=per_channel_gate,
       decay=decay_mat,
   )
