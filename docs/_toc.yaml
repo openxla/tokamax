@@ -31,6 +31,8 @@ toc:
     path: /tokamax/library_design
   - title: Contributing
     path: /tokamax/contributing
+  - title: Adding an Op
+    path: /tokamax/adding_an_op
   - title: Code Style
     path: /tokamax/code_style
 - title: Demo Notebooks
