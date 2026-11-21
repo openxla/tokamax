@@ -218,6 +218,10 @@ class FailOpenTest(DepsTestCase):
   def test_conftest(self):
     self.assert_full_run('tokamax/conftest.py')
 
+  def test_ops_list(self):
+    self.add('tokamax/_src/ops/ops_list.py', 'OPS = ()\n')
+    self.assert_full_run('tokamax/_src/ops/ops_list.py')
+
   def test_package_data(self):
     # The autotuning JSON decides which kernel configuration runs and is read
     # by path, so no import edge covers it.
@@ -897,6 +901,70 @@ class ClosureInvariantTest(DepsTestCase):
       self.assertEqual(
           actual, expected, f'wrong affected set for {source} ({reason})'
       )
+
+
+class AllowedSubgraphTest(DepsTestCase):
+  """`allowed` restricts reachability to paths staying within the subgraph."""
+
+  def test_excludes_disallowed_changed_file_and_intermediate(self):
+    # backend_test -> backend -> triton -> core. Excluding triton blocks
+    # triton from reaching backend_test, while core still reaches core_test.
+    allowed = set(self.files) - {'tokamax/_src/ops/triton.py'}
+    tests, reason = deps.affected_tests(
+        ['tokamax/_src/ops/triton.py'],
+        self.edges,
+        self.unparsed,
+        self.files,
+        allowed=allowed,
+    )
+    self.assertIsNone(reason)
+    self.assertEqual(tests, set())
+
+    tests, reason = deps.affected_tests(
+        ['tokamax/_src/core.py'],
+        self.edges,
+        self.unparsed,
+        self.files,
+        allowed=allowed,
+    )
+    self.assertIsNone(reason)
+    self.assertIn('tokamax/_src/core_test.py', tests)
+    self.assertNotIn('tokamax/_src/ops/backend_test.py', tests)
+
+  def test_autotuning_table_on_excluded_op_does_not_fail_open(self):
+    table = 'tokamax/data/autotuning/tpu7x/pallas_mosaic_tpu_ragged_dot.json'
+    allowed = set(self.files) - {'tokamax/_src/ops/ragged.py'}
+    tests, reason = deps.affected_tests(
+        [table], self.edges, self.unparsed, self.files, allowed=allowed
+    )
+    self.assertIsNone(reason)
+    self.assertEqual(tests, set())
+
+    # If the op has no tests anywhere, it still fails open even with `allowed`.
+    self.remove('tokamax/_src/ops/ragged_test.py')
+    tests, reason = deps.affected_tests(
+        [table],
+        self.edges,
+        self.unparsed,
+        self.files,
+        allowed=set(self.files) - {'tokamax/_src/ops/ragged.py'},
+    )
+    self.assertIsNone(tests)
+    self.assertIn('reaches no test', reason)
+
+  def test_deleted_file_respects_allowed_referrers(self):
+    self.remove('tokamax/_src/core.py')
+    allowed = set(self.files) - {'tokamax/_src/ops/triton.py'}
+    tests, reason = deps.affected_tests(
+        ['tokamax/_src/core.py'],
+        self.edges,
+        self.unparsed,
+        self.files,
+        allowed=allowed,
+    )
+    self.assertIsNone(reason)
+    self.assertIn('tokamax/_src/op_test.py', tests)
+    self.assertNotIn('tokamax/_src/ops/backend_test.py', tests)
 
 
 if __name__ == '__main__':
