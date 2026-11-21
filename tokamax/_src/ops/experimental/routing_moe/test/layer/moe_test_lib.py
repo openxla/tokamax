@@ -59,6 +59,7 @@ class WeightLayout:
   fold_shared_expert: bool = False
 
 
+@jax.jit(static_argnames=("n_shards",))
 def _interleave_gate_up(w: jax.Array, n_shards: int) -> jax.Array:
   """Reorders `[.., gate | up]` columns so each TP shard gets both halves."""
   gate, up = jnp.split(w, 2, axis=-1)
@@ -73,6 +74,12 @@ def _maybe_interleave(w: jax.Array | None, n_shards: int) -> jax.Array | None:
 
 def _scale_shape(scale: jax.Array | None) -> tuple[int, ...] | None:
   return None if scale is None else scale.shape
+
+
+@jax.jit(static_argnames=("repeats",))
+def _repeat_axis1(scale: jax.Array, repeats: int) -> jax.Array:
+  """Repeats `scale` along its block axis (`axis=1`)."""
+  return jnp.repeat(scale, repeats, axis=1)
 
 
 def _split_scale_blocks(
@@ -111,7 +118,7 @@ def _split_scale_blocks(
         f"Cannot split {num_blocks} scale blocks of {rows} rows across"
         f" {num_shards} shards."
     )
-  return jnp.repeat(scale, new_num_blocks // num_blocks, axis=1)
+  return _repeat_axis1(scale, new_num_blocks // num_blocks)
 
 
 def _shard_inputs(
