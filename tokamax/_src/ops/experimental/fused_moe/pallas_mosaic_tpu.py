@@ -14,6 +14,7 @@
 # ==============================================================================
 """Pallas Mosaic TPU operator implementation for Fused MoE."""
 
+import itertools
 from typing import ClassVar
 import jax
 import jax.experimental.pallas.tpu as pltpu
@@ -101,7 +102,13 @@ class PallasMosaicTpuFusedMoe(base.FusedMoe):
 
   @override
   def _get_autotuning_configs(self, ba):
-    return {self._get_heuristics_config(ba)}
+    del ba
+    return {
+        Config(capacity=capacity, sharded_plan=sharded_plan)
+        for capacity, sharded_plan in itertools.product(
+            (128, 256, 512), (False, True)
+        )
+    }
 
   @override
   def supported_on(self, device):

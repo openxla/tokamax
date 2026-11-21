@@ -21,7 +21,10 @@ from jax.extend import backend
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
+from tokamax._src import numerics
+from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.experimental.fused_moe import reference
+from tokamax._src.ops.experimental.fused_moe_decode import arg_specs
 from tokamax._src.ops.experimental.fused_moe_decode import pallas_mosaic_tpu
 
 F8 = jnp.float8_e4m3fn
@@ -292,6 +295,30 @@ class ConfigAndHeuristicsTest(parameterized.TestCase):
       pallas_mosaic_tpu.Config(num_buffers=2)
     with self.assertRaises(ValueError):
       pallas_mosaic_tpu.Config(q_block=64)
+
+  def test_arg_specs_bind_and_lift(self):
+    op = pallas_mosaic_tpu.PallasMosaicTpuFusedMoeDecode()
+    for spec in arg_specs.ARG_SPECS:
+      self.assertIsNotNone(spec.shard_map)
+      self.assertEqual(spec.num_devices, spec.args["n_ranks"])
+      ba = op.bind(**spec.args)
+      self.assertEqual(ba.arguments["n_ranks"], spec.num_devices)
+
+    single_device_spec = next(
+        s for s in arg_specs.ARG_SPECS if s.num_devices == 1
+    )
+    assert single_device_spec.shard_map is not None
+    lifted = arg_spec.lift_shard_map_args(
+        single_device_spec.args,
+        single_device_spec.shard_map,
+        devices=jax.devices()[:1],
+    )
+    initialized = numerics.random_initialize(lifted)
+    self.assertEqual(initialized["rank"].shape, (1,))
+    self.assertEqual(int(initialized["rank"][0]), 0)
+    self.assertEqual(
+        initialized["w1"].shape, single_device_spec.args["w1"].shape
+    )
 
 
 if __name__ == "__main__":

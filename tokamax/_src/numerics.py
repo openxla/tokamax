@@ -156,12 +156,25 @@ class ArrayInitializer(abc.ABC):
         ' sharded abstract mesh.'
     )
 
+  def with_shape_and_sharding(
+      self,
+      shape: tuple[int, ...],
+      sharding: jax.sharding.Sharding,
+  ) -> 'ArrayInitializer':
+    """Returns a copy of this initializer with the given shape and sharding."""
+    if shape == self.shape:
+      return self.with_sharding(sharding)
+    raise NotImplementedError(
+        f'{type(self).__name__} must implement with_shape_and_sharding to be'
+        ' lifted across a sharded mesh.'
+    )
+
 
 class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
   """A abstract array with a known range."""
 
-  def __init__(self, shape, dtype, minval, maxval):
-    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+  def __init__(self, shape, dtype, minval, maxval, sharding=None):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype, sharding=sharding)
     self.minval = minval
     self.maxval = maxval
 
@@ -170,17 +183,47 @@ class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
         rng, self.shape, self.dtype, self.minval, self.maxval
     )
 
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> 'RangedArrayInitializer':
+    return self.with_shape_and_sharding(self.shape, sharding)
+
+  def with_shape_and_sharding(
+      self,
+      shape: tuple[int, ...],
+      sharding: jax.sharding.Sharding,
+  ) -> 'RangedArrayInitializer':
+    return RangedArrayInitializer(
+        shape, self.dtype, self.minval, self.maxval, sharding=sharding
+    )
+
 
 class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
   """An abstract float array initialized uniformly in `[minval, maxval)`."""
 
-  def __init__(self, shape, dtype, minval: float, maxval: float):
-    jax.ShapeDtypeStruct.__init__(self, shape, dtype)
+  def __init__(
+      self, shape, dtype, minval: float, maxval: float, sharding=None
+  ):
+    jax.ShapeDtypeStruct.__init__(self, shape, dtype, sharding=sharding)
     self.minval = minval
     self.maxval = maxval
 
   def __call__(self, rng: np.random.Generator) -> np.ndarray:
     return rng.uniform(self.minval, self.maxval, self.shape).astype(self.dtype)
+
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> 'FloatRangedArrayInitializer':
+    return self.with_shape_and_sharding(self.shape, sharding)
+
+  def with_shape_and_sharding(
+      self,
+      shape: tuple[int, ...],
+      sharding: jax.sharding.Sharding,
+  ) -> 'FloatRangedArrayInitializer':
+    return FloatRangedArrayInitializer(
+        shape, self.dtype, self.minval, self.maxval, sharding=sharding
+    )
 
 
 # Threshold (in number of elements) above which arrays are initialized directly
@@ -307,11 +350,16 @@ def _init_qarray(rng: np.random.Generator, qarray: qwix.QArray) -> qwix.QArray:
 def _init_leaf(rng: np.random.Generator, leaf: Any) -> Any:
   """Initializes a single abstract array leaf with layout and sharding."""
   if isinstance(leaf, ArrayInitializer):
-    leaf_dict = vars(leaf)
-    sharding = leaf_dict.get('sharding', None)
-    out_sharding = (
-        leaf_dict.get('format', sharding) if sharding is not None else None
-    )
+    sharding = getattr(leaf, 'sharding', None)
+    if sharding is None:
+      out_sharding = None
+    else:
+      try:
+        out_sharding = leaf.format
+      except AttributeError:
+        out_sharding = sharding
+      if out_sharding is None:
+        out_sharding = sharding
     return jax.device_put(leaf(rng), out_sharding)
 
   if isinstance(leaf, qwix.QArray):
