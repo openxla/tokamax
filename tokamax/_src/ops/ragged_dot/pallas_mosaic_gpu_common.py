@@ -186,6 +186,19 @@ def get_smem_capacity() -> int:
   return SMEM_CAPACITY_MAP[sm_version]
 
 
+def pad_rows_for_tma(x: jax.Array) -> jax.Array:
+  """Pads the rows of `x` to a multiple of 8 if it has more than 8 rows.
+
+  TMA loads of `x` go through an SMEM ref tiled by 8 rows, which fails when the
+  row count is above 8 and not a multiple of 8. The padding rows are in no
+  group, so they are never stored and the output keeps the original rows.
+  """
+  m = x.shape[0]
+  if m <= 8 or m % 8 == 0:
+    return x
+  return jnp.pad(x, [(0, pl.cdiv(m, 8) * 8 - m)] + [(0, 0)] * (x.ndim - 1))
+
+
 def copy_ragged_smem_to_gmem(
     out_smem: Any,
     out_gmem: Any,

@@ -55,6 +55,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
   m, k = lhs.shape
   g, _, n = rhs.shape
+  lhs = common.pad_rows_for_tma(lhs)
   m_iters = pl.cdiv(m, cluster_block_m) + g - 1
   n_iters = pl.cdiv(n, cluster_block_n)
   k_iters = pl.cdiv(k, block_k)

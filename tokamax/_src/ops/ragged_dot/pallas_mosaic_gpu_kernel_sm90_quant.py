@@ -78,7 +78,7 @@ def ragged_dot_quantized_kernel(
 
   m, k = lhs.shape
   g, _, n = rhs.shape
-  w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
+  w, w_scales, x = (rhs.qvalue.mT, rhs.scale, common.pad_rows_for_tma(lhs))
   block_m, block_n, block_k = config.block_m, config.block_n, config.block_k
 
   if n % (2 * block_n) != 0:

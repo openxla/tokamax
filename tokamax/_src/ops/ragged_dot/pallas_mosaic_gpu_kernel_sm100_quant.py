@@ -113,6 +113,7 @@ def ragged_dot_gpu_quant_blackwell_kernel(
 
   w, w_scales, x = (rhs.qvalue.mT, rhs.scale, lhs)
   (num_groups, n, k_w), (m, k_x) = w.shape, x.shape
+  x = common.pad_rows_for_tma(x)
   tile_k = k_w // w_scales.shape[1]
 
   if tile_k < block_k:

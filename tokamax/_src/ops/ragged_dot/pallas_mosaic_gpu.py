@@ -23,7 +23,6 @@ import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import precision as precision_lib
 from tokamax._src import quantization
-from tokamax._src import shape as shape_lib
 from tokamax._src.ops import op
 from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
@@ -231,6 +230,15 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
       )
 
+    # The kernel wrappers pad the rows of an `lhs` array to a multiple of 8 for
+    # TMA, but a quantized `lhs` is not padded yet.
+    if isinstance(lhs, QArray):
+      m = lhs.qvalue.shape[0]
+      if m > 8 and m % 8 != 0:
+        raise NotImplementedError(
+            f"Quantized `lhs` needs {m=} to be at most 8 or a multiple of 8."
+        )
+
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
 
@@ -251,17 +259,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         )
       fn = partial(fn, int4_to_fp8_offline_permute=True)
 
-    # The kernels tile the rows of `lhs` by 8, which fails when `m` is not a
-    # multiple of 8. The padding rows are not in any group, so we drop them.
-    m = None
-    if (
-        ragged_dot_dimension_numbers == base.DEFAULT_RAGGED_DOT_DIM_NUMS
-        and isinstance(lhs, jax.Array)
-        and lhs.shape[0] % 8 != 0
-    ):
-      m = lhs.shape[0]
-      lhs = shape_lib.pad_to_next_multiple_of(lhs, 8, 0)
-
     dot_out = fn(
         lhs,  # pyrefly: ignore[bad-argument-type]
         rhs,  # pyrefly: ignore[bad-argument-type]
@@ -271,8 +268,6 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
         activation=activation if not return_residuals else None,
     )
     dot_out = cast(jax.Array, dot_out)  # FIXME
-    if m is not None:
-      dot_out = dot_out[:m]
     residuals = dot_out
     if activation is not None and return_residuals:
       dot_out = activation(dot_out)

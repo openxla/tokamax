@@ -147,6 +147,12 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
         actual.astype(jnp.float32), expected, atol=0.01, rtol=0.005
     )
 
+  @parameterized.parameters(300, 1020)
+  def test_num_rows_not_multiple_of_8_quantized_rhs(self, m):
+    self._test_quantized(
+        "int4", "int4", None, (1, 256, 1), False, task=(8, m, 256, 512)
+    )
+
 
 if __name__ == "__main__":
   absltest.main()
