@@ -16,12 +16,16 @@
 
 import dataclasses
 import enum
+import keyword
 
 
 class Platform(enum.StrEnum):
   CPU = "cpu"
   GPU = "gpu"
   TPU = "tpu"
+
+
+_ACCELERATORS = frozenset({Platform.GPU, Platform.TPU})
 
 
 def _check_name(owner: object, name: object) -> None:
@@ -48,17 +52,39 @@ CUTEDSL = Backend("cutedsl", frozenset({Platform.GPU}))
 CUDNN = Backend("cudnn", frozenset({Platform.GPU}))
 
 
+def _check_cls(cls_name: object) -> None:
+  if cls_name is not None and (
+      not isinstance(cls_name, str)
+      or not cls_name.isidentifier()
+      or keyword.iskeyword(cls_name)
+  ):
+    raise ValueError(
+        f"Impl.cls must be a non-empty identifier str, got {cls_name!r}"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Impl:
+  """Kernel implementation metadata."""
+
   name: str
   backend: Backend
   module: str
+  cls: str | None = None
   # Extra op directories (relative to _src/ops/ or google/ops/), e.g. a raw
   # kernel package that this implementation wraps, that share its backend.
   kernel_dirs: tuple[str, ...] = ()
 
   def __post_init__(self) -> None:
     _check_name(self, self.name)
+    _check_cls(self.cls)
+
+  @property
+  def accelerator_platforms(self) -> frozenset[Platform]:
+    """GPU/TPU platforms for non-XLA implementations, else empty."""
+    if self.backend == XLA:
+      return frozenset()
+    return self.backend.platforms & _ACCELERATORS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,9 +94,16 @@ class Op:
   name: str
   apis: tuple[str, ...]
   impls: tuple[Impl, ...]
+  # Ops that use this op's api or base; it is also tested on their platforms.
+  dependent_ops: tuple[str, ...] = ()
 
   def __post_init__(self) -> None:
     _check_name(self, self.name)
+    for dep in self.dependent_ops:
+      if not isinstance(dep, str) or not dep or dep == self.name:
+        raise ValueError(
+            f"Op '{self.name}' has invalid dependent_ops entry {dep!r}"
+        )
 
   @property
   def op_dir(self) -> str:
@@ -108,11 +141,13 @@ OPS: tuple[Op, ...] = (
                 name="base",
                 backend=XLA,
                 module="_src/ops/splash_attention/base.py",
+                cls="SplashAttention",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/splash_attention/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuSplashAttention",
             ),
         ),
     ),
@@ -127,11 +162,13 @@ OPS: tuple[Op, ...] = (
                 name="reference",
                 backend=XLA,
                 module="_src/ops/batched_rpa/base.py",
+                cls="BatchedRpa",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/batched_rpa/pallas_mosaic_tpu.py",
+                cls="PallasTpuBatchedRpa",
             ),
         ),
     ),
@@ -143,6 +180,7 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/causal_conv1d_gated_delta_rule/base.py",
+                cls="CausalConv1dGatedDeltaRule",
             ),
             Impl(
                 name="mosaic_tpu",
@@ -151,6 +189,7 @@ OPS: tuple[Op, ...] = (
                     "_src/ops/causal_conv1d_gated_delta_rule/"
                     "pallas_mosaic_tpu.py"
                 ),
+                cls="PallasMosaicTpuCausalConv1dGatedDeltaRule",
             ),
         ),
     ),
@@ -162,11 +201,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/deepseek_rope/base.py",
+                cls="DeepseekRope",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/deepseek_rope/pallas_mosaic_tpu.py",
+                cls="PallasTpuDeepseekRope",
             ),
         ),
     ),
@@ -178,11 +219,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/proj_and_save_state/base.py",
+                cls="ProjAndSaveState",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/proj_and_save_state/pallas_mosaic_tpu.py",
+                cls="PallasTpuProjAndSaveState",
             ),
         ),
     ),
@@ -194,11 +237,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/dsv4_compressor/base.py",
+                cls="Dsv4Compressor",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/dsv4_compressor/pallas_mosaic_tpu.py",
+                cls="PallasTpuDsv4Compressor",
             ),
         ),
     ),
@@ -210,11 +255,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/lightning_indexer/base.py",
+                cls="LightningIndexer",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/lightning_indexer/pallas_mosaic_tpu.py",
+                cls="PallasTpuLightningIndexer",
             ),
         ),
     ),
@@ -226,11 +273,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/topk/base.py",
+                cls="TopK",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/topk/pallas_mosaic_tpu.py",
+                cls="PallasTpuTopK",
             ),
         ),
     ),
@@ -242,11 +291,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/csa_gather/base.py",
+                cls="CsaGather",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/csa_gather/pallas_mosaic_tpu.py",
+                cls="PallasTpuCsaGather",
             ),
         ),
     ),
@@ -258,11 +309,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/sparse_mla/base.py",
+                cls="SparseMla",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/sparse_mla/pallas_mosaic_tpu.py",
+                cls="PallasTpuSparseMla",
             ),
         ),
     ),
@@ -274,11 +327,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/masked_dense_mla/base.py",
+                cls="MaskedDenseMla",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/masked_dense_mla/pallas_mosaic_tpu.py",
+                cls="PallasTpuMaskedDenseMla",
             ),
         ),
     ),
@@ -290,11 +345,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/mla_swa/base.py",
+                cls="MlaSwa",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla_swa/pallas_mosaic_tpu.py",
+                cls="PallasTpuMlaSwa",
             ),
         ),
     ),
@@ -306,11 +363,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/grouped_lowrank_proj/base.py",
+                cls="GroupedLowrankProj",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/grouped_lowrank_proj/pallas_mosaic_tpu.py",
+                cls="PallasTpuGroupedLowrankProj",
             ),
         ),
     ),
@@ -322,52 +381,80 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/attention/base.py",
+                cls="DotProductAttention",
             ),
             Impl(
                 name="xla_chunked",
                 backend=XLA,
                 module="_src/ops/attention/xla_chunked.py",
+                cls="XlaChunkedDotProductAttention",
             ),
             Impl(
                 name="cudnn",
                 backend=CUDNN,
                 module="_src/ops/attention/jax_nn.py",
+                cls="JaxNnDotProductAttention",
             ),
             Impl(
                 name="mosaic_gpu",
                 backend=MOSAIC_GPU,
                 module="_src/ops/attention/pallas_mosaic_gpu.py",
+                cls="PallasMosaicGpuFlashAttention",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/attention/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuFlashAttention",
             ),
             Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/attention/triton.py",
+                cls="TritonFlashAttention",
             ),
         ),
+        dependent_ops=("flex_attention",),
     ),
     Op(
         name="kda",
-        apis=("tokamax.ops.kimi_delta_attention", "tokamax.ops.gated_delta_net"),
+        apis=("tokamax.ops.kimi_delta_attention",),
         impls=(
             Impl(
                 name="xla",
                 backend=XLA,
                 module="_src/ops/kda/base.py",
+                cls="KimiDeltaAttention",
             ),
             Impl(
                 name="xla_chunked",
                 backend=XLA,
                 module="_src/ops/kda/xla_chunked.py",
+                cls="XlaChunkedKimiDeltaAttention",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/kda/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuKimiDeltaAttention",
+            ),
+        ),
+    ),
+    Op(
+        name="gated_delta_net",
+        apis=("tokamax.ops.gated_delta_net",),
+        impls=(
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/kda/base.py",
+                cls="GatedDeltaNet",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/kda/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuGatedDeltaNet",
             ),
         ),
     ),
@@ -379,6 +466,7 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/flex_attention/base.py",
+                cls="FlexAttention",
             ),
         ),
     ),
@@ -390,11 +478,15 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/mla/base.py",
+                cls="MultiHeadLatentAttention",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mla/pallas_mosaic_tpu.py",
+                cls="PallasTpuMultiHeadLatentAttention",
+                kernel_dirs=(
+                ),
             ),
         ),
     ),
@@ -406,11 +498,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/moba/base.py",
+                cls="MixtureOfBlockAttention",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/moba/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuMixtureOfBlockAttention",
             ),
         ),
     ),
@@ -422,11 +516,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/nsa/base.py",
+                cls="NativeSparseAttention",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/nsa/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuNativeSparseAttention",
             ),
         ),
     ),
@@ -438,11 +534,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/gdn2/base.py",
+                cls="GatedDeltaNet2",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/gdn2/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuGatedDeltaNet2",
             ),
         ),
     ),
@@ -454,11 +552,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/rwkv7/base.py",
+                cls="Rwkv7",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/rwkv7/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuRwkv7",
             ),
         ),
     ),
@@ -470,11 +570,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/raven/base.py",
+                cls="RavenGsa",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/raven/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuRavenGsa",
             ),
         ),
     ),
@@ -489,26 +591,31 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/ragged_dot/base.py",
+                cls="RaggedDot",
             ),
             Impl(
                 name="mosaic_gpu",
                 backend=MOSAIC_GPU,
                 module="_src/ops/ragged_dot/pallas_mosaic_gpu.py",
+                cls="PallasMosaicGpuRaggedDot",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/ragged_dot/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuRaggedDot",
             ),
             Impl(
                 name="mosaic_tpu_v2",
                 backend=MOSAIC_TPU,
                 module="_src/ops/ragged_dot/pallas_mosaic_tpu_v2.py",
+                cls="PallasMosaicTpuV2RaggedDot",
             ),
             Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/ragged_dot/triton.py",
+                cls="TritonRaggedDot",
             ),
         ),
     ),
@@ -520,11 +627,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/ragged_gather/base.py",
+                cls="RaggedGather",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_TPU,
                 module="_src/ops/ragged_gather/pallas_mosaic_tpu.py",
+                cls="PallasTpuRaggedGather",
             ),
         ),
     ),
@@ -536,11 +645,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/ragged_gather_reduce/base.py",
+                cls="RaggedGatherReduce",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/ragged_gather_reduce/pallas_mosaic_tpu.py",
+                cls="PallasTpuRaggedGatherReduce",
             ),
         ),
     ),
@@ -552,11 +663,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/router_topk/base.py",
+                cls="RouterTopK",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/router_topk/pallas_mosaic_tpu.py",
+                cls="PallasTpuRouterTopK",
             ),
         ),
     ),
@@ -568,11 +681,13 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/fused_moe/base.py",
+                cls="FusedMoe",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/fused_moe/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuFusedMoe",
             ),
         ),
     ),
@@ -617,6 +732,7 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/fused_moe_decode/base.py",
+                cls="FusedMoeDecode",
             ),
             Impl(
                 name="mosaic_tpu",
@@ -625,6 +741,7 @@ OPS: tuple[Op, ...] = (
                     "_src/ops/experimental/fused_moe_decode/"
                     "pallas_mosaic_tpu.py"
                 ),
+                cls="PallasMosaicTpuFusedMoeDecode",
             ),
         ),
     ),
@@ -647,6 +764,7 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/linear_softmax_cross_entropy_loss/base.py",
+                cls="LinearSoftmaxCrossEntropyLoss",
             ),
             Impl(
                 name="chunked_xla",
@@ -654,6 +772,7 @@ OPS: tuple[Op, ...] = (
                 module=(
                     "_src/ops/linear_softmax_cross_entropy_loss/chunked_xla.py"
                 ),
+                cls="ChunkedXlaLinearSoftmaxCrossEntropyLoss",
             ),
             Impl(
                 name="mosaic_tpu",
@@ -662,22 +781,61 @@ OPS: tuple[Op, ...] = (
                     "_src/ops/linear_softmax_cross_entropy_loss/"
                     "pallas_mosaic_tpu.py"
                 ),
+                cls="PallasMosaicTpuLinearSoftmaxCrossEntropyLoss",
             ),
         ),
     ),
     Op(
-        name="mhc",
-        apis=(
-            "tokamax.ops.mhc_pre",
-            "tokamax.ops.mhc_post",
-            "tokamax.ops.mhc_fused_post_pre",
-        ),
+        name="mhc_pre",
+        apis=("tokamax.ops.mhc_pre",),
         impls=(
-            Impl(name="xla", backend=XLA, module="_src/ops/mhc/base.py"),
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/mhc/base.py",
+                cls="MhcPre",
+            ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/mhc/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcPre",
+            ),
+        ),
+    ),
+    Op(
+        name="mhc_post",
+        apis=("tokamax.ops.mhc_post",),
+        impls=(
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/mhc/base.py",
+                cls="MhcPost",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/mhc/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcPost",
+            ),
+        ),
+    ),
+    Op(
+        name="mhc_fused_post_pre",
+        apis=("tokamax.ops.mhc_fused_post_pre",),
+        impls=(
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/mhc/base.py",
+                cls="MhcFusedPostPre",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/mhc/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcFusedPostPre",
             ),
         ),
     ),
@@ -689,23 +847,28 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/gated_linear_unit/base.py",
+                cls="GatedLinearUnit",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_GPU,
                 module="_src/ops/gated_linear_unit/pallas_mosaic_gpu.py",
+                cls="PallasMosaicGpuGatedLinearUnit",
             ),
             Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/gated_linear_unit/triton.py",
+                cls="TritonGatedLinearUnit",
             ),
             Impl(
                 name="cutedsl",
                 backend=CUTEDSL,
                 module="_src/ops/gated_linear_unit/cutedsl.py",
+                cls="CuteDslGatedLinearUnit",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="normalization",
@@ -715,18 +878,22 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/normalization/base.py",
+                cls="Normalization",
             ),
             Impl(
                 name="mosaic",
                 backend=MOSAIC_GPU,
                 module="_src/ops/normalization/mosaic.py",
+                cls="PallasMosaicGpuNormalization",
             ),
             Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/normalization/triton.py",
+                cls="TritonNormalization",
             ),
         ),
+        dependent_ops=("triangle_multiplication",),
     ),
     Op(
         name="triangle_multiplication",
@@ -736,21 +903,25 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/triangle_multiplication/base.py",
+                cls="TriangleMultiplication",
             ),
             Impl(
                 name="mosaic_gpu",
                 backend=MOSAIC_GPU,
                 module="_src/ops/triangle_multiplication/pallas_mosaic_gpu.py",
+                cls="PallasMosaicGpuTriangleMultiplication",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/triangle_multiplication/pallas_mosaic_tpu.py",
+                cls="PallasMosaicTpuTriangleMultiplication",
             ),
             Impl(
                 name="triton",
                 backend=TRITON,
                 module="_src/ops/triangle_multiplication/triton.py",
+                cls="TritonTriangleMultiplication",
             ),
         ),
     ),
@@ -762,6 +933,7 @@ OPS: tuple[Op, ...] = (
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/fused_fp8_matmul/base.py",
+                cls="FusedFp8Matmul",
             ),
             Impl(
                 name="mosaic_tpu",
@@ -770,22 +942,61 @@ OPS: tuple[Op, ...] = (
                     "_src/ops/experimental/fused_fp8_matmul/"
                     "pallas_mosaic_tpu.py"
                 ),
+                cls="PallasMosaicTpuFusedFp8Matmul",
             ),
         ),
     ),
     Op(
-        name="mhc_lite",
+        name="mhc_lite_pre",
         apis=(),
         impls=(
             Impl(
                 name="xla",
                 backend=XLA,
                 module="_src/ops/experimental/mhc_lite/base.py",
+                cls="MhcLitePre",
             ),
             Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
                 module="_src/ops/experimental/mhc_lite/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcLitePre",
+            ),
+        ),
+    ),
+    Op(
+        name="mhc_lite_post",
+        apis=(),
+        impls=(
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/experimental/mhc_lite/base.py",
+                cls="MhcLitePost",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/mhc_lite/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcLitePost",
+            ),
+        ),
+    ),
+    Op(
+        name="mhc_lite_post_and_pre",
+        apis=(),
+        impls=(
+            Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/experimental/mhc_lite/base.py",
+                cls="MhcLitePostAndPre",
+            ),
+            Impl(
+                name="mosaic_tpu",
+                backend=MOSAIC_TPU,
+                module="_src/ops/experimental/mhc_lite/pallas_mosaic_tpu.py",
+                cls="PallasTpuMhcLitePostAndPre",
             ),
         ),
     ),
@@ -815,3 +1026,13 @@ OPS: tuple[Op, ...] = (
         ),
     ),
 )
+
+
+def _check_dependent_ops(ops: tuple[Op, ...]) -> None:
+  op_names = frozenset(op.name for op in ops)
+  for op in ops:
+    if unknown := sorted(set(op.dependent_ops) - op_names):
+      raise ValueError(f"Op '{op.name}' lists unknown dependent_ops: {unknown}")
+
+
+_check_dependent_ops(OPS)
