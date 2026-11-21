@@ -86,6 +86,19 @@ class RoutingGmmSpecTest(absltest.TestCase):
     self.assertEqual(fused.size_out_n, 2560)
     self.assertTrue(fused.is_fused_act)
 
+  def test_has_routed_io_reflects_gather_and_scatter(self):
+    routed = _make_spec(8)
+    self.assertTrue(routed.has_routed_io)
+    self.assertTrue(dataclasses.replace(routed, scatter=None).has_routed_io)
+    scatter_only = dataclasses.replace(
+        routed,
+        gather=None,
+        scatter=spec.RoutingSpec(num_indices=8, remote_axis=None),
+    )
+    self.assertTrue(scatter_only.has_routed_io)
+    direct = dataclasses.replace(routed, gather=None, scatter=None)
+    self.assertFalse(direct.has_routed_io)
+
   def test_validation_rejects_mismatched_specs(self):
     base = _make_spec(8, with_down=True)
     bad_x = dataclasses.replace(base.x, col_size=512)
