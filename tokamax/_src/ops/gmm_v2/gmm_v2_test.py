@@ -862,6 +862,39 @@ class GmmTest(parameterized.TestCase):
     self.assertEqual(actual.shape, (num_local_groups, in_size, out_size))
     assert_arrays_all_close(actual, expected)
 
+  def test_tgmm_multi_bucket_mixed_group_sizes(self) -> None:
+    # Exercises all buckets (256, 512, 768) across single-tile, 2-tile,
+    # 3+-tile, empty, and sublane-unaligned groups.
+    group_sizes_list = [103, 0, 389, 768, 913, 1280, 1751, 256]
+    batch_size = sum(group_sizes_list)
+    # Pad batch_size to a multiple of 16 (TPU7 bf16 sublane tiling).
+    pad_m = (-batch_size) % 16
+    if pad_m:
+      group_sizes_list[-1] += pad_m
+      batch_size += pad_m
+    in_size, out_size = 512, 512
+    num_groups = len(group_sizes_list)
+
+    key1, key2 = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(key1, (batch_size, in_size), dtype=jnp.bfloat16)
+    grad = jax.random.normal(key2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.array(group_sizes_list, dtype=jnp.int32)
+
+    expected = reference_tgmm(lhs.swapaxes(0, 1), grad, group_sizes, num_groups)
+    tile_info = gmm_v2.TileSizes(
+        tile_m=768, tile_k=512, tile_n=512, bucket_base=256
+    )
+    actual = tgmm_v2.tgmm_v2(
+        lhs,
+        grad,
+        group_sizes,
+        num_groups,
+        preferred_element_type=jnp.bfloat16,
+        tile_info=tile_info,
+    )
+    self.assertEqual(actual.shape, (num_groups, in_size, out_size))
+    assert_arrays_all_close(actual, expected)
+
   @parameterized.product(
       batch_size=[256],
       in_size=[1024],
@@ -2786,14 +2819,20 @@ def _bf16_input_configs(is_transposed: bool = False) -> gmm_v2.InputConfigs:
   )
 
 
-def _mock_tpu_info(num_cores: int, generation: int = 5) -> mock.Mock:
+def _mock_tpu_info(
+    num_cores: int,
+    generation: int = 5,
+    mxu_column_size: int = 128,
+    vmem_capacity_bytes: int = 64 * 1024 * 1024,
+) -> mock.Mock:
   mock_tpu_info = mock.create_autospec(
       gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
   )
   mock_tpu_info.num_lanes = 128
-  mock_tpu_info.mxu_column_size = 128
+  mock_tpu_info.mxu_column_size = mxu_column_size
   mock_tpu_info.generation = generation
   mock_tpu_info.num_cores = num_cores
+  mock_tpu_info.vmem_capacity_bytes = vmem_capacity_bytes
   mock.seal(mock_tpu_info)
   return mock_tpu_info
 
@@ -3277,13 +3316,19 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
       num_cores: int,
       size_m: int = 98304,
       is_out_fused: bool = False,
+      mxu_column_size: int = 128,
+      vmem_capacity_bytes: int = 64 * 1024 * 1024,
   ) -> gmm_v2.TileSizes:
     dims = _make_dims(size_m=size_m, size_k=size_k, size_n=size_n)
     with (
         mock.patch.object(
             gmm_v2.pltpu,
             "get_tpu_info",
-            return_value=_mock_tpu_info(num_cores=num_cores),
+            return_value=_mock_tpu_info(
+                num_cores=num_cores,
+                mxu_column_size=mxu_column_size,
+                vmem_capacity_bytes=vmem_capacity_bytes,
+            ),
         ),
         config.disable_multi_core_mode(False),
     ):
@@ -3403,6 +3448,54 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
   ) -> None:
     tiles = self._calculate_tgmm_tiling(2048, 1280, num_cores=2, size_m=size_m)
     self.assertEqual(tiles.tile_m, want_tile_m)
+    self.assertEqual(tiles.bucket_base, 256)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="mxu128_vmem64m",
+          mxu_column_size=128,
+          vmem_capacity_bytes=64 * 1024 * 1024,
+          num_cores=2,
+          expected_buckets=2,
+      ),
+      dict(
+          testcase_name="mxu256_vmem128m",
+          mxu_column_size=256,
+          vmem_capacity_bytes=128 * 1024 * 1024,
+          num_cores=1,
+          expected_buckets=2,
+      ),
+      dict(
+          testcase_name="mxu256_vmem64m",
+          mxu_column_size=256,
+          vmem_capacity_bytes=64 * 1024 * 1024,
+          num_cores=1,
+          expected_buckets=3,
+      ),
+      dict(
+          testcase_name="mxu256_vmem192m",
+          mxu_column_size=256,
+          vmem_capacity_bytes=192 * 1024 * 1024,
+          num_cores=1,
+          expected_buckets=2,
+      ),
+  )
+  def test_calculate_tgmm_tiling_max_num_buckets(
+      self,
+      mxu_column_size: int,
+      vmem_capacity_bytes: int,
+      num_cores: int,
+      expected_buckets: int,
+  ) -> None:
+    tiles = self._calculate_tgmm_tiling(
+        2048,
+        1280,
+        num_cores=num_cores,
+        size_m=131072,
+        mxu_column_size=mxu_column_size,
+        vmem_capacity_bytes=vmem_capacity_bytes,
+    )
+    self.assertEqual(tiles.tile_m, tiles.bucket_base * expected_buckets)
     self.assertEqual(tiles.bucket_base, 256)
 
   @parameterized.named_parameters(
