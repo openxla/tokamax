@@ -14,6 +14,8 @@
 # ==============================================================================
 """Unit tests for PallasMosaicTpuFusedMoe operator."""
 
+import itertools
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -69,6 +71,35 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     np_ref = np.asarray(ref_out, dtype=np.float64)
     rel_l2 = float(np.linalg.norm(np_out - np_ref) / np.linalg.norm(np_ref))
     self.assertLess(rel_l2, 0.01)
+
+  def test_autotuning_configs_and_mesh_cache_key(self):
+    op_wrapper = pallas_mosaic_tpu.PallasMosaicTpuFusedMoe()
+    mesh = Mesh(np.asarray(jax.devices()[:1]), axis_names=(AXIS,))
+    x = jax.ShapeDtypeStruct((16, 512), jnp.bfloat16)
+    w1 = jax.ShapeDtypeStruct((4, 512, 512), jnp.bfloat16)
+    w2 = jax.ShapeDtypeStruct((4, 256, 512), jnp.bfloat16)
+    gating = jax.ShapeDtypeStruct((16, 4), jnp.float32)
+    ba_concrete = op_wrapper.bind(
+        x=x, w1=w1, w2=w2, gating=gating, topk=2, mesh=mesh
+    )
+    ba_abstract = op_wrapper.bind(
+        x=x, w1=w1, w2=w2, gating=gating, topk=2, mesh=mesh.abstract_mesh
+    )
+    self.assertEqual(
+        ba_concrete.autotuning_cache_key, ba_abstract.autotuning_cache_key
+    )
+    configs = ba_concrete.autotuning_configs
+    self.assertEqual(
+        configs,
+        {
+            pallas_mosaic_tpu.Config(
+                capacity=capacity, sharded_plan=sharded_plan
+            )
+            for capacity, sharded_plan in itertools.product(
+                (128, 256, 512), (False, True)
+            )
+        },
+    )
 
 
 if __name__ == "__main__":

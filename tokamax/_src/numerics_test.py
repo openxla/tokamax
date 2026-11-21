@@ -264,6 +264,25 @@ class NumericsTest(parameterized.TestCase):
     self.assertEqual(out_unsharded.shape, (8, 16))
     self.assertTrue((np.array(out_unsharded) == 1.0).all())
 
+  def test_ranged_initializers_with_shape_and_sharding(self):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ('x',))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+    int_init = numerics.RangedArrayInitializer((4,), jnp.int32, 0, 10)
+    lifted_int = int_init.with_shape_and_sharding((8,), sharding)
+    out_int = numerics.random_initialize(lifted_int)
+    self.assertEqual(out_int.shape, (8,))
+    self.assertEqual(out_int.sharding, sharding)
+    arr_int = np.asarray(out_int)
+    self.assertTrue(((arr_int >= 0) & (arr_int < 10)).all())
+
+    flt_init = numerics.FloatRangedArrayInitializer((4,), jnp.float32, 1.0, 2.0)
+    lifted_flt = flt_init.with_shape_and_sharding((8,), sharding)
+    out_flt = numerics.random_initialize(lifted_flt)
+    self.assertEqual(out_flt.shape, (8,))
+    self.assertEqual(out_flt.sharding, sharding)
+    arr_flt = np.asarray(out_flt)
+    self.assertTrue(((arr_flt >= 1.0) & (arr_flt < 2.0)).all())
+
 
 if __name__ == '__main__':
   absltest.main()
