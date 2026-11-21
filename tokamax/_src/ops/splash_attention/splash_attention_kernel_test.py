@@ -1068,6 +1068,105 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
 
+  @parameterized.product(
+      # (block, block_kv_compute, sliding window); the window's left side is
+      # window - 1 <= block, as in MaxText's sliding-window mask.
+      tiling=(
+          (512, 256, 512),
+          (512, 256, 300),
+          (1024, 512, 1024),
+          (1024, 512, 700),
+      ),
+      use_segments=(False, True),
+  )
+  def test_local_band_skip_bit_exact(self, tiling, use_segments):
+    """`local_band_skip` is bit-identical to the stock forward and backward.
+
+    On an aligned causal sliding window the forward runs the diagonal block as
+    the causal triangle and, on the block before it, only the q rows that see
+    each compute tile, with the mirrored triangle's masked sub-tiles skipped.
+    Block 1024 with compute tile 512 splits the triangles 4 x 4 (128-row
+    sub-tiles, two 256-row sv bands); block 512 with tile 256 splits them
+    2 x 2 (one 256-row sv band).
+    """
+    block, block_kv_compute, window = tiling
+    seq_len, num_heads, head_dim = 4 * block, 2, 128
+    k1, k2, k3, k4 = random.split(random.key(3), 4)
+    shape = (num_heads, seq_len, head_dim)
+    q = (random.normal(k1, shape) * 0.5).astype(jnp.bfloat16)
+    k = (random.normal(k2, shape) * 0.5).astype(jnp.bfloat16)
+    v = (random.normal(k3, shape) * 0.5).astype(jnp.bfloat16)
+    do = (random.normal(k4, shape) * 0.5).astype(jnp.bfloat16)
+    segment_ids = None
+    if use_segments:
+      # Document boundaries inside q blocks and inside compute tiles.
+      seg = jnp.searchsorted(
+          jnp.array([block // 2 + 100, 2 * block + 300]),
+          jnp.arange(seq_len),
+          side="right",
+      ).astype(jnp.int32)
+      segment_ids = splash.SegmentIds(q=seg, kv=seg)
+    mask = mask_lib.CausalMask(shape=(seq_len, seq_len)) & mask_lib.LocalMask(
+        shape=(seq_len, seq_len), window_size=(window - 1, window), offset=0
+    )
+
+    def config(local_band_skip):
+      return splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block_kv_compute,
+          block_q_dkv=block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          use_fused_bwd_kernel=True,
+          use_base2_exp=True,
+          local_band_skip=local_band_skip,
+          interpret=self.INTERPRET,
+      )
+
+    # The new path is not turned off for this mask and tiling.
+    self.assertTrue(splash._is_aligned_local_band(mask, config(True)))
+
+    def build(local_band_skip):
+      attn = splash.make_splash_mha_single_device(
+          mask, config=config(local_band_skip)
+      )
+
+      def fwd_and_bwd(q, k, v, do):
+        out, vjp = jax.vjp(
+            lambda q_, k_, v_: attn(q_, k_, v_, segment_ids=segment_ids),
+            q,
+            k,
+            v,
+        )
+        return out, *vjp(do)
+
+      return jax.jit(fwd_and_bwd)
+
+    def num_dots(jaxpr):
+      n = 0
+      for e in jaxpr.eqns:
+        n += e.primitive.name == "dot_general"
+        for p in e.params.values():
+          for sub in p if isinstance(p, (tuple, list)) else (p,):
+            sub = getattr(sub, "jaxpr", sub)
+            if hasattr(sub, "eqns"):
+              n += num_dots(sub)
+      return n
+
+    ref_fn, opt_fn = build(False), build(True)
+    # The band path splits the partial blocks' tiles into sub-tile dots, so
+    # its forward kernel has more dots than the stock one.
+    self.assertGreater(
+        num_dots(jax.make_jaxpr(opt_fn)(q, k, v, do).jaxpr),
+        num_dots(jax.make_jaxpr(ref_fn)(q, k, v, do).jaxpr),
+    )
+    for name, r, o in zip(
+        ("out", "dq", "dk", "dv"), ref_fn(q, k, v, do), opt_fn(q, k, v, do)
+    ):
+      with self.subTest(name):
+        np.testing.assert_array_equal(np.asarray(o), np.asarray(r))
+
 
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:
   """Relative L2 error ‖x - y‖ / ‖y‖."""
