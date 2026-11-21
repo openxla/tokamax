@@ -124,9 +124,16 @@ def _routing_moe_local(
       jnp.arange(topk_indices_flat.size, dtype=jnp.int32),
       is_stable=True,
   )
-  group_sizes = jax.nn.one_hot(
-      topk_indices_flat, global_num_experts, dtype=jnp.int32
-  ).sum(axis=0)
+  # `row_group` is sorted, so the group boundaries come from a binary search.
+  # NOTE: `scan_unrolled` compiles to a fixed chain of gathers. The default
+  # method compiles to a `while` loop, which is slower on TPU.
+  group_sizes = jnp.diff(
+      jnp.searchsorted(
+          row_group,
+          jnp.arange(global_num_experts + 1, dtype=row_group.dtype),
+          method="scan_unrolled",
+      )
+  )
 
   # Step 5: Invoke GMM Gate and Up.
   gmm_res = gmm.routing_gmm(
