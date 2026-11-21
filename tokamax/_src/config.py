@@ -17,10 +17,25 @@
 import contextlib
 import dataclasses
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from absl import flags
 import jax
+
+# Fallback behavior when `BoundArguments.default_config` misses the autotuning
+# cache (and neither an explicit `op.config` nor `NullConfig` applies):
+# - "heuristics": Return `op._get_heuristics_config(ba)` (default for the
+#   global `tokamax_autotuning_cache_miss_fallback` flag).
+# - "autotune": Run `ba.autotune()` inline over `ba.autotuning_configs`, cache
+#   the results in memory, and return the fastest config (raises
+#   `ExceptionGroup` if all candidate configs fail).
+# - "error": Raise `ValueError`.
+AutotuningCacheMissFallback = Literal["heuristics", "autotune", "error"]
+AUTOTUNING_CACHE_MISS_FALLBACKS: tuple[AutotuningCacheMissFallback, ...] = (
+    "heuristics",
+    "autotune",
+    "error",
+)
 
 _DEFAULT = object()
 
@@ -83,7 +98,7 @@ autotuning_cache_miss_fallback = _ConfigOption(
     flags.DEFINE_enum(
         "tokamax_autotuning_cache_miss_fallback",
         "heuristics",
-        ("heuristics", "autotune", "error"),
+        AUTOTUNING_CACHE_MISS_FALLBACKS,
         "Fallback when no config is found in the autotuning cache by"
         " `BoundArguments.default_config` ('heuristics' - use heuristics to"
         " create a config; 'autotune' - autotune over the default autotuning"

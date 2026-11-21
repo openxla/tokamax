@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import gc
 import time
-from typing import Any, override
+from typing import Any, ClassVar, override
 from unittest import mock
 
 from absl.testing import absltest
@@ -55,6 +55,7 @@ _HEURISTICS_CONFIG = _FakeOpConfig(42)
 
 
 class _FakeOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+  config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
 
   @property
   def autotuning_configs(self) -> set[_FakeOpConfig]:
@@ -735,6 +736,28 @@ class AutotuningTest(parameterized.TestCase):
     self.assertLen(merged.data, 1)
     self.assertEqual(merged.data[0][0].op, op)
     self.assertEqual(merged.data[0][1], data_first | data_second)
+
+  def test_autotuning_result_context_matches_across_op_policy_fields(self):
+    x, y = jnp.zeros((2, 3)), jnp.ones((2, 3))
+    ba_default = _FakeOp().bind(x, y)
+    ba_strict = _FakeOp(
+        bypass_device_check=True, autotuning_cache_miss_fallback="error"
+    ).bind(x, y)
+    device_kind = jax.devices()[0].device_kind
+    bmark = benchmarking.BenchmarkData(0.0, 0.0, (0.0,), {}, 0.0)
+    tuned_config = _FakeOpConfig(99)
+    data = autotuner.AutotuningData({tuned_config: bmark})
+    result = api.AutotuningResult(device_kind, ((ba_default, data),))
+
+    ba_default.op.get_autotuning_cache(device_kind).pop(
+        ba_default.autotuning_cache_key, None
+    )
+    with self.assertRaisesRegex(ValueError, "No config found"):
+      _ = ba_strict.default_config
+
+    for active in (result, api.AutotuningResult.loads(result.dumps())):
+      with active:
+        self.assertEqual(ba_strict.default_config, tuned_config)
 
 
 if __name__ == "__main__":

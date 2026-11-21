@@ -476,6 +476,131 @@ class BoundArgumentsTest(parameterized.TestCase):
       with self.assertRaisesRegex(ValueError, "No config found"):
         _ = ba.default_config
 
+  def test_per_op_autotuning_cache_miss_fallback(self):
+    cache = _FakeOp().get_autotuning_cache()
+    cache.clear()
+    self.addCleanup(cache.clear)
+    x = jnp.zeros((1, 2), dtype=jnp.float32)
+    y = jnp.ones((1, 2), dtype=jnp.float32)
+    ba = _FakeOp().bind(x, y)
+    expected_key = repr(ba.autotuning_cache_key)
+
+    # Per-op 'error' overrides global 'heuristics'.
+    strict_op = _FakeOp(autotuning_cache_miss_fallback="error")
+    with config_lib.autotuning_cache_miss_fallback("heuristics"):
+      with self.assertRaisesRegex(ValueError, "No config found"):
+        strict_op(x, y)
+
+    # Explicit manual config and NullConfig ops bypass cache-miss errors.
+    manual_config = _FakeOpConfig(7)
+    manual_op = _FakeOp(
+        config=manual_config, autotuning_cache_miss_fallback="error"
+    )
+    self.assertIs(manual_op.bind(x, y).default_config, manual_config)
+
+    class _NullConfigOp(
+        op_lib.Op[Any, jax.Array, None, op_lib.NullConfig, Any]
+    ):
+
+      def _fwd(self, a: jax.Array, b: jax.Array, *, return_residuals, config):
+        del return_residuals, config
+        return a + b, None
+
+    self.assertTrue(
+        jnp.array_equal(
+            _NullConfigOp(autotuning_cache_miss_fallback="error")(x, y), x + y
+        )
+    )
+
+    # Default None and 'heuristics' (including empty cache entries) warn with
+    # the key needed to match.
+    for fallback, global_fb in ((None, "heuristics"), ("heuristics", "error")):
+      op = _FakeOp(autotuning_cache_miss_fallback=fallback)
+      with config_lib.autotuning_cache_miss_fallback(global_fb):
+        with self.assertLogs(level="WARNING") as logs:
+          self.assertIs(op.bind(x, y).default_config, _HEURISTICS_CONFIG)
+      msg = "\n".join(logs.output)
+      self.assertIn(expected_key, msg)
+      self.assertIn("heuristics", msg)
+
+    cache[ba.autotuning_cache_key] = op_lib.AutotuningData({})
+    with self.assertLogs(level="WARNING") as logs:
+      self.assertIs(ba.default_config, _HEURISTICS_CONFIG)
+    self.assertIn(expected_key, "\n".join(logs.output))
+    cache.clear()
+
+    # Per-op 'autotune' overrides global 'error', warns against production use
+    # with key + selected config, and populates the shared cache.
+    autotune_op = _FakeOp(autotuning_cache_miss_fallback="autotune")
+    with config_lib.autotuning_cache_miss_fallback("error"):
+      with self.assertLogs(level="WARNING") as logs:
+        tuned_cfg = autotune_op.bind(x, y).default_config
+    self.assertIn(tuned_cfg, ba.autotuning_configs)
+    msg = "\n".join(logs.output)
+    for token in (
+        "experimentation",
+        "not in production",
+        "start-up time",
+        "not persisted",
+        expected_key,
+        str(tuned_cfg),
+    ):
+      self.assertIn(token, msg)
+
+    # Once cached, strict op hits the shared cache without warnings.
+    with self.assertNoLogs(level="WARNING"):
+      self.assertEqual(strict_op.bind(x, y).default_config, tuned_cfg)
+
+    # Invalid value raises ValueError; BOUND_ARGS_ADAPTER roundtrips the field.
+    invalid_op = _FakeOp(autotuning_cache_miss_fallback="invalid")  # type: ignore[arg-type]
+    with self.assertRaisesRegex(
+        ValueError, "Invalid `autotuning_cache_miss_fallback`"
+    ):
+      _ = invalid_op.bind(x, y).default_config
+
+    ba_rt = op_lib.BOUND_ARGS_ADAPTER.validate_json(
+        op_lib.BOUND_ARGS_ADAPTER.dump_json(strict_op.bind(x, y))
+    )
+    self.assertEqual(ba_rt.op.autotuning_cache_miss_fallback, "error")
+
+  def test_per_op_autotuning_cache_miss_fallback_vjp_and_fusion(self):
+    class _VjpOp(_FakeOp):
+
+      def _fwd(self, x: jax.Array, y: jax.Array, *, return_residuals, config):
+        del return_residuals, config
+        return x + y, None
+
+    fwd_cache = _VjpOp().get_autotuning_cache()
+    sub_cache = _FakeOp().get_autotuning_cache()
+    fusible_cache = FusibleOp().get_autotuning_cache()
+    for c in (fwd_cache, sub_cache, fusible_cache):
+      c.clear()
+      self.addCleanup(c.clear)
+
+    x = jnp.zeros((2, 2), dtype=jnp.float32)
+    y = jnp.ones((2, 2), dtype=jnp.float32)
+
+    # Pre-bound VJP closure propagates `.replace(...)` fallback to sub-ops.
+    vjp = lambda _r, _o, dy, a, b: (_FakeOp()(dy, a), _FakeOp()(dy, b))
+    base_op = _VjpOp(vjp=vjp)
+    base_op.bind(x, y, return_residuals=True).autotune({_AUTOTUNE_CONFIG})
+
+    strict_op = base_op.replace(autotuning_cache_miss_fallback="error")
+    with self.assertRaisesRegex(ValueError, "No config found"):
+      jax.jit(jax.grad(lambda a, b: strict_op(a, b).sum(), (0, 1)))(x, y)
+
+    _FakeOp().bind(x, x).autotune({_AUTOTUNE_CONFIG})
+    dx, dy = jax.jit(jax.grad(lambda a, b: strict_op(a, b).sum(), (0, 1)))(x, y)
+    self.assertEqual((dx.shape, dy.shape), (x.shape, y.shape))
+
+    # Fusible op enforces per-op fallback inside `@op_fusion.fuse`.
+    strict_fusible = FusibleOp(autotuning_cache_miss_fallback="error")
+    fused = op_fusion.fuse(lambda a, b: strict_fusible(a * 2.0, b))
+    with self.assertRaisesRegex(ValueError, "No config found"):
+      fused(x, y)
+    FusibleOp().bind(x, y).autotune({_HEURISTICS_CONFIG})
+    self.assertTrue(jnp.array_equal(fused(x, y), x * 2.0 + y))
+
   def test_cached_autotuning_data_cross_compile(self):
     op = _FakeOp()
     data = op_lib.AutotuningData({})

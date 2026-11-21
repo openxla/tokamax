@@ -44,6 +44,7 @@ from tokamax._src.autotuning import autotuner as autotuner_lib
 from tokamax._src.autotuning import cache as autotuning_cache
 from tokamax._src.ops import fuser_adapter
 
+AutotuningCacheMissFallback = config_lib.AutotuningCacheMissFallback
 AutotuningData = autotuner_lib.AutotuningData
 DeviceKind = autotuning_cache.DeviceKind
 
@@ -130,8 +131,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       allowing for offline autotuning.
     - Retrieve a config for the `Op`.
       - The config is retrieved using `op.bind(...).default_config`. This can be
-        configured using the `tokamax_autotuning_cache_miss_fallback` config
-        option (see `BoundArguments.default_config`).
+        configured via `op.autotuning_cache_miss_fallback` or the
+        `tokamax_autotuning_cache_miss_fallback` config option (see
+        `BoundArguments.default_config`).
     - Call `_fwd` with the canonicalized arguments and config. If `op.vjp` is
       not `None`, it will be used to compute the gradients.
 
@@ -168,6 +170,10 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
   config: C | None = None
   _: dataclasses.KW_ONLY
   bypass_device_check: bool = False
+  # Per-op override for `tokamax.config.autotuning_cache_miss_fallback`
+  # ('heuristics', 'autotune', or 'error'). When `None`, defers to the global
+  # config (which defaults to 'heuristics').
+  autotuning_cache_miss_fallback: AutotuningCacheMissFallback | None = None
   # VJP function for the op. `vjp` will be passed the residuals and the output
   # of the op, the output gradients, then all arguments passed to the op.
   # The VJP function must return a tuple of gradients for each positional
@@ -312,7 +318,13 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
         residuals = residuals.residuals
         dout = dout[0] if return_residuals else dout
         assert self.vjp is not None
-        grads = self.vjp(residuals, out, dout, *args, **kwargs)
+        if self.autotuning_cache_miss_fallback is not None:
+          with config_lib.autotuning_cache_miss_fallback(
+              self.autotuning_cache_miss_fallback
+          ):
+            grads = self.vjp(residuals, out, dout, *args, **kwargs)
+        else:
+          grads = self.vjp(residuals, out, dout, *args, **kwargs)
 
         if isinstance(grads, dict):
           grads_ba = ba.signature.bind_partial(**grads)
@@ -356,24 +368,32 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
       object.__setattr__(new_op, "vjp", kwargs["vjp"])
     return new_op
 
+  def _cache_key_op(self) -> Self:
+    return self.replace(
+        config=None,
+        vjp=None,
+        bypass_device_check=False,
+        autotuning_cache_miss_fallback=None,
+    )
+
   def get_autotuning_cache(
       self, device_kind: DeviceKind | None = None
   ) -> dict[K, AutotuningData[C]]:
-    self_no_vjp = self.replace(vjp=None)
+    cache_op = self._cache_key_op()
     final_cache = {}
     if device_kind is None:
       device_kind = backend.get_default_device().device_kind
     if not config_lib.ignore_autotuning_cache.value:
-      if (cache := _AUTOTUNING_CACHE.get(self_no_vjp)) is None:
+      if (cache := _AUTOTUNING_CACHE.get(cache_op)) is None:
         cache = autotuning_cache.AutotuningCache(
-            self_no_vjp, paths=[autotuning_cache.CACHE_PATH]
+            cache_op, paths=[autotuning_cache.CACHE_PATH]
         )
-        _AUTOTUNING_CACHE[self_no_vjp] = cache
+        _AUTOTUNING_CACHE[cache_op] = cache
 
       final_cache = cache[device_kind]
-      logging.info("Loaded autotuning cache for %s", self_no_vjp)
+      logging.info("Loaded autotuning cache for %s", cache_op)
     else:
-      logging.warning("Ignoring autotuning cache for %s", self_no_vjp)
+      logging.warning("Ignoring autotuning cache for %s", cache_op)
 
     return final_cache
 
@@ -520,17 +540,30 @@ class BoundArguments[C, K: Hashable]:
     The default config is determined as follows:
       1. If `op.config` is not `None`, return it.
       2. If `cached_autotuning_data` is not `None`, return the fastest config.
-      3. If the `tokamax_autotuning_cache_miss_fallback` config option is set to
-        'autotune', call `autotune` and return the fastest config.
-      4. If the `tokamax_autotuning_cache_miss_fallback` config option is set to
-        'heuristics', return `heuristics_config`.
-      5. Otherwise, i.e. the `tokamax_autotuning_cache_miss_fallback` config
-        option is set to 'error', an error will be raised.
+      3. If `op.autotuning_cache_miss_fallback` is not `None`, apply its
+         cache-miss fallback policy.
+      4. Otherwise, apply the `tokamax_autotuning_cache_miss_fallback` config
+         option.
+
+    Cache-miss fallback policies:
+      - 'autotune': call `autotune` and return the fastest config.
+      - 'heuristics': return `heuristics_config`.
+      - 'error': raise a `ValueError`.
 
     Returns:
       The default config for the op.
     """
-    cache_miss_fallback = config_lib.autotuning_cache_miss_fallback.value
+    cache_miss_fallback = (
+        self.op.autotuning_cache_miss_fallback
+        if self.op.autotuning_cache_miss_fallback is not None
+        else config_lib.autotuning_cache_miss_fallback.value
+    )
+    if cache_miss_fallback not in config_lib.AUTOTUNING_CACHE_MISS_FALLBACKS:
+      raise ValueError(
+          "Invalid `autotuning_cache_miss_fallback`:"
+          f" {cache_miss_fallback!r}. Expected one of"
+          f" {config_lib.AUTOTUNING_CACHE_MISS_FALLBACKS} or None."
+      )
     return self.get_config(
         autotune_configs=AUTO if cache_miss_fallback == "autotune" else None,
         allow_heuristics=cache_miss_fallback != "error",
@@ -568,14 +601,54 @@ class BoundArguments[C, K: Hashable]:
         return data.fastest_config
 
     if autotune_configs is not None:
-      return self.autotune(
+      device_kind = self._device_kind() if check_autotuning_cache else None
+      key = self.autotuning_cache_key if check_autotuning_cache else None
+      if check_autotuning_cache:
+        logging.warning(
+            "Falling back to online autotuning for %s on %s (key: %r)."
+            " Online autotuning should only be used in experimentation and not"
+            " in production, as it degrades start-up time and autotuning"
+            " results are not persisted.",
+            self.op,
+            device_kind,
+            key,
+        )
+      config = self.autotune(
           autotune_configs, cache_results=cache_autotuning_results
       ).fastest_config
+      if check_autotuning_cache:
+        logging.warning(
+            "Online autotuning completed for %s on %s; selected config: %s"
+            " (not persisted). Key: %r",
+            self.op,
+            device_kind,
+            config,
+            key,
+        )
+      return config
 
     if allow_heuristics:
+      if check_autotuning_cache:
+        logging.warning(
+            "Falling back to heuristics config (%s) for %s on %s; no matching"
+            " autotuning entry for key: %r",
+            heuristics_config,
+            self.op,
+            self._device_kind(),
+            self.autotuning_cache_key,
+        )
       return heuristics_config
 
-    raise ValueError(f"No config found for {self}.")
+    raise ValueError(
+        f"No config found for {self} (device={self._device_kind()},"
+        f" key={self.autotuning_cache_key!r})."
+    )
+
+  def _device_kind(self) -> DeviceKind:
+    device_kind = infer_device_kind(self)
+    if device_kind is None:
+      device_kind = backend.get_default_device().device_kind
+    return device_kind
 
   @property
   def heuristics_config(self) -> C:
@@ -595,13 +668,12 @@ class BoundArguments[C, K: Hashable]:
     ):
       return None
 
-    device_kind = infer_device_kind(self)
-    if device_kind is None:
-      device_kind = backend.get_default_device().device_kind
+    device_kind = self._device_kind()
     key = self.autotuning_cache_key
 
+    cache_op = self.op._cache_key_op()  # pylint: disable=protected-access
     for overlay in reversed(AUTOTUNING_CACHE_OVERLAY_STACK.get()):
-      data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
+      data = overlay.get(cache_op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
 

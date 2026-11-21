@@ -117,7 +117,7 @@ class AutotuningResult:
     # Convert to a dictionary and serialize out the op.
     device_autotuning_dict = {}
     for ba, data in self.data:
-      device_autotuning_dict.setdefault(ba.op, {})[
+      device_autotuning_dict.setdefault(ba.op._cache_key_op(), {})[  # pylint: disable=protected-access
           ba.arguments
       ] = data.prune_errors()
 
@@ -142,7 +142,9 @@ class AutotuningResult:
     overlay = {}
     for ba, data in self.data:
       key = ba.autotuning_cache_key
-      overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
+      overlay.setdefault(ba.op._cache_key_op(), {}).setdefault(  # pylint: disable=protected-access
+          self.device_kind, {}
+      )[key] = data
     stack = op_lib.AUTOTUNING_CACHE_OVERLAY_STACK
     object.__setattr__(self, "_token", stack.set(stack.get() + (overlay,)))
     result_stack = _AUTOTUNING_RESULT_OVERLAY_STACK
@@ -180,10 +182,13 @@ class AutotuningResult:
     """
     if self.device_kind != other.device_kind:
       raise ValueError("Device kinds do not match.")
-    data = {(ba.op, ba.autotuning_cache_key): (ba, d) for ba, d in self.data}
+    data = {
+        (ba.op._cache_key_op(), ba.autotuning_cache_key): (ba, d)  # pylint: disable=protected-access
+        for ba, d in self.data
+    }
 
     for new_ba, new_data in other.data:
-      key = (new_ba.op, new_ba.autotuning_cache_key)
+      key = (new_ba.op._cache_key_op(), new_ba.autotuning_cache_key)  # pylint: disable=protected-access
       ba, d = data.setdefault(key, (new_ba, new_data))
       if d is not new_data:
         data[key] = (ba, d | new_data)
@@ -332,12 +337,13 @@ def autotune(
 
   if prev_result is not None:
     existing_keys = {
-        (ba.op, ba.autotuning_cache_key) for ba, _ in prev_result.data
+        (ba.op._cache_key_op(), ba.autotuning_cache_key)  # pylint: disable=protected-access
+        for ba, _ in prev_result.data
     }
     bound_args = [
         ba
         for ba in bound_args
-        if (ba.op, ba.autotuning_cache_key) not in existing_keys
+        if (ba.op._cache_key_op(), ba.autotuning_cache_key) not in existing_keys  # pylint: disable=protected-access
     ]
 
   if not ignore_cache:

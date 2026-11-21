@@ -147,6 +147,17 @@ class BenchmarkingTest(parameterized.TestCase):
     out_shape = jax.eval_shape(f, args_abstract)
     chex.assert_trees_all_equal_shapes(out_shape, f(args))
 
+    # Empty vmap_axes can be mixed with concrete arrays (e.g. GroupSizes).
+    x_unbatched = batching.BatchedShapeDtype((4,), jnp.float32, vmap_axes=())
+    y_concrete = (jnp.ones((4,), jnp.float32),) * 2
+    f_unbatched, args_unbatched = benchmarking.standardize_function(
+        f_orig, x_unbatched, y_concrete, seed=seed
+    )
+    chex.assert_trees_all_equal(
+        f_orig(numerics.random_initialize(x_unbatched, seed=seed), y_concrete),
+        f_unbatched(args_unbatched),
+    )
+
   @parameterized.parameters(benchmarking._TIMERS.keys())
   def test_compile_benchmark(self, method):
     if jax.default_backend() != 'gpu' and method == 'cupti':

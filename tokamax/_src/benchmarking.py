@@ -447,17 +447,16 @@ def standardize_function[T](
     return f(*args, **kwargs)
 
   is_batched = lambda x: isinstance(x, batching.BatchedShapeDtype)
-  if any(map(is_batched, arrays)):
+  if batching.get_vmap_axis_sizes(arrays):
     if not all(map(is_batched, arrays)):
       raise ValueError('Cannot mix batched and non-batched arguments.')
 
-    if batching.get_vmap_axis_sizes(arrays):
-      array_vmap_axes = (
-          (None if axis is None else axis[0] for axis in x.vmap_axes)
-          for x in arrays
-      )
-      for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
-        forward = jax.vmap(forward, in_axes=(in_axes,))
+    array_vmap_axes = (
+        (None if axis is None else axis[0] for axis in x.vmap_axes)
+        for x in arrays
+    )
+    for in_axes in reversed(list(zip(*array_vmap_axes, strict=True))):
+      forward = jax.vmap(forward, in_axes=(in_axes,))
 
   if seed is None:
     # `standardize_function` should be idempotent, but the vmaps added to
