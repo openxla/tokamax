@@ -51,6 +51,7 @@ from tokamax._src.ops.batched_rpa.kernel import utils
         "decode_query_size",
         "return_lse",
         "quantize_p",
+        "return_raw_output",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -94,6 +95,8 @@ def ragged_paged_attention(
     decode_query_size: int = 1,
     return_lse: bool = False,
     quantize_p: bool = False,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
+    return_raw_output: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   """Perform batched ragged paged attention.
 
@@ -154,6 +157,10 @@ def ragged_paged_attention(
     quantize_p: If True, cast the softmax probabilities down to the kv cache
       dtype before the pv matmul. Required to get a native fp8 pv matmul when
       the kv cache is fp8, at the cost of pv precision. Defaults to False.
+    prepared_inputs: (q_hbm, new_kv_hbm), already in `prepare_inputs`' layouts.
+      If set, queries/keys/values are only used for their shapes and dtypes.
+    return_raw_output: If True, return the kernel's output in its packed
+      [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d] layout.
 
   Returns:
     out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -241,18 +248,26 @@ def ragged_paged_attention(
   )
   layout = configs.LayoutConfig.from_configs(model_cfgs, serve_cfgs)
 
-  q_hbm, new_kv_hbm, attention_sink_hbm = prepare_inputs(
-      queries,
-      keys,
-      values,
-      queries.dtype,
-      kv_cache.dtype,
-      dynamic_k_scale,
-      dynamic_v_scale,
-      kv_layout=kv_layout,
-      page_size=page_size,
-      attention_sink=attention_sink,
-  )
+  if prepared_inputs is not None:
+    if dynamic_k_scale is not None or dynamic_v_scale is not None:
+      raise ValueError("prepared_inputs doesn't support per-token kv scales.")
+    if attention_sink is not None:
+      raise ValueError("prepared_inputs doesn't support attention_sink.")
+    q_hbm, new_kv_hbm = prepared_inputs
+    attention_sink_hbm = None
+  else:
+    q_hbm, new_kv_hbm, attention_sink_hbm = prepare_inputs(
+        queries,
+        keys,
+        values,
+        queries.dtype,
+        kv_cache.dtype,
+        dynamic_k_scale,
+        dynamic_v_scale,
+        kv_layout=kv_layout,
+        page_size=page_size,
+        attention_sink=attention_sink,
+    )
 
   default_decode, default_prefill = tuning.calculate_block_sizes(
       model_cfgs,
@@ -338,12 +353,15 @@ def ragged_paged_attention(
       configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
   )
 
-  # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-  o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-  # after: [kv_heads, max_tokens, q_per_kv, d]
+  if return_raw_output:
+    o_hbm = o_hbm_alias_q_hbm
+  else:
+    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+    # after: [kv_heads, max_tokens, q_per_kv, d]
 
-  o_hbm = o_hbm[:, :, : layout.num_q_heads_per_kv_head, :head_dim]
-  o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    o_hbm = o_hbm[:, :, : layout.num_q_heads_per_kv_head, :head_dim]
+    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
 
   if not return_lse:
     return o_hbm, kv_cache
