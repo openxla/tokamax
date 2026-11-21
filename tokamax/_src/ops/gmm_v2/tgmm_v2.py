@@ -198,12 +198,13 @@ def calculate_tgmm_tiling(
   tile_m = min(bf16_bf16_tile_m, dims.size_m)
   tile_m = max(tile_m, dims.size_lhs_sublane)
 
+  tpu_info = pltpu.get_tpu_info()
   num_k_tiles = num_n_tiles = 1
-  num_lanes = pltpu.get_tpu_info().num_lanes
+  num_lanes = tpu_info.num_lanes
   tile_n = gmm_v2.align_to(dims.size_n, num_lanes)
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_lower_bound = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_lower_bound = tpu_info.mxu_column_size * 2
   tile_n_lower_bound = min(tile_n_lower_bound, dims.size_n)
   tile_k = gmm_v2.align_to(dims.size_k, num_lanes)
 
@@ -285,11 +286,9 @@ def calculate_tgmm_tiling(
   # the smaller one. Exact splits are preferred over padded splits (e.g. when
   # both k and n are odd multiples of `num_lanes`), which fused outputs don't
   # support. Splitting only shrinks tiles, so VMEM usage stays in limit.
-  num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
+  num_cores = gmm_v2.get_num_cores(tpu_info)
   if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
-    tile_k_lower_bound = min(
-        pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
-    )
+    tile_k_lower_bound = min(tpu_info.mxu_column_size * 2, dims.size_k)
     split_k = gmm_v2.split_for_cores(
         dims.size_k,
         num_k_tiles,
@@ -336,11 +335,13 @@ def calculate_tgmm_tiling(
         if split_k is not None:
           num_k_tiles, tile_k = split_k
 
-  # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
-  # full-tile int32 masks alongside the accumulator in VREGs, causing severe
-  # register spills. Also cap tile_m at the average group size so small-group
-  # shapes do not pad past typical group boundaries.
-  max_num_buckets = 2
+  # Limit TGMM to 2 M-buckets on 128-wide MXU chips (VREG spills) and
+  # large-VMEM chips (> 64 MiB, where larger (tile_k, tile_n) tiles overflow
+  # IMEM at 3+ buckets). Allow 3 buckets on 256-wide MXU chips with <= 64 MiB
+  # VMEM to reduce accumulator round-trips without overflowing IMEM.
+  has_large_mxu = tpu_info.mxu_column_size >= 256
+  has_small_vmem = tpu_info.vmem_capacity_bytes <= 64 * 1024 * 1024
+  max_num_buckets = 3 if has_large_mxu and has_small_vmem else 2
   bucket_base = tile_m
   num_groups = max(1, dims.size_group, dims.size_lhs_group)
   max_tile_m = min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
@@ -615,10 +616,24 @@ def tgmm_inner_kernel(
   cur_group_id = metadata_ref.gm_id_to_group_id[gm_id]
   group_is_changing = jnp.logical_or(is_last_gm, cur_group_id != next_group_id)
 
-  def run_matmul_step(bucket_m: int):
+  def run_matmul_step(bucket_m: int, *, is_last_bucket: bool):
     @jax.named_scope(f"bm{bucket_m}_matmul_new_group_and_changing")
     def matmul_new_group_and_changing():
       _matmul(is_new_group=True, is_group_changing=True, bucket_m=bucket_m)
+
+    @jax.named_scope(f"bm{bucket_m}_matmul_group_changing")
+    def matmul_group_changing():
+      _matmul(is_new_group=False, is_group_changing=True, bucket_m=bucket_m)
+
+    if not is_last_bucket:
+      # Any non-final tile of a group fills all `tile_m` rows (see
+      # `fill_metadata`), so smaller buckets only execute when the group ends.
+      lax.cond(
+          new_group,
+          matmul_new_group_and_changing,
+          matmul_group_changing,
+      )
+      return
 
     @jax.named_scope(f"bm{bucket_m}_matmul_new_group")
     def matmul_new_group():
@@ -627,10 +642,6 @@ def tgmm_inner_kernel(
     @jax.named_scope(f"bm{bucket_m}_matmul")
     def matmul():
       _matmul(is_new_group=False, is_group_changing=False, bucket_m=bucket_m)
-
-    @jax.named_scope(f"bm{bucket_m}_matmul_group_changing")
-    def matmul_group_changing():
-      _matmul(is_new_group=False, is_group_changing=True, bucket_m=bucket_m)
 
     lax.cond(
         new_group,
@@ -661,7 +672,11 @@ def tgmm_inner_kernel(
   lax.switch(
       bucket_idx,
       [
-          functools.partial(run_matmul_step, bucket_m=bucket_base * (i + 1))
+          functools.partial(
+              run_matmul_step,
+              bucket_m=bucket_base * (i + 1),
+              is_last_bucket=(i == num_buckets - 1),
+          )
           for i in range(num_buckets)
       ],
   )
