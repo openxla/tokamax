@@ -51,8 +51,8 @@ def _is_scale_tiling_supported(x: qwix.QArray, axis: int) -> bool:
 
 
 def _is_config_supported(
-    lhs: jax.Array | qwix.QArray | AsQArray,
-    rhs: jax.Array | qwix.QArray | AsQArray,
+    lhs: jax.Array | qwix.QArray | AsQArray | jax.ShapeDtypeStruct,
+    rhs: jax.Array | qwix.QArray | AsQArray | jax.ShapeDtypeStruct,
     config: pallas_mosaic_tpu.Config,
 ) -> bool:
   (m, k), (_, _, n) = lhs.shape, rhs.shape
@@ -203,6 +203,15 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       vjpfunc(cotangent)[0].block_until_ready()
 
   @override
+  def _test_vjp(self, num_groups, m, k, n, activation=None):
+    config = pallas_mosaic_tpu.Config()
+    lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
+    rhs = jax.ShapeDtypeStruct((num_groups, k, n), jnp.bfloat16)
+    if not _is_config_supported(lhs, rhs, config):
+      self.skipTest("Unsupported shape for default TPU tile config.")
+    super()._test_vjp(num_groups, m, k, n, activation)
+
+  @override
   def _test_quantized(
       self,
       a_dtype,
@@ -214,6 +223,27 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       # (num_groups, m, k, n)
       task=(8, 512, 256, 512),
   ):
+    num_groups, m, k, n = task
+    cdiv = lambda x, y: (x + y - 1) // y
+    if a_tile_shape is None:
+      lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
+    else:
+      lhs = qwix.QArray(
+          qvalue=jax.ShapeDtypeStruct((m, k), jnp.dtype(a_dtype)),  # pyrefly: ignore[bad-argument-type]
+          scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
+              tuple(cdiv(d, t) for d, t in zip((m, k), a_tile_shape)),
+              jnp.bfloat16,
+          ),
+      )
+    rhs = qwix.QArray(
+        qvalue=jax.ShapeDtypeStruct((num_groups, k, n), jnp.dtype(b_dtype)),  # pyrefly: ignore[bad-argument-type]
+        scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
+            tuple(cdiv(d, t) for d, t in zip((num_groups, k, n), b_tile_shape)),
+            jnp.bfloat16,
+        ),
+    )
+    if not _is_config_supported(lhs, rhs, pallas_mosaic_tpu.Config()):
+      self.skipTest("Unsupported quantized tiling for TPU.")
     with test_base.override_chex_args(atol=0.4, rtol=0.1):
       super()._test_quantized(
           a_dtype,
@@ -227,6 +257,10 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
 
   @override
   def _test_bench(self, spec):
+    if not _is_config_supported(
+        spec["lhs"], spec["rhs"], pallas_mosaic_tpu.Config()
+    ):
+      self.skipTest("Unsupported benchmark shape for TPU.")
     if "i8xi8" in self._testMethodName:
       kwargs = dict(atol=2.0, rtol=0.5)  # This is really bad!
     elif "i4" in self._testMethodName:
@@ -235,6 +269,16 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
       kwargs = {}
     with test_base.override_chex_args(**kwargs):
       super()._test_bench(spec)
+
+  def test_unsupported_config_raises(self):
+    op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(
+        config=pallas_mosaic_tpu.Config()
+    )
+    lhs = jnp.ones((8, 128), dtype=jnp.bfloat16)
+    rhs = jnp.ones((2, 128, 128), dtype=jnp.bfloat16)
+    group_sizes = jnp.array([4, 4], dtype=jnp.int32)
+    with self.assertRaises(NotImplementedError):
+      _ = op(lhs, rhs, group_sizes=group_sizes)
 
   def test_autotuning_configs(self):
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
