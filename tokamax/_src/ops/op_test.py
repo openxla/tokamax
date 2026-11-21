@@ -758,6 +758,46 @@ class BoundArgumentsTest(parameterized.TestCase):
     with config_lib.ignore_autotuning_cache(False):
       self.assertIsNotNone(ba.cached_autotuning_data)
 
+  def test_mesh_abstractify_matches_abstract_mesh_cache_key(self):
+    class _MeshOp(op_lib.Op[Any, jax.Array, None, _FakeOpConfig, Any]):
+      config_cls: ClassVar[type[_FakeOpConfig]] = _FakeOpConfig
+
+      def _fwd(
+          self,
+          x: jax.Array,
+          *,
+          mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
+          return_residuals: bool = False,
+          config: _FakeOpConfig,
+      ) -> tuple[jax.Array, None]:
+        del mesh, return_residuals, config
+        return x, None
+
+      def _get_heuristics_config(self, ba: op_lib.BoundArguments):
+        del ba
+        return _HEURISTICS_CONFIG
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ("d",))
+    bare_abstract_mesh = jax.sharding.AbstractMesh(
+        (1,), ("d",), axis_types=(jax.sharding.AxisType.Auto,)
+    )
+    sharding = jax.sharding.NamedSharding(
+        bare_abstract_mesh, jax.sharding.PartitionSpec("d")
+    )
+    x_abs = jax.ShapeDtypeStruct((4, 8), jnp.float32, sharding=sharding)
+    x_val = jnp.zeros((4, 8), jnp.float32)
+
+    op = _MeshOp()
+    ba_abs = op.bind(x=x_abs, mesh=bare_abstract_mesh)
+    ba_concrete = op.bind(x=x_val, mesh=mesh)
+    self.assertEqual(
+        ba_abs.autotuning_cache_key, ba_concrete.autotuning_cache_key
+    )
+    self.assertEqual(
+        ba_concrete.autotuning_cache_key["mesh"], bare_abstract_mesh
+    )
+    self.assertIsNone(ba_abs.autotuning_cache_key["x"].sharding)
+
 
 if __name__ == "__main__":
   absltest.main()
