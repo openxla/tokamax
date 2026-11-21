@@ -28,7 +28,9 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.common import (
     RCP_LN2,
     estimate_mini_batch,
+    get_max_mini_batch,
     get_tpu_limits,
+    tri_inv_xor_dnc,
 )
 from tokamax._src.ops.kda.cp_utils import (
   ContextParallelMetadata,
@@ -466,139 +468,6 @@ def _prepare_cp_initial_state(
 
 
 # =============================================================================
-# Fused intra-chunk utilities
-# =============================================================================
-
-def _solve_unit_lower_triangular_batched(A, b):
-  """Solve (I + A) x = b exactly for batched inputs.
-
-  Uses block forward substitution with block size 16 for TPU MXU
-  utilization.
-
-  Args:
-      A: (MB, N, N) strictly lower triangular matrix (float32).
-      b: (MB, N, D) right-hand side matrix (float32).
-
-  Returns:
-      x: (MB, N, D) exact solution matrix.
-  """
-  MB, N, D = b.shape
-  BS = 16
-  num_blocks = N // BS
-  A = A.astype(jnp.float32)
-  b = b.astype(jnp.float32)
-
-  blocks = [b[:, i * BS : (i + 1) * BS, :] for i in range(num_blocks)]
-
-  for i in range(num_blocks):
-    start = i * BS
-    end = (i + 1) * BS
-
-    A_ii = A[:, start:end, start:end]  # [MB, BS, BS]
-    x_block = blocks[i]  # [MB, BS, D]
-
-    rows = [x_block[:, r, :] for r in range(BS)]  # list of [MB, D]
-    for j in range(BS):
-      if j > 0:
-        vec = A_ii[:, j, :j]  # [MB, j]
-        mat = jnp.stack(rows[:j], axis=1)  # [MB, j, D]
-        # [MB, 1, j] @ [MB, j, D] → [MB, 1, D] → squeeze
-        correction = jnp.matmul(vec[:, None, :], mat).squeeze(1)
-        rows[j] = rows[j] - correction
-
-    x_block = jnp.stack(rows, axis=1)  # [MB, BS, D]
-    blocks[i] = x_block
-
-    if i < num_blocks - 1:
-      x_rest = jnp.concatenate(blocks[i + 1 :], axis=1)  # [MB, rest, D]
-      A_rest = A[:, (i + 1) * BS :, start:end]  # [MB, rest, BS]
-
-      update = jnp.matmul(
-        A_rest,
-        x_block,
-        preferred_element_type=jnp.float32,
-      )
-      x_rest = x_rest - update
-
-      remaining = num_blocks - 1 - i
-      for idx in range(remaining):
-        blocks[i + 1 + idx] = x_rest[:, idx * BS : (idx + 1) * BS, :]
-
-  return jnp.concatenate(blocks, axis=1)
-
-
-def _solve_unit_lower_triangular_neumann_batched(A, b):
-  """Solve (I + A) x = b with a blocked finite Neumann series.
-
-  The strictly lower triangular system is split into 8-token diagonal blocks.
-  Each diagonal block is inverted with a finite Neumann series, then the
-  block-off-diagonal system is inverted with Horner doubling.
-
-  Args:
-      A: (MB, N, N) strictly lower triangular matrix.
-      b: (MB, N, D) right-hand side matrix.
-
-  Returns:
-      A pair containing the solution with shape (MB, N, D) and the inverse of
-      (I + A) with shape (MB, N, N), both in float32.
-  """
-  N = A.shape[-1]
-  block_size = 8
-  num_blocks = N // block_size
-  inv_dtype = jnp.float32
-  identity = jnp.eye(N, dtype=inv_dtype)
-
-  # Batched dot: [MB, M, K] @ [MB, K, N] -> [MB, M, N].
-  def dot_batch(lhs, rhs):
-    return jax.lax.dot_general(
-        lhs,
-        rhs,
-        (((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    )
-
-  A = A.astype(inv_dtype)
-  block_ids = jnp.arange(N, dtype=jnp.int32) // block_size
-  same_block = (block_ids[:, None] == block_ids[None, :]).astype(inv_dtype)
-  A_diag = A * same_block[None]
-  A_off_diag = A - A_diag
-
-  neg_A_diag = -A_diag
-  diag_inverse = identity[None] + neg_A_diag
-  power = neg_A_diag
-  num_diag_steps = {4: 1, 8: 2, 16: 3, 32: 4, 64: 5}[block_size]
-  for _ in range(num_diag_steps):
-    power = dot_batch(power, power)
-    diag_inverse = dot_batch(diag_inverse, identity[None] + power)
-
-  if num_blocks == 1:
-    return dot_batch(diag_inverse, b.astype(inv_dtype)), diag_inverse
-
-  # Fuse P @ [F | b] to share a matmul, where P is the block-diagonal
-  # inverse and F is the block-off-diagonal part of A.
-  off_diag_and_rhs = jnp.concatenate(
-      [A_off_diag, b.astype(inv_dtype)], axis=-1
-  )
-  merged = dot_batch(diag_inverse, off_diag_and_rhs)
-  transformed_off_diag = merged[:, :, :N]
-  transformed_rhs = merged[:, :, N:]
-
-  # (I + G)^-1 = sum(k=0..num_blocks-1) (-G)^k. The block-strictly-lower
-  # matrix G is nilpotent, so Horner doubling evaluates this finite series.
-  neg_transformed_off_diag = -transformed_off_diag
-  off_diag_inverse = identity[None] + neg_transformed_off_diag
-  power = neg_transformed_off_diag
-  log2_num_blocks = num_blocks.bit_length() - 1
-  for _ in range(log2_num_blocks - 1):
-    power = dot_batch(power, power)
-    off_diag_inverse = off_diag_inverse + dot_batch(off_diag_inverse, power)
-
-  result = dot_batch(off_diag_inverse, transformed_rhs)
-  inverse = dot_batch(off_diag_inverse, diag_inverse)
-  return result, inverse
-
-
-# =============================================================================
 # Fused gate cumsum and intra-chunk solve
 # =============================================================================
 
@@ -612,6 +481,7 @@ def _scalar_gate_intra(
     BT: int,
     scale: float,
     gqa_repeats: int = 1,
+    precision: jax.lax.Precision | None = None,
 ):
   """Computes intra-chunk Aqk and L for a scalar gate (Gated Delta Net)."""
   gs = g_cumsum[:, :, 0]  # [MB, BT]
@@ -628,12 +498,14 @@ def _scalar_gate_intra(
       q_f32,
       k_f32,
       (((2,), (2,)), ((0,), (0,))),
+      precision=precision,
       preferred_element_type=jnp.float32,
   )  # [MB_QK, BT, BT]
   kk = jax.lax.dot_general(
       k_f32,
       k_f32,
       (((2,), (2,)), ((0,), (0,))),
+      precision=precision,
       preferred_element_type=jnp.float32,
   )  # [MB_QK, BT, BT]
   if gqa_repeats > 1:
@@ -733,15 +605,17 @@ def _fused_gate_intra_kernel(
     use_qk_l2norm: bool = False,
     return_conv_intermediates: bool = False,
     conv_kernel_size: int = 4,
+    store_akk: bool = True,
+    two_pass_bf16: bool = False,
 ):
-  """Fused Pallas kernel: gate activation + cumsum + BC=16 Aqk/L + Neumann inversion.
+  """Fused Pallas kernel: gate activation + cumsum + Aqk/L + xor_dnc inversion.
 
   When fuse_cumsum=True, g_ref contains raw gate values (not cumsum'd).
   The kernel applies gate activation (if use_gate_in_kernel) and chunk-local
   prefix sum via tril matmul before proceeding to the Aqk/L construction.
 
-  For bfloat16 inputs, uses Neumann series inversion.
-  For float32 inputs, falls back to exact forward substitution.
+  Inverts `(I + L)` via vectorized block-doubling (`tri_inv_xor_dnc`), using
+  optional 2-pass BF16 residual refinement when `two_pass_bf16=True`.
 
   Ref shapes are listed next to the parameters.
 
@@ -779,16 +653,27 @@ def _fused_gate_intra_kernel(
     out_refs = conv_in_and_out_refs
 
   # `qg` is not an output: it is not part of `KdaResiduals` and the backward
-  # recomputes it.
-  (
-      u_out_ref,
-      w_out_ref,
-      kg_out_ref,
-      Aqk_out_ref,
-      Akk_inv_out_ref,
-      g_cumsum_out_ref,
-  ) = out_refs[:6]
-  extra_out_refs = out_refs[6:]
+  # recomputes it. `Akk_inv_out_ref` is omitted when `store_akk=False`.
+  if store_akk:
+    (
+        u_out_ref,
+        w_out_ref,
+        kg_out_ref,
+        Aqk_out_ref,
+        Akk_inv_out_ref,
+        g_cumsum_out_ref,
+    ) = out_refs[:6]
+    extra_out_refs = out_refs[6:]
+  else:
+    Akk_inv_out_ref = None
+    (
+        u_out_ref,
+        w_out_ref,
+        kg_out_ref,
+        Aqk_out_ref,
+        g_cumsum_out_ref,
+    ) = out_refs[:5]
+    extra_out_refs = out_refs[5:]
 
   # Load all MB heads at once
   if native_qkv_layout:
@@ -972,6 +857,13 @@ def _fused_gate_intra_kernel(
   row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=0)
   col_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), dimension=1)
 
+  if dtype == jnp.float32:
+    solve_prec = jax.lax.Precision.HIGHEST
+  elif two_pass_bf16:
+    solve_prec = jax.lax.Precision.HIGH
+  else:
+    solve_prec = jax.lax.Precision.DEFAULT
+
   Aqk_rows = []
   L_rows = []
   for i_sc in range(NC) if per_channel_gate else ():
@@ -998,6 +890,7 @@ def _fused_gate_intra_kernel(
     qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)  # [MB, 2*BC, K]
     qk_dot = jax.lax.dot_general(
       qk_eg, k_eng_full, (((2,), (2,)), ((0,), (0,))),
+      precision=solve_prec,
       preferred_element_type=jnp.float32,
     )  # [MB, 2*BC, BT]
     Aqk_row = qk_dot[:, :BC] * scale      # [MB, BC, BT]
@@ -1018,8 +911,8 @@ def _fused_gate_intra_kernel(
     L_rows.append(Akk_row)
 
   if per_channel_gate:
-    Aqk = jnp.concatenate(Aqk_rows, axis=1).astype(dtype)  # [MB, BT, BT]
-    L = jnp.concatenate(L_rows, axis=1)  # [MB, BT, BT]
+    Aqk = jnp.concatenate(Aqk_rows, axis=1)  # [MB, BT, BT] f32
+    L = jnp.concatenate(L_rows, axis=1)  # [MB, BT, BT] f32
   else:
     Aqk, L = _scalar_gate_intra(
         q_f32_qk,
@@ -1029,30 +922,28 @@ def _fused_gate_intra_kernel(
         BT=BT,
         scale=scale,
         gqa_repeats=gqa_repeats,
+        precision=solve_prec if dtype == jnp.float32 else None,
     )
-    Aqk = Aqk.astype(dtype)
     if gqa_repeats > 1:
       k_f32 = jnp.repeat(k_f32_qk, gqa_repeats, axis=0)
 
-  # --- Solve (I + L) x = rhs ---
+  # --- Solve (I + L) x = rhs via vectorized block-doubling (`xor_dnc`) ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
   k_eg_beta = k_f32 * jnp.exp2(g_cumsum) * beta_f32  # [MB, BT, K]
   rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)  # [MB, BT, V+K]
 
-  use_neumann = dtype != jnp.float32
-
-  if use_neumann:
-    result, A_inv = _solve_unit_lower_triangular_neumann_batched(L, rhs)
-  else:
-    # --- Exact forward substitution (fp32) ---
-    I_bt = jnp.eye(BT, dtype=jnp.float32)
-    I_bt_batch = jnp.broadcast_to(I_bt, (MB, BT, BT))
-    combined_b = jnp.concatenate(
-      [rhs, I_bt_batch], axis=-1
-    )  # [MB, BT, V+K+BT]
-    full_result = _solve_unit_lower_triangular_batched(L, combined_b)
-    result = full_result[:, :, : V + K]
-    A_inv = full_result[:, :, V + K :]
+  A_inv = tri_inv_xor_dnc(
+      L,
+      use_fp32=(dtype == jnp.float32),
+      two_pass_bf16=two_pass_bf16,
+  )
+  result = jax.lax.dot_general(
+      A_inv,
+      rhs,
+      (((2,), (1,)), ((0,), (0,))),
+      precision=solve_prec,
+      preferred_element_type=jnp.float32,
+  )
 
   u = result[:, :, :V]         # [MB, BT, V]
   w = result[:, :, V : V + K]  # [MB, BT, K]
@@ -1066,21 +957,51 @@ def _fused_gate_intra_kernel(
   w_out_ref[:, 0, 0] = w.astype(w_out_ref.dtype)
   kg_out_ref[:, 0, 0] = kg.astype(kg_out_ref.dtype)
   Aqk_out_ref[:, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
-  Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
+  if Akk_inv_out_ref is not None:
+    Akk_inv_out_ref[:, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
   g_cumsum_out_ref[:, 0, 0] = g_cumsum
 
 
 def _compute_intra_fused_mini_batch(
-    H, BT, K, V, dtype=None, *, multiple_of: int = 1
+    H,
+    BT,
+    K,
+    V,
+    dtype=None,
+    *,
+    per_channel_gate: bool = True,
+    store_akk: bool = True,
+    two_pass_bf16: bool = False,
+    multiple_of: int = 1,
 ):
   """Auto-compute mini-batch size for intra fused kernel.
 
-  Each head needs VMEM for intermediates: BT*K + BT*V + 2*BT*BT (Aqk, L).
-  Uses hardware VMEM budget via ``estimate_mini_batch``.
+  Models double-buffered I/O plus f32 intra-chunk scratch (`Aqk`, `L`,
+  `tri_inv_xor_dnc` stages, and `rhs`) at `BT > 64` so `BT=128` fits within
+  64 MiB TPU7x VMEM even at `H_V=128`.
   """
-  elem_size = dtype.itemsize if dtype is not None else 4
-  per_head = (BT * K + BT * V + 2 * BT * BT) * elem_size
-  return estimate_mini_batch(per_head, H, multiple_of=multiple_of)
+  elem_size = jnp.dtype(dtype).itemsize if dtype is not None else 4
+  wy_elem = 4 if (two_pass_bf16 and elem_size == 2) else elem_size
+  if BT <= 64:
+    per_head = (BT * K + BT * V + 2 * BT * BT) * wy_elem
+    return estimate_mini_batch(per_head, H, multiple_of=multiple_of)
+
+  gw = K if per_channel_gate else 1
+  akk_elems = BT * BT if store_akk else 0
+  io_bytes = 2 * (
+      (2 * BT * K + BT * V) * elem_size
+      + (2 * BT * K + BT * V + BT * BT + akk_elems) * wy_elem
+      + BT * gw * 4
+  )
+  scratch_bt2 = 7 if per_channel_gate else 5
+  scratch_bytes = (
+      3 * BT * K + 2 * BT * (V + K) + BT * gw + scratch_bt2 * BT * BT
+  ) * 4
+  per_head = io_bytes + scratch_bytes
+  max_mb = get_max_mini_batch() // (2 if per_channel_gate else 1)
+  return estimate_mini_batch(
+      per_head, H, max_mb=max_mb, multiple_of=multiple_of
+  )
 
 
 @functools.partial(
@@ -1103,6 +1024,8 @@ def _compute_intra_fused_mini_batch(
         "head_v_dim",
         "native_bt_qkv",
         "write_q_norm",
+        "store_akk",
+        "two_pass_bf16",
     ],
 )
 @jaxtyping.jaxtyped
@@ -1139,12 +1062,14 @@ def pallas_kda_fwd_intra_fused(
     head_v_dim: int | None = None,
     native_bt_qkv: bool = False,
     write_q_norm: bool = False,
+    store_akk: bool = True,
+    two_pass_bf16: bool = False,
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H B T V"],
     Float[Array, "H B T K"],
     Float[Array, "H B T BT"],
-    Float[Array, "H B T BT"],
+    Float[Array, "H B T BT"] | None,
     Float[Array, "H B T GW"],
     Float[Array, "H_QK B T K"] | None,
     Float[Array, "H B T K"] | None,
@@ -1190,7 +1115,15 @@ def pallas_kda_fwd_intra_fused(
 
   if mini_batch is None:
     MB = _compute_intra_fused_mini_batch(
-        H, BT, K, V, dtype=act_dtype, multiple_of=gqa_repeats
+        H,
+        BT,
+        K,
+        V,
+        dtype=act_dtype,
+        per_channel_gate=per_channel_gate,
+        store_akk=store_akk,
+        two_pass_bf16=two_pass_bf16,
+        multiple_of=gqa_repeats,
     )
   else:
     MB = mini_batch
@@ -1325,22 +1258,28 @@ def pallas_kda_fwd_intra_fused(
       _make_per_head_spec(1),
       _make_per_head_spec(GW),
   ]
+  wy_dtype = (
+      jnp.float32
+      if (two_pass_bf16 and act_dtype == jnp.bfloat16)
+      else act_dtype
+  )
   out_shape = [
-      jax.ShapeDtypeStruct((H, B, NC, BT, V), act_dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), act_dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, K), act_dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, BT), act_dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, BT), act_dtype),
-      jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32),
+      jax.ShapeDtypeStruct((H, B, NC, BT, V), wy_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, K), wy_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, K), wy_dtype),
+      jax.ShapeDtypeStruct((H, B, NC, BT, BT), wy_dtype),
   ]
   out_specs = [
       _make_spec(V),
       _make_spec(K),
       _make_spec(K),
       _make_spec(BT),
-      _make_spec(BT),
-      _make_spec(GW),
   ]
+  if store_akk:
+    out_shape.append(jax.ShapeDtypeStruct((H, B, NC, BT, BT), wy_dtype))
+    out_specs.append(_make_spec(BT))
+  out_shape.append(jax.ShapeDtypeStruct((H, B, NC, BT, GW), jnp.float32))
+  out_specs.append(_make_spec(GW))
 
   conv_kernel_size = 4
   if use_conv1d_in_kernel:
@@ -1463,8 +1402,13 @@ def pallas_kda_fwd_intra_fused(
     out_specs.append(_make_qk_spec(K))
 
   total_chunks = H * B * NC
+  tri_inv_matmuls = max(0, 2 * int(math.log2(BT)) - 3) + (
+      2 if two_pass_bf16 and act_dtype == jnp.bfloat16 else 0
+  )
   intra_flops_per_chunk = (
-      4 * BT * BT * K // gqa_repeats + 2 * BT * BT * (V + K + GW) + BT * BT * BT
+      4 * BT * BT * K // gqa_repeats
+      + 2 * BT * BT * (V + K + GW)
+      + 2 * tri_inv_matmuls * BT * BT * BT
   )
   intra_transcendentals_per_chunk = (
       2 * BT * K if per_channel_gate else (BT * BT + 2 * BT)
@@ -1506,6 +1450,8 @@ def pallas_kda_fwd_intra_fused(
           use_qk_l2norm=use_qk_l2norm,
           return_conv_intermediates=return_conv_intermediates,
           conv_kernel_size=conv_kernel_size,
+          store_akk=store_akk,
+          two_pass_bf16=two_pass_bf16,
       ),
       interpret=get_interpret(),
       out_shape=out_shape,
@@ -1518,15 +1464,22 @@ def pallas_kda_fwd_intra_fused(
       ),
   )(*in_args)
 
-  u_r, w_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r = pallas_outs[:6]
-  extra_outs = pallas_outs[6:]
+  if store_akk:
+    u_r, w_r, kg_r, Aqk_r, Akk_inv_r, g_cumsum_r = pallas_outs[:6]
+    extra_outs = pallas_outs[6:]
+  else:
+    Akk_inv_r = None
+    u_r, w_r, kg_r, Aqk_r, g_cumsum_r = pallas_outs[:5]
+    extra_outs = pallas_outs[5:]
 
   # --- Reshape back to [H, B, T, D] (head-first) ---
   w_out = w_r.reshape(H, B, T, K)
   u_out = u_r.reshape(H, B, T, V)
   kg_out = kg_r.reshape(H, B, T, K)
   Aqk_flat = Aqk_r.reshape(H, B, NC * BT, BT)
-  Akk_flat = Akk_inv_r.reshape(H, B, NC * BT, BT)
+  Akk_flat = (
+      Akk_inv_r.reshape(H, B, NC * BT, BT) if Akk_inv_r is not None else None
+  )
   g_cumsum_out = g_cumsum_r.reshape(H, B, T, GW)
 
   q_norm_out = k_norm_out = v_silu_out = q_rstd_out = k_rstd_out = None
@@ -1591,6 +1544,8 @@ def kda_fwd_intra_fused(
     head_v_dim: int | None = None,
     native_bt_qkv: bool = False,
     write_q_norm: bool = False,
+    store_akk: bool = True,
+    two_pass_bf16: bool = False,
 ):
   """Fused gate cumsum + intra-chunk solve entry.
 
@@ -1604,8 +1559,11 @@ def kda_fwd_intra_fused(
       k_rstd).
   """
   assert (
-      per_channel_gate is False or chunk_size == 64
-  ), f"per-channel gate is validated at chunk_size=64 only; got {chunk_size}"
+      per_channel_gate is False or chunk_size in (64, 128)
+  ), (
+      "per-channel gate is validated at chunk_size in (64, 128); got"
+      f" {chunk_size}"
+  )
   assert chunk_size in (
       16,
       32,
@@ -1648,6 +1606,8 @@ def kda_fwd_intra_fused(
       head_v_dim=head_v_dim,
       native_bt_qkv=native_bt_qkv,
       write_q_norm=write_q_norm,
+      store_akk=store_akk,
+      two_pass_bf16=two_pass_bf16,
   )
 
 
@@ -1774,7 +1734,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # Stage 4 intra-chunk: A @ v_new
   # Apply lower-triangular mask: Aqk is causal by construction, but masking
   # here matches the original per-head loop behaviour and guards against
-  # any tiny upper-triangle fp noise from the Neumann intra-chunk solve.
+  # any tiny upper-triangle fp noise from the intra-chunk solve.
   m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]  # [BT, BT]
   b_A_f32 = jnp.where(m_s[None, :, :], b_A.astype(jnp.float32), 0.0)
   # [MB, BT, BT] @ [MB, BT, V] -> [MB, BT, V]
@@ -1826,6 +1786,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     "store_intermediates",
     "mini_batch",
     "native_out_layout",
+    "two_pass_bf16",
   ],
 )
 @jaxtyping.jaxtyped
@@ -1847,6 +1808,7 @@ def chunk_kda_fwd_h_o_varlen(
     store_intermediates: bool | None = None,
     mini_batch: int | None = None,
     native_out_layout: bool = False,
+    two_pass_bf16: bool = False,
 ) -> tuple[
     Float[Array, "..."],
     Float[Array, "B N H K V"] | None,
@@ -1891,10 +1853,22 @@ def chunk_kda_fwd_h_o_varlen(
 
   # ---- auto-compute mini-batch (MB) to maximise VMEM utilisation ----
   if mini_batch is None:
-    elem_size = q.dtype.itemsize
+    q_elem = jnp.dtype(q.dtype).itemsize
+    wy_elem = jnp.dtype(w.dtype).itemsize
+    o_elem = q_elem if native_out_layout else 4
     # scratch per head: h_state[K_PADSIZE*V_ALIGNED] in f32 + i/o buffers
-    in_bytes = (BT * K_PADSIZE + BT * V_ALIGNED + BT) * elem_size
-    out_bytes = BT * V_ALIGNED * elem_size
+    in_bytes = (
+        BT * K_PADSIZE * q_elem // gqa_repeats
+        + (2 * BT * K_PADSIZE + BT * V_ALIGNED + BT * BT) * wy_elem
+        + BT
+        * (K_PADSIZE if gk.shape[-1] == K else 1)
+        * jnp.dtype(gk.dtype).itemsize
+    )
+    out_bytes = (
+        BT * V_ALIGNED * o_elem
+        + (K_PADSIZE * V_ALIGNED * wy_elem if store_h else 0)
+        + (BT * V_ALIGNED * wy_elem if store_v_new else 0)
+    )
     scratch_bytes = K_PADSIZE * V_ALIGNED * 4  # float32 accumulator
     per_head = in_bytes + out_bytes + scratch_bytes
     MB = estimate_mini_batch(per_head, H, multiple_of=gqa_repeats)  # pylint: disable=invalid-name
@@ -1984,7 +1958,7 @@ def chunk_kda_fwd_h_o_varlen(
         [1, BT, MB * V],
         index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (b, c, h),
     )
-    o_shape = jax.ShapeDtypeStruct([B, T_alloc, H * V], u.dtype)
+    o_shape = jax.ShapeDtypeStruct([B, T_alloc, H * V], q.dtype)
   else:
     o_spec = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_t_index_map)
     o_shape = jax.ShapeDtypeStruct([H, B, T_alloc, V_ALIGNED], jnp.float32)
@@ -2037,11 +2011,12 @@ def chunk_kda_fwd_h_o_varlen(
   # mantissa); fp32 inputs: HIGHEST preserves full 23-bit mantissa fidelity.
   # This applies to the output matmuls only. The two serial-chain matmuls
   # (`w @ h` and the state update) use `get_chain_precision` instead.
-  _output_prec = (
-    jax.lax.Precision.DEFAULT
-    if q.dtype == jnp.bfloat16
-    else jax.lax.Precision.HIGHEST
-  )
+  if q.dtype != jnp.bfloat16:
+    _output_prec = jax.lax.Precision.HIGHEST
+  elif two_pass_bf16:
+    _output_prec = jax.lax.Precision.HIGH
+  else:
+    _output_prec = jax.lax.Precision.DEFAULT
 
   total_h_o_chunks = H * B * NT
   h_o_flops = total_h_o_chunks * (6 * BT * K * V + 2 * BT * BT * V)
@@ -2117,7 +2092,7 @@ def chunk_kda_fwd_h_o_varlen(
     # Post-process: o is [H, B, T, V_ALIGNED]
     if V_ALIGNED > V:
       o_out = o_out[..., :V]
-    o_out = o_out.astype(u.dtype)
+    o_out = o_out.astype(q.dtype)
 
   if output_final_state and ht_out is not None:
     if V_ALIGNED > V:
@@ -2197,6 +2172,7 @@ def chunk_kda_fwd_custom(
     use_conv1d_in_kernel: bool = False,
     use_qk_l2norm: bool = False,
     mini_batch: int | None = None,
+    two_pass_bf16: bool = False,
 ) -> tuple[
     tuple[
         Float[Array, "H B T V"],
@@ -2276,6 +2252,8 @@ def chunk_kda_fwd_custom(
       return_conv_intermediates=(use_conv1d_in_kernel and return_residuals),
       aligned_segment_ids=aligned_segment_ids,
       mini_batch=mini_batch,
+      store_akk=return_residuals,
+      two_pass_bf16=two_pass_bf16,
   )
   if use_conv1d_in_kernel:
     assert q_norm is not None
@@ -2366,6 +2344,7 @@ def chunk_kda_fwd_custom(
       store_h=disable_recompute,
       store_v_new=disable_recompute,
       mini_batch=mini_batch,
+      two_pass_bf16=two_pass_bf16,
   )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]
@@ -2434,6 +2413,7 @@ def chunk_kda_fwd_custom(
       conv_bias_k=conv_bias_k if use_conv1d_in_kernel else None,
       conv_bias_v=conv_bias_v if use_conv1d_in_kernel else None,
       chunk_size=BT,
+      two_pass_bf16=two_pass_bf16,
   )
   return output, residuals
 
@@ -2467,6 +2447,7 @@ def chunk_gdn_fwd_custom(
     segment_ids: Int[Array, "B T"] | None = None,
     return_residuals: bool = False,
     mini_batch: int | None = None,
+    two_pass_bf16: bool = False,
 ) -> tuple[
     tuple[Float[Array, "B T H_V V"], Float[Array, "B H_V K V"] | None],
     GdnResiduals | None,
@@ -2559,7 +2540,10 @@ def chunk_gdn_fwd_custom(
   else:
     beta_act = beta_hbt
 
-  need_q_from_intra = use_qk_l2norm or qkv_conv_intra is not None or native_bt_qkv
+  need_q_from_intra = (
+      use_qk_l2norm or qkv_conv_intra is not None or native_bt_qkv
+  )
+  store_akk = save_for_backward and BT < 128
   (
       w,
       u,
@@ -2598,6 +2582,8 @@ def chunk_gdn_fwd_custom(
       head_v_dim=V,
       native_bt_qkv=native_bt_qkv,
       write_q_norm=need_q_from_intra,
+      store_akk=store_akk,
+      two_pass_bf16=two_pass_bf16,
   )
   if not need_q_from_intra:
     q_stage34 = q_intra
@@ -2634,6 +2620,7 @@ def chunk_gdn_fwd_custom(
       store_v_new=False,
       mini_batch=mini_batch,
       native_out_layout=can_native_out,
+      two_pass_bf16=two_pass_bf16,
   )
   if final_state is not None:
     final_state = final_state[:, 0]
@@ -2674,5 +2661,6 @@ def chunk_gdn_fwd_custom(
       g_dtype_marker=jnp.zeros((), dtype=gate.dtype),
       chunk_size=BT,
       beta_dtype=jnp.dtype(beta.dtype).name,
+      two_pass_bf16=two_pass_bf16,
   )
   return output, residuals

@@ -43,7 +43,7 @@ class KdaResiduals:
   beta: Float[Array, "H B T_ALIGNED"]
   g_cumsum: Float[Array, "H B T_ALIGNED GW"] | None
   aqk: Float[Array, "H B T_ALIGNED BT"]
-  akk: Float[Array, "H B T_ALIGNED BT"]
+  akk: Float[Array, "H B T_ALIGNED BT"] | None
   initial_state: (
       Float[Array, "B H K V"] | Float[Array, "B N H K V"] | None
   )
@@ -71,6 +71,9 @@ class KdaResiduals:
   conv_bias_k: Float[Array, "H_K K"] | None = None
   conv_bias_v: Float[Array, "H V"] | None = None
   chunk_size: int = dataclasses.field(default=64, metadata=dict(static=True))
+  two_pass_bf16: bool = dataclasses.field(
+      default=False, metadata=dict(static=True)
+  )
 
 
 @jax.tree_util.register_dataclass
@@ -98,4 +101,7 @@ class GdnResiduals:
   chunk_size: int = dataclasses.field(default=64, metadata=dict(static=True))
   beta_dtype: str = dataclasses.field(
       default="float32", metadata=dict(static=True)
+  )
+  two_pass_bf16: bool = dataclasses.field(
+      default=False, metadata=dict(static=True)
   )

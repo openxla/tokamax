@@ -76,6 +76,11 @@ class Config:
   log-space path without an inferred numerical bound.
   `rematerialize_for_backward=True` omits chunk hidden states from forward
   residuals and manually rebuilds them in the custom backward.
+  `two_pass_bf16=True` refines the BF16 triangular inverse with one
+  Newton-Schulz residual step and keeps `(u, w, kg, Aqk, Akk)` and saved
+  per-chunk `h` (plus KDA `v_new`) in `float32` (doubling saved `h` residual
+  memory unless `rematerialize_for_backward=True`), while returning outputs in
+  the input activation dtype.
   """
 
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
@@ -83,6 +88,7 @@ class Config:
   safe_gate: bool | None = None
   rematerialize_for_backward: bool = False
   residual_checkpoint_name: str | None = None
+  two_pass_bf16: bool = False
 
 
 def _resolve_safe_gate(
@@ -154,7 +160,7 @@ def _tag_kda_residuals(
       ),
       g_cumsum=_tag_array(residuals.g_cumsum, ckpt_name),
       aqk=ad_checkpoint.checkpoint_name(residuals.aqk, name=ckpt_name),
-      akk=ad_checkpoint.checkpoint_name(residuals.akk, name=ckpt_name),
+      akk=_tag_array(residuals.akk, ckpt_name),
       h=_tag_array(residuals.h, ckpt_name),
       v_new=_tag_array(residuals.v_new, ckpt_name),
       q_rstd=_tag_array(residuals.q_rstd, ckpt_name),
@@ -298,12 +304,10 @@ class _PreparedKdaInputs:
 
 
 def _requested_chunk_size(ba) -> int:
-  """Returns the requested chunk_size, defaulting to 64 (mandatory for per-channel gates)."""
+  """Returns the requested chunk_size, defaulting to 64."""
   args = getattr(ba, "arguments", None) or {}
   requested = args.get("chunk_size")
-  if requested is None or args.get("per_channel_gate", True):
-    return 64
-  return int(requested)
+  return 64 if requested is None else int(requested)
 
 
 def _vjp_chunk_size(ba: op.BoundArguments | None, fallback_fn) -> int:
@@ -314,6 +318,111 @@ def _vjp_chunk_size(ba: op.BoundArguments | None, fallback_fn) -> int:
   return fallback_fn(ba)
 
 
+def _vjp_two_pass_bf16(ba: op.BoundArguments | None) -> bool:
+  args = getattr(ba, "arguments", None) or {}
+  residuals = args.get("residuals")
+  if residuals is not None and hasattr(residuals, "two_pass_bf16"):
+    return bool(residuals.two_pass_bf16)
+  return False
+
+
+def _estimate_per_head_vmem_bytes(
+    *,
+    act_dtype: Any,
+    chunk_size: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    per_channel_gate: bool = False,
+    is_kda: bool = False,
+    two_pass_bf16: bool = False,
+) -> int:
+  """Estimates max(forward intra, backward M4) per-head VMEM footprint."""
+  elem_size = jnp.dtype(act_dtype).itemsize
+  wy_elem = 4 if (two_pass_bf16 and elem_size == 2) else elem_size
+  bt, k, v = chunk_size, head_k_dim, head_v_dim
+  gw = k if per_channel_gate else 1
+  store_akk = is_kda or bt < 128
+  if bt <= 64:
+    per_head_intra = (bt * k + bt * v + 2 * bt * bt) * wy_elem
+  else:
+    akk_elems = bt * bt if store_akk else 0
+    io_intra = 2 * (
+        (2 * bt * k + bt * v) * elem_size
+        + (2 * bt * k + bt * v + bt * bt + akk_elems) * wy_elem
+        + bt * gw * 4
+    )
+    scratch_bt2 = 7 if per_channel_gate else 5
+    scratch_intra = (
+        3 * bt * k + 2 * bt * (v + k) + bt * gw + scratch_bt2 * bt * bt
+    ) * 4
+    per_head_intra = io_intra + scratch_intra
+
+  has_a = store_akk
+  a_elem = wy_elem if has_a else 0
+  da_elem = 4 if is_kda else 0
+  vn_dv0_bytes = bt * v * (wy_elem + 4) if is_kda else 0
+  offdiag_pairs = (
+      (bt // 16) * (bt // 16 - 1) // 2 if (per_channel_gate and bt > 64) else 0
+  )
+  dqkv_elem = 4 if is_kda else elem_size
+  io_bwd = (
+      (2 * bt * k + 2 * bt * v + bt * gw + bt) * elem_size
+      + (3 * bt * k * wy_elem if is_kda else 0)
+      + vn_dv0_bytes
+      + k * v * wy_elem
+      + bt * bt * (a_elem + da_elem)
+      + (2 * bt * k + bt * v) * dqkv_elem
+      + (
+          k * v
+          + 5 * bt * k
+          + bt * v
+          + bt * gw
+          + bt
+          + (5 if not has_a else 2) * bt * bt
+          + 3 * offdiag_pairs * 16 * k
+      )
+      * 4
+  )
+  per_head_bwd = io_bwd + io_bwd * 3 // 2
+  return max(per_head_intra, per_head_bwd)
+
+
+def _valid_autotune_mini_batches(
+    mini_batches: tuple[int | None, ...],
+    *,
+    chunk_size: int,
+    act_dtype: Any,
+    head_k_dim: int,
+    head_v_dim: int,
+    per_channel_gate: bool,
+    is_kda: bool,
+    two_pass_bf16: bool = False,
+) -> tuple[int | None, ...]:
+  vmem_limit = common.get_vmem_limit_bytes()
+  max_mb = common.get_max_mini_batch(
+      chunk_size=chunk_size if chunk_size > 128 else None,
+      vmem_limit_bytes=vmem_limit,
+  )
+  if per_channel_gate and chunk_size > 64:
+    max_mb = max_mb // 2
+  per_head = _estimate_per_head_vmem_bytes(
+      act_dtype=act_dtype,
+      chunk_size=chunk_size,
+      head_k_dim=head_k_dim,
+      head_v_dim=head_v_dim,
+      per_channel_gate=per_channel_gate,
+      is_kda=is_kda,
+      two_pass_bf16=two_pass_bf16,
+  )
+  return tuple(
+      mb
+      for mb in mini_batches
+      if mb is not None
+      and (chunk_size <= 64 or mb <= max_mb)
+      and mb * per_head <= vmem_limit
+  ) or (None,)
+
+
 # Maximum fused conv1d width: the forward kernel keeps an 8-row halo of the
 # previous chunk (`_CONV_HALO` in the forward kernel).
 _MAX_CONV_WIDTH = 8
@@ -321,13 +430,13 @@ _MAX_CONV_WIDTH = 8
 
 def _check_chunk_size_support(chunk_size: int, *, per_channel_gate: bool):
   """Checks the chunk sizes supported by the Mosaic TPU kernels."""
-  # Per-channel gates require chunk_size=64; scalar gates support powers of 2
-  # in [16, 512].
+  # Per-channel gates support chunk_size in (64, 128); scalar gates support
+  # powers of 2 in [16, 512].
   if per_channel_gate:
-    if chunk_size != 64:
+    if chunk_size not in (64, 128):
       raise NotImplementedError(
-          "`mosaic` supports chunk_size=64 with a per-channel gate; got"
-          f" {chunk_size}."
+          "`mosaic` supports chunk_size in (64, 128) with a per-channel gate;"
+          f" got {chunk_size}."
       )
   elif chunk_size not in (16, 32, 64, 128, 256, 512):
     raise NotImplementedError(
@@ -481,22 +590,41 @@ class PallasMosaicTpuKimiDeltaAttention(
     if not args:
       return {Config(chunk_size=_requested_chunk_size(ba))}
     q = args.get("query")
-    heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
+    v = args.get("value")
+    q_shaped = q is not None and hasattr(q, "shape")
+    heads = int(q.shape[0]) if q_shaped else 32
+    seq_len = q.shape[2] if q_shaped else None
+    key_dim = int(q.shape[3]) if q_shaped else 128
+    val_dim = int(v.shape[3]) if v is not None and hasattr(v, "shape") else key_dim
+    act_dtype = q.dtype if q is not None and hasattr(q, "dtype") else jnp.bfloat16
     per_channel_gate = args.get("per_channel_gate", True)
     segment_ids = args.get("segment_ids")
     req_cs = args.get("chunk_size")
-    if per_channel_gate or segment_ids is not None:
-      chunk_sizes = (64,)
-    elif req_cs is not None:
+    if req_cs is not None:
       chunk_sizes = (int(req_cs),)
+    elif segment_ids is not None:
+      chunk_sizes = (64,)
     else:
-      chunk_sizes = (32, 64, 128)
+      base_cs = (64, 128) if per_channel_gate else (32, 64, 128)
+      if isinstance(seq_len, int):
+        chunk_sizes = tuple(cs for cs in base_cs if seq_len % cs == 0) or (64,)
+      else:
+        chunk_sizes = base_cs
     mini_batches = tuple(
         mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
     ) or (None,)
     configs = set()
     for cs in chunk_sizes:
-      for mb in mini_batches:
+      cs_mbs = _valid_autotune_mini_batches(
+          mini_batches,
+          chunk_size=cs,
+          act_dtype=act_dtype,
+          head_k_dim=key_dim,
+          head_v_dim=val_dim,
+          per_channel_gate=per_channel_gate,
+          is_kda=True,
+      )
+      for mb in cs_mbs:
         configs.add(Config(chunk_size=cs, mini_batch=mb))
     return configs
 
@@ -699,8 +827,6 @@ class PallasMosaicTpuKimiDeltaAttention(
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
     if chunk_size is not None:
-      # `config.chunk_size` is pinned to 64 for per-channel gates (see
-      # `_requested_chunk_size`), so the requested value is checked as well.
       _check_chunk_size_support(chunk_size, per_channel_gate=per_channel_gate)
     effective_chunk_size = (
         chunk_size if chunk_size is not None else config.chunk_size
@@ -791,6 +917,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_conv1d_in_kernel=use_conv1d_in_kernel,
         use_qk_l2norm=use_qk_l2norm,
         mini_batch=config.mini_batch,
+        two_pass_bf16=config.two_pass_bf16,
     )
     value, final_state = output
     if final_state is not None and final_state.ndim == 4:
@@ -822,7 +949,10 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config(chunk_size=_vjp_chunk_size(ba, _requested_chunk_size))
+    return Config(
+        chunk_size=_vjp_chunk_size(ba, _requested_chunk_size),
+        two_pass_bf16=_vjp_two_pass_bf16(ba),
+    )
 
   @override
   def _get_autotuning_configs(
@@ -832,12 +962,32 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     if not args:
       return {Config(chunk_size=_requested_chunk_size(ba))}
     q = args.get("query")
-    heads = q.shape[0] if q is not None and hasattr(q, "shape") else 32
+    v = args.get("value")
+    q_shaped = q is not None and hasattr(q, "shape")
+    heads = int(q.shape[0]) if q_shaped else 32
+    key_dim = int(q.shape[3]) if q_shaped else 128
+    val_dim = int(v.shape[3]) if v is not None and hasattr(v, "shape") else key_dim
+    act_dtype = q.dtype if q is not None and hasattr(q, "dtype") else jnp.bfloat16
+    per_channel_gate = args.get("per_channel_gate", True)
     cs = _vjp_chunk_size(ba, _requested_chunk_size)
+    two_pass = _vjp_two_pass_bf16(ba)
     mini_batches = tuple(
         mb for mb in (8, 16, 32) if mb <= heads and heads % mb == 0
     ) or (None,)
-    return {Config(chunk_size=cs, mini_batch=mb) for mb in mini_batches}
+    cs_mbs = _valid_autotune_mini_batches(
+        mini_batches,
+        chunk_size=cs,
+        act_dtype=act_dtype,
+        head_k_dim=key_dim,
+        head_v_dim=val_dim,
+        per_channel_gate=per_channel_gate,
+        is_kda=True,
+        two_pass_bf16=two_pass,
+    )
+    return {
+        Config(chunk_size=cs, mini_batch=mb, two_pass_bf16=two_pass)
+        for mb in cs_mbs
+    }
 
   def _fwd(
       self,
@@ -881,6 +1031,11 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     del output_final_state, return_residuals, use_conv1d_in_kernel
     del residual_checkpoint_name, chunk_size
     effective_chunk_size = residuals.chunk_size
+    effective_two_pass = (
+        config.two_pass_bf16
+        if self.config is not None
+        else residuals.two_pass_bf16
+    )
     safe_gate = _resolve_safe_gate(
         config,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -927,6 +1082,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         dout,
         per_channel_gate=per_channel_gate,
         mini_batch=config.mini_batch,
+        two_pass_bf16=effective_two_pass,
     )
 
     grads = {
@@ -985,25 +1141,6 @@ def _requested_gdn_chunk_size(ba: op.BoundArguments) -> int:
   return 64 if requested is None else int(requested)
 
 
-def _estimate_gdn_per_head_vmem_bytes(
-    *,
-    act_dtype: jnp.dtype,
-    chunk_size: int,
-    head_k_dim: int,
-    head_v_dim: int,
-) -> int:
-  elem_size = jnp.dtype(act_dtype).itemsize
-  bt, k, v = chunk_size, head_k_dim, head_v_dim
-  per_head_intra = (bt * k + bt * v + 2 * bt * bt) * elem_size
-  io_bwd = (
-      (3 * bt * k + bt * v + 2 * bt + bt * bt + k * v) * elem_size
-      + (2 * bt * k + bt * v) * elem_size
-      + (k * v + 5 * bt * k + bt * v + 2 * bt + 2 * bt * bt) * 4
-  )
-  per_head_bwd = io_bwd + io_bwd * 3 // 2
-  return max(per_head_intra, per_head_bwd)
-
-
 def check_gdn_inputs_support(
     *,
     act_dtype: jnp.dtype,
@@ -1020,6 +1157,7 @@ def check_gdn_inputs_support(
     segment_ids: jax.Array | None,
     context_parallel_metadata: ContextParallelMetadata | None,
     mini_batch: int | None = None,
+    two_pass_bf16: bool = False,
 ) -> None:
   """Checks whether the Pallas/Mosaic TPU GDN backend supports static inputs."""
   if act_dtype not in (jnp.bfloat16, jnp.float32):
@@ -1078,11 +1216,14 @@ def check_gdn_inputs_support(
         f" got mini_batch={mini_batch}."
     )
   vmem_limit_bytes = common.get_vmem_limit_bytes()
-  per_head_bytes = _estimate_gdn_per_head_vmem_bytes(
+  per_head_bytes = _estimate_per_head_vmem_bytes(
       act_dtype=act_dtype,
       chunk_size=chunk_size,
       head_k_dim=head_k_dim,
       head_v_dim=head_v_dim,
+      per_channel_gate=False,
+      is_kda=False,
+      two_pass_bf16=two_pass_bf16,
   )
   if gqa_repeats * per_head_bytes > vmem_limit_bytes:
     raise NotImplementedError(
@@ -1127,20 +1268,45 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
       return {Config(chunk_size=_requested_gdn_chunk_size(ba))}
     heads = int(args.get("num_v_heads") or 32)
     gqa_repeats = heads // int(args.get("num_k_heads") or heads)
+    act_src = (
+        args.get("qkv") if args.get("qkv") is not None else args.get("query")
+    )
+    src_shaped = act_src is not None and hasattr(act_src, "shape")
+    seq_len = act_src.shape[1] if src_shaped else None
+    act_dtype = (
+        act_src.dtype
+        if act_src is not None and hasattr(act_src, "dtype")
+        else jnp.bfloat16
+    )
+    key_dim = int(args.get("head_k_dim") or 128)
+    val_dim = int(args.get("head_v_dim") or 128)
+    segment_ids = args.get("segment_ids")
     req_cs = args.get("chunk_size")
-    chunk_sizes = (int(req_cs),) if req_cs is not None else (32, 64)
+    if req_cs is not None:
+      chunk_sizes = (int(req_cs),)
+    elif segment_ids is None and isinstance(seq_len, int):
+      chunk_sizes = tuple(cs for cs in (32, 64, 128) if seq_len % cs == 0) or (
+          64,
+      )
+    else:
+      chunk_sizes = (32, 64, 128)
+    mini_batches = tuple(
+        mb
+        for mb in (8, 16, 32)
+        if mb <= heads and heads % mb == 0 and mb % gqa_repeats == 0
+    ) or (None,)
     configs = set()
     for cs in chunk_sizes:
-      max_mb = 16 if cs > 64 else 32
-      mbs = tuple(
-          mb
-          for mb in (8, 16, 32)
-          if mb <= max_mb
-          and mb <= heads
-          and heads % mb == 0
-          and mb % gqa_repeats == 0
-      ) or (None,)
-      for mb in mbs:
+      cs_mbs = _valid_autotune_mini_batches(
+          mini_batches,
+          chunk_size=cs,
+          act_dtype=act_dtype,
+          head_k_dim=key_dim,
+          head_v_dim=val_dim,
+          per_channel_gate=False,
+          is_kda=False,
+      )
+      for mb in cs_mbs:
         configs.add(Config(chunk_size=cs, mini_batch=mb))
     return configs
 
@@ -1214,6 +1380,7 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
         mini_batch=config.mini_batch,
+        two_pass_bf16=config.two_pass_bf16,
     )
     safe_gate = _resolve_safe_gate(
         config, use_gate_in_kernel=use_gate_in_kernel, lower_bound=None
@@ -1246,6 +1413,7 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
         segment_ids=segment_ids,
         return_residuals=return_residuals,
         mini_batch=config.mini_batch,
+        two_pass_bf16=config.two_pass_bf16,
     )
     ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
     if ckpt_name is not None:
@@ -1271,7 +1439,10 @@ class PallasMosaicTpuGatedDeltaNetVjp(
 
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
-    return Config(chunk_size=_vjp_chunk_size(ba, _requested_gdn_chunk_size))
+    return Config(
+        chunk_size=_vjp_chunk_size(ba, _requested_gdn_chunk_size),
+        two_pass_bf16=_vjp_two_pass_bf16(ba),
+    )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
@@ -1280,17 +1451,37 @@ class PallasMosaicTpuGatedDeltaNetVjp(
       return {Config(chunk_size=_requested_gdn_chunk_size(ba))}
     heads = int(args.get("num_v_heads") or 32)
     gqa_repeats = heads // int(args.get("num_k_heads") or heads)
+    act_src = (
+        args.get("qkv") if args.get("qkv") is not None else args.get("query")
+    )
+    act_dtype = (
+        act_src.dtype
+        if act_src is not None and hasattr(act_src, "dtype")
+        else jnp.bfloat16
+    )
+    key_dim = int(args.get("head_k_dim") or 128)
+    val_dim = int(args.get("head_v_dim") or 128)
     cs = _vjp_chunk_size(ba, _requested_gdn_chunk_size)
-    max_mb = 16 if cs > 64 else 32
+    two_pass = _vjp_two_pass_bf16(ba)
     mini_batches = tuple(
         mb
         for mb in (8, 16, 32)
-        if mb <= max_mb
-        and mb <= heads
-        and heads % mb == 0
-        and mb % gqa_repeats == 0
+        if mb <= heads and heads % mb == 0 and mb % gqa_repeats == 0
     ) or (None,)
-    return {Config(chunk_size=cs, mini_batch=mb) for mb in mini_batches}
+    cs_mbs = _valid_autotune_mini_batches(
+        mini_batches,
+        chunk_size=cs,
+        act_dtype=act_dtype,
+        head_k_dim=key_dim,
+        head_v_dim=val_dim,
+        per_channel_gate=False,
+        is_kda=False,
+        two_pass_bf16=two_pass,
+    )
+    return {
+        Config(chunk_size=cs, mini_batch=mb, two_pass_bf16=two_pass)
+        for mb in cs_mbs
+    }
 
   def _fwd(
       self,
@@ -1328,6 +1519,11 @@ class PallasMosaicTpuGatedDeltaNetVjp(
     del out, output_final_state, return_residuals
     del context_parallel_metadata, residual_checkpoint_name, chunk_size
     effective_chunk_size = residuals.chunk_size
+    effective_two_pass = (
+        config.two_pass_bf16
+        if self.config is not None
+        else residuals.two_pass_bf16
+    )
     has_fused_qkv = qkv is not None
     if residuals.h is None:
       safe_gate = _resolve_safe_gate(
@@ -1360,6 +1556,7 @@ class PallasMosaicTpuGatedDeltaNetVjp(
           segment_ids=segment_ids,
           return_residuals=True,
           mini_batch=config.mini_batch,
+          two_pass_bf16=effective_two_pass,
       )
       assert recomputed is not None
       residuals = recomputed
@@ -1392,6 +1589,7 @@ class PallasMosaicTpuGatedDeltaNetVjp(
         residuals,
         dout,
         mini_batch=config.mini_batch,
+        two_pass_bf16=effective_two_pass,
     )
 
     grads: dict[str, jax.Array] = {

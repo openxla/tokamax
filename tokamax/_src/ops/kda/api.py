@@ -125,9 +125,9 @@ def kimi_delta_attention(
       (True, shape `[..., K]`) or a scalar per head/token (False, shape `[...,
       1]`).
     chunk_size: Optional chunk length for chunked implementations; `None`
-      selects the implementation default (64). `"mosaic"` supports 64 with a
-      per-channel gate and powers of two in `[16, 512]` with a scalar gate.
-      `"xla"` evaluates the recurrence token by token and ignores it.
+      selects the implementation default (64). `"mosaic"` supports 64 and 128
+      with a per-channel gate and powers of two in `[16, 512]` with a scalar
+      gate. `"xla"` evaluates the recurrence token by token and ignores it.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`. Padding
       is represented by 0.
     lower_bound: Optional sigmoid-gate lower bound.

@@ -557,7 +557,8 @@ class GatedDeltaNet(op.Op[Any, Output, Residuals, _Config, _Key]):
       config: _Config,
   ) -> tuple[Output, Residuals]:
     """Dispatches to the pure JAX GDN reference implementation."""
-    del config, return_residuals, chunk_size, residual_checkpoint_name
+    del config, return_residuals, chunk_size
+    del residual_checkpoint_name
     if not use_beta_sigmoid_in_kernel:
       _validate_beta(beta)
     output = reference.gated_delta_net(

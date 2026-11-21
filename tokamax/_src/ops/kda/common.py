@@ -218,6 +218,98 @@ def _hillis_steele_scan(
 
   return acc
 
+
+def tri_inv_xor_dnc(
+    L: jax.Array,
+    *,
+    use_fp32: bool = False,
+    two_pass_bf16: bool = False,
+) -> jax.Array:
+  """Inverts unit lower-triangular `I + L` via block-doubling (`xor_dnc`).
+
+  For strictly lower-triangular `L` of shape `[MB, BT, BT]` (`BT` a power of 2
+  in `[16, 512]`), computes `(I + L)^{-1}` in `O(log2(BT))` batched MXU stages:
+    * Stage `s = 1` initializes `2x2` diagonal block inverses `I - B^{(1)}`
+      with zero matmuls.
+    * Stages `s = 2, 4, ..., BT // 4` merge `s x s` diagonal block inverses
+      via `T <- T - (T @ B^{(s)}) @ T` (2 batched `[MB, BT, BT]` matmuls/stage).
+    * Final stage `s = BT // 2` slices only the sublane axis (`s >= 8`, always
+      8-sublane aligned) to merge the bottom-left block in 2 half-height
+      `[MB, BT // 2, BT] @ [MB, BT, BT]` matmuls without slicing minor lanes.
+
+  When `two_pass_bf16=True` and `not use_fp32`, applies one Newton-Schulz BF16
+  residual-refinement step (`E = -strict_lower(T + dot_high(T, L))`,
+  `T <- T + strict_lower(dot_bf16(E, T))`) to reach `O(u_bf16^2) ~ 1e-5`
+  accuracy without slow FP32 emulation.
+
+  Args:
+    L: Strictly lower-triangular `float32` tensor `[MB, BT, BT]`.
+    use_fp32: Whether to execute MXU matmuls at `Precision.HIGHEST` (FP32).
+    two_pass_bf16: Whether to refine the 1-pass BF16 inverse with a second BF16
+      residual pass when `use_fp32=False`.
+
+  Returns:
+    Unit lower-triangular `float32` tensor `(I + L)^{-1}` of shape `[MB, BT, BT]`.
+  """
+  BT = L.shape[-1]
+  assert BT >= 2 and (BT & (BT - 1)) == 0, (
+      f"tri_inv_xor_dnc requires power-of-2 BT >= 2, got {BT}"
+  )
+
+  r = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+  c = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+  strict = r > c
+  diag = r == c
+  zero = jnp.float32(0.0)
+  one = jnp.float32(1.0)
+
+  stage_prec = (
+      jax.lax.Precision.HIGHEST if use_fp32 else jax.lax.Precision.DEFAULT
+  )
+  dims = (((2,), (1,)), ((0,), (0,)))
+
+  def _dot(a: jax.Array, b: jax.Array, prec=stage_prec) -> jax.Array:
+    return jax.lax.dot_general(
+        a, b, dims, precision=prec, preferred_element_type=jnp.float32
+    )
+
+  L_strict = jnp.where(strict[None], L.astype(jnp.float32), zero)
+
+  # Stage s = 1: exact 2x2 diagonal block inverses with 0 matmuls.
+  mask_1 = (r == c + 1) & ((c & 1) == 0)
+  T = jnp.where(
+      diag[None],
+      one,
+      jnp.where(mask_1[None], -L_strict, zero),
+  )
+
+  # Intermediate block-doubling stages: s = 2, 4, ..., BT // 4.
+  s = 2
+  half_bt = BT // 2
+  while s < half_bt:
+    mask_s = ((r // (2 * s)) == (c // (2 * s))) & ((r & s) != 0) & ((c & s) == 0)
+    B_s = jnp.where(mask_s[None], L_strict, zero)
+    T = T - _dot(_dot(T, B_s), T)
+    s *= 2
+
+  # Final stage s = BT // 2: slice only sublane axis 1 (never minor lane axis 2).
+  if BT >= 4:
+    mask_last = (r >= half_bt) & (c < half_bt)
+    B_last = jnp.where(mask_last[None], L_strict, zero)
+    tb_bot = _dot(T[:, half_bt:, :], B_last)
+    upd_bot = _dot(tb_bot, T)
+    T = jnp.concatenate([T[:, :half_bt, :], T[:, half_bt:, :] - upd_bot], axis=1)
+
+  T = jnp.where(strict[None], T, jnp.where(diag[None], one, zero))
+
+  if two_pass_bf16 and not use_fp32:
+    al = _dot(T, L_strict, jax.lax.Precision.HIGH)
+    err = jnp.where(strict[None], -(T + al), zero)
+    corr = _dot(err, T, jax.lax.Precision.DEFAULT)
+    T = T + jnp.where(strict[None], corr, zero)
+
+  return T
+
 # =============================================================================
 # Delta-rule hidden-state kernels
 # =============================================================================
@@ -753,7 +845,7 @@ def _chunk_gated_delta_rule_fwd(
 
   # -- Output shapes ---
   # h stored as [B, NT, H, K_PADSIZE, V_ALIGNED] with V before K (varlen convention).
-  h_spec = jax.ShapeDtypeStruct([H, B, NT, K_PADSIZE, V_ALIGNED], k.dtype)
+  h_spec = jax.ShapeDtypeStruct([H, B, NT, K_PADSIZE, V_ALIGNED], u.dtype)
   v_new_spec = (
     jax.ShapeDtypeStruct([H, B, T, V_ALIGNED], jnp.float32) if save_new_value else None
   )
