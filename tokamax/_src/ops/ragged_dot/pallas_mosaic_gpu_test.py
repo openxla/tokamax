@@ -14,6 +14,8 @@
 # ==============================================================================
 
 from absl.testing import absltest
+from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
 import qwix
@@ -131,6 +133,19 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     configs = op._get_autotuning_configs(ba)
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
+
+  @parameterized.parameters(14, 1020)
+  def test_num_rows_not_multiple_of_8(self, m):
+    num_groups, k, n = 8, 128, 256
+    a, b, _ = self._create_inputs(num_groups, m, k, n, jnp.bfloat16)
+    group_size = m // num_groups
+    group_sizes = [group_size] * (num_groups - 1)
+    group_sizes = jnp.array(group_sizes + [m - sum(group_sizes)], jnp.int32)
+    actual = self._dot_fn(a, b, group_sizes=group_sizes)
+    expected = test_base.ref(a, b, group_sizes)
+    chex.assert_trees_all_close(
+        actual.astype(jnp.float32), expected, atol=0.01, rtol=0.005
+    )
 
 
 if __name__ == "__main__":
