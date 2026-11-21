@@ -38,6 +38,7 @@ Optimization Provenance:
   Jetski Teamwork + Auto evolutionary RSI optimization.
 """
 
+from collections.abc import Callable
 import functools
 from typing import Any, cast
 
@@ -56,7 +57,15 @@ NUM_BUCKETS = 256
 # 128KB double-buffered by emit_pipeline out of the 512KB tile memory).
 MAX_SLICE_WORDS = 64 * 1024
 MAX_DOUBLE_BUF_WORDS = 32 * 1024
-# Unroll factor for the loops that walk the whole resident slice.
+# Unroll factor for the loops that walk the whole resident slice. The walks run
+# over whole blocks of this many chunks (see ``_block_chunks``): the slice tail
+# is padded with -inf out to a block boundary, so their trip count is a
+# multiple of the unroll at any row length and the compiler's scalar remainder
+# never runs. Wider blocks (16, 32, 64) measured slower on every shape at
+# OptLevel.O3, so the walks keep the unroll of the unpadded loops.
+BLOCK_UNROLL = 8
+# Unroll factor of the loops with a dynamic, unpadded bound (the DCP merge emit,
+# and the slice walks of a slice too short to pad to a block).
 SCAN_UNROLL = 8
 
 L0_SHIFT = 24
@@ -76,6 +85,29 @@ def _align_to(x, a):
 
 def _cdiv_dyn(x):
   return jnp.right_shift(x + (LANES - 1), 4)
+
+
+def _block_chunks(raw_len: int) -> int:
+  """Chunks per whole block of the full-slice walks.
+
+  Blocking the walks means padding the slice up to a whole number of
+  ``LANES * blk``-word blocks, so the largest block is only taken where the
+  padding is nearly free: never more than an eighth of the slice, and never
+  across ``MAX_DOUBLE_BUF_WORDS`` (which would drop the slice to single
+  buffering) or ``MAX_SLICE_WORDS``.
+  """
+  base = _align_to(raw_len, LANES)
+  blk = BLOCK_UNROLL
+  while blk > 1:
+    padded = _align_to(raw_len, LANES * blk)
+    too_fat = padded * 8 > base * 9
+    crosses = any(
+        padded > cap >= base for cap in (MAX_DOUBLE_BUF_WORDS, MAX_SLICE_WORDS)
+    )
+    if not (too_fat or crosses):
+      break
+    blk //= 2
+  return blk
 
 
 def _topk_body(
@@ -100,6 +132,7 @@ def _topk_body(
     k: int,
     p: int = 1,
     slice_len: int,
+    blk: int,
     num_waves: int,
     write_empty: bool,
     return_scores: bool,
@@ -129,8 +162,34 @@ def _topk_body(
   base_iota = lane_iota if p == 1 else col_base + lane_iota
   neg_inf_key = jnp.int32(KEY_NEG_INF)
 
+  blk_shift = int(np.log2(blk * LANES))
+
   def vec_at(ref, idx):
     return ref[pl.ds(idx, LANES)][0]
+
+  def block_loop(
+      blocks: jax.Array, body: Callable[..., Any], carry: Any = None
+  ) -> Any:
+    """Walks ``blocks`` whole blocks of ``blk`` chunks of the resident slice.
+
+    The slice tail is padded with -inf out to a block boundary, so a walk of
+    whole blocks covers exactly the live chunks of the row at any length. The
+    trip count is then a multiple of the unroll factor and the remainder the
+    compiler emits behind the unrolled body never runs -- a short or partly
+    filled slice stays on the unrolled path instead of falling into a scalar
+    tail. Unrolling itself stays with the compiler: a Python-level unroll into
+    one loop iteration hides the independence that ``sc.parallel_access``
+    grants across iterations.
+
+    A slice too short to pad to a block (``blk == 1``) keeps the old shape.
+    """
+    unroll = blk if blk > 1 else SCAN_UNROLL
+    if carry is None:
+      plsc.parallel_loop(0, blocks * blk, unroll=unroll)(body)
+      return None
+    return plsc.parallel_loop(0, blocks * blk, unroll=unroll, carry=carry)(
+        body
+    )  # pytype: disable=bad-argument-type
 
   def monotone_key(bits):
     m = jnp.bitwise_and(jnp.right_shift(bits, 31), jnp.int32(MONO_MASK))
@@ -230,6 +289,10 @@ def _topk_body(
     else:
       i_hi = jnp.clip(row_eff_len - col_base, 0, slice_len)
     walk_chunks = _cdiv_dyn(i_hi)
+    # Whole blocks of ``blk`` chunks cover the live part of the slice once its
+    # tail is filled with -inf below; ``slice_len`` is a multiple of
+    # ``blk * LANES``, so the fill never leaves the resident slice.
+    walk_blocks = jnp.right_shift(i_hi + (blk * LANES - 1), blk_shift)
 
     zero_hist(NUM_BUCKETS // LANES)
 
@@ -242,13 +305,24 @@ def _topk_body(
           jnp.int32(BITS_NEG_INF),
       )
 
+      def pad_body(i):
+        scores_vmem[pl.ds(pl.multiple_of(i * LANES, LANES), LANES)] = jnp.full(
+            (LANES,), BITS_NEG_INF, jnp.int32
+        )
+
+      # The lanes at or past i_hi of chunk walk_chunks - 1 were set to -inf
+      # just above, so this only fills the whole chunks after it, up to the
+      # block boundary every walk below stops at. Nothing past that is read.
+      if blk > 1:
+        plsc.parallel_loop(walk_chunks, walk_blocks * blk, unroll=1)(pad_body)
+
       def hist0_body(i):
         key = monotone_key(scores_vmem[pl.ds(i * LANES, LANES)])
         scores_vmem[pl.ds(i * LANES, LANES)] = key
         bucket = jnp.right_shift(key, L0_SHIFT) + jnp.int32(NUM_BUCKETS // 2)
         hist_add(bucket, key > neg_inf_key)
 
-      plsc.parallel_loop(0, walk_chunks, unroll=SCAN_UNROLL)(hist0_body)
+      block_loop(walk_blocks, hist0_body)
 
     sync_and_reduce_hist(0, active)
 
@@ -310,12 +384,11 @@ def _topk_body(
 
       if use_compact and lvl_idx in (1, 2):
         do_compact = (~done) & (~compacted) & (cnt <= k)
-        n_cand_new = plsc.parallel_loop(
-            0,
-            jnp.where(do_compact, walk_chunks, 0),
-            unroll=SCAN_UNROLL,
+        n_cand_new = block_loop(
+            jnp.where(do_compact, walk_blocks, 0),
+            functools.partial(compact_body, lo_b=lo_excl),
             carry=n_cand,
-        )(functools.partial(compact_body, lo_b=lo_excl))
+        )
         n_cand = jnp.where(do_compact, n_cand_new, n_cand)
         compacted = compacted | do_compact
         cand_chunks = _cdiv_dyn(n_cand)
@@ -345,11 +418,10 @@ def _topk_body(
         )
         hist_add(bucket, match)
 
-      plsc.parallel_loop(
-          0,
-          jnp.where(done | compacted, 0, walk_chunks),
-          unroll=SCAN_UNROLL,
-      )(functools.partial(ref_body, src_vmem=scores_vmem))
+      block_loop(
+          jnp.where(done | compacted, 0, walk_blocks),
+          functools.partial(ref_body, src_vmem=scores_vmem),
+      )
       if use_compact:
         plsc.parallel_loop(
             0,
@@ -416,7 +488,7 @@ def _topk_body(
 
     if dcp_merge:
       score_chunk_base = vec_at(len_slice_vmem, 0) * (k // LANES)
-      emit_chunks = jnp.where(active, k // LANES, 0)
+      emit_bound = jnp.where(active, k // LANES, 0)
 
       def count_prior_ties(i, rank):
         key = scores_vmem[pl.ds(i * LANES, LANES)]
@@ -431,8 +503,19 @@ def _topk_body(
       )(count_prior_ties)
     else:
       score_chunk_base = 0
-      emit_chunks = jnp.where(active, walk_chunks, 0)
+      emit_bound = jnp.where(active, walk_blocks, 0)
       prior_ties = jnp.int32(0)
+
+    def emit_loop(
+        run: jax.Array, body: Callable[..., Any], carry: Any, dcp_unroll: int
+    ) -> Any:
+      """Emit walk: whole slice blocks, or the DCP merge's ``k`` scores."""
+      bound = jnp.where(run, emit_bound, 0)
+      if not dcp_merge:
+        return block_loop(bound, body, carry=carry)
+      return plsc.parallel_loop(0, bound, unroll=dcp_unroll, carry=carry)(
+          body
+      )  # pytype: disable=bad-argument-type
 
     def emit(i, woff, key, sel, *, from_cand=False):
       if dcp_merge:
@@ -459,14 +542,9 @@ def _topk_body(
       key = scores_vmem[pl.ds((score_chunk_base + i) * LANES, LANES)]
       return emit(i, woff, key, key > gate)
 
-    m_whole = plsc.parallel_loop(
-        0,
-        jnp.where(whole_bucket & (~compacted), emit_chunks, 0),
-        unroll=SCAN_UNROLL,
-        carry=jnp.int32(0),
-    )(
-        emit_whole
-    )  # pytype: disable=bad-argument-type
+    m_whole = emit_loop(
+        whole_bucket & (~compacted), emit_whole, jnp.int32(0), SCAN_UNROLL
+    )
 
     if use_compact:
 
@@ -496,12 +574,12 @@ def _topk_body(
       sel = strict | (in_set & (tie_rank <= my_take))
       return emit(i, woff, key, sel), tie_rank[LANES - 1]
 
-    m_ranked, _ = plsc.parallel_loop(
-        0,
-        jnp.where((~whole_bucket) & (~compacted), emit_chunks, 0),
-        unroll=4,
-        carry=(jnp.int32(0), prior_ties),
-    )(emit_ranked)
+    m_ranked, _ = emit_loop(
+        (~whole_bucket) & (~compacted),
+        emit_ranked,
+        (jnp.int32(0), prior_ties),
+        4,
+    )
 
     if use_compact:
 
@@ -775,7 +853,13 @@ def _sc_topk_direct(
       else jax.lax.bitcast_convert_type(scores, jnp.int32)
   )
   groups_per_chip = 32 // p
-  slice_len = _align_to(n // p, LANES)
+  # The full-slice walks run over whole blocks of ``blk`` chunks, so the slice
+  # is rounded up to a whole block; the pad below carries the extra words into
+  # HBM, where the kernel overwrites them with -inf. Rounding the per-slice
+  # width up keeps ``slice_len * p >= n`` even if ``p`` does not divide ``n``.
+  raw_slice = _cdiv(n, p)
+  blk = _block_chunks(raw_slice)
+  slice_len = _align_to(raw_slice, LANES * blk)
   num_waves = _cdiv(b, groups_per_chip)
   padded_b = num_waves * groups_per_chip
   pad_b = padded_b - b
@@ -847,6 +931,7 @@ def _sc_topk_direct(
       k=k,
       p=p,
       slice_len=slice_len,
+      blk=blk,
       num_waves=num_waves,
       write_empty=write_empty,
       return_scores=return_scores,
