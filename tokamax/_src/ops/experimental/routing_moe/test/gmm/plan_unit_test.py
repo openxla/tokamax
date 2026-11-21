@@ -42,6 +42,10 @@ def _tpu_info() -> pltpu.TpuInfo:
   return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
+def _vmem_limit_for_effective_budget(target_bytes: int) -> int:
+  return math.ceil(target_bytes / 0.9)
+
+
 def _make_spec(
     num_tokens: int,
     *,
@@ -230,12 +234,9 @@ class TileMTest(parameterized.TestCase):
     spec_zero_groups = dataclasses.replace(
         base, w=dataclasses.replace(base.w, group_size=0), num_global_groups=0
     )
-    default_plan = gmm_plan.RoutingGmmPlan()
     for gmm_spec in (spec_zero_m, spec_zero_groups):
       self.assertEqual(
-          gmm_plan._max_group_rows(
-              default_plan, spec=gmm_spec, tpu_info=_tpu_info()
-          ),
+          gmm_plan._max_group_rows(gmm_spec, _tpu_info()),
           128,
       )
 
@@ -275,44 +276,6 @@ class TileMTest(parameterized.TestCase):
     #   tile_m=64.
     resolved = _resolve(num_tokens, with_down=True, size_k2=256)
     self.assertEqual(resolved.tile_m, expected_tile_m)
-
-  @parameterized.parameters(
-      (0.5, 16),
-      (2.0, 64),
-  )
-  def test_skew_headroom_scales_tile(
-      self, skew_headroom: float, expected_tile_m: int
-  ):
-    # With 1088 tokens, 512 experts, top_k=10, size_k2=256: expected_rows=21.25
-    # and dma_floor=16, so 10.625 -> 16 and 42.5 -> 64 (the default gives 32).
-    custom_plan = gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
-    resolved = _resolve(1088, custom_plan, with_down=True, size_k2=256)
-    self.assertEqual(resolved.tile_m, expected_tile_m)
-
-  @parameterized.parameters(0.0, -1.5)
-  def test_non_positive_skew_headroom_raises(self, skew_headroom: float):
-    with self.assertRaisesRegex(ValueError, "skew_headroom must be positive"):
-      gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
-
-  @parameterized.parameters(
-      (8, 128),
-      (32, 32),
-  )
-  def test_dma_floor_divisor_scales_tile(
-      self, dma_floor_divisor: int, expected_tile_m: int
-  ):
-    # With 256 tokens and size_k2=1024: skew_rows=8, so the floor
-    # 1024 // divisor binds (the default 16 gives 64).
-    custom_plan = gmm_plan.RoutingGmmPlan(dma_floor_divisor=dma_floor_divisor)
-    resolved = _resolve(256, custom_plan, with_down=True, size_k2=1024)
-    self.assertEqual(resolved.tile_m, expected_tile_m)
-
-  @parameterized.parameters(0, -16)
-  def test_non_positive_dma_floor_divisor_raises(self, dma_floor_divisor: int):
-    with self.assertRaisesRegex(
-        ValueError, "dma_floor_divisor must be positive"
-    ):
-      gmm_plan.RoutingGmmPlan(dma_floor_divisor=dma_floor_divisor)
 
   def test_wide_intermediate_dma_floor(self):
     # At num_tokens=256, num_experts=512:
@@ -400,7 +363,7 @@ class TileMTest(parameterized.TestCase):
     # At 16,384 tokens, unquantized bf16 fused weights need tile_m stepped down
     # under a 32 MiB budget when fusion is forced, while default plan unfuses.
     tight_budget = dict(
-        vmem_limit_bytes=32 * 1024 * 1024, vmem_usage_fraction=1.0
+        vmem_limit_bytes=_vmem_limit_for_effective_budget(32 * 1024 * 1024)
     )
     default_plan = _resolve(
         16384,
@@ -429,8 +392,7 @@ class TileMTest(parameterized.TestCase):
         200,
         gmm_plan.RoutingGmmPlan(
             fuse_up_and_down=True,
-            vmem_limit_bytes=28 * 1024 * 1024,
-            vmem_usage_fraction=1.0,
+            vmem_limit_bytes=_vmem_limit_for_effective_budget(28 * 1024 * 1024),
         ),
         quantized=False,
         with_down=True,
@@ -445,7 +407,7 @@ class TileMTest(parameterized.TestCase):
     # (~25.0 MiB) does; an explicit bucket_base=128 bounds the step-down so
     # RoutingGmmConfig validation never sees tile_m < bucket_base.
     tighter_budget = dict(
-        vmem_limit_bytes=26 * 1024 * 1024, vmem_usage_fraction=1.0
+        vmem_limit_bytes=_vmem_limit_for_effective_budget(26 * 1024 * 1024)
     )
     unbounded = _resolve(
         16384,
@@ -551,12 +513,6 @@ class NumWBuffersTest(parameterized.TestCase):
   ):
     resolved = _resolve(num_tokens, quantized=quantized)
     self.assertEqual(resolved.num_w_buffers, 8)
-
-  @parameterized.parameters(2, 4, 6)
-  def test_max_num_w_buffers_caps_growth(self, max_num_w_buffers: int):
-    custom_plan = gmm_plan.RoutingGmmPlan(max_num_w_buffers=max_num_w_buffers)
-    resolved = _resolve(8, custom_plan)
-    self.assertEqual(resolved.num_w_buffers, max_num_w_buffers)
 
   @parameterized.parameters(2, 4, 6)
   def test_explicit_num_w_buffers_is_kept(self, num_w_buffers: int):
@@ -690,7 +646,9 @@ class QuantStashPlanTest(parameterized.TestCase):
     # 13.5 MB fits tile_m=256 with 2 bf16 stash buffers (13,377,536 bytes), but
     # overflows to tile_m=128 with 3 buffers or f32 stash dtype. 16 experts
     # give 160 expected rows per group so the expected-load bound allows 256.
-    single_budget = dict(vmem_limit_bytes=13_500_000, vmem_usage_fraction=1.0)
+    single_budget = dict(
+        vmem_limit_bytes=_vmem_limit_for_effective_budget(13_500_000)
+    )
     default_single = _resolve(
         256,
         gmm_plan.RoutingGmmPlan(**single_budget),
@@ -710,7 +668,9 @@ class QuantStashPlanTest(parameterized.TestCase):
 
     # 13.55 MB fits fused up/down with 2 bf16 stash buffers (13,459,456 bytes),
     # but unfuses with 3 buffers or f32 stash dtype. 32 tokens give tile_m=32.
-    fused_budget = dict(vmem_limit_bytes=13_550_000, vmem_usage_fraction=1.0)
+    fused_budget = dict(
+        vmem_limit_bytes=_vmem_limit_for_effective_budget(13_550_000)
+    )
     default_two_stage = _resolve(
         32,
         gmm_plan.RoutingGmmPlan(**fused_budget),
@@ -1375,7 +1335,7 @@ class BufferingAndLookaheadTest(parameterized.TestCase):
     self.assertEqual(_resolve(32, with_down=True).num_w_buffers, 8)
     self.assertEqual(_resolve(2048, with_down=True).num_w_buffers, 4)
     self.assertEqual(_resolve(2048, with_down=False).num_w_buffers, 8)
-    override = gmm_plan.RoutingGmmPlan(max_num_w_buffers=6)
+    override = gmm_plan.RoutingGmmPlan(num_w_buffers=6)
     self.assertEqual(_resolve(2048, override, with_down=True).num_w_buffers, 6)
 
   def test_large_expert_weights_cap_buffers_and_keep_lookahead(self):
