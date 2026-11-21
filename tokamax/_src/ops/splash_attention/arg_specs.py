@@ -112,57 +112,98 @@ def _splash_attention_arg_specs() -> tuple[arg_spec.ArgSpec, ...]:
   return tuple(specs)
 
 
+def _additional_arg_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Creates additional causal Splash Attention argument specs."""
+  existing = {(128, 128, 4096, 192, 128)}
+  shape_groups = (
+      # MLA (`d_qk=192, d_v=128`, `H_q == H_kv`).
+      (((16, 16),), (4096, 8192), (192, 128)),
+      (((32, 32), (64, 64), (128, 128)), (4096, 8192, 32768), (192, 128)),
+      # `d=512` causal GQA (e.g. Gemma 4 global layers).
+      (((32, 4), (16, 2)), (4096, 8192), (512, 512)),
+      # `d=256` causal GQA (e.g. Gemma 3, Qwen 3.5 / 3.8).
+      (((64, 4), (32, 2), (16, 8)), (4096, 8192), (256, 256)),
+      # `d=128` causal GQA (e.g. Qwen 3).
+      (((64, 4), (32, 4)), (8192,), (128, 128)),
+  )
+  specs = []
+  for head_pairs, seq_lens, (d_qk, d_v) in shape_groups:
+    for num_q_heads, num_kv_heads in head_pairs:
+      for seq_len in seq_lens:
+        if (num_q_heads, num_kv_heads, seq_len, d_qk, d_v) in existing:
+          continue
+        specs.append(
+            _create_spec(
+                name=(
+                    f"q{num_q_heads}_kv{num_kv_heads}_s{seq_len}"
+                    f"_dqk{d_qk}_dv{d_v}"
+                ),
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                q_seq_len=seq_len,
+                kv_seq_len=seq_len,
+                head_dim_qk=d_qk,
+                head_dim_v=d_v,
+            )
+        )
+  return tuple(specs)
+
+
 ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
-    _create_spec(
-        name="q64_kv8_s8192_dqk128_dv128",
-        num_q_heads=64,
-        num_kv_heads=8,
-        q_seq_len=8192,
-        kv_seq_len=8192,
-        head_dim_qk=128,
-        head_dim_v=128,
-        dtype=jnp.bfloat16,
-        is_causal=True,
-        is_mqa=False,
-        tags=("primary",),
-    ),
-    _create_spec(
-        name="q64_kv8_sq16384_skv131072_dqk128_dv128",
-        num_q_heads=64,
-        num_kv_heads=8,
-        q_seq_len=16384,
-        kv_seq_len=131072,
-        head_dim_qk=128,
-        head_dim_v=128,
-        dtype=jnp.bfloat16,
-        is_causal=True,
-        is_mqa=False,
-        tags=("primary",),
-    ),
-    _create_spec(
-        name="q128_kv8_s8192_dqk128_dv128",
-        num_q_heads=128,
-        num_kv_heads=8,
-        q_seq_len=8192,
-        kv_seq_len=8192,
-        head_dim_qk=128,
-        head_dim_v=128,
-        dtype=jnp.bfloat16,
-        is_causal=True,
-        is_mqa=False,
-        tags=("primary",),
-    ),
-    _create_spec(
-        name="q128_kv128_s4096_dqk192_dv128",
-        num_q_heads=128,
-        num_kv_heads=128,
-        q_seq_len=4096,
-        kv_seq_len=4096,
-        head_dim_qk=192,
-        head_dim_v=128,
-        dtype=jnp.bfloat16,
-        is_causal=True,
-        is_mqa=False,
-        tags=("primary",),
-    ),
-) + _splash_attention_arg_specs()
+    (
+        _create_spec(
+            name="q64_kv8_s8192_dqk128_dv128",
+            num_q_heads=64,
+            num_kv_heads=8,
+            q_seq_len=8192,
+            kv_seq_len=8192,
+            head_dim_qk=128,
+            head_dim_v=128,
+            dtype=jnp.bfloat16,
+            is_causal=True,
+            is_mqa=False,
+            tags=("primary",),
+        ),
+        _create_spec(
+            name="q64_kv8_sq16384_skv131072_dqk128_dv128",
+            num_q_heads=64,
+            num_kv_heads=8,
+            q_seq_len=16384,
+            kv_seq_len=131072,
+            head_dim_qk=128,
+            head_dim_v=128,
+            dtype=jnp.bfloat16,
+            is_causal=True,
+            is_mqa=False,
+            tags=("primary",),
+        ),
+        _create_spec(
+            name="q128_kv8_s8192_dqk128_dv128",
+            num_q_heads=128,
+            num_kv_heads=8,
+            q_seq_len=8192,
+            kv_seq_len=8192,
+            head_dim_qk=128,
+            head_dim_v=128,
+            dtype=jnp.bfloat16,
+            is_causal=True,
+            is_mqa=False,
+            tags=("primary",),
+        ),
+        _create_spec(
+            name="q128_kv128_s4096_dqk192_dv128",
+            num_q_heads=128,
+            num_kv_heads=128,
+            q_seq_len=4096,
+            kv_seq_len=4096,
+            head_dim_qk=192,
+            head_dim_v=128,
+            dtype=jnp.bfloat16,
+            is_causal=True,
+            is_mqa=False,
+            tags=("primary",),
+        ),
+    )
+    + _additional_arg_specs()
+    + _splash_attention_arg_specs()
+)
