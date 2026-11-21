@@ -360,6 +360,9 @@ SHARDS: ShardMap = {
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/gmm/gmm_prod_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/api_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/base_test.py',
+            'tokamax/_src/ops/experimental/routing_moe_op/pallas_mosaic_tpu_test.py',
         ),
         minutes=15,
         compat_minutes=1,
@@ -691,9 +694,7 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     'experimental-ssd-scan': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/ssd_scan/ssd_scan_test.py',
-        ),
+        paths=('tokamax/_src/ops/experimental/ssd_scan/ssd_scan_test.py',),
         minutes=1,
         compat_minutes=1,
     ),
@@ -748,6 +749,7 @@ SHARDS: ShardMap = {
             'tokamax/_src/pydantic_test.py',
             'tokamax/_src/shape_test.py',
             'tokamax/_src/test_utils_test.py',
+            'tokamax/ops/experimental/tpu_test.py',
         ),
         minutes=1,
         compat_minutes=1,
