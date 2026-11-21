@@ -236,6 +236,8 @@ class PallasMosaicGpuFlashAttention(base.DotProductAttention[Config, Key]):
       f = lambda *args, f=f: combine_partial_results(*f(*args))  # pyrefly: ignore[bad-argument-type]
 
     out, residuals = base.vmap_batch_dims(f)(*args)
+    # `combine_partial_results` (`split_k > 1`) returns float32.
+    out = out.astype(out_dtype)
     if not return_residuals:
       residuals = None
     if config.fold_q_sequence_heads:
