@@ -53,10 +53,11 @@ class OutputReduceProdTest(parameterized.TestCase):
         num_local_experts=case_inputs.num_local_experts,
     )
     case_inputs.assert_close(timed_kernel.fn(timed_kernel.args))
-    logging.info("xla: %.1f us", xla.latency_us())
-    logging.info(
-        "kernel: %.1f us %s", timed_kernel.latency_us(), timed_kernel.trace()
-    )
+    if helper_util.ROUTING_MOE_PROFILE.value:
+      logging.info("xla: %.1f us", xla.latency_us())
+      logging.info(
+          "kernel: %.1f us %s", timed_kernel.latency_us(), timed_kernel.trace()
+      )
 
 
 if __name__ == "__main__":
