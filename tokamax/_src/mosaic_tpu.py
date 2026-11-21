@@ -29,7 +29,6 @@ QArray = qwix.QArray
 LANES = 128
 
 
-@functools.lru_cache
 def _adaptive_sublane_size() -> int:
   """Returns the sublane size based on the generation.
 
