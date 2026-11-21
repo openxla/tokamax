@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Annotated, TYPE_CHECKING, Any, TypeAlias
 
 import jax
+from jax import ad_checkpoint
 import jax.numpy as jnp
 import numpy as np
 import pydantic
@@ -68,12 +69,13 @@ class ContextParallelMetadata:
   ``pre_num_ranks`` / ``post_num_ranks`` describe the rank's position in
   the segment-spanning chain.
 
-  All fields except ``mesh`` and ``axis_name`` are typically left as
-  ``None`` by the caller: ``chunk_kda``'s CP entry path derives
-  ``cu_seqlens`` + chain fields from rank-local ``segment_ids`` via one
-  small ``all_gather`` (see ``_derive_cp_metadata_from_segment_ids``),
-  then fills them back via ``dataclasses.replace`` before passing the
-  completed context to the downstream Pallas kernel.
+  In-place sequence CP (used by ``gated_delta_net`` and stateless
+  ``kimi_delta_attention`` when ``T_local % chunk_size == 0``) requires only
+  ``ContextParallelMetadata(mesh, axis_name)`` (plus ``max_num_segments`` on
+  KDA when ``segment_ids`` is provided; ``segment_ids > max_num_segments`` are
+  clipped to padding). The chain fields (``is_first_rank``, ``is_last_rank``,
+  ``pre_num_ranks``, ``post_num_ranks``) are retained only for legacy varlen
+  ``chunk_kda`` compatibility.
 
   The chain fields (``is_first_rank`` / ``pre_num_ranks`` etc.) accept
   EITHER Python static values OR traced ``jax.Array`` values — the
@@ -100,6 +102,8 @@ class ContextParallelMetadata:
       share the last segment.
     conv1d_kernel_size: Reserved for conv1d CP. ``None`` for KDA.
     pre_num_conv_tokens: Reserved for conv1d CP. ``None`` for KDA.
+    cp_residual_checkpoint_name: Optional JAX ``ad_checkpoint.checkpoint_name``
+      tag applied to cross-rank halo and incoming-state activations.
   """
 
   mesh: "jax.sharding.Mesh"
@@ -110,6 +114,7 @@ class ContextParallelMetadata:
   post_num_ranks: int | jax.Array | None = None
   conv1d_kernel_size: int | None = None
   pre_num_conv_tokens: int | None = None
+  cp_residual_checkpoint_name: str | None = None
 
   # Identity-based hash + eq so traced jnp.array fields (which are not
   # hashable) don't break dataclass auto-generated __hash__. This is safe
@@ -117,7 +122,12 @@ class ContextParallelMetadata:
   # site constructs its own ContextParallelMetadata — identity hashing keys the
   # cache per call site, which is what we want.
   def __hash__(self) -> int:
-    return hash((id(self.mesh), self.axis_name, self.cp_size))
+    return hash((
+        id(self.mesh),
+        self.axis_name,
+        self.cp_size,
+        self.cp_residual_checkpoint_name,
+    ))
 
   def __eq__(self, other: Any) -> bool:
     if not isinstance(other, ContextParallelMetadata):
@@ -441,3 +451,241 @@ def _merge_dht(
     return jnp.where(active, merged, carry)
 
   return jax.lax.fori_loop(0, cp_size, body, zero)
+
+
+def cp_shift_right(
+    x: jax.Array, axis_name: str, cp_size: int
+) -> jax.Array:
+  """Sends `x` from rank `r - 1` to rank `r`, zeroing `rank == 0`."""
+  if cp_size <= 1:
+    return jnp.zeros_like(x)
+  perm = [(i, i + 1) for i in range(cp_size - 1)]
+  return jax.lax.ppermute(x, axis_name=axis_name, perm=perm)
+
+
+def cp_shift_left(
+    x: jax.Array, axis_name: str, cp_size: int
+) -> jax.Array:
+  """Sends `x` from rank `r + 1` to rank `r`, zeroing `rank == cp_size - 1`."""
+  if cp_size <= 1:
+    return jnp.zeros_like(x)
+  perm = [(i + 1, i) for i in range(cp_size - 1)]
+  return jax.lax.ppermute(x, axis_name=axis_name, perm=perm)
+
+
+def cp_associative_scan_fwd(
+    s_local: jax.Array,
+    m_local: jax.Array,
+    *,
+    axis_name: str,
+    cp_size: int,
+) -> jax.Array:
+  """Computes incoming state `S_in` (`[B, H, K, V]` f32) via O(log2 P) ppermutes."""
+  s_acc = s_local.astype(jnp.float32)
+  m_acc = m_local.astype(jnp.float32)
+  if cp_size <= 1:
+    return jnp.zeros_like(s_acc)
+
+  _, _, K, V = s_acc.shape
+  rank = jax.lax.axis_index(axis_name)
+  # The trailing `cp_shift_right` discards rank `cp_size - 1`'s inclusive
+  # prefix, so every rank's exclusive prefix spans at most `cp_size - 1` ranks
+  # (0 doubling steps when `cp_size == 2`).
+  stride = 1
+  while stride < cp_size - 1:
+    perm = [(i, i + stride) for i in range(cp_size - stride)]
+    need_m = stride * 2 < cp_size - 1
+    if need_m:
+      packed = jnp.concatenate([s_acc, m_acc], axis=-1)
+      packed_prev = jax.lax.ppermute(packed, axis_name=axis_name, perm=perm)
+      s_prev = packed_prev[..., :V]
+      m_prev = packed_prev[..., V : V + K]
+    else:
+      s_prev = jax.lax.ppermute(s_acc, axis_name=axis_name, perm=perm)
+      m_prev = None
+    s_comb = (
+        jnp.matmul(
+            m_acc,
+            s_prev,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        + s_acc
+    )
+    active = rank >= stride
+    s_acc = jnp.where(active, s_comb, s_acc)
+    if need_m:
+      assert m_prev is not None
+      m_comb = jnp.matmul(
+          m_acc,
+          m_prev,
+          precision=jax.lax.Precision.HIGHEST,
+          preferred_element_type=jnp.float32,
+      )
+      m_acc = jnp.where(active, m_comb, m_acc)
+    stride *= 2
+
+  return cp_shift_right(s_acc, axis_name, cp_size)
+
+
+def cp_associative_scan_bwd(
+    ds_local: jax.Array,
+    dm_local: jax.Array,
+    *,
+    axis_name: str,
+    cp_size: int,
+) -> jax.Array:
+  """Computes outgoing state cotangent `dht` (`[B, H, K, V]` f32) via ppermutes."""
+  ds_acc = ds_local.astype(jnp.float32)
+  dm_acc = dm_local.astype(jnp.float32)
+  if cp_size <= 1:
+    return jnp.zeros_like(ds_acc)
+
+  _, _, K, V = ds_acc.shape
+  rank = jax.lax.axis_index(axis_name)
+  # The trailing `cp_shift_left` discards rank 0's inclusive suffix, so every
+  # rank's exclusive suffix spans at most `cp_size - 1` downstream ranks.
+  stride = 1
+  while stride < cp_size - 1:
+    perm = [(i, i - stride) for i in range(stride, cp_size)]
+    need_m = stride * 2 < cp_size - 1
+    if need_m:
+      packed = jnp.concatenate([ds_acc, dm_acc], axis=-1)
+      packed_next = jax.lax.ppermute(packed, axis_name=axis_name, perm=perm)
+      ds_next = packed_next[..., :V]
+      dm_next = packed_next[..., V : V + K]
+    else:
+      ds_next = jax.lax.ppermute(ds_acc, axis_name=axis_name, perm=perm)
+      dm_next = None
+    ds_comb = (
+        jnp.matmul(
+            dm_acc,
+            ds_next,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        + ds_acc
+    )
+    active = (rank + stride) < cp_size
+    ds_acc = jnp.where(active, ds_comb, ds_acc)
+    if need_m:
+      assert dm_next is not None
+      dm_comb = jnp.matmul(
+          dm_acc,
+          dm_next,
+          precision=jax.lax.Precision.HIGHEST,
+          preferred_element_type=jnp.float32,
+      )
+      dm_acc = jnp.where(active, dm_comb, dm_acc)
+    stride *= 2
+
+  return cp_shift_left(ds_acc, axis_name, cp_size)
+
+
+def cp_canonicalize_packed_segment_ids(
+    segment_ids_local: jax.Array,
+    *,
+    axis_name: str,
+    cp_size: int,
+    halo_len: int = 0,
+    cp_checkpoint_name: str | None = None,
+    precomputed_cp_halo: tuple[jax.Array, jax.Array | None] | None = None,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array | None,
+    tuple[jax.Array, jax.Array | None],
+]:
+  """Canonicalizes rank-local `[B, T]` `segment_ids` across `axis_name`."""
+  from tokamax._src.ops.kda.utils import canonicalize_packed_segment_ids  # pylint: disable=g-import-not-at-top
+
+  seg = jnp.maximum(segment_ids_local.astype(jnp.int32), 0)
+  _, t_local = seg.shape
+
+  if precomputed_cp_halo is not None:
+    prev_active_raw, halo_recv = precomputed_cp_halo
+    cp_halo = precomputed_cp_halo
+  else:
+    def _prop_fn(lhs, rhs):
+      l_has, l_val = lhs
+      r_has, r_val = rhs
+      return l_has | r_has, jnp.where(r_has, r_val, l_val)
+
+    _, last_raw_local = jax.lax.associative_scan(
+        _prop_fn, (seg > 0, seg), axis=1
+    )
+    has_acc = jnp.any(seg > 0, axis=1).astype(jnp.int32)
+    val_acc = last_raw_local[:, -1]
+
+    if cp_size > 1:
+      rank = jax.lax.axis_index(axis_name)
+      # `cp_shift_right` drops rank `cp_size - 1`, so only `cp_size - 1`
+      # upstream ranks ever contribute to any exclusive prefix.
+      stride = 1
+      while stride < cp_size - 1:
+        perm = [(i, i + stride) for i in range(cp_size - stride)]
+        pair_prev = jax.lax.ppermute(
+            jnp.stack([has_acc, val_acc], axis=-1),
+            axis_name=axis_name,
+            perm=perm,
+        )
+        prev_has = pair_prev[:, 0] > 0
+        prev_val = pair_prev[:, 1]
+        cur_has = has_acc > 0
+        comb_has = (prev_has | cur_has).astype(jnp.int32)
+        comb_val = jnp.where(cur_has, val_acc, prev_val)
+        active = rank >= stride
+        has_acc = jnp.where(active, comb_has, has_acc)
+        val_acc = jnp.where(active, comb_val, val_acc)
+        stride *= 2
+      prev_active_raw = cp_shift_right(val_acc, axis_name, cp_size)
+    else:
+      prev_active_raw = jnp.zeros_like(val_acc)
+
+    if cp_checkpoint_name is not None:
+      prev_active_raw = ad_checkpoint.checkpoint_name(
+          prev_active_raw, name=cp_checkpoint_name
+      )
+
+    if halo_len <= 0:
+      halo_recv = None
+    else:
+      if t_local > halo_len:
+        pre_seg = seg[:, : t_local - halo_len]
+        pre_has = jnp.any(pre_seg > 0, axis=1)
+        pre_end = last_raw_local[:, t_local - halo_len - 1]
+        my_halo_init = jnp.where(pre_has, pre_end, prev_active_raw)
+        my_halo_raw = seg[:, t_local - halo_len :]
+      else:
+        my_halo_init = prev_active_raw
+        my_halo_raw = jnp.pad(seg, ((0, 0), (halo_len - t_local, 0)))
+
+      halo_msg = jnp.concatenate([my_halo_init[:, None], my_halo_raw], axis=1)
+      halo_recv = cp_shift_right(halo_msg, axis_name, cp_size)
+      if cp_checkpoint_name is not None:
+        halo_recv = ad_checkpoint.checkpoint_name(
+            halo_recv, name=cp_checkpoint_name
+        )
+    cp_halo = (prev_active_raw, halo_recv)
+
+  if halo_len <= 0 or halo_recv is None:
+    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+        seg, prev_active_seg=prev_active_raw
+    )
+    return seg_canon, act_doc, is_new_doc, None, cp_halo
+
+  halo_init_raw = halo_recv[:, 0]
+  halo_seg_raw = halo_recv[:, 1:]
+  h_recv = halo_seg_raw.shape[1]
+  seg_canon_ext, act_doc_ext, is_new_doc_ext = canonicalize_packed_segment_ids(
+      jnp.concatenate([halo_seg_raw, seg], axis=1),
+      prev_active_seg=halo_init_raw,
+  )
+  return (
+      seg_canon_ext[:, h_recv:],
+      act_doc_ext[:, h_recv:],
+      is_new_doc_ext[:, h_recv:],
+      seg_canon_ext[:, h_recv - halo_len : h_recv],
+      cp_halo,
+  )

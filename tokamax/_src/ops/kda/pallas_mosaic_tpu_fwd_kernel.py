@@ -20,6 +20,7 @@ import functools
 import math
 
 import jax
+from jax import ad_checkpoint
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
@@ -33,9 +34,12 @@ from tokamax._src.ops.kda.common import (
     tri_inv_xor_dnc,
 )
 from tokamax._src.ops.kda.cp_utils import (
-  ContextParallelMetadata,
-  _merge_initial_state,
-  all_gather_into_tensor,
+    ContextParallelMetadata,
+    _merge_initial_state,
+    all_gather_into_tensor,
+    cp_associative_scan_fwd,
+    cp_canonicalize_packed_segment_ids,
+    cp_shift_right,
 )
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import GdnResiduals
 from tokamax._src.ops.kda.pallas_mosaic_tpu_types import KdaResiduals
@@ -531,15 +535,20 @@ def _make_chunk_halo(
     x_r: jax.Array,
     aligned_segment_ids: jax.Array | None = None,
     halo: int = _CONV_HALO,
+    rank_halo: jax.Array | None = None,
 ) -> jax.Array:
   """Extracts the last `halo` tokens of chunk l-1 for each chunk l."""
   prev = x_r[:, :, :-1, -halo:, :]
   if aligned_segment_ids is not None:
-    H, B, NC, BT, _ = x_r.shape
+    _, B, NC, BT, _ = x_r.shape
     seg_r = aligned_segment_ids.reshape(B, NC, BT)
     same_seg = (seg_r[:, 1:, 0] == seg_r[:, :-1, -1]) & (seg_r[:, 1:, 0] >= 0)
     prev = jnp.where(same_seg[None, :, :, None, None], prev, 0)
-  return jnp.pad(prev, ((0, 0), (0, 0), (1, 0), (0, 0), (0, 0)))
+  if rank_halo is None:
+    return jnp.pad(prev, ((0, 0), (0, 0), (1, 0), (0, 0), (0, 0)))
+  return jnp.concatenate(
+      [rank_halo.astype(prev.dtype)[:, :, None, :, :], prev], axis=2
+  )
 
 
 def _apply_causal_conv1d_silu(
@@ -1253,6 +1262,9 @@ def pallas_kda_fwd_intra_fused(
     store_akk: bool = True,
     two_pass_bf16: bool = False,
     packed_tok_meta: Int[Array, "B NC 8 BT"] | None = None,
+    rank_halo_q: Float[Array, "..."] | None = None,
+    rank_halo_k: Float[Array, "..."] | None = None,
+    rank_halo_v: Float[Array, "..."] | None = None,
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H B T V"],
@@ -1486,9 +1498,15 @@ def pallas_kda_fwd_intra_fused(
         1 <= W <= _CONV_HALO
     ), f"conv_weight kernel size W={W} must be in [1, {_CONV_HALO}]"
     conv_kernel_size = W
-    q_prev_r = _make_chunk_halo(q_r, aligned_segment_ids, halo=_CONV_HALO)
-    k_prev_r = _make_chunk_halo(k_r, aligned_segment_ids, halo=_CONV_HALO)
-    v_prev_r = _make_chunk_halo(v_r, aligned_segment_ids, halo=_CONV_HALO)
+    q_prev_r = _make_chunk_halo(
+        q_r, aligned_segment_ids, halo=_CONV_HALO, rank_halo=rank_halo_q
+    )
+    k_prev_r = _make_chunk_halo(
+        k_r, aligned_segment_ids, halo=_CONV_HALO, rank_halo=rank_halo_k
+    )
+    v_prev_r = _make_chunk_halo(
+        v_r, aligned_segment_ids, halo=_CONV_HALO, rank_halo=rank_halo_v
+    )
     w_q_exp = (
         jnp.repeat(conv_weight_q, H // H_Q, axis=0)
         if H_Q < H
@@ -1749,6 +1767,9 @@ def kda_fwd_intra_fused(
     store_akk: bool = True,
     two_pass_bf16: bool = False,
     packed_tok_meta: jax.Array | None = None,
+    rank_halo_q: jax.Array | None = None,
+    rank_halo_k: jax.Array | None = None,
+    rank_halo_v: jax.Array | None = None,
 ):
   """Fused gate cumsum + intra-chunk solve entry.
 
@@ -1812,6 +1833,9 @@ def kda_fwd_intra_fused(
       store_akk=store_akk,
       two_pass_bf16=two_pass_bf16,
       packed_tok_meta=packed_tok_meta,
+      rank_halo_q=rank_halo_q,
+      rank_halo_k=rank_halo_k,
+      rank_halo_v=rank_halo_v,
   )
 
 
@@ -2410,6 +2434,195 @@ def chunk_kda_fwd_h_o_varlen(
   return o_out, ht_out, h_out, v_new_out
 
 
+def _local_cp_fwd_summary_kernel(
+    *refs,
+    BT: int,
+    MB: int,
+    NT: int,
+    K_PADSIZE: int,
+    V_ALIGNED: int,
+    HAS_KEEP: bool,
+):
+  """Pallas forward chunk-state summary scan keeping `(S, M)` in VMEM."""
+  if HAS_KEEP:
+    (
+        keep_ref,
+        kg_ref,
+        w_ref,
+        u_ref,
+        gk_ref,
+        s_out_ref,
+        m_out_ref,
+        s_scratch,
+        m_scratch,
+    ) = refs
+  else:
+    keep_ref = None
+    (
+        kg_ref,
+        w_ref,
+        u_ref,
+        gk_ref,
+        s_out_ref,
+        m_out_ref,
+        s_scratch,
+        m_scratch,
+    ) = refs
+
+  i_b = pl.program_id(1)
+  i_c = pl.program_id(2)
+
+  @pl.when(i_c == 0)
+  def _init():
+    s_scratch[...] = jnp.zeros((MB, K_PADSIZE, V_ALIGNED), dtype=jnp.float32)
+    m_scratch[...] = jnp.broadcast_to(
+        jnp.eye(K_PADSIZE, dtype=jnp.float32), (MB, K_PADSIZE, K_PADSIZE)
+    )
+
+  s_acc = s_scratch[...]
+  m_acc = m_scratch[...]
+  b_kg = kg_ref[:, 0, :].astype(jnp.float32)
+  b_w = w_ref[:, 0, :].astype(jnp.float32)
+  b_u = u_ref[:, 0, :].astype(jnp.float32)
+  b_gk_last = gk_ref[:, 0, :][:, BT - 1, :].astype(jnp.float32)
+  if HAS_KEEP:
+    assert keep_ref is not None
+    keep_f = keep_ref[i_b, i_c].astype(jnp.float32)
+    decay = keep_f * jnp.exp2(keep_f * b_gk_last)
+  else:
+    decay = jnp.exp2(b_gk_last)
+
+  prec = get_chain_precision()
+  v_new_s = b_u - jnp.matmul(
+      b_w, s_acc, precision=prec, preferred_element_type=jnp.float32
+  )
+  kg_t = b_kg.transpose(0, 2, 1)
+  s_next = decay[:, :, None] * s_acc + jnp.matmul(
+      kg_t, v_new_s, precision=prec, preferred_element_type=jnp.float32
+  )
+  w_m = jnp.matmul(
+      b_w, m_acc, precision=prec, preferred_element_type=jnp.float32
+  )
+  m_next = decay[:, :, None] * m_acc - jnp.matmul(
+      kg_t, w_m, precision=prec, preferred_element_type=jnp.float32
+  )
+  s_scratch[...] = s_next
+  m_scratch[...] = m_next
+
+  @pl.when(i_c == NT - 1)
+  def _store():
+    s_out_ref[0, :, :] = s_scratch[...].astype(s_out_ref.dtype)
+    m_out_ref[0, :, :] = m_scratch[...].astype(m_out_ref.dtype)
+
+
+def compute_local_cp_fwd_summary(
+    *,
+    kg: jax.Array,
+    w: jax.Array,
+    u: jax.Array,
+    gk: jax.Array,
+    chunk_size: int,
+    packed_chunk_keep: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes local rank affine state summary `(S_local, M_local)` in fp32."""
+  H, B, T, K = kg.shape
+  V = u.shape[-1]
+  GW = gk.shape[-1]
+  BT = chunk_size
+  NT = T // BT
+  if NT == 0:
+    return (
+        jnp.zeros((B, H, K, V), dtype=jnp.float32),
+        jnp.broadcast_to(jnp.eye(K, dtype=jnp.float32), (B, H, K, K)),
+    )
+
+  K_PADSIZE = int(align_up(K, 128))
+  V_ALIGNED = int(align_up(V, 128))
+  act_elem = jnp.dtype(kg.dtype).itemsize
+  gk_elem = jnp.dtype(gk.dtype).itemsize
+  per_head = (
+      2 * BT * (2 * K_PADSIZE * act_elem + V_ALIGNED * act_elem + GW * gk_elem)
+      + 3 * (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE) * 4
+  )
+  MB = estimate_mini_batch(per_head, H)
+
+  def _pad_last(x: jax.Array, pad: int) -> jax.Array:
+    return jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, pad))) if pad > 0 else x
+
+  kg_t = _pad_last(kg, K_PADSIZE - K)
+  w_t = _pad_last(w, K_PADSIZE - K)
+  u_t = _pad_last(u, V_ALIGNED - V)
+  gk_t = _pad_last(gk, (K_PADSIZE - K) if GW == K else 0)
+  gw_block = K_PADSIZE if GW == K else GW
+
+  def _in_map(h, b, c, *_):
+    return (h, b, c, 0)
+
+  def _out_map(h, b, c, *_):
+    del c
+    return (b, h, 0, 0)
+
+  has_keep = packed_chunk_keep is not None
+  in_specs = [
+      pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_in_map),
+      pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_in_map),
+      pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_in_map),
+      pl.BlockSpec([MB, 1, BT, gw_block], index_map=_in_map),
+  ]
+  out_specs = [
+      pl.BlockSpec([1, MB, K_PADSIZE, V_ALIGNED], index_map=_out_map),
+      pl.BlockSpec([1, MB, K_PADSIZE, K_PADSIZE], index_map=_out_map),
+  ]
+  out_shapes = [
+      jax.ShapeDtypeStruct((B, H, K_PADSIZE, V_ALIGNED), jnp.float32),
+      jax.ShapeDtypeStruct((B, H, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  scratches = [
+      pltpu.VMEM((MB, K_PADSIZE, V_ALIGNED), jnp.float32),
+      pltpu.VMEM((MB, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  call_args = (
+      [packed_chunk_keep.astype(jnp.int32)] if has_keep else []
+  ) + [kg_t, w_t, u_t, gk_t]
+  total_chunks = H * B * NT
+  cost = pl.CostEstimate(
+      flops=total_chunks * 4 * BT * K_PADSIZE * (V_ALIGNED + K_PADSIZE),
+      transcendentals=total_chunks * gw_block,
+      bytes_accessed=sum(
+          int(x.size) * jnp.dtype(x.dtype).itemsize for x in call_args
+      )
+      + sum(int(s.size) * 4 for s in out_shapes),
+  )
+  s_pad, m_pad = pl.pallas_call(
+      functools.partial(
+          _local_cp_fwd_summary_kernel,
+          BT=BT,
+          MB=MB,
+          NT=NT,
+          K_PADSIZE=K_PADSIZE,
+          V_ALIGNED=V_ALIGNED,
+          HAS_KEEP=has_keep,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=1 if has_keep else 0,
+          grid=(H // MB, B, NT),
+          in_specs=in_specs,
+          out_specs=out_specs,
+          scratch_shapes=scratches,
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "arbitrary"),
+          vmem_limit_bytes=(
+              None if get_interpret() else get_tpu_limits().vmem_limit_bytes
+          ),
+      ),
+      out_shape=out_shapes,
+      cost_estimate=cost,
+      interpret=get_interpret(),
+  )(*call_args)
+  return s_pad[..., :K, :V], m_pad[..., :K, :K]
+
+
 @jaxtyping.jaxtyped
 def chunk_kda_fwd_custom(
     q: Float[Array, "H B T_ALIGNED K"],
@@ -2449,6 +2662,7 @@ def chunk_kda_fwd_custom(
     use_qk_l2norm: bool = False,
     mini_batch: int | None = None,
     two_pass_bf16: bool = False,
+    cp_checkpoint_name: str | None = None,
 ) -> tuple[
     tuple[
         Float[Array, "H B T V"],
@@ -2469,8 +2683,10 @@ def chunk_kda_fwd_custom(
       context_parallel_metadata is not None
       and context_parallel_metadata.is_cp_enabled
   )
+  _is_varlen = cu_seqlens is not None
+  _inplace_cp = _cp_active and not _is_varlen
   cp_metadata = None
-  if _cp_active:
+  if _cp_active and _is_varlen:
     assert context_parallel_metadata is not None
     cp_metadata = (
         context_parallel_metadata.is_first_rank,
@@ -2481,30 +2697,91 @@ def chunk_kda_fwd_custom(
     if any(value is None for value in cp_metadata):
       raise ValueError("Enabled CP context is missing derived rank metadata.")
 
-  _is_varlen = cu_seqlens is not None
+  cp_ckpt = (
+      (
+          cp_checkpoint_name
+          or context_parallel_metadata.cp_residual_checkpoint_name
+      )
+      if _inplace_cp and context_parallel_metadata is not None
+      else None
+  )
+  halo_len_raw = (
+      max(
+          conv_weight_q.shape[1],
+          conv_weight_k.shape[1],
+          conv_weight_v.shape[1],
+      )
+      - 1
+      if (
+          _inplace_cp
+          and use_conv1d_in_kernel
+          and conv_weight_q is not None
+          and conv_weight_k is not None
+          and conv_weight_v is not None
+      )
+      else 0
+  )
   packed_tok_meta = None
   packed_chunk_keep = None
-  if (
-      segment_ids is not None
-      and not _is_varlen
-      and aligned_segment_ids is None
-      and not _cp_active
-  ):
-    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
-        segment_ids
-    )
-    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
-        seg_canon,
-        act_doc,
-        is_new_doc,
-        BT,
-        has_initial_state=(initial_state is not None),
-    )
+  cp_seg_halo = None
+  if segment_ids is not None and not _is_varlen and aligned_segment_ids is None:
+    if _inplace_cp:
+      assert context_parallel_metadata is not None
+      seg_canon, act_doc, is_new_doc, halo_seg_canon, cp_seg_halo = (
+          cp_canonicalize_packed_segment_ids(
+              segment_ids,
+              axis_name=context_parallel_metadata.axis_name,
+              cp_size=context_parallel_metadata.cp_size,
+              halo_len=halo_len_raw,
+              cp_checkpoint_name=cp_ckpt,
+          )
+      )
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=False,
+          conv_halo_seg=halo_seg_canon,
+      )
+    else:
+      seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+          segment_ids
+      )
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=(initial_state is not None),
+      )
 
   # ------------------------------------------------------------------
   # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
   # ------------------------------------------------------------------
   q_raw_in, k_raw_in, v_raw_in = q, k, v
+  rank_halo_q = rank_halo_k = rank_halo_v = None
+  if _inplace_cp and use_conv1d_in_kernel and halo_len_raw > 0:
+    assert context_parallel_metadata is not None
+    axis_name = context_parallel_metadata.axis_name
+    cp_size = context_parallel_metadata.cp_size
+    rank_halo_q = cp_shift_right(q[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+    rank_halo_k = cp_shift_right(k[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+    rank_halo_v = cp_shift_right(v[:, :, -_CONV_HALO:, :], axis_name, cp_size)
+    if cp_ckpt is not None:
+      rank_halo_q = ad_checkpoint.checkpoint_name(rank_halo_q, name=cp_ckpt)
+      rank_halo_k = ad_checkpoint.checkpoint_name(rank_halo_k, name=cp_ckpt)
+      rank_halo_v = ad_checkpoint.checkpoint_name(rank_halo_v, name=cp_ckpt)
+    q_raw_in = jnp.concatenate(
+        [rank_halo_q[:, :, -halo_len_raw:, :], q], axis=2
+    )
+    k_raw_in = jnp.concatenate(
+        [rank_halo_k[:, :, -halo_len_raw:, :], k], axis=2
+    )
+    v_raw_in = jnp.concatenate(
+        [rank_halo_v[:, :, -halo_len_raw:, :], v], axis=2
+    )
+
   scale_val = 1.0 / math.sqrt(K) if scale is None else scale
   (
       w,
@@ -2550,6 +2827,9 @@ def chunk_kda_fwd_custom(
       store_akk=return_residuals,
       two_pass_bf16=two_pass_bf16,
       packed_tok_meta=packed_tok_meta,
+      rank_halo_q=rank_halo_q,
+      rank_halo_k=rank_halo_k,
+      rank_halo_v=rank_halo_v,
   )
   if use_conv1d_in_kernel:
     assert q_norm is not None
@@ -2568,7 +2848,27 @@ def chunk_kda_fwd_custom(
     q_rstd_res, k_rstd_res = q_rstd, k_rstd
     q_raw_res = k_raw_res = v_raw_res = None
 
-  if _cp_active:
+  if _inplace_cp:
+    assert context_parallel_metadata is not None
+    s_local, m_local = compute_local_cp_fwd_summary(
+        kg=kg,
+        w=w,
+        u=u,
+        gk=g_cumsum,
+        chunk_size=BT,
+        packed_chunk_keep=packed_chunk_keep,
+    )
+    initial_state = cp_associative_scan_fwd(
+        s_local,
+        m_local,
+        axis_name=context_parallel_metadata.axis_name,
+        cp_size=context_parallel_metadata.cp_size,
+    )
+    if cp_ckpt is not None:
+      initial_state = ad_checkpoint.checkpoint_name(
+          initial_state, name=cp_ckpt
+      )
+  elif _cp_active:
     assert (
         cu_seqlens is not None
         and chunk_indices is not None
@@ -2712,6 +3012,7 @@ def chunk_kda_fwd_custom(
       conv_bias_v=conv_bias_v if use_conv1d_in_kernel else None,
       chunk_size=BT,
       two_pass_bf16=two_pass_bf16,
+      cp_seg_halo=cp_seg_halo,
   )
   return output, residuals
 
@@ -2743,9 +3044,17 @@ def chunk_gdn_fwd_custom(
     disable_recompute: bool = True,
     chunk_size: int = 64,
     segment_ids: Int[Array, "B T"] | None = None,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
     return_residuals: bool = False,
     mini_batch: int | None = None,
     two_pass_bf16: bool = False,
+    cp_checkpoint_name: str | None = None,
+    precomputed_initial_state: Float[Array, "B H_V K V"] | None = None,
+    precomputed_qkv_conv: Float[Array, "B T C_QKV"] | None = None,
+    precomputed_qkv_raw: Float[Array, "..."] | None = None,
+    precomputed_cp_seg_halo: (
+        tuple[Int[Array, "B"], Int[Array, "B T_HALO"] | None] | None
+    ) = None,
 ) -> tuple[
     tuple[Float[Array, "B T H_V V"], Float[Array, "B H_V K V"] | None],
     GdnResiduals | None,
@@ -2756,15 +3065,85 @@ def chunk_gdn_fwd_custom(
   H_V = num_v_heads
   K = head_k_dim
   V = head_v_dim
-  gqa_repeats = H_V // H_QK
   q_size = H_QK * K
   k_size = H_QK * K
   v_size = H_V * V
   BT = chunk_size
+  _cp_active = (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  )
+  cp_ckpt = (
+      (
+          cp_checkpoint_name
+          or context_parallel_metadata.cp_residual_checkpoint_name
+      )
+      if _cp_active and context_parallel_metadata is not None
+      else None
+  )
+  halo_len = (
+      conv_weight.shape[0] - 1
+      if (
+          _cp_active
+          and precomputed_qkv_conv is None
+          and conv_weight is not None
+          and conv_weight.shape[0] > 1
+      )
+      else 0
+  )
+
+  packed_tok_meta = None
+  packed_chunk_keep = None
+  seg_canon = None
+  seg_canon_ext = None
+  cp_seg_halo = precomputed_cp_seg_halo
+  if segment_ids is not None:
+    if _cp_active:
+      assert context_parallel_metadata is not None
+      seg_canon, act_doc, is_new_doc, halo_seg_canon, cp_seg_halo = (
+          cp_canonicalize_packed_segment_ids(
+              segment_ids,
+              axis_name=context_parallel_metadata.axis_name,
+              cp_size=context_parallel_metadata.cp_size,
+              halo_len=halo_len,
+              cp_checkpoint_name=cp_ckpt,
+              precomputed_cp_halo=precomputed_cp_seg_halo,
+          )
+      )
+      seg_canon_ext = (
+          jnp.concatenate([halo_seg_canon, seg_canon], axis=1)
+          if halo_len > 0 and halo_seg_canon is not None
+          else seg_canon
+      )
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=False,
+          conv_halo_seg=halo_seg_canon,
+      )
+    else:
+      seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+          segment_ids
+      )
+      seg_canon_ext = seg_canon
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=(initial_state is not None),
+      )
 
   qkv_raw = None
   qkv_conv = None
-  if qkv is not None or conv_weight is not None:
+  if precomputed_qkv_conv is not None:
+    B, T, _ = precomputed_qkv_conv.shape
+    act_dtype = precomputed_qkv_conv.dtype
+    qkv_conv = precomputed_qkv_conv
+    qkv_raw = precomputed_qkv_raw
+  elif qkv is not None or conv_weight is not None:
     if qkv is not None:
       B, T, _ = qkv.shape
       act_dtype = qkv.dtype
@@ -2782,10 +3161,28 @@ def chunk_gdn_fwd_custom(
           axis=-1,
       )
     if conv_weight is not None:
-      qkv_raw = qkv_in if return_residuals else None
-      qkv_conv = causal_conv1d_silu_fwd_bt(
-          qkv_in, conv_weight, conv_bias, segment_ids=segment_ids
-      )
+      if halo_len > 0:
+        assert context_parallel_metadata is not None
+        qkv_halo = cp_shift_right(
+            qkv_in[:, -halo_len:, :],
+            context_parallel_metadata.axis_name,
+            context_parallel_metadata.cp_size,
+        )
+        if cp_ckpt is not None:
+          qkv_halo = ad_checkpoint.checkpoint_name(qkv_halo, name=cp_ckpt)
+        qkv_ext = jnp.concatenate([qkv_halo, qkv_in], axis=1)
+        qkv_raw = qkv_ext if return_residuals else None
+        qkv_conv = causal_conv1d_silu_fwd_bt(
+            qkv_ext,
+            conv_weight,
+            conv_bias,
+            canonical_segment_ids=seg_canon_ext,
+        )[:, halo_len:, :]
+      else:
+        qkv_raw = qkv_in if return_residuals else None
+        qkv_conv = causal_conv1d_silu_fwd_bt(
+            qkv_in, conv_weight, conv_bias, canonical_segment_ids=seg_canon
+        )
     else:
       qkv_conv = qkv_in
   else:
@@ -2837,20 +3234,6 @@ def chunk_gdn_fwd_custom(
     beta_act = jax.nn.sigmoid(beta_hbt.astype(jnp.float32))
   else:
     beta_act = beta_hbt
-
-  packed_tok_meta = None
-  packed_chunk_keep = None
-  if segment_ids is not None:
-    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
-        segment_ids
-    )
-    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
-        seg_canon,
-        act_doc,
-        is_new_doc,
-        BT,
-        has_initial_state=(initial_state is not None),
-    )
 
   need_q_from_intra = (
       use_qk_l2norm
@@ -2905,6 +3288,30 @@ def chunk_gdn_fwd_custom(
     q_stage34 = q_intra
   assert q_stage34 is not None
 
+  if _cp_active:
+    if precomputed_initial_state is not None:
+      initial_state = precomputed_initial_state
+    else:
+      assert context_parallel_metadata is not None
+      s_local, m_local = compute_local_cp_fwd_summary(
+          kg=kg,
+          w=w,
+          u=u,
+          gk=g_cumsum,
+          chunk_size=BT,
+          packed_chunk_keep=packed_chunk_keep,
+      )
+      initial_state = cp_associative_scan_fwd(
+          s_local,
+          m_local,
+          axis_name=context_parallel_metadata.axis_name,
+          cp_size=context_parallel_metadata.cp_size,
+      )
+      if cp_ckpt is not None:
+        initial_state = ad_checkpoint.checkpoint_name(
+            initial_state, name=cp_ckpt
+        )
+
   stage34_cu_seqlens = jnp.broadcast_to(
       jnp.asarray([0, T], dtype=jnp.int32), (B, 2)
   )
@@ -2954,8 +3361,9 @@ def chunk_gdn_fwd_custom(
 
   save_split_qkv = save_for_backward and qkv_conv is None
   if not save_for_backward:
-    qkv_conv = None
-    qkv_raw = None
+    if not _cp_active:
+      qkv_conv = None
+      qkv_raw = None
     g_cumsum = None
     Akk = None
     h = None
@@ -2980,5 +3388,6 @@ def chunk_gdn_fwd_custom(
       chunk_size=BT,
       beta_dtype=jnp.dtype(beta.dtype).name,
       two_pass_bf16=two_pass_bf16,
+      cp_seg_halo=cp_seg_halo,
   )
   return output, residuals

@@ -103,9 +103,25 @@ def kimi_delta_attention(
   from tokamax._src.ops.kda.utils import canonicalize_packed_segment_ids  # pylint: disable=g-import-not-at-top
 
   q, k, v, g = query, key, value, gate
+  local_seq_len = q.shape[2]
   cp_enabled = context_parallel_metadata is not None and getattr(
       context_parallel_metadata, "is_cp_enabled", False
   )
+  if cp_enabled:
+    assert context_parallel_metadata is not None
+    axis_name = context_parallel_metadata.axis_name
+
+    def gather_time_axis(x, axis: int):
+      return jax.lax.all_gather(x, axis_name=axis_name, axis=axis, tiled=True)
+
+    q = gather_time_axis(q, 2)
+    k = gather_time_axis(k, 2)
+    v = gather_time_axis(v, 2)
+    g = gather_time_axis(g, 2)
+    beta = gather_time_axis(beta, 2)
+    if segment_ids is not None:
+      segment_ids = gather_time_axis(segment_ids, 1)
+
   use_rolling_packed = (
       segment_ids is not None
       and initial_state is None
@@ -116,7 +132,7 @@ def kimi_delta_attention(
       initial_state=initial_state,
       max_num_segments=max_num_segments,
   )
-  if use_rolling_packed and not cp_enabled:
+  if use_rolling_packed:
     assert segment_ids is not None
     seg_clipped = jnp.where(
         (segment_ids > 0) & (segment_ids <= num_states), segment_ids, 0
@@ -176,7 +192,6 @@ def kimi_delta_attention(
   value_dim = v.shape[-1]
   acc_dtype = _accumulator_dtype(q.dtype)
   output_dtype = q.dtype
-  local_seq_len = seq_len
   if use_qk_l2norm:
     q_h = _l2_normalize(q, acc_dtype)
     k_h = _l2_normalize(k, acc_dtype)
@@ -188,32 +203,6 @@ def kimi_delta_attention(
   v_h = v.astype(acc_dtype)
   g_h = g.astype(acc_dtype)
   beta_h = beta.astype(acc_dtype)
-  if cp_enabled:
-    assert context_parallel_metadata is not None
-    axis_name = context_parallel_metadata.axis_name
-    from tokamax._src.ops.kda.cp_utils import (  # pylint: disable=g-import-not-at-top
-        all_gather_into_tensor,
-    )
-
-    def gather_time_axis(x, axis: int):
-      x_all, _ = all_gather_into_tensor(x, axis_name)
-      return jnp.concatenate(
-          [x_all[i] for i in range(x_all.shape[0])], axis=axis
-      )
-
-    q_h = gather_time_axis(q_h, 2)
-    k_h = gather_time_axis(k_h, 2)
-    v_h = gather_time_axis(v_h, 2)
-    g_h = gather_time_axis(g_h, 2)
-    beta_h = gather_time_axis(beta_h, 2)
-    if segment_ids is not None:
-      segment_ids = gather_time_axis(segment_ids, 1)
-      if use_rolling_packed:
-        seg_clipped = jnp.where(
-            (segment_ids > 0) & (segment_ids <= num_states), segment_ids, 0
-        )
-        segment_ids, _, _ = canonicalize_packed_segment_ids(seg_clipped)
-    _, _, seq_len, _ = q_h.shape
 
   output_h = jnp.zeros((heads, batch, seq_len, value_dim), dtype=acc_dtype)
 
@@ -395,13 +384,9 @@ def gated_delta_net(
   if cp_enabled:
     assert context_parallel_metadata is not None
     axis_name = context_parallel_metadata.axis_name
-    from tokamax._src.ops.kda.cp_utils import all_gather_into_tensor  # pylint: disable=g-import-not-at-top
 
     def gather_time_axis(x, axis: int):
-      x_all, _ = all_gather_into_tensor(x, axis_name)
-      return jnp.concatenate(
-          [x_all[i] for i in range(x_all.shape[0])], axis=axis
-      )
+      return jax.lax.all_gather(x, axis_name=axis_name, axis=axis, tiled=True)
 
     qkv_work = gather_time_axis(qkv_work, 1)
     gate = gather_time_axis(gate, 1)

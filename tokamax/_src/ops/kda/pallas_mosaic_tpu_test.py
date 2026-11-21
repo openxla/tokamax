@@ -264,7 +264,6 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
                 max_num_segments=1,
             ),
         ),
-        ("segment_ids", dict(max_num_segments=1)),
     )
 
     for error_fragment, overrides in cases:
@@ -277,6 +276,25 @@ class PallasMosaicTpuKimiDeltaAttentionTest(parameterized.TestCase):
               context_parallel_metadata=context_parallel_metadata,
               **overrides,
           )
+
+    with self.assertRaisesRegex(ValueError, "max_num_segments"):
+      _call_attention(
+          "mosaic",
+          q,
+          v,
+          context_parallel_metadata=context_parallel_metadata,
+          segment_ids=segment_ids,
+      )
+
+    q_unaligned = jnp.ones((1, 1, 80, 128), dtype=jnp.float32)
+    v_unaligned = jnp.ones((1, 1, 80, 128), dtype=jnp.float32)
+    with self.assertRaisesRegex(NotImplementedError, "chunk_size"):
+      _call_attention(
+          "mosaic",
+          q_unaligned,
+          v_unaligned,
+          context_parallel_metadata=context_parallel_metadata,
+      )
 
 
 def _count_pallas_calls(jaxpr_or_closed) -> int:

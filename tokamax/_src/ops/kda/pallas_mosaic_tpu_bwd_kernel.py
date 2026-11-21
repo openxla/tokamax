@@ -34,6 +34,7 @@ from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.common import (
     chunk_gated_delta_rule_fwd_h,
     estimate_mini_batch,
+    get_max_mini_batch,
     get_tpu_limits,
     get_vmem_limit_bytes,
     kda_gate_chunk_cumsum,
@@ -43,6 +44,9 @@ from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
     _merge_dht,
     all_gather_into_tensor,
+    cp_associative_scan_bwd,
+    cp_canonicalize_packed_segment_ids,
+    cp_shift_left,
 )
 from tokamax._src.ops.kda.pallas_mosaic_tpu_fwd_kernel import (
     chunk_kda_fwd_h_o_varlen,
@@ -61,6 +65,7 @@ from tokamax._src.ops.kda.utils import (
     compute_packed_chunk_metadata,
     exp,
     exp2,
+    get_chain_precision,
     get_interpret,
     l2norm_bwd,
     segment_ids_to_seqlens,
@@ -2500,18 +2505,22 @@ def _fused_dhu_wy_intra_cumsum_pallas_jit(
           *block_vmem_refs[num_pipe_in + num_pipe_out :],
       )
 
-    if interpret and not pltpu.is_tpu_device():
-      prev_mesh = jax.sharding.get_abstract_mesh()
-      tpu_ctx = jax.sharding.use_abstract_mesh(
-          jax.sharding.AbstractMesh(
-              prev_mesh.axis_sizes,
-              prev_mesh.axis_names,
-              prev_mesh.axis_types,
-              abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
-          )
-      )
-    else:
-      tpu_ctx = contextlib.nullcontext()
+    tpu_ctx = (
+        jax.sharding.use_abstract_mesh(
+            jax.sharding.AbstractMesh(
+                (),
+                (),
+                (),
+                abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+            )
+        )
+        if (
+            interpret
+            and not pltpu.is_tpu_device()
+            and jax.sharding.get_abstract_mesh().empty
+        )
+        else contextlib.nullcontext()
+    )
     with tpu_ctx:
       pltpu.emit_pipeline(
           body,
@@ -2898,6 +2907,795 @@ def _conv1d_silu_bwd(
   )
 
 
+def _local_cp_bwd_summary_kernel(
+    *refs,
+    BT: int,
+    MB: int,
+    NT: int,
+    K_PADSIZE: int,
+    V_ALIGNED: int,
+    SCALE: float,
+    HAS_PACKED_META: bool,
+):
+  """Pallas reverse chunk-state summary scan keeping `(dS, dM)` in VMEM."""
+  if HAS_PACKED_META:
+    (
+        keep_ref,
+        qg_ref,
+        kg_ref,
+        w_ref,
+        do_ref,
+        dv0_ref,
+        gk_ref,
+        meta_ref,
+        ds_out_ref,
+        dm_out_ref,
+        ds_scratch,
+        dm_scratch,
+    ) = refs
+  else:
+    keep_ref = meta_ref = None
+    (
+        qg_ref,
+        kg_ref,
+        w_ref,
+        do_ref,
+        dv0_ref,
+        gk_ref,
+        ds_out_ref,
+        dm_out_ref,
+        ds_scratch,
+        dm_scratch,
+    ) = refs
+
+  i_b = pl.program_id(1)
+  c_rev = pl.program_id(2)
+  chunk_id = NT - 1 - c_rev
+
+  @pl.when(c_rev == 0)
+  def _init():
+    ds_scratch[...] = jnp.zeros((MB, K_PADSIZE, V_ALIGNED), dtype=jnp.float32)
+    dm_scratch[...] = jnp.broadcast_to(
+        jnp.eye(K_PADSIZE, dtype=jnp.float32), (MB, K_PADSIZE, K_PADSIZE)
+    )
+
+  ds_acc = ds_scratch[...]
+  dm_acc = dm_scratch[...]
+  qg_f = qg_ref[:, 0, :].astype(jnp.float32)
+  kg_f = kg_ref[:, 0, :].astype(jnp.float32)
+  w_f = w_ref[:, 0, :].astype(jnp.float32)
+  do_f = do_ref[:, 0, :].astype(jnp.float32)
+  dv0_f = dv0_ref[:, 0, :].astype(jnp.float32)
+  gk_last = gk_ref[:, 0, :][:, BT - 1, :].astype(jnp.float32)
+
+  if HAS_PACKED_META:
+    assert keep_ref is not None and meta_ref is not None
+    valid_f = meta_ref[0, 0, 0][4].astype(jnp.float32)[None, :, None]
+    do_f = do_f * valid_f
+    dv0_f = dv0_f * valid_f
+    keep_f = keep_ref[i_b, chunk_id].astype(jnp.float32)
+    decay = keep_f * jnp.exp2(keep_f * gk_last)
+  else:
+    decay = jnp.exp2(gk_last)
+
+  prec = get_chain_precision()
+  dv_s = dv0_f + jnp.matmul(
+      kg_f, ds_acc, precision=prec, preferred_element_type=jnp.float32
+  )
+  qg_t = qg_f.transpose(0, 2, 1)
+  w_t = w_f.transpose(0, 2, 1)
+  ds_next = (
+      decay[:, :, None] * ds_acc
+      + SCALE
+      * jnp.matmul(
+          qg_t, do_f, precision=prec, preferred_element_type=jnp.float32
+      )
+      - jnp.matmul(
+          w_t, dv_s, precision=prec, preferred_element_type=jnp.float32
+      )
+  )
+  kg_dm = jnp.matmul(
+      kg_f, dm_acc, precision=prec, preferred_element_type=jnp.float32
+  )
+  dm_next = decay[:, :, None] * dm_acc - jnp.matmul(
+      w_t, kg_dm, precision=prec, preferred_element_type=jnp.float32
+  )
+  ds_scratch[...] = ds_next
+  dm_scratch[...] = dm_next
+
+  @pl.when(c_rev == NT - 1)
+  def _store():
+    ds_out_ref[0, :, :] = ds_scratch[...].astype(ds_out_ref.dtype)
+    dm_out_ref[0, :, :] = dm_scratch[...].astype(dm_out_ref.dtype)
+
+
+def compute_local_cp_bwd_summary(
+    *,
+    qg: jax.Array,
+    kg: jax.Array,
+    w: jax.Array,
+    do: jax.Array,
+    dv0: jax.Array,
+    gk: jax.Array,
+    scale: float,
+    chunk_size: int,
+    packed_chunk_keep: jax.Array | None = None,
+    packed_tok_meta: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes local reverse affine summary `(dS_local, dM_local)` in fp32."""
+  H, B, T, K = qg.shape
+  V = do.shape[-1]
+  GW = gk.shape[-1]
+  BT = chunk_size
+  NT = T // BT
+  if NT == 0:
+    return (
+        jnp.zeros((B, H, K, V), dtype=jnp.float32),
+        jnp.broadcast_to(jnp.eye(K, dtype=jnp.float32), (B, H, K, K)),
+    )
+
+  K_PADSIZE = int(align_up(K, 128))
+  V_ALIGNED = int(align_up(V, 128))
+  q_elem = jnp.dtype(qg.dtype).itemsize
+  do_elem = jnp.dtype(do.dtype).itemsize
+  gk_elem = jnp.dtype(gk.dtype).itemsize
+  per_head = (
+      2
+      * BT
+      * (
+          3 * K_PADSIZE * q_elem
+          + 2 * V_ALIGNED * do_elem
+          + GW * gk_elem
+      )
+      + 3 * (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE) * 4
+  )
+  MB = estimate_mini_batch(per_head, H)
+
+  def _pad_last(x: jax.Array, pad: int) -> jax.Array:
+    return jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, pad))) if pad > 0 else x
+
+  qg_t = _pad_last(qg, K_PADSIZE - K)
+  kg_t = _pad_last(kg, K_PADSIZE - K)
+  w_t = _pad_last(w, K_PADSIZE - K)
+  do_t = _pad_last(do, V_ALIGNED - V)
+  dv0_t = _pad_last(dv0, V_ALIGNED - V)
+  gk_t = _pad_last(gk, (K_PADSIZE - K) if GW == K else 0)
+  gw_block = K_PADSIZE if GW == K else GW
+
+  def _in_rev_map(h, b, c_rev, *_):
+    return (h, b, NT - 1 - c_rev, 0)
+
+  def _out_map(h, b, c_rev, *_):
+    del c_rev
+    return (b, h, 0, 0)
+
+  has_packed_meta = (
+      packed_tok_meta is not None and packed_chunk_keep is not None
+  )
+  in_specs = [
+      pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_in_rev_map),
+      pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_in_rev_map),
+      pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_in_rev_map),
+      pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_in_rev_map),
+      pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_in_rev_map),
+      pl.BlockSpec([MB, 1, BT, gw_block], index_map=_in_rev_map),
+  ]
+  call_args: list[jax.Array] = []
+  if has_packed_meta:
+    assert packed_chunk_keep is not None and packed_tok_meta is not None
+    call_args.append(packed_chunk_keep.astype(jnp.int32))
+    in_specs.append(
+        pl.BlockSpec(
+            [1, 1, 1, 8, BT],
+            index_map=lambda h, b, c_rev, *_: (0, b, NT - 1 - c_rev, 0, 0),
+        )
+    )
+  call_args.extend([qg_t, kg_t, w_t, do_t, dv0_t, gk_t])
+  if has_packed_meta:
+    assert packed_tok_meta is not None
+    call_args.append(packed_tok_meta[None, ...])
+
+  out_specs = [
+      pl.BlockSpec([1, MB, K_PADSIZE, V_ALIGNED], index_map=_out_map),
+      pl.BlockSpec([1, MB, K_PADSIZE, K_PADSIZE], index_map=_out_map),
+  ]
+  out_shapes = [
+      jax.ShapeDtypeStruct((B, H, K_PADSIZE, V_ALIGNED), jnp.float32),
+      jax.ShapeDtypeStruct((B, H, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  scratches = [
+      pltpu.VMEM((MB, K_PADSIZE, V_ALIGNED), jnp.float32),
+      pltpu.VMEM((MB, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  total_chunks = H * B * NT
+  cost = pl.CostEstimate(
+      flops=total_chunks * BT * K_PADSIZE * (6 * V_ALIGNED + 4 * K_PADSIZE),
+      transcendentals=total_chunks * gw_block,
+      bytes_accessed=sum(
+          int(x.size) * jnp.dtype(x.dtype).itemsize for x in call_args
+      )
+      + sum(int(s.size) * 4 for s in out_shapes),
+  )
+  ds_pad, dm_pad = pl.pallas_call(
+      functools.partial(
+          _local_cp_bwd_summary_kernel,
+          BT=BT,
+          MB=MB,
+          NT=NT,
+          K_PADSIZE=K_PADSIZE,
+          V_ALIGNED=V_ALIGNED,
+          SCALE=scale,
+          HAS_PACKED_META=has_packed_meta,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=1 if has_packed_meta else 0,
+          grid=(H // MB, B, NT),
+          in_specs=in_specs,
+          out_specs=out_specs,
+          scratch_shapes=scratches,
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "arbitrary"),
+          vmem_limit_bytes=(
+              None if get_interpret() else get_tpu_limits().vmem_limit_bytes
+          ),
+      ),
+      out_shape=out_shapes,
+      cost_estimate=cost,
+      interpret=get_interpret(),
+  )(*call_args)
+  return ds_pad[..., :K, :V], dm_pad[..., :K, :K]
+
+
+def _gdn_local_cp_bwd_summary_kernel(
+    *refs,
+    BT: int,
+    MB: int,
+    MB_QK: int,
+    NT: int,
+    K: int,
+    V: int,
+    K_PADSIZE: int,
+    V_ALIGNED: int,
+    GQA_REPEATS: int,
+    SCALE: float,
+    USE_QK_L2NORM: bool,
+    TWO_PASS_BF16: bool,
+    NATIVE_QKV_DO: bool,
+    ALIASED_QKV: bool,
+    HAS_AKK_IN: bool,
+    HAS_PACKED_META: bool,
+):
+  """Pallas reverse scan for GDN `(dS_local, dM_local)` + transient `Akk`."""
+  idx = 0
+  keep_ref = None
+  if HAS_PACKED_META:
+    keep_ref = refs[idx]
+    idx += 1
+
+  q_ref = refs[idx]
+  k_ref = refs[idx + 1]
+  do_ref = refs[idx + 2]
+  beta_ref = refs[idx + 3]
+  g_ref = refs[idx + 4]
+  idx += 5
+
+  akk_in_ref = None
+  if HAS_AKK_IN:
+    akk_in_ref = refs[idx]
+    idx += 1
+
+  meta_ref = None
+  if HAS_PACKED_META:
+    meta_ref = refs[idx]
+    idx += 1
+
+  ds_out_ref = refs[idx]
+  dm_out_ref = refs[idx + 1]
+  idx += 2
+
+  akk_out_ref = None
+  if not HAS_AKK_IN:
+    akk_out_ref = refs[idx]
+    idx += 1
+
+  ds_scratch = refs[idx]
+  dm_scratch = refs[idx + 1]
+
+  act_dtype = q_ref.dtype
+  i_b = pl.program_id(1)
+  c_rev = pl.program_id(2)
+  chunk_id = NT - 1 - c_rev
+
+  @pl.when(c_rev == 0)
+  def _init():
+    ds_scratch[...] = jnp.zeros((MB, K_PADSIZE, V_ALIGNED), dtype=jnp.float32)
+    dm_scratch[...] = jnp.broadcast_to(
+        jnp.eye(K_PADSIZE, dtype=jnp.float32), (MB, K_PADSIZE, K_PADSIZE)
+    )
+
+  ds_acc = ds_scratch[...]
+  dm_acc = dm_scratch[...]
+
+  if NATIVE_QKV_DO:
+    q_tile = q_ref[0] if ALIASED_QKV else q_ref[0, 0]
+    k_tile = k_ref[0] if ALIASED_QKV else k_ref[0, 0]
+    do_tile = do_ref[0, 0]
+    q_f = jnp.stack(
+        [q_tile[:, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    ).astype(jnp.float32)
+    k_f = jnp.stack(
+        [k_tile[:, h * K : (h + 1) * K] for h in range(MB_QK)], axis=0
+    ).astype(jnp.float32)
+    do_f = jnp.stack(
+        [do_tile[:, h * V : (h + 1) * V] for h in range(MB)], axis=0
+    ).astype(jnp.float32)
+  else:
+    q_f = q_ref[:, 0, :].astype(jnp.float32)
+    k_f = k_ref[:, 0, :].astype(jnp.float32)
+    do_f = do_ref[:, 0, :].astype(jnp.float32)
+
+  bb_f = beta_ref[:, 0, 0, 0].astype(jnp.float32)
+  bg_f = g_ref[:, 0, 0, 0].astype(jnp.float32)[..., None]
+
+  if HAS_PACKED_META:
+    assert meta_ref is not None and keep_ref is not None
+    meta_tile = meta_ref[0, 0, 0]
+    seg_tok = meta_tile[0]
+    m_in_f = meta_tile[2].astype(jnp.float32)[None, :, None]
+    m_out_f = meta_tile[3].astype(jnp.float32)[None, :, None]
+    valid_f = meta_tile[4].astype(jnp.float32)[None, :, None]
+    q_f = q_f * valid_f
+    k_f = k_f * valid_f
+    do_f = do_f * valid_f
+    bb_f = bb_f * valid_f[..., 0]
+    seg_r = jnp.broadcast_to(seg_tok[:, None], (BT, BT))
+    seg_c = jnp.broadcast_to(seg_tok[None, :], (BT, BT))
+    same_doc = (seg_r == seg_c) & (seg_r > 0)
+  else:
+    m_in_f = m_out_f = valid_f = same_doc = None
+
+  if USE_QK_L2NORM:
+    q_sq = jnp.sum(q_f * q_f, axis=-1, keepdims=True)
+    k_sq = jnp.sum(k_f * k_f, axis=-1, keepdims=True)
+    rstd_q = jnp.where(
+        q_sq == 0.0,
+        0.0,
+        jax.lax.rsqrt(jnp.where(q_sq == 0.0, 1.0, q_sq) + 1e-6),
+    )
+    rstd_k = jnp.where(
+        k_sq == 0.0,
+        0.0,
+        jax.lax.rsqrt(jnp.where(k_sq == 0.0, 1.0, k_sq) + 1e-6),
+    )
+    q_f = (q_f * rstd_q).astype(act_dtype).astype(jnp.float32)
+    k_f = (k_f * rstd_k).astype(act_dtype).astype(jnp.float32)
+
+  # Intra-chunk matmuls mirror `_fused_dhu_wy_intra_cumsum_kernel`; the
+  # `(dS, dM)` chain follows `get_chain_precision` like the forward summary.
+  if act_dtype != jnp.bfloat16:
+    prec = jax.lax.Precision.HIGHEST
+  elif TWO_PASS_BF16:
+    prec = jax.lax.Precision.HIGH
+  else:
+    prec = jax.lax.Precision.DEFAULT
+  chain_prec = get_chain_precision()
+  if HAS_AKK_IN:
+    qk_dot = jnp.matmul(
+        q_f,
+        k_f.transpose(0, 2, 1),
+        precision=prec,
+        preferred_element_type=jnp.float32,
+    )
+    kk_dot = None
+  else:
+    qk_kk = jnp.matmul(
+        jnp.concatenate([q_f, k_f], axis=1),
+        k_f.transpose(0, 2, 1),
+        precision=prec,
+        preferred_element_type=jnp.float32,
+    )
+    qk_dot = qk_kk[:, :BT]
+    kk_dot = qk_kk[:, BT:]
+
+  if GQA_REPEATS > 1:
+    q_v = jnp.repeat(q_f, GQA_REPEATS, axis=0)
+    k_v = jnp.repeat(k_f, GQA_REPEATS, axis=0)
+    qk_dot = jnp.repeat(qk_dot, GQA_REPEATS, axis=0)
+    if kk_dot is not None:
+      kk_dot = jnp.repeat(kk_dot, GQA_REPEATS, axis=0)
+  else:
+    q_v, k_v = q_f, k_f
+
+  row_bt = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+  col_bt = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+  m_causal = row_bt >= col_bt
+  m_strict = row_bt > col_bt
+  if same_doc is not None:
+    m_causal = m_causal & same_doc
+    m_strict = m_strict & same_doc
+  diff_g = bg_f - bg_f.transpose(0, 2, 1)
+  decay_mat = jnp.where(
+      m_causal[None], jnp.exp2(jnp.where(m_causal[None], diff_g, 0.0)), 0.0
+  )
+  aqk_c = qk_dot * decay_mat * SCALE
+  dv0_c = jnp.matmul(
+      aqk_c.transpose(0, 2, 1),
+      do_f,
+      precision=prec,
+      preferred_element_type=jnp.float32,
+  )
+
+  if HAS_AKK_IN:
+    assert akk_in_ref is not None
+    a_inv = akk_in_ref[:, 0, :].astype(jnp.float32)
+  else:
+    assert kk_dot is not None and akk_out_ref is not None
+    l_bwd = jnp.where(
+        m_strict[None], kk_dot * decay_mat * bb_f[:, :, None], 0.0
+    )
+    a_inv = tri_inv_xor_dnc(
+        l_bwd,
+        use_fp32=(act_dtype == jnp.float32),
+        two_pass_bf16=TWO_PASS_BF16,
+    )
+    akk_out_ref[:, 0, :] = a_inv.astype(akk_out_ref.dtype)
+
+  if m_in_f is not None and m_out_f is not None:
+    g_exp_in = m_in_f * jnp.exp2(m_in_f * bg_f)
+    g_exp_out = m_out_f * jnp.exp2(
+        m_out_f * (bg_f[:, BT - 1 : BT, :] - bg_f)
+    )
+  else:
+    g_exp_in = jnp.exp2(bg_f)
+    g_exp_out = jnp.exp2(bg_f[:, BT - 1 : BT, :] - bg_f)
+
+  if HAS_PACKED_META:
+    assert keep_ref is not None
+    keep_f = keep_ref[i_b, chunk_id].astype(jnp.float32)
+    decay_last = keep_f * jnp.exp2(keep_f * bg_f[:, BT - 1, :])
+  else:
+    decay_last = jnp.exp2(bg_f[:, BT - 1, :])
+
+  qg_c = q_v * g_exp_in
+  kg_c = k_v * g_exp_out
+  w_c = jnp.matmul(
+      a_inv,
+      k_v * bb_f[:, :, None] * g_exp_in,
+      precision=prec,
+      preferred_element_type=jnp.float32,
+  )
+  if valid_f is not None:
+    w_c = w_c * valid_f
+
+  dv_s = dv0_c + jnp.matmul(
+      kg_c, ds_acc, precision=chain_prec, preferred_element_type=jnp.float32
+  )
+  qg_t = qg_c.transpose(0, 2, 1)
+  w_t = w_c.transpose(0, 2, 1)
+  ds_next = (
+      decay_last[:, :, None] * ds_acc
+      + SCALE
+      * jnp.matmul(
+          qg_t, do_f, precision=chain_prec, preferred_element_type=jnp.float32
+      )
+      - jnp.matmul(
+          w_t, dv_s, precision=chain_prec, preferred_element_type=jnp.float32
+      )
+  )
+  kg_dm = jnp.matmul(
+      kg_c, dm_acc, precision=chain_prec, preferred_element_type=jnp.float32
+  )
+  dm_next = decay_last[:, :, None] * dm_acc - jnp.matmul(
+      w_t, kg_dm, precision=chain_prec, preferred_element_type=jnp.float32
+  )
+  ds_scratch[...] = ds_next
+  dm_scratch[...] = dm_next
+
+  @pl.when(c_rev == NT - 1)
+  def _store():
+    ds_out_ref[0, :, :] = ds_scratch[...].astype(ds_out_ref.dtype)
+    dm_out_ref[0, :, :] = dm_scratch[...].astype(dm_out_ref.dtype)
+
+
+def compute_gdn_local_cp_bwd_summary(
+    *,
+    qkv_conv: jax.Array | None,
+    q_bt: jax.Array | None,
+    k_bt: jax.Array | None,
+    beta_hbt: jax.Array,
+    g_hbt: jax.Array,
+    do_bt: jax.Array,
+    akk: jax.Array | None,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    scale: float,
+    chunk_size: int,
+    use_qk_l2norm: bool,
+    two_pass_bf16: bool,
+    mini_batch: int | None = None,
+    packed_tok_meta: jax.Array | None = None,
+    packed_chunk_keep: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Computes GDN `(dS_local, dM_local)` in Pallas and reuses rebuilt `Akk`."""
+  B, T, H_V, V = do_bt.shape
+  H_QK = num_k_heads
+  K = head_k_dim
+  assert H_V == num_v_heads and V == head_v_dim
+  BT = chunk_size
+  NT = T // BT
+  gqa_repeats = H_V // H_QK
+  act_source = qkv_conv if qkv_conv is not None else q_bt
+  assert act_source is not None
+  act_dtype = act_source.dtype
+
+  K_PADSIZE = int(align_up(K, 128))
+  V_ALIGNED = int(align_up(V, 128))
+  interpret = get_interpret()
+  can_native_qkv_do = (
+      K == K_PADSIZE and V == V_ALIGNED and BT % 8 == 0 and not interpret
+  )
+
+  act_elem = jnp.dtype(act_dtype).itemsize
+  akk_bytes = 4 if (two_pass_bf16 or act_dtype == jnp.float32) else act_elem
+  io_bytes = 2 * (
+      (2 * BT * K_PADSIZE + BT * V_ALIGNED) * act_elem
+      + 2 * BT * 4
+      + BT * BT * akk_bytes
+      + (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE) * 4
+  )
+  scratch_bytes = (
+      2 * (K_PADSIZE * V_ALIGNED + K_PADSIZE * K_PADSIZE)
+      + 4 * BT * K_PADSIZE
+      + 2 * BT * V_ALIGNED
+      + (6 if akk is None else 2) * BT * BT
+  ) * 4
+  per_head = io_bytes + scratch_bytes
+  vmem_limit = get_vmem_limit_bytes()
+  vmem_budget = (vmem_limit * 64) // BT if BT > 64 else vmem_limit
+  max_mb = get_max_mini_batch(chunk_size=BT if BT > 128 else None)
+  auto_mb = estimate_mini_batch(
+      per_head,
+      H_V,
+      max_mb=max_mb,
+      vmem_budget=vmem_budget,
+      multiple_of=gqa_repeats,
+  )
+  if (
+      mini_batch is not None
+      and mini_batch <= H_V
+      and H_V % mini_batch == 0
+      and mini_batch % gqa_repeats == 0
+      and mini_batch <= max(max_mb, gqa_repeats)
+      and mini_batch * per_head <= vmem_budget
+  ):
+    MB = mini_batch
+  else:
+    MB = auto_mb
+  MB_QK = MB // gqa_repeats
+
+  q_size = H_QK * K
+  k_size = H_QK * K
+  aliased_qkv = False
+  if can_native_qkv_do:
+    tile_q = MB_QK * K
+    tile_v = MB * V
+    if qkv_conv is not None:
+      aliased_qkv = True
+      q_arg = qkv_conv
+      k_arg = qkv_conv
+      q_spec = pl.BlockSpec(
+          (pl.Element(1), pl.Element(BT), pl.Element(tile_q)),
+          lambda hg, b, c_rev, *_: (
+              b,
+              pl.multiple_of((NT - 1 - c_rev) * BT, 8),
+              pl.multiple_of(hg * tile_q, 128),
+          ),
+      )
+      k_spec = pl.BlockSpec(
+          (pl.Element(1), pl.Element(BT), pl.Element(tile_q)),
+          lambda hg, b, c_rev, *_: (
+              b,
+              pl.multiple_of((NT - 1 - c_rev) * BT, 8),
+              pl.multiple_of(q_size + hg * tile_q, 128),
+          ),
+      )
+    else:
+      assert q_bt is not None and k_bt is not None
+      q_arg = q_bt.reshape(B, NT, BT, q_size)
+      k_arg = k_bt.reshape(B, NT, BT, k_size)
+      q_spec = pl.BlockSpec(
+          (1, 1, BT, tile_q),
+          lambda hg, b, c_rev, *_: (b, NT - 1 - c_rev, 0, hg),
+      )
+      k_spec = q_spec
+    do_arg = do_bt.reshape(B, NT, BT, H_V * V)
+    do_spec = pl.BlockSpec(
+        (1, 1, BT, tile_v),
+        lambda hg, b, c_rev, *_: (b, NT - 1 - c_rev, 0, hg),
+    )
+  else:
+    if qkv_conv is not None:
+      q_hbt = (
+          qkv_conv[:, :, :q_size].reshape(B, T, H_QK, K).transpose(2, 0, 1, 3)
+      )
+      k_hbt = (
+          qkv_conv[:, :, q_size : q_size + k_size]
+          .reshape(B, T, H_QK, K)
+          .transpose(2, 0, 1, 3)
+      )
+    else:
+      assert q_bt is not None and k_bt is not None
+      q_hbt = q_bt.transpose(2, 0, 1, 3)
+      k_hbt = k_bt.transpose(2, 0, 1, 3)
+    do_hbt = do_bt.transpose(2, 0, 1, 3)
+    if K_PADSIZE > K:
+      q_hbt = jnp.pad(q_hbt, ((0, 0), (0, 0), (0, 0), (0, K_PADSIZE - K)))
+      k_hbt = jnp.pad(k_hbt, ((0, 0), (0, 0), (0, 0), (0, K_PADSIZE - K)))
+    if V_ALIGNED > V:
+      do_hbt = jnp.pad(do_hbt, ((0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
+    q_arg = q_hbt
+    k_arg = k_hbt
+    do_arg = do_hbt
+    q_spec = pl.BlockSpec(
+        (MB_QK, 1, BT, K_PADSIZE),
+        lambda hg, b, c_rev, *_: (hg, b, NT - 1 - c_rev, 0),
+    )
+    k_spec = q_spec
+    do_spec = pl.BlockSpec(
+        (MB, 1, BT, V_ALIGNED),
+        lambda hg, b, c_rev, *_: (hg, b, NT - 1 - c_rev, 0),
+    )
+
+  beta_r = beta_hbt.reshape(H_V, B, NT, 1, BT)
+  g_r = g_hbt.reshape(H_V, B, NT, 1, BT)
+  narrow_spec = pl.BlockSpec(
+      (MB, 1, 1, 1, BT),
+      lambda hg, b, c_rev, *_: (hg, b, NT - 1 - c_rev, 0, 0),
+  )
+
+  has_akk_in = akk is not None
+  has_packed_meta = (
+      packed_tok_meta is not None and packed_chunk_keep is not None
+  )
+  in_specs = [q_spec, k_spec, do_spec, narrow_spec, narrow_spec]
+  call_args: list[jax.Array] = []
+  if has_packed_meta:
+    assert packed_chunk_keep is not None
+    call_args.append(packed_chunk_keep.astype(jnp.int32))
+  call_args.extend([q_arg, k_arg, do_arg, beta_r, g_r])
+
+  if has_akk_in:
+    assert akk is not None
+    in_specs.append(
+        pl.BlockSpec(
+            (MB, 1, BT, BT),
+            lambda hg, b, c_rev, *_: (hg, b, NT - 1 - c_rev, 0),
+        )
+    )
+    call_args.append(akk)
+
+  if has_packed_meta:
+    assert packed_tok_meta is not None
+    in_specs.append(
+        pl.BlockSpec(
+            (1, 1, 1, 8, BT),
+            lambda hg, b, c_rev, *_: (0, b, NT - 1 - c_rev, 0, 0),
+        )
+    )
+    call_args.append(packed_tok_meta[None, ...])
+
+  def _out_map(hg, b, c_rev, *_):
+    del c_rev
+    return (b, hg, 0, 0)
+
+  out_specs = [
+      pl.BlockSpec((1, MB, K_PADSIZE, V_ALIGNED), index_map=_out_map),
+      pl.BlockSpec((1, MB, K_PADSIZE, K_PADSIZE), index_map=_out_map),
+  ]
+  out_shapes = [
+      jax.ShapeDtypeStruct((B, H_V, K_PADSIZE, V_ALIGNED), jnp.float32),
+      jax.ShapeDtypeStruct((B, H_V, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  akk_out_dtype = jnp.float32 if two_pass_bf16 else act_dtype
+  if not has_akk_in:
+    out_specs.append(
+        pl.BlockSpec(
+            (MB, 1, BT, BT),
+            lambda hg, b, c_rev, *_: (hg, b, NT - 1 - c_rev, 0),
+        )
+    )
+    out_shapes.append(jax.ShapeDtypeStruct((H_V, B, T, BT), akk_out_dtype))
+
+  scratches = [
+      pltpu.VMEM((MB, K_PADSIZE, V_ALIGNED), jnp.float32),
+      pltpu.VMEM((MB, K_PADSIZE, K_PADSIZE), jnp.float32),
+  ]
+  total_chunks = H_V * B * NT
+  tri_inv_matmuls = max(0, 2 * int(math.log2(BT)) - 3) + (
+      2 if two_pass_bf16 and act_dtype == jnp.bfloat16 else 0
+  )
+  tri_flops = 0 if has_akk_in else 2 * tri_inv_matmuls * BT * BT * BT
+  qk_kk_flops = ((2 if has_akk_in else 4) * BT * BT * K_PADSIZE) // gqa_repeats
+  if aliased_qkv:
+    assert qkv_conv is not None
+    in_bytes = int(B * T * 2 * q_size) * jnp.dtype(qkv_conv.dtype).itemsize
+    extra_in = [do_arg, beta_r, g_r]
+    if has_akk_in and akk is not None:
+      extra_in.append(akk)
+    if has_packed_meta:
+      assert packed_chunk_keep is not None and packed_tok_meta is not None
+      extra_in.extend([packed_chunk_keep.astype(jnp.int32), packed_tok_meta])
+    in_bytes += sum(
+        int(x.size) * jnp.dtype(x.dtype).itemsize for x in extra_in
+    )
+  else:
+    in_bytes = sum(
+        int(x.size) * jnp.dtype(x.dtype).itemsize for x in call_args
+    )
+  out_bytes = sum(
+      int(s.size) * jnp.dtype(s.dtype).itemsize for s in out_shapes
+  )
+  cost = pl.CostEstimate(
+      flops=total_chunks
+      * (
+          BT * K_PADSIZE * (6 * V_ALIGNED + 4 * K_PADSIZE + 2 * BT)
+          + qk_kk_flops
+          + 2 * BT * BT * V_ALIGNED
+          + tri_flops
+      ),
+      transcendentals=total_chunks * (BT * BT + 3 * BT),
+      bytes_accessed=in_bytes + out_bytes,
+  )
+  pallas_outs = pl.pallas_call(
+      functools.partial(
+          _gdn_local_cp_bwd_summary_kernel,
+          BT=BT,
+          MB=MB,
+          MB_QK=MB_QK,
+          NT=NT,
+          K=K,
+          V=V,
+          K_PADSIZE=K_PADSIZE,
+          V_ALIGNED=V_ALIGNED,
+          GQA_REPEATS=gqa_repeats,
+          SCALE=scale,
+          USE_QK_L2NORM=use_qk_l2norm,
+          TWO_PASS_BF16=two_pass_bf16,
+          NATIVE_QKV_DO=can_native_qkv_do,
+          ALIASED_QKV=aliased_qkv,
+          HAS_AKK_IN=has_akk_in,
+          HAS_PACKED_META=has_packed_meta,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=1 if has_packed_meta else 0,
+          grid=(H_V // MB, B, NT),
+          in_specs=in_specs,
+          out_specs=out_specs,
+          scratch_shapes=scratches,
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "arbitrary"),
+          vmem_limit_bytes=(
+              None if get_interpret() else get_tpu_limits().vmem_limit_bytes
+          ),
+      ),
+      out_shape=out_shapes,
+      cost_estimate=cost,
+      interpret=interpret,
+  )(*call_args)
+
+  if has_akk_in:
+    ds_pad, dm_pad = pallas_outs
+    assert akk is not None
+    akk_eff = akk
+  else:
+    ds_pad, dm_pad, akk_eff = pallas_outs
+  return ds_pad[..., :K, :V], dm_pad[..., :K, :K], akk_eff
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -2996,10 +3794,17 @@ def chunk_kda_bwd_custom(
     T_orig = do.shape[2]
     do = jnp.pad(do, ((0, 0), (0, 0), (0, q.shape[2] - T_orig), (0, 0)))
 
-  if (
+  _cp_active = (
       context_parallel_metadata is not None
       and context_parallel_metadata.is_cp_enabled
-  ):
+  )
+  _legacy_varlen_cp = _cp_active and (
+      cu_seqlens is not None or aligned_cu is not None
+  )
+  _inplace_cp = _cp_active and not _legacy_varlen_cp
+
+  if _legacy_varlen_cp:
+    assert context_parallel_metadata is not None
     if segment_ids is None:
       raise ValueError("backward CP requires rank-local `segment_ids`.")
     if cp_metadata is None:
@@ -3033,31 +3838,59 @@ def chunk_kda_bwd_custom(
   BT = chunk_size
   NT = T // BT
   scale = K ** -0.5 if scale is None else scale
-  _cp_active = (
-      context_parallel_metadata is not None
-      and context_parallel_metadata.is_cp_enabled
+  halo_len_raw = (
+      residuals.q_raw.shape[2] - T if residuals.q_raw is not None else 0
   )
   use_inplace_packed = (
       cu_seqlens is None
       and segment_ids_aligned is None
       and segment_ids is not None
-      and not _cp_active
+      and not _legacy_varlen_cp
   )
   seg_canon = None
+  seg_canon_conv = None
   packed_tok_meta = None
   packed_chunk_keep = None
   packed_valid_mask = None
   if use_inplace_packed:
     assert segment_ids is not None
     seg_2d = segment_ids[None, :] if segment_ids.ndim == 1 else segment_ids
-    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(seg_2d)
-    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
-        seg_canon,
-        act_doc,
-        is_new_doc,
-        BT,
-        has_initial_state=(initial_state is not None),
-    )
+    if _inplace_cp:
+      assert context_parallel_metadata is not None
+      seg_canon, act_doc, is_new_doc, halo_seg_canon, _ = (
+          cp_canonicalize_packed_segment_ids(
+              seg_2d,
+              axis_name=context_parallel_metadata.axis_name,
+              cp_size=context_parallel_metadata.cp_size,
+              halo_len=halo_len_raw,
+              precomputed_cp_halo=residuals.cp_seg_halo,
+          )
+      )
+      seg_canon_conv = (
+          jnp.concatenate(
+              [halo_seg_canon[:, -halo_len_raw:], seg_canon], axis=1
+          )
+          if halo_len_raw > 0 and halo_seg_canon is not None
+          else seg_canon
+      )
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=False,
+          conv_halo_seg=halo_seg_canon,
+      )
+    else:
+      seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(seg_2d)
+      seg_canon_conv = seg_canon
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=(initial_state is not None),
+      )
     packed_valid_mask = seg_canon > 0
   elif (cu_seqlens is None) and (segment_ids is not None):
     # per-batch cu_seqlens [B, N+1]
@@ -3276,6 +4109,8 @@ def chunk_kda_bwd_custom(
         )
 
   assert v_new is not None
+  if packed_valid_mask is not None:
+    do = jnp.where(packed_valid_mask[None, :, :, None], do, 0.0)
   # ---- Stage 1: dAqk and initial dv ----
   dAqk, dv = chunk_kda_bwd_dAv_kernel(
     q=q,
@@ -3288,7 +4123,47 @@ def chunk_kda_bwd_custom(
     two_pass_bf16=two_pass_bf16,
   )
 
-  if _cp_active:
+  if _inplace_cp:
+    assert context_parallel_metadata is not None
+    if qg is None or kg is None or w is None:
+      assert g is not None
+      g_wide = (
+          g
+          if g.shape[-1] == q.shape[-1]
+          else jnp.broadcast_to(g, g.shape[:-1] + (q.shape[-1],))
+      )
+      w, _, qg, kg = _recompute_w_u_fwd(
+          k=k,
+          v=v,
+          beta=beta,
+          A=Akk,
+          q=q,
+          gk=g_wide,
+          chunk_size=BT,
+          two_pass_bf16=two_pass_bf16,
+          packed_tok_meta=packed_tok_meta,
+      )
+    assert g is not None
+    ds_local, dm_local = compute_local_cp_bwd_summary(
+        qg=qg,
+        kg=kg,
+        w=w,
+        do=do,
+        dv0=dv,
+        gk=g,
+        scale=scale,
+        chunk_size=BT,
+        packed_chunk_keep=packed_chunk_keep,
+        packed_tok_meta=packed_tok_meta,
+    )
+    dht = cp_associative_scan_bwd(
+        ds_local,
+        dm_local,
+        axis_name=context_parallel_metadata.axis_name,
+        cp_size=context_parallel_metadata.cp_size,
+    )
+    initial_state = None
+  elif _legacy_varlen_cp:
     assert context_parallel_metadata is not None
     if segment_ids is None:
       raise ValueError("backward CP requires rank-local segment_ids")
@@ -3458,30 +4333,69 @@ def chunk_kda_bwd_custom(
         and residuals.conv_weight_k is not None
         and residuals.conv_weight_v is not None
     )
-    dq, dw_q, db_q = _conv1d_silu_bwd(
-        residuals.q_raw,
-        residuals.conv_weight_q,
-        residuals.conv_bias_q,
-        dq,
-        segment_ids_aligned,
-        packed_canonical_seg=seg_canon,
-    )
-    dk, dw_k, db_k = _conv1d_silu_bwd(
-        residuals.k_raw,
-        residuals.conv_weight_k,
-        residuals.conv_bias_k,
-        dk,
-        segment_ids_aligned,
-        packed_canonical_seg=seg_canon,
-    )
-    dv, dw_v, db_v = _conv1d_silu_bwd(
-        residuals.v_raw,
-        residuals.conv_weight_v,
-        residuals.conv_bias_v,
-        dv,
-        segment_ids_aligned,
-        packed_canonical_seg=seg_canon,
-    )
+    if halo_len_raw > 0:
+      assert context_parallel_metadata is not None
+      axis_name = context_parallel_metadata.axis_name
+      cp_size = context_parallel_metadata.cp_size
+      pad_spec = ((0, 0), (0, 0), (halo_len_raw, 0), (0, 0))
+      dq_ext, dw_q, db_q = _conv1d_silu_bwd(
+          residuals.q_raw,
+          residuals.conv_weight_q,
+          residuals.conv_bias_q,
+          jnp.pad(dq, pad_spec),
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon_conv,
+      )
+      dk_ext, dw_k, db_k = _conv1d_silu_bwd(
+          residuals.k_raw,
+          residuals.conv_weight_k,
+          residuals.conv_bias_k,
+          jnp.pad(dk, pad_spec),
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon_conv,
+      )
+      dv_ext, dw_v, db_v = _conv1d_silu_bwd(
+          residuals.v_raw,
+          residuals.conv_weight_v,
+          residuals.conv_bias_v,
+          jnp.pad(dv, pad_spec),
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon_conv,
+      )
+      dq = dq_ext[:, :, halo_len_raw:, :].at[:, :, -halo_len_raw:, :].add(
+          cp_shift_left(dq_ext[:, :, :halo_len_raw, :], axis_name, cp_size)
+      )
+      dk = dk_ext[:, :, halo_len_raw:, :].at[:, :, -halo_len_raw:, :].add(
+          cp_shift_left(dk_ext[:, :, :halo_len_raw, :], axis_name, cp_size)
+      )
+      dv = dv_ext[:, :, halo_len_raw:, :].at[:, :, -halo_len_raw:, :].add(
+          cp_shift_left(dv_ext[:, :, :halo_len_raw, :], axis_name, cp_size)
+      )
+    else:
+      dq, dw_q, db_q = _conv1d_silu_bwd(
+          residuals.q_raw,
+          residuals.conv_weight_q,
+          residuals.conv_bias_q,
+          dq,
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon,
+      )
+      dk, dw_k, db_k = _conv1d_silu_bwd(
+          residuals.k_raw,
+          residuals.conv_weight_k,
+          residuals.conv_bias_k,
+          dk,
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon,
+      )
+      dv, dw_v, db_v = _conv1d_silu_bwd(
+          residuals.v_raw,
+          residuals.conv_weight_v,
+          residuals.conv_bias_v,
+          dv,
+          segment_ids_aligned,
+          packed_canonical_seg=seg_canon,
+      )
 
   if cu_seqlens is not None:
     dq = _unalign_output(dq, cu_seqlens, aligned_cu, T_orig)
@@ -3536,6 +4450,7 @@ def chunk_gdn_bwd_custom(
         Float[Array, "B H_V K V"] | None,
     ],
     *,
+    context_parallel_metadata: ContextParallelMetadata | None = None,
     mini_batch: int | None = None,
     two_pass_bf16: bool = False,
 ) -> tuple[
@@ -3563,21 +4478,58 @@ def chunk_gdn_bwd_custom(
   k_size = H_QK * K
   B, T, _, _ = do_bt.shape
   act_dtype = do_bt.dtype
+  _cp_active = (
+      context_parallel_metadata is not None
+      and context_parallel_metadata.is_cp_enabled
+  )
+  halo_len = (
+      residuals.qkv_raw.shape[1] - T
+      if residuals.conv_weight is not None and residuals.qkv_raw is not None
+      else 0
+  )
 
+  seg_canon = None
+  seg_canon_ext = None
   packed_tok_meta = None
   packed_chunk_keep = None
   packed_valid_mask = None
   if residuals.segment_ids is not None:
-    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
-        residuals.segment_ids
-    )
-    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
-        seg_canon,
-        act_doc,
-        is_new_doc,
-        BT,
-        has_initial_state=has_initial_state,
-    )
+    if _cp_active:
+      assert context_parallel_metadata is not None
+      seg_canon, act_doc, is_new_doc, halo_seg_canon, _ = (
+          cp_canonicalize_packed_segment_ids(
+              residuals.segment_ids,
+              axis_name=context_parallel_metadata.axis_name,
+              cp_size=context_parallel_metadata.cp_size,
+              halo_len=halo_len,
+              precomputed_cp_halo=residuals.cp_seg_halo,
+          )
+      )
+      seg_canon_ext = (
+          jnp.concatenate([halo_seg_canon, seg_canon], axis=1)
+          if halo_len > 0 and halo_seg_canon is not None
+          else seg_canon
+      )
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=False,
+          conv_halo_seg=halo_seg_canon,
+      )
+    else:
+      seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+          residuals.segment_ids
+      )
+      seg_canon_ext = seg_canon
+      packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+          seg_canon,
+          act_doc,
+          is_new_doc,
+          BT,
+          has_initial_state=has_initial_state,
+      )
     packed_valid_mask = seg_canon > 0
 
   g = residuals.g_cumsum
@@ -3595,6 +4547,36 @@ def chunk_gdn_bwd_custom(
     )
   if residuals.h is None:
     raise ValueError("GDN backward requires h in residuals.")
+
+  akk_eff = residuals.akk
+  if _cp_active:
+    assert context_parallel_metadata is not None
+    ds_local, dm_local, akk_eff = compute_gdn_local_cp_bwd_summary(
+        qkv_conv=residuals.qkv_conv,
+        q_bt=residuals.q,
+        k_bt=residuals.k,
+        beta_hbt=residuals.beta,
+        g_hbt=g,
+        do_bt=do_bt,
+        akk=residuals.akk,
+        num_k_heads=H_QK,
+        num_v_heads=H_V,
+        head_k_dim=K,
+        head_v_dim=V,
+        scale=scale,
+        chunk_size=BT,
+        use_qk_l2norm=use_qk_l2norm,
+        two_pass_bf16=two_pass_bf16,
+        mini_batch=mini_batch,
+        packed_tok_meta=packed_tok_meta,
+        packed_chunk_keep=packed_chunk_keep,
+    )
+    dht = cp_associative_scan_bwd(
+        ds_local,
+        dm_local,
+        axis_name=context_parallel_metadata.axis_name,
+        cp_size=context_parallel_metadata.cp_size,
+    )
 
   dht_5d = dht[:, None] if dht is not None else None
   interpret = get_interpret()
@@ -3615,7 +4597,7 @@ def chunk_gdn_bwd_custom(
         w=None,
         g=g,
         beta=residuals.beta,
-        A=residuals.akk,
+        A=akk_eff,
         h=residuals.h,
         do=do_bt,
         dv0=None,
@@ -3648,7 +4630,7 @@ def chunk_gdn_bwd_custom(
             w=None,
             g=g,
             beta=residuals.beta,
-            A=residuals.akk,
+            A=akk_eff,
             h=residuals.h,
             do=do_bt,
             dv0=None,
@@ -3705,7 +4687,7 @@ def chunk_gdn_bwd_custom(
             w=None,
             g=g,
             beta=residuals.beta,
-            A=residuals.akk,
+            A=akk_eff,
             h=residuals.h,
             do=do_hbt,
             dv0=None,
@@ -3761,13 +4743,31 @@ def chunk_gdn_bwd_custom(
   dconv_w = dconv_b = None
   if residuals.conv_weight is not None:
     assert residuals.qkv_raw is not None and dy_conv is not None
-    dqkv_in, dconv_w, dconv_b = causal_conv1d_silu_bwd_bt(
-        residuals.qkv_raw,
-        residuals.conv_weight,
-        residuals.conv_bias,
-        dy_conv,
-        segment_ids=residuals.segment_ids,
-    )
+    if halo_len > 0:
+      assert context_parallel_metadata is not None
+      dy_conv_ext = jnp.pad(dy_conv, ((0, 0), (halo_len, 0), (0, 0)))
+      dqkv_ext, dconv_w, dconv_b = causal_conv1d_silu_bwd_bt(
+          residuals.qkv_raw,
+          residuals.conv_weight,
+          residuals.conv_bias,
+          dy_conv_ext,
+          canonical_segment_ids=seg_canon_ext,
+      )
+      dqkv_in = dqkv_ext[:, halo_len:, :].at[:, -halo_len:, :].add(
+          cp_shift_left(
+              dqkv_ext[:, :halo_len, :],
+              context_parallel_metadata.axis_name,
+              context_parallel_metadata.cp_size,
+          )
+      )
+    else:
+      dqkv_in, dconv_w, dconv_b = causal_conv1d_silu_bwd_bt(
+          residuals.qkv_raw,
+          residuals.conv_weight,
+          residuals.conv_bias,
+          dy_conv,
+          canonical_segment_ids=seg_canon,
+      )
   else:
     dqkv_in = dy_conv
 

@@ -580,10 +580,11 @@ SHARDS: ShardMap = {
     'experimental-kda': Spec(
         paths=(
             'tokamax/_src/ops/kda/base_test.py',
+            'tokamax/_src/ops/kda/pallas_mosaic_tpu_cp_test.py',
             'tokamax/_src/ops/kda/pallas_mosaic_tpu_test.py',
             'tokamax/_src/ops/kda/xla_chunked_test.py',
         ),
-        minutes=2,
+        minutes=5,
         compat_minutes=1,
     ),
     'experimental-router-topk': Spec(

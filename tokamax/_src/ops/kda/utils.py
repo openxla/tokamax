@@ -50,14 +50,17 @@ def get_interpret() -> bool:
 
 
 def get_chain_precision() -> jax.lax.Precision:
-  """Precision for the two matmuls on the forward's serial recurrent chain.
+  """Precision for serial recurrent and CP summary chain matmuls.
 
   Set by the `tokamax_kda_chain_precision` config option: `highest` (default),
-  `high` or `default`. The two matmuls are `w @ h` and `kg^T @ v_new` in
-  `pallas_mosaic_tpu_fwd_kernel`. Their operands are read from bf16 buffers,
-  so lower precision uses fewer MXU passes. `v_new` feeds the recurrent state,
-  so errors compound across chunks; validate accuracy on TPU (CPU interpret
-  mode does not model TPU matmul precision).
+  `high` or `default`. Applies to `w @ h` and `kg^T @ v_new` in the forward
+  recurrent kernel and to the `(S, M)` / `(dS, dM)` context-parallel summary
+  chain matmuls in `pallas_mosaic_tpu_{fwd,bwd}_kernel`. Lower precision uses
+  fewer MXU passes, but errors compound across chunks; validate accuracy on TPU
+  (CPU interpret mode does not model TPU matmul precision).
+
+  Returns:
+    The configured `jax.lax.Precision` level.
   """
   return {
       "highest": jax.lax.Precision.HIGHEST,
@@ -242,9 +245,13 @@ def causal_conv1d_silu_fwd_bt(
     weight: jax.Array,
     bias: jax.Array | None = None,
     segment_ids: jax.Array | None = None,
+    *,
+    canonical_segment_ids: jax.Array | None = None,
 ) -> jax.Array:
   """Applies token-major `[B, T, C]` depthwise causal conv1d + SiLU."""
-  if segment_ids is not None:
+  if canonical_segment_ids is not None:
+    segment_ids = canonical_segment_ids
+  elif segment_ids is not None:
     segment_ids, _, _ = canonicalize_packed_segment_ids(segment_ids)
   w_len = weight.shape[0]
   t_len = x.shape[1]
@@ -275,9 +282,13 @@ def causal_conv1d_silu_bwd_bt(
     bias: jax.Array | None,
     dy: jax.Array,
     segment_ids: jax.Array | None = None,
+    *,
+    canonical_segment_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
   """Analytical VJP of `causal_conv1d_silu_fwd_bt` on `[B, T, C]`."""
-  if segment_ids is not None:
+  if canonical_segment_ids is not None:
+    segment_ids = canonical_segment_ids
+  elif segment_ids is not None:
     segment_ids, _, _ = canonicalize_packed_segment_ids(segment_ids)
   w_len = weight.shape[0]
   t_len = x.shape[1]

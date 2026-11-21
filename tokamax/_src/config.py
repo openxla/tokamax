@@ -158,9 +158,10 @@ kda_chain_precision = _ConfigOption(
         "tokamax_kda_chain_precision",
         "highest",
         ("highest", "high", "default"),
-        "Matmul precision for the two matmuls on the serial recurrent chain of"
-        " the KDA Pallas Mosaic TPU forward kernel (`w @ h` and"
-        " `kg^T @ v_new`). Lower precision uses fewer MXU passes, but errors"
-        " compound across chunks, so validate accuracy on TPU.",
+        "Matmul precision for the serial recurrent chain of the KDA Pallas"
+        " Mosaic TPU forward kernel (`w @ h` and `kg^T @ v_new`) and the"
+        " `(S, M)` / `(dS, dM)` context-parallel summary chains. Lower"
+        " precision uses fewer MXU passes, but errors compound across chunks,"
+        " so validate accuracy on TPU.",
     )
 )

@@ -509,14 +509,10 @@ def check_inputs_support(
           "`mosaic` context-parallel execution does not support "
           "`output_final_state=True`."
       )
-    if segment_ids is None:
+    if segment_ids is not None and max_num_segments is None:
       raise NotImplementedError(
-          "`mosaic` context-parallel execution requires rank-local "
-          "`segment_ids`."
-      )
-    if max_num_segments is None:
-      raise NotImplementedError(
-          "`mosaic` context-parallel execution requires `max_num_segments`."
+          "`mosaic` context-parallel execution requires `max_num_segments` "
+          "when `segment_ids` is provided."
       )
     if key_dim % 128 != 0 or value_dim % 128 != 0:
       raise NotImplementedError(
@@ -552,7 +548,7 @@ def check_inputs_support(
           f"`mosaic` supports conv1d widths in [1, {_MAX_CONV_WIDTH}]; got"
           f" W={conv_width}."
       )
-  if segment_ids is None and seq_len % chunk_size != 0:
+  if (segment_ids is None or cp_enabled) and seq_len % chunk_size != 0:
     raise NotImplementedError(
         "`mosaic` requires the sequence length to be divisible by "
         f"`chunk_size`; got T={seq_len}, chunk_size={chunk_size}."
@@ -616,29 +612,37 @@ class PallasMosaicTpuKimiDeltaAttention(
         cp_meta, "is_cp_enabled", False
     )
     req_cs = args.get("chunk_size")
-    use_inplace_packed = (
-        segment_ids is not None
-        and not cp_enabled
-        and args.get("initial_state") is None
-        and not args.get("output_final_state", False)
+    stateless = args.get("initial_state") is None and not args.get(
+        "output_final_state", False
     )
     if req_cs is not None:
       chunk_sizes = (int(req_cs),)
     elif segment_ids is not None:
-      if use_inplace_packed:
+      if not stateless:
+        chunk_sizes = (64,)
+      elif cp_enabled:
         if isinstance(seq_len, int):
-          if not per_channel_gate and seq_len % 64 != 0:
-            chunk_sizes = tuple(
-                cs for cs in (32, 16) if seq_len % cs == 0
-            ) or (64,)
-          else:
-            chunk_sizes = (64, 128) if seq_len > 64 else (64,)
+          chunk_sizes = (
+              tuple(cs for cs in (64, 128) if seq_len % cs == 0) or (64,)
+          )
         else:
           chunk_sizes = (64, 128)
-      else:
+      elif (
+          isinstance(seq_len, int)
+          and not per_channel_gate
+          and seq_len % 64 != 0
+      ):
+        chunk_sizes = tuple(
+            cs for cs in (32, 16) if seq_len % cs == 0
+        ) or (64,)
+      elif isinstance(seq_len, int) and seq_len <= 64:
         chunk_sizes = (64,)
+      else:
+        chunk_sizes = (64, 128)
     else:
-      base_cs = (64, 128) if per_channel_gate else (32, 64, 128)
+      base_cs = (
+          (64, 128) if (per_channel_gate or cp_enabled) else (32, 64, 128)
+      )
       if isinstance(seq_len, int):
         chunk_sizes = tuple(cs for cs in base_cs if seq_len % cs == 0) or (64,)
       else:
@@ -673,7 +677,17 @@ class PallasMosaicTpuKimiDeltaAttention(
         if self.config is not None
         else None
     )
-    if ckpt_name is None or return_residuals or self.vjp is None:
+    cp_meta = kwargs.get("context_parallel_metadata")
+    has_cp_ckpt = (
+        cp_meta is not None
+        and cp_meta.is_cp_enabled
+        and cp_meta.cp_residual_checkpoint_name is not None
+    )
+    if (
+        (ckpt_name is None and not has_cp_ckpt)
+        or return_residuals
+        or self.vjp is None
+    ):
       return super().__call__(*args, return_residuals=return_residuals, **kwargs)
     return _call_with_selective_checkpoint_vjp(self, *args, **kwargs)
 
@@ -702,7 +716,13 @@ class PallasMosaicTpuKimiDeltaAttention(
     )
     use_inplace_packed = (
         segment_ids is not None
-        and not cp_enabled
+        and initial_state is None
+        and not output_final_state
+        and (not cp_enabled or q.shape[2] % chunk_size == 0)
+    )
+    use_inplace_unpacked_cp = (
+        cp_enabled
+        and segment_ids is None
         and initial_state is None
         and not output_final_state
     )
@@ -735,6 +755,8 @@ class PallasMosaicTpuKimiDeltaAttention(
         g = jnp.pad(g, pad_4d)
         beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_t)))
         seg_prepared = jnp.pad(seg_prepared, ((0, 0), (0, pad_t)))
+      cu_seqlens = None
+    elif use_inplace_unpacked_cp:
       cu_seqlens = None
     else:
       context_parallel_metadata, cu_seqlens = derive_context_parallel_metadata(
@@ -961,6 +983,20 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_conv1d_in_kernel=use_conv1d_in_kernel,
     )
 
+    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
+    cp_enabled = (
+        prepared.context_parallel_metadata is not None
+        and prepared.context_parallel_metadata.is_cp_enabled
+    )
+    cp_ckpt_name = (
+        (
+            prepared.context_parallel_metadata.cp_residual_checkpoint_name
+            or ckpt_name
+        )
+        if cp_enabled and prepared.context_parallel_metadata is not None
+        else None
+    )
+
     output, residuals = chunk_kda_fwd_custom(
         prepared.q,
         prepared.k,
@@ -997,6 +1033,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         use_qk_l2norm=use_qk_l2norm,
         mini_batch=config.mini_batch,
         two_pass_bf16=config.two_pass_bf16,
+        cp_checkpoint_name=cp_ckpt_name,
     )
     out_val, final_state = output
     if out_val.shape[2] != query.shape[2]:
@@ -1004,18 +1041,13 @@ class PallasMosaicTpuKimiDeltaAttention(
     if final_state is not None and final_state.ndim == 4:
       final_state = final_state[:, None]
     output = (out_val, final_state)
-    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
     if ckpt_name is not None:
-      cp_enabled = (
-          prepared.context_parallel_metadata is not None
-          and prepared.context_parallel_metadata.is_cp_enabled
-      )
       output, residuals = _tag_kda_residuals(
           output,
           residuals,
           ckpt_name,
           tag_qkv=use_conv1d_in_kernel or use_qk_l2norm,
-          tag_initial_state=cp_enabled,
+          tag_initial_state=(cp_enabled and prepared.cu_seqlens is not None),
       )
     return output, residuals
 
@@ -1238,6 +1270,8 @@ def check_gdn_inputs_support(
     segment_ids: jax.Array | None,
     context_parallel_metadata: ContextParallelMetadata | None,
     mini_batch: int | None = None,
+    initial_state: jax.Array | None = None,
+    output_final_state: bool = False,
     two_pass_bf16: bool = False,
 ) -> None:
   """Checks whether the Pallas/Mosaic TPU GDN backend supports static inputs."""
@@ -1283,9 +1317,22 @@ def check_gdn_inputs_support(
       context_parallel_metadata is not None
       and context_parallel_metadata.is_cp_enabled
   ):
-    raise NotImplementedError(
-        "`mosaic` GDN does not yet support sequence context parallelism."
-    )
+    if initial_state is not None:
+      raise NotImplementedError(
+          "`mosaic` context-parallel execution does not support "
+          "`initial_state`."
+      )
+    if output_final_state:
+      raise NotImplementedError(
+          "`mosaic` context-parallel execution does not support "
+          "`output_final_state=True`."
+      )
+    if head_k_dim % 128 != 0 or head_v_dim % 128 != 0:
+      raise NotImplementedError(
+          "`mosaic` context-parallel execution requires key and value "
+          "dimensions to be multiples of 128; got "
+          f"K={head_k_dim}, V={head_v_dim}."
+      )
   gqa_repeats = num_v_heads // num_k_heads
   if mini_batch is not None and (
       mini_batch < 1
@@ -1363,20 +1410,29 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
     key_dim = int(args.get("head_k_dim") or 128)
     val_dim = int(args.get("head_v_dim") or 128)
     segment_ids = args.get("segment_ids")
+    cp_meta = args.get("context_parallel_metadata")
+    cp_enabled = cp_meta is not None and getattr(
+        cp_meta, "is_cp_enabled", False
+    )
     req_cs = args.get("chunk_size")
     if req_cs is not None:
       chunk_sizes = (int(req_cs),)
     elif segment_ids is not None:
       if isinstance(seq_len, int):
-        chunk_sizes = (
-            tuple(cs for cs in (64, 128) if seq_len % cs == 0)
-            or tuple(cs for cs in (32, 16) if seq_len % cs == 0)
-            or (64,)
-        )
+        if cp_enabled:
+          chunk_sizes = (
+              tuple(cs for cs in (64, 128) if seq_len % cs == 0) or (64,)
+          )
+        else:
+          chunk_sizes = (
+              tuple(cs for cs in (64, 128) if seq_len % cs == 0)
+              or tuple(cs for cs in (32, 16) if seq_len % cs == 0)
+              or (64,)
+          )
       else:
         chunk_sizes = (64, 128)
     else:
-      base_cs = (32, 64, 128)
+      base_cs = (64, 128) if cp_enabled else (32, 64, 128)
       if isinstance(seq_len, int):
         chunk_sizes = tuple(cs for cs in base_cs if seq_len % cs == 0) or (64,)
       else:
@@ -1413,7 +1469,17 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
         if self.config is not None
         else None
     )
-    if ckpt_name is None or return_residuals or self.vjp is None:
+    cp_meta = kwargs.get("context_parallel_metadata")
+    has_cp_ckpt = (
+        cp_meta is not None
+        and cp_meta.is_cp_enabled
+        and cp_meta.cp_residual_checkpoint_name is not None
+    )
+    if (
+        (ckpt_name is None and not has_cp_ckpt)
+        or return_residuals
+        or self.vjp is None
+    ):
       return super().__call__(*args, return_residuals=return_residuals, **kwargs)
     return _call_with_selective_checkpoint_vjp(self, *args, **kwargs)
 
@@ -1471,12 +1537,21 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
         mini_batch=config.mini_batch,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
         two_pass_bf16=config.two_pass_bf16,
     )
     safe_gate = _resolve_safe_gate(
         config, use_gate_in_kernel=use_gate_in_kernel, lower_bound=None
     )
     save_intermediates = not config.rematerialize_for_backward
+    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
+    cp_ckpt_name = (
+        (context_parallel_metadata.cp_residual_checkpoint_name or ckpt_name)
+        if context_parallel_metadata is not None
+        and context_parallel_metadata.is_cp_enabled
+        else None
+    )
     output, residuals = chunk_gdn_fwd_custom(
         query=query,
         key=key,
@@ -1502,11 +1577,12 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
         disable_recompute=save_intermediates,
         chunk_size=effective_chunk_size,
         segment_ids=segment_ids,
+        context_parallel_metadata=context_parallel_metadata,
         return_residuals=return_residuals,
         mini_batch=config.mini_batch,
         two_pass_bf16=config.two_pass_bf16,
+        cp_checkpoint_name=cp_ckpt_name,
     )
-    ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
     if ckpt_name is not None:
       output, residuals = _tag_gdn_residuals(
           output,
@@ -1607,8 +1683,8 @@ class PallasMosaicTpuGatedDeltaNetVjp(
       return_residuals: bool,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
-    del out, output_final_state, return_residuals
-    del context_parallel_metadata, residual_checkpoint_name, chunk_size
+    del out, output_final_state, return_residuals, residual_checkpoint_name
+    del chunk_size
     effective_chunk_size = residuals.chunk_size
     effective_two_pass = (
         config.two_pass_bf16
@@ -1645,9 +1721,14 @@ class PallasMosaicTpuGatedDeltaNetVjp(
           disable_recompute=True,
           chunk_size=effective_chunk_size,
           segment_ids=segment_ids,
+          context_parallel_metadata=context_parallel_metadata,
           return_residuals=True,
           mini_batch=config.mini_batch,
           two_pass_bf16=effective_two_pass,
+          precomputed_initial_state=residuals.initial_state,
+          precomputed_qkv_conv=residuals.qkv_conv,
+          precomputed_qkv_raw=residuals.qkv_raw,
+          precomputed_cp_seg_halo=residuals.cp_seg_halo,
       )
       assert recomputed is not None
       residuals = recomputed
@@ -1679,6 +1760,7 @@ class PallasMosaicTpuGatedDeltaNetVjp(
         has_fused_qkv,
         residuals,
         dout,
+        context_parallel_metadata=context_parallel_metadata,
         mini_batch=config.mini_batch,
         two_pass_bf16=effective_two_pass,
     )
