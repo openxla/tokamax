@@ -58,7 +58,7 @@ class KdaResiduals:
   aligned_cu_seqlens: Int[Array, "B N_CU"] | Int[Array, "N_CU"] | None
   chunk_indices: Int[Array, "B NT 2"] | Int[Array, "NT 2"] | None
   aligned_segment_ids: Int[Array, "B T_ALIGNED"] | None
-  segment_ids: Int[Array, "B T_ORIG"] | None
+  segment_ids: Int[Array, "B T_SEG"] | None
   cp_metadata: CpMetadata
   v_new: Float[Array, "H B T_ALIGNED V"] | None = None
   q_raw: Float[Array, "H B T_ALIGNED K"] | None = None

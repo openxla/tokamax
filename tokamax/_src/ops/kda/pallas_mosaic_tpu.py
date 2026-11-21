@@ -301,6 +301,7 @@ class _PreparedKdaInputs:
   aligned_segment_ids: jax.Array | None
   q_rstd: jax.Array | None
   k_rstd: jax.Array | None
+  segment_ids: jax.Array | None = None
 
 
 def _requested_chunk_size(ba) -> int:
@@ -531,6 +532,17 @@ def check_inputs_support(
           f"N={initial_state.shape[1]}."
       )
   _check_chunk_size_support(chunk_size, per_channel_gate=per_channel_gate)
+  use_inplace_packed = (
+      segment_ids is not None
+      and not cp_enabled
+      and initial_state is None
+      and not output_final_state
+  )
+  if use_inplace_packed and chunk_size not in (16, 32, 64, 128):
+    raise NotImplementedError(
+        "`mosaic` in-place packed KDA supports chunk_size in"
+        f" (16, 32, 64, 128); got {chunk_size}."
+    )
   for conv_weight in conv_weights:
     if conv_weight is None:
       continue
@@ -599,11 +611,32 @@ class PallasMosaicTpuKimiDeltaAttention(
     act_dtype = q.dtype if q is not None and hasattr(q, "dtype") else jnp.bfloat16
     per_channel_gate = args.get("per_channel_gate", True)
     segment_ids = args.get("segment_ids")
+    cp_meta = args.get("context_parallel_metadata")
+    cp_enabled = cp_meta is not None and getattr(
+        cp_meta, "is_cp_enabled", False
+    )
     req_cs = args.get("chunk_size")
+    use_inplace_packed = (
+        segment_ids is not None
+        and not cp_enabled
+        and args.get("initial_state") is None
+        and not args.get("output_final_state", False)
+    )
     if req_cs is not None:
       chunk_sizes = (int(req_cs),)
     elif segment_ids is not None:
-      chunk_sizes = (64,)
+      if use_inplace_packed:
+        if isinstance(seq_len, int):
+          if not per_channel_gate and seq_len % 64 != 0:
+            chunk_sizes = tuple(
+                cs for cs in (32, 16) if seq_len % cs == 0
+            ) or (64,)
+          else:
+            chunk_sizes = (64, 128) if seq_len > 64 else (64,)
+        else:
+          chunk_sizes = (64, 128)
+      else:
+        chunk_sizes = (64,)
     else:
       base_cs = (64, 128) if per_channel_gate else (32, 64, 128)
       if isinstance(seq_len, int):
@@ -663,19 +696,60 @@ class PallasMosaicTpuKimiDeltaAttention(
       use_conv1d_in_kernel: bool = False,
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
-    context_parallel_metadata, cu_seqlens = derive_context_parallel_metadata(
-        segment_ids=segment_ids,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        context_parallel_metadata=context_parallel_metadata,
-        max_num_segments=max_num_segments,
+    cp_enabled = (
+        context_parallel_metadata is not None
+        and context_parallel_metadata.is_cp_enabled
     )
-    if cu_seqlens is None:
-      cu_seqlens, max_num_segments = segment_ids_to_cu_seqlens(
+    use_inplace_packed = (
+        segment_ids is not None
+        and not cp_enabled
+        and initial_state is None
+        and not output_final_state
+    )
+    seg_prepared = segment_ids
+    if use_inplace_packed:
+      assert segment_ids is not None
+      if segment_ids.ndim != 2 or segment_ids.shape != (q.shape[1], q.shape[2]):
+        raise ValueError(
+            f"`segment_ids` must have shape {(q.shape[1], q.shape[2])}; got"
+            f" {segment_ids.shape}."
+        )
+      if max_num_segments is None:
+        raise ValueError(
+            "`max_num_segments` is required when `segment_ids` is provided "
+            "without `initial_state`."
+        )
+      if max_num_segments <= 0:
+        raise ValueError("`max_num_segments` must be positive.")
+      seg_prepared = jnp.where(
+          (segment_ids > 0) & (segment_ids <= max_num_segments),
           segment_ids,
+          0,
+      )
+      pad_t = (-q.shape[2]) % chunk_size
+      if pad_t:
+        pad_4d = ((0, 0), (0, 0), (0, pad_t), (0, 0))
+        q = jnp.pad(q, pad_4d)
+        k = jnp.pad(k, pad_4d)
+        v = jnp.pad(v, pad_4d)
+        g = jnp.pad(g, pad_4d)
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_t)))
+        seg_prepared = jnp.pad(seg_prepared, ((0, 0), (0, pad_t)))
+      cu_seqlens = None
+    else:
+      context_parallel_metadata, cu_seqlens = derive_context_parallel_metadata(
+          segment_ids=segment_ids,
           initial_state=initial_state,
+          output_final_state=output_final_state,
+          context_parallel_metadata=context_parallel_metadata,
           max_num_segments=max_num_segments,
       )
+      if cu_seqlens is None:
+        cu_seqlens, max_num_segments = segment_ids_to_cu_seqlens(
+            segment_ids,
+            initial_state=initial_state,
+            max_num_segments=max_num_segments,
+        )
 
     aligned_cu_seqlens = None
     chunk_indices = None
@@ -770,6 +844,10 @@ class PallasMosaicTpuKimiDeltaAttention(
       )
 
     if use_qk_l2norm and not use_conv1d_in_kernel:
+      if use_inplace_packed and seg_prepared is not None:
+        valid_4d = (seg_prepared > 0)[None, :, :, None]
+        q_aligned = jnp.where(valid_4d, q_aligned, 0.0)
+        k_aligned = jnp.where(valid_4d, k_aligned, 0.0)
       q_prepared, q_rstd = l2norm_fwd(q_aligned)
       k_prepared, k_rstd = l2norm_fwd(k_aligned)
     else:
@@ -790,6 +868,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_segment_ids=aligned_segment_ids,
         q_rstd=q_rstd,
         k_rstd=k_rstd,
+        segment_ids=seg_prepared,
     )
 
   @jaxtyping.jaxtyped
@@ -895,7 +974,7 @@ class PallasMosaicTpuKimiDeltaAttention(
         output_final_state=output_final_state,
         use_gate_in_kernel=use_gate_in_kernel,
         per_channel_gate=per_channel_gate,
-        segment_ids=segment_ids,
+        segment_ids=prepared.segment_ids,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         disable_recompute=save_intermediates_for_backward,
@@ -919,10 +998,12 @@ class PallasMosaicTpuKimiDeltaAttention(
         mini_batch=config.mini_batch,
         two_pass_bf16=config.two_pass_bf16,
     )
-    value, final_state = output
+    out_val, final_state = output
+    if out_val.shape[2] != query.shape[2]:
+      out_val = out_val[:, :, : query.shape[2], :]
     if final_state is not None and final_state.ndim == 4:
       final_state = final_state[:, None]
-    output = (value, final_state)
+    output = (out_val, final_state)
     ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
     if ckpt_name is not None:
       cp_enabled = (
@@ -1193,9 +1274,10 @@ def check_gdn_inputs_support(
           f"`mosaic` supports conv1d widths in [1, {_MAX_CONV_WIDTH}]; got"
           f" W={conv_width}."
       )
-  if segment_ids is not None:
+  if segment_ids is not None and chunk_size not in (16, 32, 64, 128):
     raise NotImplementedError(
-        "`mosaic` GDN does not yet support `segment_ids`."
+        "`mosaic` packed GDN supports chunk_size in (16, 32, 64, 128); got"
+        f" {chunk_size}."
     )
   if (
       context_parallel_metadata is not None
@@ -1284,12 +1366,21 @@ class PallasMosaicTpuGatedDeltaNet(base.GatedDeltaNet[Config, Any]):
     req_cs = args.get("chunk_size")
     if req_cs is not None:
       chunk_sizes = (int(req_cs),)
-    elif segment_ids is None and isinstance(seq_len, int):
-      chunk_sizes = tuple(cs for cs in (32, 64, 128) if seq_len % cs == 0) or (
-          64,
-      )
+    elif segment_ids is not None:
+      if isinstance(seq_len, int):
+        chunk_sizes = (
+            tuple(cs for cs in (64, 128) if seq_len % cs == 0)
+            or tuple(cs for cs in (32, 16) if seq_len % cs == 0)
+            or (64,)
+        )
+      else:
+        chunk_sizes = (64, 128)
     else:
-      chunk_sizes = (32, 64, 128)
+      base_cs = (32, 64, 128)
+      if isinstance(seq_len, int):
+        chunk_sizes = tuple(cs for cs in base_cs if seq_len % cs == 0) or (64,)
+      else:
+        chunk_sizes = base_cs
     mini_batches = tuple(
         mb
         for mb in (8, 16, 32)

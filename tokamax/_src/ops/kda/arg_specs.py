@@ -329,4 +329,9 @@ GDN_ARG_SPECS: Final[tuple[arg_spec.ArgSpec, ...]] = (
         name="gdn_gqa_fixed_training_b1_t8192_bf16",
         seq_len=8192,
     ),
+    _gdn_qwen3_5_397b_a17b_spec(
+        name="gdn_gqa_packed_training_b1_t8192_n25_bf16",
+        seq_len=8192,
+        num_segments=25,
+    ),
 )

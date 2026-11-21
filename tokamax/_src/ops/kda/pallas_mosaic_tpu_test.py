@@ -1371,6 +1371,760 @@ class GatedDeltaNetMosaicTest(parameterized.TestCase):
           float(jnp.max(jnp.abs(g_mos.astype(jnp.float32) - g_ref))), tol
       )
 
+  @parameterized.parameters((16,), (32,), (64,), (128,))
+  def test_gdn_inplace_packed_fwd_bwd_matches_xla(self, chunk_size: int):
+    b, t, h_qk, h_v, d = 2, 256, 1, 2, 128
+    c_qkv = 2 * h_qk * d + h_v * d
+    keys = jax.random.split(jax.random.PRNGKey(500 + chunk_size), 9)
+    qkv = jax.random.normal(keys[0], (b, t, c_qkv), jnp.float32) * 0.4
+    conv_w = jax.random.normal(keys[1], (4, c_qkv), jnp.float32) * 0.15
+    conv_b = jax.random.normal(keys[2], (c_qkv,), jnp.float32) * 0.05
+    gate = jax.random.normal(keys[3], (b, t, h_v), jnp.float32) * 0.4
+    beta = jax.random.normal(keys[4], (b, t, h_v), jnp.float32)
+    a_log = jnp.log(jax.random.uniform(keys[5], (h_v,), minval=0.1, maxval=0.8))
+    dt_bias = jax.random.normal(keys[6], (h_v,), jnp.float32) * 0.1
+    h0 = jax.random.normal(keys[7], (b, h_v, d, d), jnp.float32) * 0.1
+    do = jax.random.normal(keys[8], (b, t, h_v, d), jnp.float32)
+
+    # Row 0: leading 0-pad, [5, 0, 5] continuity across chunk 0->1, 4 docs in
+    # chunk 1, cross-chunk doc 9, and trailing 0-pad.
+    seg_row0 = jnp.concatenate([
+        jnp.zeros((5,), jnp.int32),
+        jnp.full((20,), 5, jnp.int32),
+        jnp.zeros((7,), jnp.int32),
+        jnp.full((48,), 5, jnp.int32),
+        jnp.full((15,), 2, jnp.int32),
+        jnp.full((15,), 7, jnp.int32),
+        jnp.full((25,), 1, jnp.int32),
+        jnp.full((65,), 9, jnp.int32),
+        jnp.zeros((56,), jnp.int32),
+    ])
+    # Row 1: reused non-adjacent ID [1, 2, 1] (must reset at 1->2 and 2->1)
+    # plus a full 128-token 0-padding span.
+    seg_row1 = jnp.concatenate([
+        jnp.full((20,), 1, jnp.int32),
+        jnp.full((20,), 2, jnp.int32),
+        jnp.full((30,), 1, jnp.int32),
+        jnp.zeros((128,), jnp.int32),
+        jnp.full((58,), 4, jnp.int32),
+    ])
+    segment_ids = jnp.stack([seg_row0, seg_row1], axis=0)
+
+    def run(impl: str):
+      def fn(qkv_, gate_, beta_, conv_w_, conv_b_, a_log_, dt_bias_, h0_):
+        out, ht = api.gated_delta_net(
+            qkv=qkv_,
+            gate=gate_,
+            beta=beta_,
+            num_k_heads=h_qk,
+            num_v_heads=h_v,
+            head_k_dim=d,
+            head_v_dim=d,
+            conv_weight=conv_w_,
+            conv_bias=conv_b_,
+            a_log=a_log_,
+            delta_time_bias=dt_bias_,
+            initial_state=h0_,
+            output_final_state=True,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            chunk_size=chunk_size,
+            segment_ids=segment_ids,
+            implementation=impl,
+        )
+        loss = jnp.sum(out * do) + 0.1 * jnp.sum(ht)
+        return loss, (out, ht)
+
+      return jax.value_and_grad(fn, argnums=tuple(range(8)), has_aux=True)(
+          qkv, gate, beta, conv_w, conv_b, a_log, dt_bias, h0
+      )
+
+    (loss_ref, (out_ref, ht_ref)), grads_ref = run("xla")
+    (loss_mos, (out_mos, ht_mos)), grads_mos = run("mosaic")
+
+    pad_mask = segment_ids == 0
+    self.assertEqual(
+        float(jnp.max(jnp.abs(jnp.where(pad_mask[:, :, None, None], out_mos, 0.0)))),
+        0.0,
+    )
+    self.assertEqual(
+        float(jnp.max(jnp.abs(jnp.where(pad_mask[:, :, None], grads_mos[0], 0.0)))),
+        0.0,
+    )
+    out_atol = 1e-3 if jax.default_backend() == "cpu" else 3e-3
+    grad_atol = 2e-3 if jax.default_backend() == "cpu" else 5e-3
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), out_atol)
+    self.assertLess(float(jnp.max(jnp.abs(ht_mos - ht_ref))), out_atol)
+    self.assertAlmostEqual(float(loss_mos), float(loss_ref), places=2)
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), grad_atol)
+
+  @parameterized.parameters((64, False), (128, False), (64, True))
+  def test_kda_inplace_packed_fwd_bwd_matches_xla(
+      self, chunk_size: int, remat_bwd: bool
+  ):
+    h, b, t, d, w_conv = 2, 2, 256, 128, 4
+    keys = jax.random.split(
+        jax.random.PRNGKey(700 + chunk_size + int(remat_bwd)), 15
+    )
+    q = jax.random.normal(keys[0], (h, b, t, d), jnp.float32) * 0.4
+    k = jax.random.normal(keys[1], (h, b, t, d), jnp.float32) * 0.4
+    v = jax.random.normal(keys[2], (h, b, t, d), jnp.float32) * 0.4
+    g = jax.random.normal(keys[3], (h, b, t, d), jnp.float32) * 0.4
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (h, b, t), jnp.float32))
+    a_log = jnp.zeros((h,), jnp.float32)
+    dt_bias = jax.random.normal(keys[5], (h * d,), jnp.float32) * 0.05
+    cw_q = jax.random.normal(keys[6], (h, w_conv, d), jnp.float32) * 0.15
+    cw_k = jax.random.normal(keys[7], (h, w_conv, d), jnp.float32) * 0.15
+    cw_v = jax.random.normal(keys[8], (h, w_conv, d), jnp.float32) * 0.15
+    cb_q = jax.random.normal(keys[9], (h, d), jnp.float32) * 0.05
+    cb_k = jax.random.normal(keys[10], (h, d), jnp.float32) * 0.05
+    cb_v = jax.random.normal(keys[11], (h, d), jnp.float32) * 0.05
+    do = jax.random.normal(keys[12], (h, b, t, d), jnp.float32)
+
+    seg_row0 = jnp.concatenate([
+        jnp.zeros((6,), jnp.int32),
+        jnp.full((22,), 1, jnp.int32),
+        jnp.zeros((6,), jnp.int32),
+        jnp.full((46,), 1, jnp.int32),
+        jnp.full((18,), 2, jnp.int32),
+        jnp.full((20,), 3, jnp.int32),
+        jnp.full((30,), 4, jnp.int32),
+        jnp.full((52,), 5, jnp.int32),
+        jnp.zeros((56,), jnp.int32),
+    ])
+    seg_row1 = jnp.concatenate([
+        jnp.full((40,), 1, jnp.int32),
+        jnp.zeros((128,), jnp.int32),
+        jnp.full((60,), 2, jnp.int32),
+        jnp.full((28,), 99, jnp.int32),  # > max_num_segments=5 -> padding
+    ])
+    segment_ids = jnp.stack([seg_row0, seg_row1], axis=0)
+
+    kda_op = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
+        config=pallas_mosaic_tpu.Config(
+            chunk_size=chunk_size, rematerialize_for_backward=remat_bwd
+        )
+    )
+    with mock.patch.object(
+        pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention,
+        "supported_on",
+        return_value=True,
+    ):
+      _, res = kda_op(
+          q,
+          k,
+          v,
+          g,
+          beta,
+          a_log=a_log,
+          delta_time_bias=dt_bias,
+          use_qk_l2norm=True,
+          use_gate_in_kernel=True,
+          per_channel_gate=True,
+          lower_bound=-5.0,
+          chunk_size=chunk_size,
+          segment_ids=segment_ids,
+          max_num_segments=5,
+          conv_weight_q=cw_q,
+          conv_weight_k=cw_k,
+          conv_weight_v=cw_v,
+          conv_bias_q=cb_q,
+          conv_bias_k=cb_k,
+          conv_bias_v=cb_v,
+          use_conv1d_in_kernel=True,
+          return_residuals=True,
+      )
+      self.assertIsNone(res.aligned_cu_seqlens)
+
+      def run_mos(q_, k_, v_, g_, beta_, a_log_, dt_bias_, cw_q_, cw_k_, cw_v_):
+        out, _ = kda_op(
+            q_,
+            k_,
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            delta_time_bias=dt_bias_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            chunk_size=chunk_size,
+            segment_ids=segment_ids,
+            max_num_segments=5,
+            conv_weight_q=cw_q_,
+            conv_weight_k=cw_k_,
+            conv_weight_v=cw_v_,
+            conv_bias_q=cb_q,
+            conv_bias_k=cb_k,
+            conv_bias_v=cb_v,
+            use_conv1d_in_kernel=True,
+        )
+        return jnp.sum(out * do), out
+
+      def run_ref(q_, k_, v_, g_, beta_, a_log_, dt_bias_, cw_q_, cw_k_, cw_v_):
+        out, _ = api.kimi_delta_attention(
+            q_,
+            k_,
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            delta_time_bias=dt_bias_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            chunk_size=chunk_size,
+            segment_ids=segment_ids,
+            max_num_segments=5,
+            conv_weight_q=cw_q_,
+            conv_weight_k=cw_k_,
+            conv_weight_v=cw_v_,
+            conv_bias_q=cb_q,
+            conv_bias_k=cb_k,
+            conv_bias_v=cb_v,
+            use_conv1d_in_kernel=True,
+            implementation="xla",
+        )
+        return jnp.sum(out * do), out
+
+      args_all = (q, k, v, g, beta, a_log, dt_bias, cw_q, cw_k, cw_v)
+      (loss_ref, out_ref), grads_ref = jax.value_and_grad(
+          run_ref, argnums=tuple(range(10)), has_aux=True
+      )(*args_all)
+      (loss_mos, out_mos), grads_mos = jax.value_and_grad(
+          run_mos, argnums=tuple(range(10)), has_aux=True
+      )(*args_all)
+
+    out_atol = 1e-3 if jax.default_backend() == "cpu" else 3e-3
+    grad_atol = 2e-3 if jax.default_backend() == "cpu" else 5e-3
+    loss_places = 2 if jax.default_backend() == "cpu" else 1
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), out_atol)
+    self.assertAlmostEqual(
+        float(loss_mos), float(loss_ref), places=loss_places
+    )
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), grad_atol)
+
+  @parameterized.parameters((False,), (True,))
+  def test_kda_packed_reused_ids_and_unaligned_seq_len_matches_xla(
+      self, remat_bwd: bool
+  ):
+    h, h_q, b, t, d, w_conv = 4, 2, 2, 90, 128, 4  # T=90 % 64 != 0, H_Q < H
+    keys = jax.random.split(jax.random.PRNGKey(810 + int(remat_bwd)), 13)
+    q_gqa = jax.random.normal(keys[0], (h_q, b, t, d), jnp.float32) * 0.4
+    k_gqa = jax.random.normal(keys[1], (h_q, b, t, d), jnp.float32) * 0.4
+    v = jax.random.normal(keys[2], (h, b, t, d), jnp.float32) * 0.4
+    g = jax.random.normal(keys[3], (h, b, t, d), jnp.float32) * 0.4
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (h, b, t), jnp.float32))
+    a_log = jnp.zeros((h,), jnp.float32)
+    dt_bias = jax.random.normal(keys[5], (h * d,), jnp.float32) * 0.05
+    cw_q = jax.random.normal(keys[6], (h_q, w_conv, d), jnp.float32) * 0.15
+    cw_k = jax.random.normal(keys[7], (h_q, w_conv, d), jnp.float32) * 0.15
+    cw_v = jax.random.normal(keys[8], (h, w_conv, d), jnp.float32) * 0.15
+    cb_q = jax.random.normal(keys[9], (h_q, d), jnp.float32) * 0.05
+    cb_k = jax.random.normal(keys[10], (h_q, d), jnp.float32) * 0.05
+    cb_v = jax.random.normal(keys[11], (h, d), jnp.float32) * 0.05
+    do = jax.random.normal(keys[12], (h, b, t, d), jnp.float32)
+
+    # Row 0: leading 0-pad, [1, 2, 1] reused IDs (3 spans with max_num_segments=2),
+    # mid 0-pad continuing span 1, and > max_num_segments clipped to padding.
+    seg_row0 = jnp.concatenate([
+        jnp.zeros((5,), jnp.int32),
+        jnp.full((20,), 1, jnp.int32),
+        jnp.full((25,), 2, jnp.int32),
+        jnp.full((15,), 1, jnp.int32),
+        jnp.zeros((6,), jnp.int32),
+        jnp.full((14,), 1, jnp.int32),
+        jnp.full((5,), 9, jnp.int32),
+    ])
+    # Row 1: mid 0-pad + [2, 1, 2] reused IDs + trailing 0-pad.
+    seg_row1 = jnp.concatenate([
+        jnp.full((22,), 2, jnp.int32),
+        jnp.zeros((8,), jnp.int32),
+        jnp.full((24,), 1, jnp.int32),
+        jnp.full((26,), 2, jnp.int32),
+        jnp.zeros((10,), jnp.int32),
+    ])
+    segment_ids = jnp.stack([seg_row0, seg_row1], axis=0)
+
+    q_rep = jnp.repeat(q_gqa, h // h_q, axis=0)
+    k_rep = jnp.repeat(k_gqa, h // h_q, axis=0)
+    kda_default = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention()
+    ba_short = kda_default.bind(
+        q_rep[:, :, :48, :],
+        k_rep[:, :, :48, :],
+        v[:, :, :48, :],
+        g[:, :, :48, :],
+        beta[:, :, :48],
+        segment_ids=segment_ids[:, :48],
+        max_num_segments=2,
+    )
+    cfgs_short = kda_default._get_autotuning_configs(ba_short)  # pylint: disable=protected-access
+    self.assertEqual({c.chunk_size for c in cfgs_short}, {64})
+    ba_long = kda_default.bind(
+        q_rep, k_rep, v, g, beta, segment_ids=segment_ids, max_num_segments=2
+    )
+    cfgs_long = kda_default._get_autotuning_configs(ba_long)  # pylint: disable=protected-access
+    self.assertEqual({c.chunk_size for c in cfgs_long}, {64, 128})
+
+    kda_op = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
+        config=pallas_mosaic_tpu.Config(
+            chunk_size=64,
+            rematerialize_for_backward=remat_bwd,
+            residual_checkpoint_name="kda_unaligned_ckpt",
+        )
+    )
+    with mock.patch.object(
+        pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention,
+        "supported_on",
+        return_value=True,
+    ):
+      def run_mos(q_, k_, v_, g_, beta_, a_log_, dt_bias_, cw_q_, cw_k_, cw_v_):
+        out, _ = kda_op(
+            jnp.repeat(q_, h // h_q, axis=0),
+            jnp.repeat(k_, h // h_q, axis=0),
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            delta_time_bias=dt_bias_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            chunk_size=64,
+            segment_ids=segment_ids,
+            max_num_segments=2,
+            conv_weight_q=cw_q_,
+            conv_weight_k=cw_k_,
+            conv_weight_v=cw_v_,
+            conv_bias_q=cb_q,
+            conv_bias_k=cb_k,
+            conv_bias_v=cb_v,
+            use_conv1d_in_kernel=True,
+        )
+        return jnp.sum(out * do), out
+
+      def run_ref(q_, k_, v_, g_, beta_, a_log_, dt_bias_, cw_q_, cw_k_, cw_v_):
+        out, _ = api.kimi_delta_attention(
+            jnp.repeat(q_, h // h_q, axis=0),
+            jnp.repeat(k_, h // h_q, axis=0),
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            delta_time_bias=dt_bias_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            chunk_size=64,
+            segment_ids=segment_ids,
+            max_num_segments=2,
+            conv_weight_q=cw_q_,
+            conv_weight_k=cw_k_,
+            conv_weight_v=cw_v_,
+            conv_bias_q=cb_q,
+            conv_bias_k=cb_k,
+            conv_bias_v=cb_v,
+            use_conv1d_in_kernel=True,
+            implementation="xla",
+        )
+        return jnp.sum(out * do), out
+
+      args_all = (q_gqa, k_gqa, v, g, beta, a_log, dt_bias, cw_q, cw_k, cw_v)
+      (loss_ref, out_ref), grads_ref = jax.value_and_grad(
+          run_ref, argnums=tuple(range(10)), has_aux=True
+      )(*args_all)
+      ckpt_mos = jax.checkpoint(
+          run_mos,
+          policy=jax.checkpoint_policies.save_only_these_names(
+              "kda_unaligned_ckpt"
+          ),
+      )
+      (loss_mos, out_mos), grads_mos = jax.value_and_grad(
+          ckpt_mos, argnums=tuple(range(10)), has_aux=True
+      )(*args_all)
+
+    self.assertEqual(out_mos.shape, (h, b, t, d))
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), 1e-3)
+    self.assertAlmostEqual(float(loss_mos), float(loss_ref), places=2)
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertEqual(g_mos.shape, g_ref.shape)
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), 2e-3)
+
+  @parameterized.parameters((64,), (128,))
+  def test_kda_scalar_gate_packed_fwd_bwd_matches_xla(self, chunk_size: int):
+    h, b, t, d = 2, 2, 128, 128
+    keys = jax.random.split(jax.random.PRNGKey(850 + chunk_size), 8)
+    q = jax.random.normal(keys[0], (h, b, t, d), jnp.float32) * 0.4
+    k = jax.random.normal(keys[1], (h, b, t, d), jnp.float32) * 0.4
+    v = jax.random.normal(keys[2], (h, b, t, d), jnp.float32) * 0.4
+    g = jax.random.normal(keys[3], (h, b, t, 1), jnp.float32) * 0.4
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (h, b, t), jnp.float32))
+    a_log = jnp.zeros((h,), jnp.float32)
+    dt_bias = jax.random.normal(keys[5], (h,), jnp.float32) * 0.1
+    do = jax.random.normal(keys[6], (h, b, t, d), jnp.float32)
+    segment_ids = jnp.asarray(
+        [
+            [0] * 4 + [1] * 28 + [0] * 8 + [1] * 24 + [2] * 36 + [1] * 28,
+            [2] * 32 + [1] * 32 + [2] * 40 + [0] * 24,
+        ],
+        dtype=jnp.int32,
+    )
+
+    with mock.patch.object(
+        pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention,
+        "supported_on",
+        return_value=True,
+    ):
+      def run(impl: str):
+        def loss_fn(q_, k_, v_, g_, beta_, a_log_, dt_bias_):
+          out, _ = api.kimi_delta_attention(
+              q_,
+              k_,
+              v_,
+              g_,
+              beta_,
+              a_log=a_log_,
+              delta_time_bias=dt_bias_,
+              use_qk_l2norm=True,
+              use_gate_in_kernel=True,
+              per_channel_gate=False,
+              chunk_size=chunk_size,
+              segment_ids=segment_ids,
+              max_num_segments=2,
+              implementation=impl,
+          )
+          return jnp.sum(out * do), out
+
+        return jax.value_and_grad(
+            loss_fn, argnums=tuple(range(7)), has_aux=True
+        )(q, k, v, g, beta, a_log, dt_bias)
+
+      (loss_ref, out_ref), grads_ref = run("xla")
+      (loss_mos, out_mos), grads_mos = run("mosaic")
+
+    out_atol = 1e-3 if jax.default_backend() == "cpu" else 3e-3
+    grad_atol = 2e-3 if jax.default_backend() == "cpu" else 5e-3
+    loss_places = 2 if jax.default_backend() == "cpu" else 1
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), out_atol)
+    self.assertAlmostEqual(
+        float(loss_mos), float(loss_ref), places=loss_places
+    )
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), grad_atol)
+
+  def test_gdn_packed_all_zero_and_negative_segments_with_h0_matches_xla(self):
+    b, t, h_qk, h_v, d = 2, 128, 1, 2, 128
+    c_qkv = 2 * h_qk * d + h_v * d
+    keys = jax.random.split(jax.random.PRNGKey(860), 8)
+    qkv = jax.random.normal(keys[0], (b, t, c_qkv), jnp.float32) * 0.4
+    conv_w = jax.random.normal(keys[1], (4, c_qkv), jnp.float32) * 0.15
+    gate = jax.random.normal(keys[2], (b, t, h_v), jnp.float32) * 0.4
+    beta = jax.random.normal(keys[3], (b, t, h_v), jnp.float32)
+    a_log = jnp.zeros((h_v,), jnp.float32)
+    h0 = jax.random.normal(keys[4], (b, h_v, d, d), jnp.float32) * 0.2
+    do = jax.random.normal(keys[5], (b, t, h_v, d), jnp.float32)
+    dht = jax.random.normal(keys[6], (b, h_v, d, d), jnp.float32)
+
+    # Row 0: all-padding (0 and negative -1) -> ht[0] == h0[0], dh0[0] == dht[0].
+    # Row 1: all-zero chunk 0 ([0]*64) then active doc 5 with -1 trailing pad.
+    seg_row0 = jnp.where(jnp.arange(t) % 2 == 0, 0, -1).astype(jnp.int32)
+    seg_row1 = jnp.concatenate([
+        jnp.zeros((64,), jnp.int32),
+        jnp.full((48,), 5, jnp.int32),
+        jnp.full((16,), -1, jnp.int32),
+    ])
+    segment_ids = jnp.stack([seg_row0, seg_row1], axis=0)
+
+    def run(impl: str):
+      def fn(qkv_, gate_, beta_, conv_w_, a_log_, h0_):
+        out, ht = api.gated_delta_net(
+            qkv=qkv_,
+            gate=gate_,
+            beta=beta_,
+            num_k_heads=h_qk,
+            num_v_heads=h_v,
+            head_k_dim=d,
+            head_v_dim=d,
+            conv_weight=conv_w_,
+            a_log=a_log_,
+            initial_state=h0_,
+            output_final_state=True,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            chunk_size=64,
+            segment_ids=segment_ids,
+            implementation=impl,
+        )
+        loss = jnp.sum(out * do) + jnp.sum(ht * dht)
+        return loss, (out, ht)
+
+      return jax.value_and_grad(fn, argnums=tuple(range(6)), has_aux=True)(
+          qkv, gate, beta, conv_w, a_log, h0
+      )
+
+    (loss_ref, (out_ref, ht_ref)), grads_ref = run("xla")
+    (loss_mos, (out_mos, ht_mos)), grads_mos = run("mosaic")
+
+    self.assertTrue(bool(jnp.all(jnp.isfinite(out_mos))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(ht_mos))))
+    for g in grads_mos:
+      self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
+    # Row 0 is entirely padding (<= 0): m_keep preserves h0[0] -> ht[0] and dh0[0] == dht[0].
+    self.assertLess(float(jnp.max(jnp.abs(ht_mos[0] - h0[0]))), 1e-6)
+    self.assertLess(float(jnp.max(jnp.abs(grads_mos[5][0] - dht[0]))), 1e-6)
+    self.assertEqual(float(jnp.max(jnp.abs(out_mos[0]))), 0.0)
+    self.assertEqual(float(jnp.max(jnp.abs(out_mos[1, -16:]))), 0.0)
+    out_atol = 1e-3 if jax.default_backend() == "cpu" else 3e-3
+    grad_atol = 2e-3 if jax.default_backend() == "cpu" else 5e-3
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), out_atol)
+    self.assertLess(float(jnp.max(jnp.abs(ht_mos - ht_ref))), out_atol)
+    self.assertAlmostEqual(float(loss_mos), float(loss_ref), places=2)
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), grad_atol)
+
+  def test_gdn_packed_split_remat_no_conv_no_l2norm_matches_xla(self):
+    b, t, h_qk, h_v, d = 2, 128, 1, 2, 128
+    keys = jax.random.split(jax.random.PRNGKey(870), 7)
+    q = jax.random.normal(keys[0], (b, t, h_qk, d), jnp.float32) * 0.4
+    k = jax.random.normal(keys[1], (b, t, h_qk, d), jnp.float32) * 0.4
+    v = jax.random.normal(keys[2], (b, t, h_v, d), jnp.float32) * 0.4
+    gate = jax.random.normal(keys[3], (b, t, h_v), jnp.float32) * 0.4
+    beta = jax.random.normal(keys[4], (b, t, h_v), jnp.float32)
+    a_log = jnp.zeros((h_v,), jnp.float32)
+    do = jax.random.normal(keys[5], (b, t, h_v, d), jnp.float32)
+    segment_ids = jnp.asarray(
+        [
+            [1] * 30 + [0] * 10 + [1] * 40 + [2] * 48,
+            [2] * 50 + [-1] * 14 + [3] * 64,
+        ],
+        dtype=jnp.int32,
+    )
+
+    gdn_op = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet(
+        config=pallas_mosaic_tpu.Config(
+            chunk_size=64, rematerialize_for_backward=True
+        )
+    )
+
+    def run_mos(q_, k_, v_, gate_, beta_, a_log_):
+      out, _ = gdn_op(
+          q_,
+          k_,
+          v_,
+          gate_,
+          beta_,
+          a_log=a_log_,
+          use_qk_l2norm=False,
+          use_gate_in_kernel=True,
+          use_beta_sigmoid_in_kernel=True,
+          segment_ids=segment_ids,
+      )
+      return jnp.sum(out * do), out
+
+    def run_ref(q_, k_, v_, gate_, beta_, a_log_):
+      out, _ = api.gated_delta_net(
+          q_,
+          k_,
+          v_,
+          gate_,
+          beta_,
+          a_log=a_log_,
+          use_qk_l2norm=False,
+          use_gate_in_kernel=True,
+          use_beta_sigmoid_in_kernel=True,
+          segment_ids=segment_ids,
+          implementation="xla",
+      )
+      return jnp.sum(out * do), out
+
+    args_all = (q, k, v, gate, beta, a_log)
+    (loss_ref, out_ref), grads_ref = jax.value_and_grad(
+        run_ref, argnums=tuple(range(6)), has_aux=True
+    )(*args_all)
+    (loss_mos, out_mos), grads_mos = jax.value_and_grad(
+        run_mos, argnums=tuple(range(6)), has_aux=True
+    )(*args_all)
+    out_atol = 1e-3 if jax.default_backend() == "cpu" else 3e-3
+    grad_atol = 2e-3 if jax.default_backend() == "cpu" else 2e-2
+    loss_places = 2 if jax.default_backend() == "cpu" else 1
+    self.assertLess(float(jnp.max(jnp.abs(out_mos - out_ref))), out_atol)
+    self.assertAlmostEqual(
+        float(loss_mos), float(loss_ref), places=loss_places
+    )
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(float(jnp.max(jnp.abs(g_mos - g_ref))), grad_atol)
+
+  def test_packed_bf16_two_pass_matches_xla(self):
+    h, b, t, d = 2, 2, 128, 128
+    keys = jax.random.split(jax.random.PRNGKey(880), 8)
+    q = (jax.random.normal(keys[0], (h, b, t, d), jnp.float32) * 0.4).astype(
+        jnp.bfloat16
+    )
+    k = (jax.random.normal(keys[1], (h, b, t, d), jnp.float32) * 0.4).astype(
+        jnp.bfloat16
+    )
+    v = (jax.random.normal(keys[2], (h, b, t, d), jnp.float32) * 0.4).astype(
+        jnp.bfloat16
+    )
+    g = (jax.random.normal(keys[3], (h, b, t, d), jnp.float32) * 0.4).astype(
+        jnp.bfloat16
+    )
+    beta = jax.nn.sigmoid(
+        jax.random.normal(keys[4], (h, b, t), jnp.float32)
+    ).astype(jnp.bfloat16)
+    a_log = jnp.zeros((h,), jnp.float32)
+    do = (jax.random.normal(keys[5], (h, b, t, d), jnp.float32) * 0.2).astype(
+        jnp.bfloat16
+    )
+    segment_ids = jnp.asarray(
+        [
+            [0] * 8 + [1] * 40 + [2] * 32 + [1] * 48,
+            [1] * 60 + [-1] * 4 + [2] * 64,
+        ],
+        dtype=jnp.int32,
+    )
+
+    kda_op = pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention(
+        config=pallas_mosaic_tpu.Config(
+            chunk_size=64, two_pass_bf16=True, rematerialize_for_backward=True
+        )
+    )
+    with mock.patch.object(
+        pallas_mosaic_tpu.PallasMosaicTpuKimiDeltaAttention,
+        "supported_on",
+        return_value=True,
+    ):
+      def run_mos(q_, k_, v_, g_, beta_, a_log_):
+        out, _ = kda_op(
+            q_,
+            k_,
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            segment_ids=segment_ids,
+            max_num_segments=2,
+        )
+        return jnp.sum(out.astype(jnp.float32) * do.astype(jnp.float32)), out
+
+      def run_ref(q_, k_, v_, g_, beta_, a_log_):
+        out, _ = api.kimi_delta_attention(
+            q_,
+            k_,
+            v_,
+            g_,
+            beta_,
+            a_log=a_log_,
+            use_qk_l2norm=True,
+            use_gate_in_kernel=True,
+            per_channel_gate=True,
+            lower_bound=-5.0,
+            segment_ids=segment_ids,
+            max_num_segments=2,
+            implementation="xla",
+        )
+        return jnp.sum(out * do.astype(jnp.float32)), out
+
+      (loss_ref, out_ref), grads_ref = jax.value_and_grad(
+          run_ref, argnums=tuple(range(6)), has_aux=True
+      )(
+          q.astype(jnp.float32),
+          k.astype(jnp.float32),
+          v.astype(jnp.float32),
+          g.astype(jnp.float32),
+          beta.astype(jnp.float32),
+          a_log,
+      )
+      (loss_mos, out_mos), grads_mos = jax.value_and_grad(
+          run_mos, argnums=tuple(range(6)), has_aux=True
+      )(q, k, v, g, beta, a_log)
+
+    self.assertEqual(out_mos.dtype, jnp.bfloat16)
+    self.assertLess(
+        float(jnp.max(jnp.abs(out_mos.astype(jnp.float32) - out_ref))), 5e-4
+    )
+    self.assertAlmostEqual(float(loss_mos), float(loss_ref), places=2)
+    for g_mos, g_ref in zip(grads_mos, grads_ref):
+      self.assertLess(
+          float(jnp.max(jnp.abs(g_mos.astype(jnp.float32) - g_ref))), 1e-3
+      )
+
+    # Also verify GDN packed bf16 + two_pass_bf16=True.
+    gdn_op = pallas_mosaic_tpu.PallasMosaicTpuGatedDeltaNet(
+        config=pallas_mosaic_tpu.Config(chunk_size=64, two_pass_bf16=True)
+    )
+    q_g = q.transpose(1, 2, 0, 3)
+    k_g = k.transpose(1, 2, 0, 3)
+    v_g = v.transpose(1, 2, 0, 3)
+    g_g = g[:, :, :, 0].transpose(1, 2, 0)
+    b_g = beta.transpose(1, 2, 0)
+    do_g = do.transpose(1, 2, 0, 3)
+
+    def gdn_mos(q_, k_, v_, g_, b_):
+      out, _ = gdn_op(
+          q_,
+          k_,
+          v_,
+          g_,
+          b_,
+          a_log=a_log,
+          use_qk_l2norm=True,
+          use_gate_in_kernel=True,
+          use_beta_sigmoid_in_kernel=True,
+          segment_ids=segment_ids,
+      )
+      return jnp.sum(out.astype(jnp.float32) * do_g.astype(jnp.float32)), out
+
+    def gdn_ref(q_, k_, v_, g_, b_):
+      out, _ = api.gated_delta_net(
+          q_,
+          k_,
+          v_,
+          g_,
+          b_,
+          a_log=a_log,
+          use_qk_l2norm=True,
+          use_gate_in_kernel=True,
+          use_beta_sigmoid_in_kernel=True,
+          segment_ids=segment_ids,
+          implementation="xla",
+      )
+      return jnp.sum(out * do_g.astype(jnp.float32)), out
+
+    (gl_ref, go_ref), gg_ref = jax.value_and_grad(
+        gdn_ref, argnums=tuple(range(5)), has_aux=True
+    )(
+        q_g.astype(jnp.float32),
+        k_g.astype(jnp.float32),
+        v_g.astype(jnp.float32),
+        g_g.astype(jnp.float32),
+        b_g.astype(jnp.float32),
+    )
+    (gl_mos, go_mos), gg_mos = jax.value_and_grad(
+        gdn_mos, argnums=tuple(range(5)), has_aux=True
+    )(q_g, k_g, v_g, g_g, b_g)
+    self.assertEqual(go_mos.dtype, jnp.bfloat16)
+    self.assertLess(
+        float(jnp.max(jnp.abs(go_mos.astype(jnp.float32) - go_ref))), 5e-4
+    )
+    self.assertAlmostEqual(float(gl_mos), float(gl_ref), places=2)
+    for gm, gr in zip(gg_mos, gg_ref):
+      self.assertLess(
+          float(jnp.max(jnp.abs(gm.astype(jnp.float32) - gr))), 1e-3
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -100,7 +100,29 @@ def kimi_delta_attention(
     use_conv1d_in_kernel: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
   """Computes KDA with an explicit token-by-token JAX recurrence."""
+  from tokamax._src.ops.kda.utils import canonicalize_packed_segment_ids  # pylint: disable=g-import-not-at-top
+
   q, k, v, g = query, key, value, gate
+  cp_enabled = context_parallel_metadata is not None and getattr(
+      context_parallel_metadata, "is_cp_enabled", False
+  )
+  use_rolling_packed = (
+      segment_ids is not None
+      and initial_state is None
+      and not output_final_state
+  )
+  num_states = _state_count(
+      segment_ids=segment_ids,
+      initial_state=initial_state,
+      max_num_segments=max_num_segments,
+  )
+  if use_rolling_packed and not cp_enabled:
+    assert segment_ids is not None
+    seg_clipped = jnp.where(
+        (segment_ids > 0) & (segment_ids <= num_states), segment_ids, 0
+    )
+    segment_ids, _, _ = canonicalize_packed_segment_ids(seg_clipped)
+
   if use_conv1d_in_kernel:
     assert (
         conv_weight_q is not None
@@ -113,6 +135,8 @@ def kimi_delta_attention(
       _, _, seq_len, _ = x_in.shape
       x_f32 = x_in.astype(jnp.float32)
       w_f32 = w_in.astype(jnp.float32)
+      if w_f32.shape[0] < x_f32.shape[0]:
+        w_f32 = jnp.repeat(w_f32, x_f32.shape[0] // w_f32.shape[0], axis=0)
       acc = x_f32 * w_f32[:, None, conv_width - 1 : conv_width, :]
       for lag in range(1, min(conv_width, seq_len)):
         x_lag = jnp.pad(
@@ -129,8 +153,14 @@ def kimi_delta_attention(
             + x_lag * w_f32[:, None, conv_width - 1 - lag : conv_width - lag, :]
         )
       if b_in is not None:
-        acc = acc + b_in.astype(jnp.float32)[:, None, None, :]
-      return jax.nn.silu(acc).astype(x_in.dtype)
+        b_f32 = b_in.astype(jnp.float32)
+        if b_f32.shape[0] < x_f32.shape[0]:
+          b_f32 = jnp.repeat(b_f32, x_f32.shape[0] // b_f32.shape[0], axis=0)
+        acc = acc + b_f32[:, None, None, :]
+      out = jax.nn.silu(acc)
+      if segment_ids is not None:
+        out = jnp.where((segment_ids > 0)[None, :, :, None], out, 0.0)
+      return out.astype(x_in.dtype)
 
     q = _ref_conv(q, conv_weight_q, conv_bias_q)
     k = _ref_conv(k, conv_weight_k, conv_bias_k)
@@ -158,9 +188,6 @@ def kimi_delta_attention(
   v_h = v.astype(acc_dtype)
   g_h = g.astype(acc_dtype)
   beta_h = beta.astype(acc_dtype)
-  cp_enabled = context_parallel_metadata is not None and getattr(
-      context_parallel_metadata, "is_cp_enabled", False
-  )
   if cp_enabled:
     assert context_parallel_metadata is not None
     axis_name = context_parallel_metadata.axis_name
@@ -181,74 +208,124 @@ def kimi_delta_attention(
     beta_h = gather_time_axis(beta_h, 2)
     if segment_ids is not None:
       segment_ids = gather_time_axis(segment_ids, 1)
+      if use_rolling_packed:
+        seg_clipped = jnp.where(
+            (segment_ids > 0) & (segment_ids <= num_states), segment_ids, 0
+        )
+        segment_ids, _, _ = canonicalize_packed_segment_ids(seg_clipped)
     _, _, seq_len, _ = q_h.shape
-
-  num_states = _state_count(
-      segment_ids=segment_ids,
-      initial_state=initial_state,
-      max_num_segments=max_num_segments,
-  )
-
-  states = jnp.zeros(
-      (batch, num_states, heads, key_dim, value_dim), dtype=acc_dtype
-  )
-  if initial_state is not None:
-    states = states + initial_state.astype(acc_dtype)
 
   output_h = jnp.zeros((heads, batch, seq_len, value_dim), dtype=acc_dtype)
 
-  def step_token(h, b, t, carry):
-    states, output_h = carry
-    if segment_ids is None:
-      state_idx = jnp.array(0, dtype=jnp.int32)
-      valid = jnp.array(True)
-    else:
-      seg_id = segment_ids[b, t].astype(jnp.int32)
-      state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
-      valid = (seg_id > 0) & (seg_id <= num_states)
-
-    previous_state = states[b, state_idx, h]
-    state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
-    prediction = k_h[h, b, t] @ state
-    residual = v_h[h, b, t] - prediction
-    new_state = state + (
-        beta_h[h, b, t] * k_h[h, b, t]
-    )[:, None] * residual[None, :]
-    out_t = q_h[h, b, t] @ new_state
-    output_h = output_h.at[h, b, t].set(
-        jnp.where(valid, out_t, jnp.zeros_like(out_t))
+  if use_rolling_packed:
+    states_rolling = jnp.zeros(
+        (batch, heads, key_dim, value_dim), dtype=acc_dtype
     )
-    updated_state = jnp.where(valid, new_state, previous_state)
-    states = states.at[b, state_idx, h].set(updated_state)
-    return states, output_h
 
-  def step_head(h, carry):
-    states, output_h = carry
+    def step_head_rolling(h, carry):
+      states_b, out_h = carry
 
-    def body_b(b, b_carry):
-      def body_t(t, t_carry):
-        return step_token(h, b, t, t_carry)
+      def body_b(b, b_carry):
+        state_cur = states_b[b, h]
+        prev_seg = jnp.int32(0)
 
-      return jax.lax.fori_loop(0, seq_len, body_t, b_carry)
+        def body_t(t, t_carry):
+          st, last_active_seg, out_arr = t_carry
+          assert segment_ids is not None
+          seg_id = segment_ids[b, t].astype(jnp.int32)
+          valid = seg_id > 0
+          reset = valid & (last_active_seg > 0) & (seg_id != last_active_seg)
+          next_active_seg = jnp.where(valid, seg_id, last_active_seg)
+          st_in = jnp.where(reset, jnp.zeros_like(st), st)
+          decayed = st_in * jnp.exp(g_h[h, b, t])[:, None]
+          pred = k_h[h, b, t] @ decayed
+          resid = v_h[h, b, t] - pred
+          new_st = decayed + (
+              beta_h[h, b, t] * k_h[h, b, t]
+          )[:, None] * resid[None, :]
+          out_t = q_h[h, b, t] @ new_st
+          out_arr = out_arr.at[h, b, t].set(
+              jnp.where(valid, out_t, jnp.zeros_like(out_t))
+          )
+          st_next = jnp.where(valid, new_st, st)
+          return st_next, next_active_seg, out_arr
+
+        final_st, _, out_h_b = jax.lax.fori_loop(
+            0, seq_len, body_t, (state_cur, prev_seg, b_carry[1])
+        )
+        return b_carry[0].at[b, h].set(final_st), out_h_b
+
+      return jax.lax.fori_loop(0, batch, body_b, (states_b, out_h))
+
+    if cp_enabled:
+      step_head_rolling = jax.checkpoint(
+          step_head_rolling,
+          prevent_cse=False,
+          policy=jax.checkpoint_policies.dots_saveable,
+      )
+    _, output_h = jax.lax.fori_loop(
+        0, heads, step_head_rolling, (states_rolling, output_h)
+    )
+    states = None
+  else:
+    states = jnp.zeros(
+        (batch, num_states, heads, key_dim, value_dim), dtype=acc_dtype
+    )
+    if initial_state is not None:
+      states = states + initial_state.astype(acc_dtype)
+
+    def step_token(h, b, t, carry):
+      states, output_h = carry
+      if segment_ids is None:
+        state_idx = jnp.array(0, dtype=jnp.int32)
+        valid = jnp.array(True)
+      else:
+        seg_id = segment_ids[b, t].astype(jnp.int32)
+        state_idx = jnp.clip(seg_id - 1, 0, num_states - 1)
+        valid = (seg_id > 0) & (seg_id <= num_states)
+
+      previous_state = states[b, state_idx, h]
+      state = previous_state * jnp.exp(g_h[h, b, t])[:, None]
+      prediction = k_h[h, b, t] @ state
+      residual = v_h[h, b, t] - prediction
+      new_state = state + (
+          beta_h[h, b, t] * k_h[h, b, t]
+      )[:, None] * residual[None, :]
+      out_t = q_h[h, b, t] @ new_state
+      output_h = output_h.at[h, b, t].set(
+          jnp.where(valid, out_t, jnp.zeros_like(out_t))
+      )
+      updated_state = jnp.where(valid, new_state, previous_state)
+      states = states.at[b, state_idx, h].set(updated_state)
+      return states, output_h
+
+    def step_head(h, carry):
+      states, output_h = carry
+
+      def body_b(b, b_carry):
+        def body_t(t, t_carry):
+          return step_token(h, b, t, t_carry)
+
+        return jax.lax.fori_loop(0, seq_len, body_t, b_carry)
+
+      states, output_h = jax.lax.fori_loop(
+          0, batch, body_b, (states, output_h)
+      )
+      return states, output_h
+
+    if cp_enabled:
+      # Keep the native token-by-token recurrence, but rematerialize each
+      # head's large state intermediates during backward. Dot outputs are much
+      # smaller than the K x V states and are retained to limit recomputation.
+      step_head = jax.checkpoint(
+          step_head,
+          prevent_cse=False,
+          policy=jax.checkpoint_policies.dots_saveable,
+      )
 
     states, output_h = jax.lax.fori_loop(
-        0, batch, body_b, (states, output_h)
+        0, heads, step_head, (states, output_h)
     )
-    return states, output_h
-
-  if cp_enabled:
-    # Keep the native token-by-token recurrence, but rematerialize each
-    # head's large state intermediates during backward. Dot outputs are much
-    # smaller than the K x V states and are retained to limit recomputation.
-    step_head = jax.checkpoint(
-        step_head,
-        prevent_cse=False,
-        policy=jax.checkpoint_policies.dots_saveable,
-    )
-
-  states, output_h = jax.lax.fori_loop(
-      0, heads, step_head, (states, output_h)
-  )
 
   if cp_enabled:
     assert context_parallel_metadata is not None

@@ -129,7 +129,15 @@ def kimi_delta_attention(
       with a per-channel gate and powers of two in `[16, 512]` with a scalar
       gate. `"xla"` evaluates the recurrence token by token and ignores it.
     segment_ids: Optional 1-indexed varlen segment IDs, shape `[B, T]`. Padding
-      is represented by 0.
+      is represented by 0. On stateless calls (`initial_state is None` and
+      `not output_final_state`), `"mosaic"` and `"xla"` canonicalize arbitrary
+      spans in `[1, max_num_segments]` (`segment_ids <= 0` or
+      `> max_num_segments` are treated as padding that freezes state without
+      resetting, so `[5, 0, 5]` continues a span while `[1, 2, 1]` resets).
+      Stateful calls (`initial_state` or `output_final_state=True`) and
+      `"xla_chunked"` retain the contiguous `1..N` per-slot contract. Pass
+      `None` (rather than all-ones `segment_ids`) for unpacked sequences to
+      avoid packed-metadata canonicalization and in-kernel masking overhead.
     lower_bound: Optional sigmoid-gate lower bound.
     context_parallel_metadata: Optional context-parallel metadata. Construct it
       with `kda.ContextParallelMetadata(mesh, axis_name)`.
@@ -285,9 +293,11 @@ def gated_delta_net(
     use_beta_sigmoid_in_kernel: Whether to apply `sigmoid(beta)` inside the op.
     chunk_size: Chunk length for `"mosaic"`; defaults to None (autotuned, 64
       heuristic fallback).
-    segment_ids: Optional `[B, T]` document segment IDs (`0` for padding;
-      `segment_ids > 0` denote contiguous spans, so IDs must be unique per
-      contiguous span).
+    segment_ids: Optional `[B, T]` document segment IDs (`<= 0` for padding,
+      which freezes state without resetting so `[5, 0, 5]` continues and
+      `[1, 2, 1]` starts a new document). Pass `None` (rather than all-ones
+      `segment_ids`) for unpacked sequences to avoid packed-metadata
+      canonicalization and in-kernel masking overhead.
     context_parallel_metadata: Optional sequence context-parallel metadata.
     residual_checkpoint_name: Optional `jax.ad_checkpoint.checkpoint_name` tag
       applied to outputs and forward Pallas residuals for custom remat policies.

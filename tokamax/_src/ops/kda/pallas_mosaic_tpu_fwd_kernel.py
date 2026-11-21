@@ -42,7 +42,9 @@ from tokamax._src.ops.kda.pallas_mosaic_tpu_types import KdaResiduals
 from tokamax._src.ops.kda.utils import (
     _unalign_output,
     align_up,
+    canonicalize_packed_segment_ids,
     causal_conv1d_silu_fwd_bt,
+    compute_packed_chunk_metadata,
     exp2,
     get_chain_precision,
     get_interpret,
@@ -482,6 +484,7 @@ def _scalar_gate_intra(
     scale: float,
     gqa_repeats: int = 1,
     precision: jax.lax.Precision | None = None,
+    seg_tok: jax.Array | None = None,
 ):
   """Computes intra-chunk Aqk and L for a scalar gate (Gated Delta Net)."""
   gs = g_cumsum[:, :, 0]  # [MB, BT]
@@ -489,6 +492,12 @@ def _scalar_gate_intra(
   col = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
   causal = row >= col
   strict = row > col
+  if seg_tok is not None:
+    seg_r = jnp.broadcast_to(seg_tok[:, None], (BT, BT))
+    seg_c = jnp.broadcast_to(seg_tok[None, :], (BT, BT))
+    same_doc = (seg_r == seg_c) & (seg_r > 0)
+    causal = causal & same_doc
+    strict = strict & same_doc
 
   # Mask pairwise differences before exp2 to prevent overflow on anti-causal entries.
   diff = gs[:, :, None] - gs[:, None, :]  # [MB, BT, BT]
@@ -539,6 +548,9 @@ def _apply_causal_conv1d_silu(
     w_pad: jax.Array,
     bias: jax.Array,
     W: int,
+    *,
+    conv_lags_tok: jax.Array | None = None,
+    valid_f32: jax.Array | None = None,
 ) -> jax.Array:
   """Computes depthwise causal conv1d (W <= _CONV_HALO) + SiLU in fp32."""
   x_curr_f32 = x_curr.astype(jnp.float32)
@@ -550,9 +562,15 @@ def _apply_causal_conv1d_silu(
         [x_prev_f32[:, _CONV_HALO - lag :, :], x_curr_f32[:, :-lag, :]],
         axis=1,
     )
+    if conv_lags_tok is not None:
+      lag_f32 = ((conv_lags_tok >> lag) & 1).astype(jnp.float32)
+      x_lag = x_lag * lag_f32[None, :, None]
     acc = acc + x_lag * w_f32[:, _CONV_HALO - 1 - lag : _CONV_HALO - lag, :]
   acc = acc + bias.astype(jnp.float32)[:, None, :]
-  return jax.nn.silu(acc)
+  out = jax.nn.silu(acc)
+  if valid_f32 is not None:
+    out = out * valid_f32[None, :, None]
+  return out
 
 
 def _fused_gate_intra_kernel(
@@ -607,6 +625,7 @@ def _fused_gate_intra_kernel(
     conv_kernel_size: int = 4,
     store_akk: bool = True,
     two_pass_bf16: bool = False,
+    has_packed_meta: bool = False,
 ):
   """Fused Pallas kernel: gate activation + cumsum + Aqk/L + xor_dnc inversion.
 
@@ -647,10 +666,30 @@ def _fused_gate_intra_kernel(
         b_q_ref,
         b_k_ref,
         b_v_ref,
-        *out_refs,
+        *rem_refs,
     ) = conv_in_and_out_refs
   else:
-    out_refs = conv_in_and_out_refs
+    rem_refs = conv_in_and_out_refs
+
+  meta_ref = None
+  if has_packed_meta:
+    meta_ref = rem_refs[0]
+    out_refs = rem_refs[1:]
+  else:
+    out_refs = rem_refs
+
+  seg_tok = act_tok = valid_int = conv_lags_tok = None
+  valid_f32 = m_in_f32 = m_out_f32 = None
+  if has_packed_meta:
+    assert meta_ref is not None
+    meta_tile = meta_ref[0, 0, 0]  # [8, BT] int32
+    seg_tok = meta_tile[0]
+    act_tok = meta_tile[1]
+    m_in_f32 = meta_tile[2].astype(jnp.float32)
+    m_out_f32 = meta_tile[3].astype(jnp.float32)
+    valid_int = meta_tile[4]
+    valid_f32 = valid_int.astype(jnp.float32)
+    conv_lags_tok = meta_tile[5]
 
   # `qg` is not an output: it is not part of `KdaResiduals` and the backward
   # recomputes it. `Akk_inv_out_ref` is omitted when `store_akk=False`.
@@ -720,13 +759,31 @@ def _fused_gate_intra_kernel(
     b_v = b_v_ref[:, 0, 0, 0]  # [MB, V]
 
     q_silu = _apply_causal_conv1d_silu(
-        q_in, q_prev, w_q, b_q, conv_kernel_size
+        q_in,
+        q_prev,
+        w_q,
+        b_q,
+        conv_kernel_size,
+        conv_lags_tok=conv_lags_tok,
+        valid_f32=valid_f32,
     ).astype(dtype)
     k_silu = _apply_causal_conv1d_silu(
-        k_in, k_prev, w_k, b_k, conv_kernel_size
+        k_in,
+        k_prev,
+        w_k,
+        b_k,
+        conv_kernel_size,
+        conv_lags_tok=conv_lags_tok,
+        valid_f32=valid_f32,
     ).astype(dtype)
     v_silu = _apply_causal_conv1d_silu(
-        v_in, v_prev, w_v, b_v, conv_kernel_size
+        v_in,
+        v_prev,
+        w_v,
+        b_v,
+        conv_kernel_size,
+        conv_lags_tok=conv_lags_tok,
+        valid_f32=valid_f32,
     ).astype(dtype)
 
     q_rstd_val = k_rstd_val = None
@@ -766,6 +823,12 @@ def _fused_gate_intra_kernel(
         q_rstd_ref[:, 0, 0, 0] = q_rstd_val[..., 0]
         k_rstd_ref[:, 0, 0, 0] = k_rstd_val[..., 0]
   else:
+    if has_packed_meta:
+      assert valid_f32 is not None
+      valid_3d = valid_f32[None, :, None]
+      q_in = (q_in.astype(jnp.float32) * valid_3d).astype(dtype)
+      k_in = (k_in.astype(jnp.float32) * valid_3d).astype(dtype)
+      v_in = (v_in.astype(jnp.float32) * valid_3d).astype(dtype)
     if use_qk_l2norm:
       q_f32_s = q_in.astype(jnp.float32)
       k_f32_s = k_in.astype(jnp.float32)
@@ -793,6 +856,9 @@ def _fused_gate_intra_kernel(
 
   # --- Gate activation + cumsum ---
   g_f32 = g.astype(jnp.float32)
+  if has_packed_meta:
+    assert valid_f32 is not None
+    g_f32 = g_f32 * valid_f32[None, :, None]
 
   if use_gate_in_kernel:
     dt_b = delta_time_bias_ref[:, 0, 0, 0]        # [MB, GW]
@@ -804,11 +870,24 @@ def _fused_gate_intra_kernel(
       g_f32 = lower_bound * jax.nn.sigmoid(
         jnp.exp(A_val)[:, None, None] * g_f32
       )
+    if has_packed_meta:
+      assert valid_f32 is not None
+      g_f32 = g_f32 * valid_f32[None, :, None]
 
   if fuse_cumsum:
+    same_span_bt = None
+    if has_packed_meta:
+      assert act_tok is not None
+      act_r = jnp.broadcast_to(act_tok[:, None], (BT, BT))
+      act_c = jnp.broadcast_to(act_tok[None, :], (BT, BT))
+      same_span_bt = act_r == act_c
     if g_f32.shape[-1] == 1:
-      idx_g = jnp.arange(BT, dtype=jnp.int32)
-      _fwd_mask = (idx_g[:, None] <= idx_g[None, :]).astype(jnp.float32)
+      row_g = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+      col_g = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+      _fwd_mask_b = row_g <= col_g
+      if same_span_bt is not None:
+        _fwd_mask_b = _fwd_mask_b & same_span_bt
+      _fwd_mask = _fwd_mask_b.astype(jnp.float32)
       g_cumsum = (
           jnp.matmul(
               g_f32[..., 0],
@@ -819,7 +898,12 @@ def _fused_gate_intra_kernel(
           * cumsum_scale
       )
     else:
-      tril = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
+      row_g = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+      col_g = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+      tril_b = row_g >= col_g
+      if same_span_bt is not None:
+        tril_b = tril_b & same_span_bt
+      tril = tril_b.astype(jnp.float32)
       # tril[BT,BT] @ g_f32[MB,BT,K] → [MB,BT,K]: contract on BT, batch on MB
       g_cumsum = jax.lax.dot_general(
         tril, g_f32, (((1,), (1,)), ((), ())),
@@ -837,6 +921,9 @@ def _fused_gate_intra_kernel(
     q_f32 = q_f32_qk
     k_f32 = k_f32_qk
   beta_f32 = beta.astype(jnp.float32)
+  if has_packed_meta:
+    assert valid_f32 is not None
+    beta_f32 = beta_f32 * valid_f32[None, :, None]
 
   # --- BC=16 sub-block factored Aqk/L (fla safe-gate style, j-batched) ---
   # Per i_sc, batch the j_sc loop into a single (MB, 2*BC, K) x (MB, BT, K) matmul:
@@ -864,6 +951,37 @@ def _fused_gate_intra_kernel(
   else:
     solve_prec = jax.lax.Precision.DEFAULT
 
+  gn_ref_all = None
+  seg_bt_k = None
+  same_doc_bt = None
+  bt_1d = None
+  if per_channel_gate and has_packed_meta:
+    assert (
+        seg_tok is not None
+        and act_tok is not None
+        and valid_int is not None
+    )
+    bt_1d = jnp.arange(BT, dtype=jnp.int32)
+    bt_row = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+    bt_col = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+    seg_r = jnp.broadcast_to(seg_tok[:, None], (BT, BT))
+    seg_c = jnp.broadcast_to(seg_tok[None, :], (BT, BT))
+    same_doc_bt = (seg_r == seg_c) & (seg_r > 0)
+    same_blk_doc = ((bt_row // BC) == (bt_col // BC)) & same_doc_bt
+    first_t = jnp.min(jnp.where(same_blk_doc, bt_col, BT), axis=1)
+    last_t = jnp.max(jnp.where(same_blk_doc, bt_col, 0), axis=1)
+    ref_t = (first_t + last_t) // 2 if safe_gate else first_t
+    ref_t = valid_int * ref_t + (1 - valid_int) * bt_1d
+    ref_r = jnp.broadcast_to(ref_t[:, None], (BT, BT))
+    pick_ref_bt = (bt_col == ref_r).astype(jnp.float32)
+    gn_ref_all = jax.lax.dot_general(
+        pick_ref_bt,
+        g_cumsum,
+        (((1,), (1,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ).transpose(1, 0, 2)  # [MB, BT, K]
+    seg_bt_k = jnp.broadcast_to(seg_tok[:, None], (BT, K))
   Aqk_rows = []
   L_rows = []
   for i_sc in range(NC) if per_channel_gate else ():
@@ -873,18 +991,72 @@ def _fused_gate_intra_kernel(
     g_i = g_cumsum[:, i_s : i_s + BC]    # [MB, BC, K]
     beta_i = beta_f32[:, i_s : i_s + BC]  # [MB, BC, 1]
 
-    gn_ref = g_i[:, ref_idx : ref_idx + 1, :]   # [MB, 1, K] — query sub-block ref
-    diff_i = g_i - gn_ref                        # [MB, BC, K], <= 0
-    exp_diff_i = jnp.exp2(diff_i)
-    q_eg = q_i * exp_diff_i     # [MB, BC, K]
-    k_eg = k_i * exp_diff_i     # [MB, BC, K]
+    if has_packed_meta:
+      assert (
+          gn_ref_all is not None
+          and seg_bt_k is not None
+          and same_doc_bt is not None
+          and bt_1d is not None
+          and seg_tok is not None
+          and act_tok is not None
+      )
+      gn_ref_i = gn_ref_all[:, i_s : i_s + BC]  # [MB, BC, K]
+      valid_i = seg_bt_k[i_s : i_s + BC] > 0    # [BC, K]
+      diff_i = jnp.where(valid_i[None], g_i - gn_ref_i, 0.0)
+      exp_diff_i = jnp.where(valid_i[None], jnp.exp2(diff_i), 0.0)
+      q_eg = q_i * exp_diff_i
+      k_eg = k_i * exp_diff_i
 
-    # j-side: full BT rows. Mask anti-causal rows BEFORE exp2 (avoids
-    # overflow when gn_ref - g_cumsum[t] is large positive). The 2D mask
-    # is built from broadcasted_iota to bypass the i1 reshape limitation.
-    valid_j = (row_iota_bt_k < (i_s + BC)).astype(jnp.float32)   # [BT, K]
-    diff_j_safe = (gn_ref - g_cumsum) * valid_j[None]              # [MB, BT, K]
-    k_eng_full = k_f32 * jnp.exp2(diff_j_safe) * valid_j[None]    # [MB, BT, K]
+      in_diag_k = (row_iota_bt_k >= i_s) & (row_iota_bt_k < i_s + BC)
+      valid_diag_j = in_diag_k & (seg_bt_k > 0)
+      if i_sc > 0:
+        d_prev = jnp.sum(act_tok * (bt_1d == (i_s - 1)).astype(jnp.int32))
+        is_dprev_1d = (
+            (bt_1d >= i_s).astype(jnp.int32)
+            * (bt_1d < i_s + BC).astype(jnp.int32)
+            * (seg_tok == d_prev).astype(jnp.int32)
+            * (d_prev > 0).astype(jnp.int32)
+        )
+        any_dprev_i = jnp.max(is_dprev_1d)
+        t0 = jnp.minimum(
+            jnp.min(is_dprev_1d * bt_1d + (1 - is_dprev_1d) * BT), BT - 1
+        )
+        pick_t0 = (row_iota_bt_k == t0).astype(jnp.float32)
+        gn_dprev = jnp.sum(
+            gn_ref_all * pick_t0[None], axis=1, keepdims=True
+        )  # [MB, 1, K]
+        d_prev_2d = jnp.broadcast_to(d_prev, (BT, K))
+        any_dprev_2d = jnp.broadcast_to(any_dprev_i, (BT, K))
+        valid_pre_j = (
+            (row_iota_bt_k < i_s)
+            & (seg_bt_k == d_prev_2d)
+            & (d_prev_2d > 0)
+            & (any_dprev_2d > 0)
+        )
+        valid_j_b = valid_pre_j | valid_diag_j
+        gn_ref_j = jnp.where(
+            (row_iota_bt_k < i_s)[None], gn_dprev, gn_ref_all
+        )
+      else:
+        valid_j_b = valid_diag_j
+        gn_ref_j = gn_ref_all
+      diff_j_safe = jnp.where(valid_j_b[None], gn_ref_j - g_cumsum, 0.0)
+      k_eng_full = jnp.where(
+          valid_j_b[None], k_f32 * jnp.exp2(diff_j_safe), 0.0
+      )
+    else:
+      gn_ref = g_i[:, ref_idx : ref_idx + 1, :]   # [MB, 1, K] — query sub-block ref
+      diff_i = g_i - gn_ref                        # [MB, BC, K], <= 0
+      exp_diff_i = jnp.exp2(diff_i)
+      q_eg = q_i * exp_diff_i     # [MB, BC, K]
+      k_eg = k_i * exp_diff_i     # [MB, BC, K]
+
+      # j-side: full BT rows. Mask anti-causal rows BEFORE exp2 (avoids
+      # overflow when gn_ref - g_cumsum[t] is large positive). The 2D mask
+      # is built from broadcasted_iota to bypass the i1 reshape limitation.
+      valid_j = (row_iota_bt_k < (i_s + BC)).astype(jnp.float32)   # [BT, K]
+      diff_j_safe = (gn_ref - g_cumsum) * valid_j[None]              # [MB, BT, K]
+      k_eng_full = k_f32 * jnp.exp2(diff_j_safe) * valid_j[None]    # [MB, BT, K]
 
     # Stack q_eg / k_eg and do one matmul: [MB, 2*BC, K] x [MB, K, BT] -> [MB, 2*BC, BT]
     qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)  # [MB, 2*BC, K]
@@ -904,6 +1076,11 @@ def _fused_gate_intra_kernel(
     strict_diag = row_iota_bc_bt > col_local                           # [BC, BT]
     aqk_keep = (~in_diag) | causal_diag
     akk_keep = (~in_diag) | strict_diag
+    if has_packed_meta:
+      assert same_doc_bt is not None
+      same_row = same_doc_bt[i_s : i_s + BC] & (col_iota_bc_bt < i_s + BC)
+      aqk_keep = aqk_keep & same_row
+      akk_keep = akk_keep & same_row
     Aqk_row = jnp.where(aqk_keep[None], Aqk_row, jnp.float32(0.0))
     Akk_row = jnp.where(akk_keep[None], Akk_row, jnp.float32(0.0))
 
@@ -923,13 +1100,19 @@ def _fused_gate_intra_kernel(
         scale=scale,
         gqa_repeats=gqa_repeats,
         precision=solve_prec if dtype == jnp.float32 else None,
+        seg_tok=seg_tok,
     )
     if gqa_repeats > 1:
       k_f32 = jnp.repeat(k_f32_qk, gqa_repeats, axis=0)
 
   # --- Solve (I + L) x = rhs via vectorized block-doubling (`xor_dnc`) ---
   v_beta = v.astype(jnp.float32) * beta_f32          # [MB, BT, V]
-  k_eg_beta = k_f32 * jnp.exp2(g_cumsum) * beta_f32  # [MB, BT, K]
+  if has_packed_meta:
+    assert m_in_f32 is not None
+    m_in_3d = m_in_f32[None, :, None]
+    k_eg_beta = m_in_3d * k_f32 * jnp.exp2(m_in_3d * g_cumsum) * beta_f32
+  else:
+    k_eg_beta = k_f32 * jnp.exp2(g_cumsum) * beta_f32  # [MB, BT, K]
   rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)  # [MB, BT, V+K]
 
   A_inv = tri_inv_xor_dnc(
@@ -950,7 +1133,12 @@ def _fused_gate_intra_kernel(
 
   # --- kg ---
   g_last = g_cumsum[:, BT - 1 : BT, :]  # [MB, 1, K]
-  kg = k_f32 * exp2(g_last - g_cumsum)
+  if has_packed_meta:
+    assert m_out_f32 is not None
+    m_out_3d = m_out_f32[None, :, None]
+    kg = m_out_3d * k_f32 * exp2(m_out_3d * (g_last - g_cumsum))
+  else:
+    kg = k_f32 * exp2(g_last - g_cumsum)
 
   # --- Store all MB heads ---
   u_out_ref[:, 0, 0] = u.astype(u_out_ref.dtype)
@@ -1064,6 +1252,7 @@ def pallas_kda_fwd_intra_fused(
     write_q_norm: bool = False,
     store_akk: bool = True,
     two_pass_bf16: bool = False,
+    packed_tok_meta: Int[Array, "B NC 8 BT"] | None = None,
 ) -> tuple[
     Float[Array, "H B T K"],
     Float[Array, "H B T V"],
@@ -1401,6 +1590,18 @@ def pallas_kda_fwd_intra_fused(
     out_shape.append(jax.ShapeDtypeStruct((H_QK, B, NC, BT, K), act_dtype))
     out_specs.append(_make_qk_spec(K))
 
+  has_packed_meta = packed_tok_meta is not None
+  if has_packed_meta:
+    assert packed_tok_meta is not None
+    meta_r = packed_tok_meta[None, ...]  # [1, B, NC, 8, BT]
+    in_args.append(meta_r)
+    in_specs.append(
+        pl.BlockSpec(
+            index_map=lambda i, j, l: (0, j, l, 0, 0),
+            block_shape=(1, 1, 1, 8, BT),
+        )
+    )
+
   total_chunks = H * B * NC
   tri_inv_matmuls = max(0, 2 * int(math.log2(BT)) - 3) + (
       2 if two_pass_bf16 and act_dtype == jnp.bfloat16 else 0
@@ -1452,6 +1653,7 @@ def pallas_kda_fwd_intra_fused(
           conv_kernel_size=conv_kernel_size,
           store_akk=store_akk,
           two_pass_bf16=two_pass_bf16,
+          has_packed_meta=has_packed_meta,
       ),
       interpret=get_interpret(),
       out_shape=out_shape,
@@ -1546,6 +1748,7 @@ def kda_fwd_intra_fused(
     write_q_norm: bool = False,
     store_akk: bool = True,
     two_pass_bf16: bool = False,
+    packed_tok_meta: jax.Array | None = None,
 ):
   """Fused gate cumsum + intra-chunk solve entry.
 
@@ -1608,6 +1811,7 @@ def kda_fwd_intra_fused(
       write_q_norm=write_q_norm,
       store_akk=store_akk,
       two_pass_bf16=two_pass_bf16,
+      packed_tok_meta=packed_tok_meta,
   )
 
 
@@ -1619,24 +1823,7 @@ def kda_fwd_intra_fused(
 def _chunk_kda_fwd_h_o_varlen_kernel(
     seqlens_ref,  # scalar prefetch: cu_seqlens [N+1]
     chunk_to_seq_ref,  # scalar prefetch: chunk -> seq mapping [NT]
-    # Stage 3 inputs
-    w_ref,  # [MB, 1, BT, K_PADSIZE]
-    u_ref,  # [MB, 1, BT, V_ALIGNED]
-    kg_ref,  # [MB, 1, BT, K_PADSIZE]
-    gk_ref,  # [MB, 1, BT, K_PADSIZE]  -- g_cumsum; [MB, 1, BT, 1] scalar gate
-    # Stage 4 inputs
-    q_ref,  # [MB, 1, BT, K_PADSIZE]
-    A_ref,  # [MB, 1, BT, BT]
-    # Optional initial state
-    h0_ref,  # [1, MB, K_PADSIZE, V_ALIGNED] or None
-    # Outputs
-    o_ref,  # [MB, 1, BT, V_ALIGNED]
-    ht_ref,  # [1, MB, K_PADSIZE, V_ALIGNED] or None
-    h_out_ref,  # [MB, 1, 1, K_PADSIZE, V_ALIGNED] or None  -- per-chunk pre-update h
-    v_new_out_ref,  # [MB, 1, BT, V_ALIGNED] or None         -- per-token v_new
-    # Scratch
-    scratch_ref,  # [MB, K_PADSIZE, V_ALIGNED]
-    *,
+    *in_out_scratch_refs,
     BT,
     scale,
     USE_INITIAL_STATE,
@@ -1647,6 +1834,7 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     GQA_REPEATS,
     NATIVE_OUT_LAYOUT,
     OUTPUT_PRECISION,
+    HAS_PACKED_META=False,
 ):
   """Fused Stage 3+4 Pallas kernel body for varlen with H-dim mini-batch.
 
@@ -1659,6 +1847,41 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     - At t0 == bos: init scratch (h0 or zeros) for this sequence
     - At t0 + BT >= eos: store final state for this sequence
   """
+  if HAS_PACKED_META:
+    (
+        keep_ref,
+        w_ref,
+        u_ref,
+        kg_ref,
+        gk_ref,
+        q_ref,
+        A_ref,
+        h0_ref,
+        meta_ref,
+        o_ref,
+        ht_ref,
+        h_out_ref,
+        v_new_out_ref,
+        scratch_ref,
+    ) = in_out_scratch_refs
+  else:
+    keep_ref = None
+    meta_ref = None
+    (
+        w_ref,
+        u_ref,
+        kg_ref,
+        gk_ref,
+        q_ref,
+        A_ref,
+        h0_ref,
+        o_ref,
+        ht_ref,
+        h_out_ref,
+        v_new_out_ref,
+        scratch_ref,
+    ) = in_out_scratch_refs
+
   i_b = pl.program_id(1)
   i_c = pl.program_id(2)
   seq_idx = chunk_to_seq_ref[i_b, i_c]
@@ -1669,6 +1892,14 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
 
   K = w_ref.shape[-1]
   V = u_ref.shape[-1]
+
+  seg_tok = m_in_f32 = valid_f32 = None
+  if HAS_PACKED_META:
+    assert meta_ref is not None
+    meta_tile = meta_ref[0, 0, 0]  # [8, BT] int32
+    seg_tok = meta_tile[0]
+    m_in_f32 = meta_tile[2].astype(jnp.float32)
+    valid_f32 = meta_tile[4].astype(jnp.float32)
 
   # === Init state (first chunk of THIS sequence) — uniform across all MB heads ===
   @pl.when(t0 == bos)
@@ -1700,6 +1931,9 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
       precision=get_chain_precision(),
       preferred_element_type=jnp.float32,
   )  # [MB, BT, V]
+  if HAS_PACKED_META:
+    assert valid_f32 is not None
+    b_v_new = b_v_new * valid_f32[None, :, None]
 
   # Spill v_new (used by bwd Stage 0 when disable_recompute=True).
   if STORE_V_NEW:
@@ -1715,16 +1949,22 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   b_A = A_ref[:,0,:]                               # [MB, BT, BT]
 
   b_g_ref_row = b_g[:, 0:1, :]                # [MB, 1, K]
-  b_qg = b_q.astype(jnp.float32) * jnp.exp2(
-    jnp.maximum(b_g - b_g_ref_row, -126.0)
-  )                                            # [MB, BT, K]
+  if HAS_PACKED_META:
+    assert m_in_f32 is not None
+    m_in_3d = m_in_f32[None, :, None]
+    diff_qg = m_in_3d * jnp.maximum(b_g - b_g_ref_row, -126.0)
+    b_qg = m_in_3d * b_q.astype(jnp.float32) * jnp.exp2(diff_qg)
+  else:
+    b_qg = b_q.astype(jnp.float32) * jnp.exp2(
+      jnp.maximum(b_g - b_g_ref_row, -126.0)
+    )                                            # [MB, BT, K]
   b_h_scaled = b_h * jnp.exp2(
     jnp.maximum(b_g_ref_row[:, 0, :], -126.0)
   )[:, :, None]                                # [MB, K, V]
 
   # [MB, BT, K] @ [MB, K, V] -> [MB, BT, V]
   # Output-only GEMM: bf16 inputs use DEFAULT (no extra precision to preserve),
-  # fp32 inputs use HIGHEST to maintain full mantissa fidelity.
+  # fp32 inputs use DEFAULT/HIGHEST to maintain full mantissa fidelity.
   b_o = jnp.matmul(
     b_qg, b_h_scaled,
     precision=OUTPUT_PRECISION,
@@ -1735,7 +1975,15 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # Apply lower-triangular mask: Aqk is causal by construction, but masking
   # here matches the original per-head loop behaviour and guards against
   # any tiny upper-triangle fp noise from the intra-chunk solve.
-  m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]  # [BT, BT]
+  row_s = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=0)
+  col_s = jax.lax.broadcasted_iota(jnp.int32, (BT, BT), dimension=1)
+  m_s = row_s >= col_s
+  if HAS_PACKED_META:
+    assert seg_tok is not None
+    seg_r = jnp.broadcast_to(seg_tok[:, None], (BT, BT))
+    seg_c = jnp.broadcast_to(seg_tok[None, :], (BT, BT))
+    same_doc = (seg_r == seg_c) & (seg_r > 0)
+    m_s = m_s & same_doc
   b_A_f32 = jnp.where(m_s[None, :, :], b_A.astype(jnp.float32), 0.0)
   # [MB, BT, BT] @ [MB, BT, V] -> [MB, BT, V]
   b_o = b_o + jnp.matmul(
@@ -1743,6 +1991,9 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
     precision=OUTPUT_PRECISION,
     preferred_element_type=jnp.float32,
   )                                            # [MB, BT, V]
+  if HAS_PACKED_META:
+    assert valid_f32 is not None
+    b_o = b_o * valid_f32[None, :, None]
 
   if NATIVE_OUT_LAYOUT:
     b_o_cast = b_o.astype(o_ref.dtype)
@@ -1756,7 +2007,14 @@ def _chunk_kda_fwd_h_o_varlen_kernel(
   # On the serial chain: accumulates directly into the recursive hidden state,
   # so its precision comes from `get_chain_precision` (HIGHEST by default).
   b_gk_last = gk_ref[:,0,:][:, BT - 1, :].astype(jnp.float32)  # [MB, K]
-  b_h_new = b_h * jnp.exp2(b_gk_last)[:, :, None]          # [MB, K, V] decay
+  if HAS_PACKED_META:
+    assert keep_ref is not None
+    keep_f32 = keep_ref[i_b, i_c].astype(jnp.float32)
+    b_h_new = keep_f32 * (
+        b_h * jnp.exp2(keep_f32 * b_gk_last)[:, :, None]
+    )
+  else:
+    b_h_new = b_h * jnp.exp2(b_gk_last)[:, :, None]          # [MB, K, V] decay
 
   b_kg = kg_ref[:,0,:]   # [MB, BT, K]
   # [MB, K, BT] @ [MB, BT, V] -> [MB, K, V]
@@ -1809,6 +2067,8 @@ def chunk_kda_fwd_h_o_varlen(
     mini_batch: int | None = None,
     native_out_layout: bool = False,
     two_pass_bf16: bool = False,
+    packed_tok_meta: Int[Array, "B NT 8 BT"] | None = None,
+    packed_chunk_keep: Int[Array, "B NT"] | None = None,
 ) -> tuple[
     Float[Array, "..."],
     Float[Array, "B N H K V"] | None,
@@ -1925,12 +2185,12 @@ def chunk_kda_fwd_h_o_varlen(
     h0 = None
 
   # Index maps with MB heads per grid point. Scalar prefetch order:
-  # (seqlens_ref, chunk_to_seq_ref).
+  # (seqlens_ref, chunk_to_seq_ref[, keep_ref]).
   # Inputs are [H, B, T_alloc, X]; BlockSpec slices MB heads at h*MB.
-  def _t_index_map(h, b, c, seqlens_ref, chunk_to_seq_ref):
+  def _t_index_map(h, b, c, *_):
     return (h, b, c, 0)
 
-  def _A_index_map(h, b, c, seqlens_ref, chunk_to_seq_ref):
+  def _A_index_map(h, b, c, *_):
     return (h, b, c, 0)
 
   bspec_k = pl.BlockSpec([MB, 1, BT, K_PADSIZE], index_map=_t_index_map)
@@ -1944,7 +2204,7 @@ def chunk_kda_fwd_h_o_varlen(
   bspec_h0 = (
     pl.BlockSpec(
       [1, 1, MB, K_PADSIZE, V_ALIGNED],
-      index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (
+      index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref, *_: (
         b, chunk_to_seq_ref[b, c], h, 0, 0
       ),
     )
@@ -1956,7 +2216,7 @@ def chunk_kda_fwd_h_o_varlen(
     assert V == V_ALIGNED, f"native_out_layout requires aligned V={V}"
     o_spec = pl.BlockSpec(
         [1, BT, MB * V],
-        index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (b, c, h),
+        index_map=lambda h, b, c, *_: (b, c, h),
     )
     o_shape = jax.ShapeDtypeStruct([B, T_alloc, H * V], q.dtype)
   else:
@@ -1965,7 +2225,7 @@ def chunk_kda_fwd_h_o_varlen(
   ht_spec = (
     pl.BlockSpec(
       [1, 1, MB, K_PADSIZE, V_ALIGNED],
-      index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (
+      index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref, *_: (
         b, chunk_to_seq_ref[b, c], h, 0, 0
       ),
     )
@@ -1976,7 +2236,7 @@ def chunk_kda_fwd_h_o_varlen(
   h_out_spec = (
     pl.BlockSpec(
       [MB, 1, 1, K_PADSIZE, V_ALIGNED],
-      index_map=lambda h, b, c, seqlens_ref, chunk_to_seq_ref: (
+      index_map=lambda h, b, c, *_: (
         h, b, c, 0, 0
       ),
     )
@@ -2018,6 +2278,39 @@ def chunk_kda_fwd_h_o_varlen(
   else:
     _output_prec = jax.lax.Precision.DEFAULT
 
+  has_packed_meta = packed_tok_meta is not None
+  if (packed_tok_meta is None) != (packed_chunk_keep is None):
+    raise ValueError(
+        "packed_tok_meta and packed_chunk_keep must be both provided or both"
+        " None."
+    )
+  in_specs_h_o = [
+      bspec_k,  # w
+      bspec_v,  # u
+      bspec_k,  # kg
+      bspec_gk,  # gk
+      bspec_q,  # q
+      bspec_a,  # A
+      bspec_h0,  # h0
+  ]
+  call_args_h_o: list[jax.Array | None] = [
+      cu_seqlens.astype(jnp.int32),
+      chunk_to_seq,
+  ]
+  if has_packed_meta:
+    assert packed_tok_meta is not None and packed_chunk_keep is not None
+    call_args_h_o.append(packed_chunk_keep.astype(jnp.int32))
+    in_specs_h_o.append(
+        pl.BlockSpec(
+            [1, 1, 1, 8, BT],
+            index_map=lambda h, b, c, *_: (0, b, c, 0, 0),
+        )
+    )
+  call_args_h_o.extend([w_t, u_t, kg_t, gk_t, q_t, A_t, h0])
+  if has_packed_meta:
+    assert packed_tok_meta is not None
+    call_args_h_o.append(packed_tok_meta[None, ...])
+
   total_h_o_chunks = H * B * NT
   h_o_flops = total_h_o_chunks * (6 * BT * K * V + 2 * BT * BT * V)
   h_o_transcendentals = total_h_o_chunks * (BT + 1) * GW
@@ -2051,19 +2344,12 @@ def chunk_kda_fwd_h_o_varlen(
           GQA_REPEATS=gqa_repeats,
           NATIVE_OUT_LAYOUT=native_out_layout,
           OUTPUT_PRECISION=_output_prec,
+          HAS_PACKED_META=has_packed_meta,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
+          num_scalar_prefetch=3 if has_packed_meta else 2,
           grid=grid,
-          in_specs=[
-              bspec_k,  # w
-              bspec_v,  # u
-              bspec_k,  # kg
-              bspec_gk,  # gk
-              bspec_q,  # q
-              bspec_a,  # A
-              bspec_h0,  # h0
-          ],
+          in_specs=in_specs_h_o,
           out_specs=[o_spec, ht_spec, h_out_spec, v_new_out_spec],
           scratch_shapes=[scratch],
       ),
@@ -2074,17 +2360,7 @@ def chunk_kda_fwd_h_o_varlen(
       out_shape=[o_shape, ht_shape, h_out_shape, v_new_out_shape],
       cost_estimate=h_o_cost_estimate,
       interpret=interpret,
-  )(
-      cu_seqlens.astype(jnp.int32),
-      chunk_to_seq,
-      w_t,
-      u_t,
-      kg_t,
-      gk_t,
-      q_t,
-      A_t,
-      h0,
-  )
+  )(*call_args_h_o)
 
   if native_out_layout:
     o_out = o_out.reshape(B, T_alloc, H, V)
@@ -2206,6 +2482,25 @@ def chunk_kda_fwd_custom(
       raise ValueError("Enabled CP context is missing derived rank metadata.")
 
   _is_varlen = cu_seqlens is not None
+  packed_tok_meta = None
+  packed_chunk_keep = None
+  if (
+      segment_ids is not None
+      and not _is_varlen
+      and aligned_segment_ids is None
+      and not _cp_active
+  ):
+    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+        segment_ids
+    )
+    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+        seg_canon,
+        act_doc,
+        is_new_doc,
+        BT,
+        has_initial_state=(initial_state is not None),
+    )
+
   # ------------------------------------------------------------------
   # Step 1 + 2 (Fused): Gate cumsum + Intra-chunk solve
   # ------------------------------------------------------------------
@@ -2254,6 +2549,7 @@ def chunk_kda_fwd_custom(
       mini_batch=mini_batch,
       store_akk=return_residuals,
       two_pass_bf16=two_pass_bf16,
+      packed_tok_meta=packed_tok_meta,
   )
   if use_conv1d_in_kernel:
     assert q_norm is not None
@@ -2345,6 +2641,8 @@ def chunk_kda_fwd_custom(
       store_v_new=disable_recompute,
       mini_batch=mini_batch,
       two_pass_bf16=two_pass_bf16,
+      packed_tok_meta=packed_tok_meta,
+      packed_chunk_keep=packed_chunk_keep,
   )
   if not _is_varlen and final_state is not None:
     final_state = final_state[:, 0]
@@ -2540,8 +2838,25 @@ def chunk_gdn_fwd_custom(
   else:
     beta_act = beta_hbt
 
+  packed_tok_meta = None
+  packed_chunk_keep = None
+  if segment_ids is not None:
+    seg_canon, act_doc, is_new_doc = canonicalize_packed_segment_ids(
+        segment_ids
+    )
+    packed_tok_meta, packed_chunk_keep = compute_packed_chunk_metadata(
+        seg_canon,
+        act_doc,
+        is_new_doc,
+        BT,
+        has_initial_state=(initial_state is not None),
+    )
+
   need_q_from_intra = (
-      use_qk_l2norm or qkv_conv_intra is not None or native_bt_qkv
+      use_qk_l2norm
+      or qkv_conv_intra is not None
+      or native_bt_qkv
+      or segment_ids is not None
   )
   store_akk = save_for_backward and BT < 128
   (
@@ -2584,6 +2899,7 @@ def chunk_gdn_fwd_custom(
       write_q_norm=need_q_from_intra,
       store_akk=store_akk,
       two_pass_bf16=two_pass_bf16,
+      packed_tok_meta=packed_tok_meta,
   )
   if not need_q_from_intra:
     q_stage34 = q_intra
@@ -2621,6 +2937,8 @@ def chunk_gdn_fwd_custom(
       mini_batch=mini_batch,
       native_out_layout=can_native_out,
       two_pass_bf16=two_pass_bf16,
+      packed_tok_meta=packed_tok_meta,
+      packed_chunk_keep=packed_chunk_keep,
   )
   if final_state is not None:
     final_state = final_state[:, 0]

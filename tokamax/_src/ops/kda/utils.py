@@ -24,7 +24,7 @@ import os
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
+from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import config
 from tokamax._src import jaxtyping
 from tokamax._src.ops.kda.cp_utils import (
@@ -90,6 +90,153 @@ def l2norm_bwd(y: jax.Array, rstd: jax.Array, dy: jax.Array):
   return dx.astype(y.dtype)
 
 
+def canonicalize_packed_segment_ids(
+    segment_ids: jax.Array,
+    prev_active_seg: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Maps `[B, T]` raw segment IDs to monotonically increasing span IDs.
+
+  Tokens with `segment_ids <= 0` are treated as padding (`canonical_seg = 0`)
+  that freeze recurrent state without resetting it, so `[5, 0, 5]` continues
+  the same document (`canonical_seg = [1, 0, 1]`, `active_doc_id = [1, 1, 1]`)
+  whereas reused non-adjacent IDs `[1, 2, 1]` start a fresh document
+  (`canonical_seg = [1, 2, 3]`).
+
+  Args:
+    segment_ids: Integer `[B, T]` segment IDs (`> 0` active, `<= 0` padding).
+    prev_active_seg: Optional `[B]` raw active segment ID carried from a
+      preceding shard (`0` when no prior active document exists).
+
+  Returns:
+    `(canonical_seg, active_doc_id, is_new_doc)` each of shape `[B, T]` int32 /
+    bool.
+  """
+  seg = jnp.maximum(segment_ids.astype(jnp.int32), 0)
+  batch = seg.shape[0]
+  if prev_active_seg is None:
+    init_raw = jnp.zeros((batch, 1), dtype=jnp.int32)
+  else:
+    init_raw = jnp.maximum(
+        jnp.asarray(prev_active_seg, dtype=jnp.int32).reshape(batch, 1), 0
+    )
+  seg_ext = jnp.concatenate([init_raw, seg], axis=1)
+
+  def _prop_fn(lhs, rhs):
+    l_has, l_val = lhs
+    r_has, r_val = rhs
+    return l_has | r_has, jnp.where(r_has, r_val, l_val)
+
+  _, last_raw_ext = jax.lax.associative_scan(
+      _prop_fn, (seg_ext > 0, seg_ext), axis=1
+  )
+  prev_raw = last_raw_ext[:, :-1]
+  is_new_doc = (seg > 0) & (seg != prev_raw)
+  active_doc_id = (init_raw > 0).astype(jnp.int32) + jnp.cumsum(
+      is_new_doc.astype(jnp.int32), axis=1
+  )
+  canonical_seg = jnp.where(seg > 0, active_doc_id, 0)
+  return canonical_seg, active_doc_id, is_new_doc
+
+
+def compute_packed_chunk_metadata(
+    canonical_seg: jax.Array,
+    active_doc_id: jax.Array,
+    is_new_doc: jax.Array,
+    chunk_size: int,
+    *,
+    has_initial_state: bool = False,
+    conv_halo_seg: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+  """Builds Mosaic-aligned per-chunk metadata `(packed_tok_meta, chunk_keep)`.
+
+  `packed_tok_meta` has shape `[B, NT, 8, BT]` (`int32`, one 8-sublane TPU tile
+  per chunk) with precomputed `0/1` sublanes so Pallas kernels never broadcast
+  or reshape `i1` masks across sublanes or lanes:
+    - `[:, :, 0, :]`: `canonical_seg` (`0` on padding, `>= 1` on valid tokens)
+    - `[:, :, 1, :]`: `act_eff` (propagated span ID for `same_span` cumsum)
+    - `[:, :, 2, :]`: `m_in` (`1` where token reads incoming chunk state `h`)
+    - `[:, :, 3, :]`: `m_out` (`1` where token updates outgoing chunk state)
+    - `[:, :, 4, :]`: `valid` (`1` where `canonical_seg > 0`, `0` on padding)
+    - `[:, :, 5, :]`: `sum_{lag=1..7} (same_lag << lag)` for depthwise `conv1d`
+      taps (`W <= 8`)
+    - `[:, :, 6:8, :]`: zero-padded sublanes for `(8, BT)` TPU register tiling.
+
+  Args:
+    canonical_seg: `[B, T]` canonicalized `int32` segment IDs (`0` on padding).
+    active_doc_id: `[B, T]` monotonically increasing active document IDs.
+    is_new_doc: `[B, T]` boolean mask marking the first token of each document.
+    chunk_size: Intra-chunk size `BT`.
+    has_initial_state: Whether `initial_state` feeds the first document.
+    conv_halo_seg: Optional `[B, halo_len]` canonical segment IDs preceding the
+      local sequence shard.
+
+  Returns:
+    `(packed_tok_meta, packed_chunk_keep)` where `packed_tok_meta` has shape
+    `[B, NT, 8, BT]` (`int32`) and `packed_chunk_keep` has shape `[B, NT]`
+    (`int32`, `1` when incoming chunk state carries through to `h_next`).
+  """
+  batch, seq_len = canonical_seg.shape
+  bt = chunk_size
+  if bt <= 0 or seq_len % bt != 0:
+    raise ValueError(
+        "`compute_packed_chunk_metadata` requires positive `chunk_size` dividing"
+        f" `seq_len`; got seq_len={seq_len}, chunk_size={bt}."
+    )
+  nt = seq_len // bt
+  if has_initial_state:
+    act_eff = jnp.where(active_doc_id == 0, jnp.int32(1), active_doc_id)
+    init_prev = jnp.ones((batch, 1), dtype=jnp.int32)
+  else:
+    act_eff = active_doc_id
+    init_prev = active_doc_id[:, 0:1] - is_new_doc[:, 0:1].astype(jnp.int32)
+
+  seg_c = canonical_seg.reshape(batch, nt, bt)
+  act_c = act_eff.reshape(batch, nt, bt)
+  prev_end_doc = jnp.concatenate([init_prev, act_c[:, :-1, bt - 1]], axis=1)
+
+  valid_b = seg_c > 0
+  valid_c = valid_b.astype(jnp.int32)
+  has_valid = jnp.any(valid_b, axis=-1)
+  first_idx = jnp.argmax(valid_c, axis=-1, keepdims=True)
+  first_real_doc = jnp.where(
+      has_valid, jnp.take_along_axis(seg_c, first_idx, axis=-1)[..., 0], 0
+  )
+  last_real_doc = jnp.max(seg_c, axis=-1)
+
+  m_in_c = (valid_b & (seg_c == prev_end_doc[:, :, None])).astype(jnp.int32)
+  m_out_c = (valid_b & (seg_c == last_real_doc[:, :, None])).astype(jnp.int32)
+
+  max_lag = 7
+  if conv_halo_seg is None:
+    halo_pad = jnp.zeros((batch, max_lag), dtype=jnp.int32)
+  else:
+    halo_raw = conv_halo_seg.astype(jnp.int32)
+    if halo_raw.shape[1] < max_lag:
+      halo_pad = jnp.pad(halo_raw, ((0, 0), (max_lag - halo_raw.shape[1], 0)))
+    else:
+      halo_pad = halo_raw[:, -max_lag:]
+  seg_ext = jnp.concatenate([halo_pad, canonical_seg], axis=1)
+  conv_lags_c = jnp.zeros((batch, nt, bt), dtype=jnp.int32)
+  for lag in range(1, max_lag + 1):
+    same_lag = (
+        canonical_seg == seg_ext[:, max_lag - lag : max_lag + seq_len - lag]
+    ) & (canonical_seg > 0)
+    conv_lags_c = conv_lags_c | (
+        same_lag.reshape(batch, nt, bt).astype(jnp.int32) << lag
+    )
+
+  m_keep = (~has_valid) | (
+      (prev_end_doc > 0)
+      & (first_real_doc == prev_end_doc)
+      & (last_real_doc == prev_end_doc)
+  )
+  meta_6 = jnp.stack(
+      [seg_c, act_c, m_in_c, m_out_c, valid_c, conv_lags_c], axis=2
+  ).astype(jnp.int32)
+  packed_tok_meta = jnp.pad(meta_6, ((0, 0), (0, 0), (0, 2), (0, 0)))
+  return packed_tok_meta, m_keep.astype(jnp.int32)
+
+
 def causal_conv1d_silu_fwd_bt(
     x: jax.Array,
     weight: jax.Array,
@@ -97,6 +244,8 @@ def causal_conv1d_silu_fwd_bt(
     segment_ids: jax.Array | None = None,
 ) -> jax.Array:
   """Applies token-major `[B, T, C]` depthwise causal conv1d + SiLU."""
+  if segment_ids is not None:
+    segment_ids, _, _ = canonicalize_packed_segment_ids(segment_ids)
   w_len = weight.shape[0]
   t_len = x.shape[1]
   x_pad = jnp.pad(x, ((0, 0), (w_len - 1, 0), (0, 0))) if w_len > 1 else x
@@ -128,6 +277,8 @@ def causal_conv1d_silu_bwd_bt(
     segment_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
   """Analytical VJP of `causal_conv1d_silu_fwd_bt` on `[B, T, C]`."""
+  if segment_ids is not None:
+    segment_ids, _, _ = canonicalize_packed_segment_ids(segment_ids)
   w_len = weight.shape[0]
   t_len = x.shape[1]
   x_pad = jnp.pad(x, ((0, 0), (w_len - 1, 0), (0, 0))) if w_len > 1 else x
@@ -577,6 +728,7 @@ def chunk_local_cumsum_vector(
     reverse: bool = False,
     scale: float | None = None,
     output_dtype: jax.typing.DTypeLike = jnp.float32,
+    packed_tok_meta: Int[Array, "B NT 8 BT"] | None = None,
 ) -> Float[Array, "H B T K"]:
   """Computes prefix or suffix sums independently within each chunk."""
   assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
@@ -600,12 +752,35 @@ def chunk_local_cumsum_vector(
   else:
     cum_mask = jnp.tril(jnp.ones((bt, bt), dtype=jnp.float32))
 
-  o_chunked = jnp.einsum(
-      "ij,hbnjs->hbnis",
-      cum_mask,
-      g_chunked,
-      precision=jax.lax.Precision.HIGHEST,
-  )
+  if packed_tok_meta is not None:
+    # Forward (`reverse=False`) computes F(g) = M_{tril, act} (V g) so the span
+    # sum carries through trailing 0-padding into index BT - 1 (consumed by
+    # inter-chunk decay and kg). Its exact transpose (`reverse=True`) is
+    # F^T(dg) = V (M_{triu, act} dg): input stays unmasked so cotangents placed
+    # at BT - 1 propagate back into valid tokens, then output is masked by V.
+    valid_c = packed_tok_meta[:, :, 4, :] > 0
+    act_c = packed_tok_meta[:, :, 1, :]
+    if not reverse:
+      g_chunked = jnp.where(valid_c[None, :, :, :, None], g_chunked, 0.0)
+    same_span = (act_c[:, :, :, None] == act_c[:, :, None, :]).astype(
+        jnp.float32
+    )
+    mask_bnt = cum_mask[None, None, :, :] * same_span
+    o_chunked = jnp.einsum(
+        "bnij,hbnjs->hbnis",
+        mask_bnt,
+        g_chunked,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    if reverse:
+      o_chunked = jnp.where(valid_c[None, :, :, :, None], o_chunked, 0.0)
+  else:
+    o_chunked = jnp.einsum(
+        "ij,hbnjs->hbnis",
+        cum_mask,
+        g_chunked,
+        precision=jax.lax.Precision.HIGHEST,
+    )
   o = o_chunked.reshape(h, b, t_padded, s)[:, :, :t, :]
 
   if scale is not None:
@@ -624,6 +799,7 @@ def kda_gate_chunk_cumsum(
     output_dtype: jax.typing.DTypeLike = jnp.float32,
     lower_bound: float | None = None,
     valid_mask: Bool[Array, "B T"] | None = None,
+    packed_tok_meta: Int[Array, "B NT 8 BT"] | None = None,
 ) -> Float[Array, "H B T GW"]:
   """Applies the KDA gate activation and its chunk-local cumulative sum."""
   h, _, _, gw = g.shape
@@ -649,4 +825,5 @@ def kda_gate_chunk_cumsum(
       chunk_size=chunk_size,
       scale=scale,
       output_dtype=output_dtype or jnp.float32,
+      packed_tok_meta=packed_tok_meta,
   )
