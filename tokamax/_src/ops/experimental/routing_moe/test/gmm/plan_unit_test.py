@@ -172,7 +172,7 @@ def _make_config(
     row_group: bool = True,
     with_down: bool = False,
     with_scatter: bool = True,
-    num_experts: int = 512,
+    **spec_kwargs: Any,
 ) -> gmm_config.RoutingGmmConfig:
   """Builds a RoutingGmmConfig, by default for a 512-expert, top-10 MoE layer."""
   gmm_spec = _make_spec(
@@ -181,7 +181,7 @@ def _make_config(
       row_group=row_group,
       with_down=with_down,
       with_scatter=with_scatter,
-      num_experts=num_experts,
+      **spec_kwargs,
   )
   resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
       None,
@@ -230,69 +230,62 @@ class TileMTest(parameterized.TestCase):
     spec_zero_groups = dataclasses.replace(
         base, w=dataclasses.replace(base.w, group_size=0), num_global_groups=0
     )
-    default_plan = gmm_plan.RoutingGmmPlan()
+    resolved_out_format = out_format_lib.ResolvedActivationFormat.create(
+        None,
+        default_dtype=base.x.dtype,
+        default_quant=out_format_lib.ResolvedLaneStrided(
+            block_col_size=out_format_lib.tile_size
+        ),
+    )
     for gmm_spec in (spec_zero_m, spec_zero_groups):
-      self.assertEqual(
-          gmm_plan._max_group_rows(
-              default_plan, spec=gmm_spec, tpu_info=_tpu_info()
-          ),
-          128,
+      resolved = gmm_plan.ResolvedGmmPlan.create(
+          None,
+          spec=gmm_spec,
+          out_format=resolved_out_format,
+          tpu_info=_tpu_info(),
       )
+      self.assertEqual(resolved.tile_m, 128)
+      self.assertEqual(resolved.bucket_rows, [128])
 
   @parameterized.parameters(12, 64, 200)
-  def test_tile_is_capped_at_tokens(self, num_tokens: int):
+  def test_direct_tile_is_capped_at_tokens(self, num_tokens: int):
     min_tile_m = _tpu_info().num_sublanes
     self.assertEqual(
-        _resolve(num_tokens, num_experts=16).tile_m,
+        _resolve(num_tokens, routed=False).tile_m,
         min_tile_m * math.ceil(num_tokens / min_tile_m),
     )
 
-  @parameterized.parameters(
-      (256, True, 48),
-      (256, False, 48),
-      (2048, True, 64),
-      (2048, False, 64),
-      (4096, True, 128),
-      (4096, False, 128),
-  )
-  def test_intermediate_batch_scales_with_expected_group_rows(
-      self, num_tokens: int, quantized: bool, expected_tile_m: int
-  ):
-    # With 512 experts and top_k=10, with_down=True (size_k2=768, dma_floor=48).
-    resolved = _resolve(num_tokens, quantized=quantized, with_down=True)
-    self.assertEqual(resolved.tile_m, expected_tile_m)
+  @parameterized.parameters(256, 4096)
+  def test_direct_tile_is_unchanged_from_256_tokens(self, num_tokens: int):
+    self.assertEqual(_resolve(num_tokens, routed=False).tile_m, 256)
 
   @parameterized.parameters(
-      (1088, 32),
-      (1100, 64),
+      (12, 16),
+      (64, 16),
+      (256, 16),
+      (512, 32),
+      (1024, 32),
+      (2048, 64),
+      (3072, 80),
+      (4096, 112),
+      (8192, 192),
   )
-  def test_skew_headroom_boundary_selects_power_of_2_tile(
+  def test_routed_single_bucket_tile_scales_with_mean_group_load(
       self, num_tokens: int, expected_tile_m: int
   ):
-    # With 512 experts, top_k=10, with_down=True, size_k2=256 (dma_floor=16):
-    # - 1088 tokens -> expected_rows=21.25, 1.5 * 21.25 = 31.875 -> tile_m=32.
-    # - 1100 tokens -> expected_rows=21.484375, 1.5 * 21.484375 = 32.2265625 ->
-    #   tile_m=64.
+    # With 512 experts, top_k=10, with_down=True, size_k2=256 (dma_floor=16),
+    # weights < 12 MiB so bucket_rows stays a single bucket up to 8192 tokens.
     resolved = _resolve(num_tokens, with_down=True, size_k2=256)
     self.assertEqual(resolved.tile_m, expected_tile_m)
+    self.assertEqual(resolved.bucket_rows, [expected_tile_m])
 
-  @parameterized.parameters(
-      (0.5, 16),
-      (2.0, 64),
-  )
-  def test_skew_headroom_scales_tile(
-      self, skew_headroom: float, expected_tile_m: int
-  ):
-    # With 1088 tokens, 512 experts, top_k=10, size_k2=256: expected_rows=21.25
-    # and dma_floor=16, so 10.625 -> 16 and 42.5 -> 64 (the default gives 32).
-    custom_plan = gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
-    resolved = _resolve(1088, custom_plan, with_down=True, size_k2=256)
-    self.assertEqual(resolved.tile_m, expected_tile_m)
-
-  @parameterized.parameters(0.0, -1.5)
-  def test_non_positive_skew_headroom_raises(self, skew_headroom: float):
-    with self.assertRaisesRegex(ValueError, "skew_headroom must be positive"):
-      gmm_plan.RoutingGmmPlan(skew_headroom=skew_headroom)
+  def test_high_load_keeps_two_buckets_even_for_small_expert_weights(self):
+    # At 16,384 tokens (320 mean rows/expert -> target >= 2 * bucket_base=256),
+    # default small weights (< 12 MiB) still keep [128, 256] buckets so tail
+    # tiles <= 128 rows halve MXU/DMA work.
+    resolved = _resolve(16384)
+    self.assertEqual(resolved.tile_m, 256)
+    self.assertEqual(resolved.bucket_rows, [128, 256])
 
   @parameterized.parameters(
       (8, 128),
@@ -301,7 +294,7 @@ class TileMTest(parameterized.TestCase):
   def test_dma_floor_divisor_scales_tile(
       self, dma_floor_divisor: int, expected_tile_m: int
   ):
-    # With 256 tokens and size_k2=1024: skew_rows=8, so the floor
+    # With 256 tokens and size_k2=1024: mean_rows=5, so the floor
     # 1024 // divisor binds (the default 16 gives 64).
     custom_plan = gmm_plan.RoutingGmmPlan(dma_floor_divisor=dma_floor_divisor)
     resolved = _resolve(256, custom_plan, with_down=True, size_k2=1024)
@@ -349,27 +342,21 @@ class TileMTest(parameterized.TestCase):
         192,
     )
 
-  @parameterized.product(
-      num_tokens=[256, 2048, 4096],
-      quantized=[True, False],
-      with_down=[True, False],
-  )
-  def test_small_tile_keeps_tile_table_bounded(
-      self, num_tokens: int, quantized: bool, with_down: bool
-  ):
-    # A tile_m sized by expected rows is at least 1.5x the mean group load, so
-    # one group spans at most 2/3 * num_global_groups tiles.
-    gmm_spec = _make_spec(num_tokens, quantized=quantized, with_down=with_down)
-    resolved = _resolve(num_tokens, quantized=quantized, with_down=with_down)
-    self.assertLessEqual(
-        math.ceil(gmm_spec.size_out_m / resolved.tile_m),
-        math.ceil(2 * gmm_spec.num_global_groups / 3) + 1,
-    )
+  def test_large_expert_weights_keep_two_buckets_above_bucket_base(self):
+    # 2,560 x 6,144 fp8 weights are 15 MiB per expert (>= 12 MiB threshold).
+    small_batch = _resolve(16, size_n=6144)
+    self.assertEqual(small_batch.bucket_rows, [16])
+    for num_tokens in (8192, 16384):
+      with self.subTest(num_tokens=num_tokens):
+        resolved = _resolve(num_tokens, size_n=6144)
+        self.assertEqual(resolved.tile_m, 256)
+        self.assertEqual(resolved.bucket_rows, [128, 256])
 
   @parameterized.parameters(8192, 16384)
   def test_large_prefill_reaches_max_tile_m(self, num_tokens: int):
-    self.assertEqual(_resolve(num_tokens, with_down=True).tile_m, 256)
-    self.assertEqual(_resolve(num_tokens, with_down=False).tile_m, 256)
+    self.assertLessEqual(_resolve(num_tokens, with_down=True).tile_m, 256)
+    self.assertEqual(_resolve(16384, with_down=True).tile_m, 256)
+    self.assertEqual(_resolve(16384, with_down=False).tile_m, 256)
 
   def test_explicit_tile_m_is_kept(self):
     custom_plan = gmm_plan.RoutingGmmPlan(tile_m=128)
@@ -421,10 +408,9 @@ class TileMTest(parameterized.TestCase):
     self.assertEqual(forced_fused.bucket_rows, [128])
 
   def test_forced_fusion_step_down_aligns_non_power_of_two_tile_m(self):
-    # At 200 tokens, default tile_m is clamped to 200 (25 * 8, ~30.1 MiB);
-    # stepping down under a 28 MiB budget must stay a multiple of num_sublanes
-    # (128 at ~27.4 MiB, not 200 // 2 = 100). 16 experts give 125 expected rows
-    # per group so the expected-load bound does not shrink tile_m below 200.
+    # At 200 direct tokens, default tile_m is clamped to 200 (25 * 8,
+    # ~30.1 MiB); stepping down under a 28 MiB budget must stay a multiple of
+    # num_sublanes (128 at ~27.4 MiB, not 200 // 2 = 100).
     cfg = _make_config(
         200,
         gmm_plan.RoutingGmmPlan(
@@ -434,7 +420,7 @@ class TileMTest(parameterized.TestCase):
         ),
         quantized=False,
         with_down=True,
-        num_experts=16,
+        routed=False,
     )
     self.assertTrue(cfg.plan.fuse_up_and_down)
     self.assertEqual(cfg.plan.tile_m, 128)
@@ -479,9 +465,10 @@ class FusedK2SlicingTest(parameterized.TestCase):
     self.assertEqual(resolved.tile_k2, 768)
 
   def test_remote_scatter_selects_split_k2_plan(self):
-    # With a remote unpermute the planner keeps tile_m=256 and slices k2.
+    # With a remote unpermute at full load, the planner keeps tile_m=256 and
+    # slices k2.
     resolved = _resolve(
-        256,
+        16384,
         with_down=True,
         size_k=7168,
         size_k2=3072,
@@ -498,9 +485,10 @@ class FusedK2SlicingTest(parameterized.TestCase):
     self.assertEqual(resolved.num_w_buffers, 2)
 
   def test_local_scatter_falls_back_to_unfused(self):
-    # Without a remote unpermute, slicing k2 is not worth it: run unfused.
+    # Without a remote unpermute at full load, slicing k2 is not worth it: run
+    # unfused.
     resolved = _resolve(
-        256,
+        16384,
         with_down=True,
         size_k=7168,
         size_k2=3072,
@@ -688,18 +676,18 @@ class QuantStashPlanTest(parameterized.TestCase):
         dtype=jnp.float8_e4m3fn, quant=out_format_lib.auto_quant
     )
     # 13.5 MB fits tile_m=256 with 2 bf16 stash buffers (13,377,536 bytes), but
-    # overflows to tile_m=128 with 3 buffers or f32 stash dtype. 16 experts
-    # give 160 expected rows per group so the expected-load bound allows 256.
+    # overflows to tile_m=128 with 3 buffers or f32 stash dtype. 512 tokens with
+    # 16 experts give 320 expected rows per group so target >= 256.
     single_budget = dict(vmem_limit_bytes=13_500_000, vmem_usage_fraction=1.0)
     default_single = _resolve(
-        256,
+        512,
         gmm_plan.RoutingGmmPlan(**single_budget),
         out_format=fmt,
         size_n=1024,
         num_experts=16,
     )
     larger_stash_single = _resolve(
-        256,
+        512,
         dataclasses.replace(extra_plan, **single_budget),
         out_format=fmt,
         size_n=1024,

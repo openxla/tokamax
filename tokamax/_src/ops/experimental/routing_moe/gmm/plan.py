@@ -24,7 +24,6 @@ carrying `None` unions past planning.
 from collections.abc import Callable
 import dataclasses
 import functools
-import math
 from typing import Self
 
 import jax
@@ -83,11 +82,6 @@ class RoutingGmmPlan:
   max_tile_m: int | None = None
   # Upper bound on the number of buckets (tile_m / bucket_base).
   max_num_buckets: int | None = None
-  # Multiplier on the mean rows per expert group when bounding tile_m, so
-  # moderately skewed groups still fit in one tile.
-  # TODO: The default of 1.5 was chosen empirically from TPUv7x routing
-  # skew sweeps and is not derived. Revisit it based on measured routing skew.
-  skew_headroom: float | None = None
   # tile_m is kept at or above i_local // dma_floor_divisor, where i_local is
   # the per-shard intermediate width, so per-tile row gather/scatter stays
   # small next to the group's weight DMA.
@@ -96,10 +90,10 @@ class RoutingGmmPlan:
   dma_floor_divisor: int | None = None
 
   def __post_init__(self) -> None:
-    for name in ("skew_headroom", "dma_floor_divisor"):
-      value = getattr(self, name)
-      if value is not None and value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}.")
+    if self.dma_floor_divisor is not None and self.dma_floor_divisor <= 0:
+      raise ValueError(
+          f"dma_floor_divisor must be positive, got {self.dma_floor_divisor}."
+      )
 
 
 def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
@@ -154,7 +148,6 @@ def _resolve_smem_indices(
         "max_num_w_buffers",
         "max_tile_m",
         "max_num_buckets",
-        "skew_headroom",
         "dma_floor_divisor",
     ),
 )
@@ -423,62 +416,26 @@ def resolve_tiling_and_fusion(
   return tiling, False
 
 
-def _token_rows(
-    x: tensor_spec.ActivationSpec,
-    tpu_info: pltpu.TpuInfo,
-) -> int:
-  """Rows a tile ever needs, rounded up to whole sublane tiles.
-
-  With gather, a group gets at most one row per input token; without gather,
-  x holds all routed rows so a group gets at most x.row_size. Compact VMEM
-  loads and stores operate on u32 words, so one sublane tile (`num_sublanes`
-  rows) suffices.
-
-  Args:
-    x: Activation spec.
-    tpu_info: TPU the kernel runs on.
-
-  Returns:
-    Maximum number of rows a tile needs, rounded up to `num_sublanes`.
-  """
-  min_tile_m = tpu_info.num_sublanes
-  return min_tile_m * pl.cdiv(x.row_size, min_tile_m)
-
-
-def _max_group_rows(
-    plan: RoutingGmmPlan,
-    *,
+def _row_align(
     spec: gmm_spec_lib.RoutingGmmSpec,
     tpu_info: pltpu.TpuInfo,
 ) -> int:
-  """Bounds tile_m by expected rows per group and input token count.
-
-  Args:
-    plan: User plan, for `skew_headroom` and `dma_floor_divisor`.
-    spec: Validated input specifications and operator semantics.
-    tpu_info: TPU the kernel runs on.
-
-  Returns:
-    Maximum number of rows a tile needs, rounded up to `num_sublanes`.
-  """
+  """Returns row alignment (`2 * num_sublanes` on multi-tile routed ops)."""
   min_tile_m = tpu_info.num_sublanes
-  token_cap = max(min_tile_m, _token_rows(spec.x, tpu_info))
-  if spec.size_out_m <= 0 or spec.num_global_groups <= 0:
-    return token_cap
-  if spec.size_k2 is not None:
-    i_local = spec.size_k2
-  elif spec.w.fused_gate_up:
-    i_local = spec.w.out_size // 2
-  elif spec.gather is None and spec.scatter is not None:
-    i_local = spec.size_k
-  else:
-    i_local = min(spec.size_k, spec.w.out_size)
-  dma_floor = max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
-  expected_rows = spec.size_out_m / spec.num_global_groups
-  skew_headroom = plan.skew_headroom or 1.5
-  skew_rows = pl.next_power_of_2(math.ceil(skew_headroom * expected_rows))
-  target_rows = min_tile_m * pl.cdiv(max(dma_floor, skew_rows), min_tile_m)
-  return min(target_rows, token_cap)
+  return (
+      2 * min_tile_m
+      if (spec.has_routed_io and spec.x.row_size > min_tile_m)
+      else min_tile_m
+  )
+
+
+def _max_group_rows(
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    tpu_info: pltpu.TpuInfo,
+) -> int:
+  """Rows a tile ever needs, aligned to packed sublane width."""
+  row_align = _row_align(spec, tpu_info)
+  return row_align * max(1, pl.cdiv(spec.x.row_size, row_align))
 
 
 def _tile_m_limits(plan: RoutingGmmPlan) -> tuple[int, int]:
@@ -493,12 +450,18 @@ def _tile_m_limits(plan: RoutingGmmPlan) -> tuple[int, int]:
 
 
 def _tile_m_candidates(
-    plan: RoutingGmmPlan, *, bucket_base: int, max_group_rows: int
+    plan: RoutingGmmPlan,
+    *,
+    bucket_base: int,
+    max_group_rows: int,
+    single_routed_bucket: bool = False,
 ) -> list[int]:
   """The tile_m values the heuristic may pick, largest first."""
   if plan.tile_m is not None:
     return [plan.tile_m]
   max_tile_m, max_num_buckets = _tile_m_limits(plan)
+  if single_routed_bucket:
+    max_num_buckets = 1
   candidates = set()
   for num_buckets in range(1, max_num_buckets + 1):
     tile_m = num_buckets * bucket_base
@@ -754,8 +717,7 @@ def _w_buffer_range(
   # compute empirically covers weight DMA latency at 4 buffers while avoiding
   # extra prologue weight prefetches; on large (>= 12 MiB) expert weights, cap
   # at 3 buffers so prologue weight DMAs do not stall slot 0.
-  large_expert_weight_bytes = 12 * 1024 * 1024
-  if _expert_weight_bytes(spec) >= large_expert_weight_bytes:
+  if _is_large_expert_weight(spec):
     default_max = 3
   elif spec.w2 is not None and tile_m >= 64:
     default_max = 4
@@ -852,7 +814,8 @@ def _fused_tiling(
     return None
   tile_k, tile_n = spec.size_k, spec.size_out_n
 
-  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
+  min_tile_m = tpu_info.num_sublanes
+  max_group_rows = _max_group_rows(spec, tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
 
   estimate_vmem = functools.partial(
@@ -908,11 +871,18 @@ def _fused_tiling(
         num_w_buffers=num_w_buffers,
     )
 
-  bucket_base = _resolve_bucket_base(
-      plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
+  bucket_base, single_routed_bucket = _resolve_bucket_base(
+      plan,
+      spec=spec,
+      matmul_dtype=matmul_dtype,
+      max_group_rows=max_group_rows,
+      min_tile_m=min_tile_m,
   )
   largest_tile_m = _tile_m_candidates(
-      plan, bucket_base=bucket_base, max_group_rows=max_group_rows
+      plan,
+      bucket_base=bucket_base,
+      max_group_rows=max_group_rows,
+      single_routed_bucket=single_routed_bucket,
   )[0]
 
   # Step 1: Try fusion + largest possible tile_m.
@@ -924,7 +894,7 @@ def _fused_tiling(
     if tiling is not None:
       return tiling
     if plan.fuse_up_and_down and plan.tile_m is None:
-      floor_m = max(tpu_info.num_sublanes, plan.bucket_base or 0)
+      floor_m = max(min_tile_m, plan.bucket_base or 0)
       cand_m = largest_tile_m
       while cand_m > floor_m:
         cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
@@ -942,24 +912,16 @@ def _fused_tiling(
   # If fusion requires k2 tiling, the weights can't be reused across m tiles,
   # so we only attempt to do fusion + k2 tiling when remote scatter (to overlap
   # ICI with a larger block of computation) and tile_m is sufficiently large
-  # (for HBM bw and compute overlap). The expected-load bound on tile_m assumes
-  # that reuse, so only the token count bounds tile_m here.
-  token_rows = _token_rows(x, tpu_info)
-  sliced_tile_m = _tile_m_candidates(
-      plan,
-      bucket_base=_resolve_bucket_base(
-          plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=token_rows
-      ),
-      max_group_rows=token_rows,
-  )[0]
-  bucket_base = _resolve_bucket_base(
-      dataclasses.replace(plan, tile_m=sliced_tile_m),
-      w=w,
+  # (for HBM bw and compute overlap).
+  bucket_base, _ = _resolve_bucket_base(
+      dataclasses.replace(plan, tile_m=largest_tile_m),
+      spec=spec,
       matmul_dtype=matmul_dtype,
-      max_group_rows=token_rows,
+      max_group_rows=max_group_rows,
+      min_tile_m=min_tile_m,
   )
   for tile_k2 in tile_k2_candidates:
-    tiling = try_fit(sliced_tile_m, tile_k2, bucket_base)
+    tiling = try_fit(largest_tile_m, tile_k2, bucket_base)
     if tiling is not None:
       return tiling
   return None
@@ -1163,16 +1125,36 @@ def _vmem_estimate(
   return x_vmem + out_vmem + matmul_vmem
 
 
+def _dma_floor(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    min_tile_m: int,
+) -> int:
+  """Minimum tile_m so per-tile row gather/scatter stays small next to DMA."""
+  if spec.size_k2 is not None:
+    i_local = spec.size_k2
+  elif spec.w.fused_gate_up:
+    i_local = spec.w.out_size // 2
+  elif spec.gather is None and spec.scatter is not None:
+    i_local = spec.size_k
+  else:
+    i_local = min(spec.size_k, spec.w.out_size)
+  return max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
+
+
 def _resolve_bucket_base(
     plan: RoutingGmmPlan,
     *,
-    w: tensor_spec.WeightSpec,
+    spec: gmm_spec_lib.RoutingGmmSpec,
     matmul_dtype: jnp.dtype,
     max_group_rows: int,
-) -> int:
-  """Resolves `bucket_base` from user plan or bitwidth heuristics."""
+    min_tile_m: int,
+) -> tuple[int, bool]:
+  """Resolves `(bucket_base, single_routed_bucket)` from plan and group load."""
   if plan.bucket_base is not None:
-    return plan.bucket_base
+    return plan.bucket_base, False
+  w = spec.w
   is_mxu_quantized = matmul_dtype not in (jnp.bfloat16.dtype, jnp.float32.dtype)
   w_bits = jax.dtypes.itemsize_bits(w.dtype)
   # When using bf16 for x and w, 128 is the largest tile_m value that is safe
@@ -1181,7 +1163,41 @@ def _resolve_bucket_base(
   bucket_base = 128 // min(pl.cdiv(16, w_bits), 2)
   if is_mxu_quantized:
     bucket_base *= 2
-  return min(bucket_base, plan.tile_m or max_group_rows)
+  if plan.tile_m is not None:
+    return min(bucket_base, plan.tile_m), False
+  if not spec.has_routed_io:
+    return min(bucket_base, max_group_rows), False
+  pair_tile_m = 2 * min_tile_m
+  if (
+      spec.x.row_size <= pair_tile_m
+      or spec.num_global_groups <= 0
+      or spec.size_out_m <= 0
+  ):
+    return min(bucket_base, max_group_rows), True
+  # Align to `2 * num_sublanes` so 2-packed compact VMEM loads avoid crosslane
+  # shuffles. `9/8 * mean + min_tile_m` was tuned empirically (comparing `{9/8,
+  # 8/7, 7/6, 5/4}` up to 4x skew and `9/8` vs `1.5` on `gmm_prod_test`
+  # 128-512-expert suites): `min_tile_m` covers small-mean variance while `9/8`
+  # drops steps tightly (`mean=20`->`32`, `mean=80`->`112`, `mean=160`->`192`
+  # instead of `48`/`208` at `5/4` or `128`/`240` at `1.5`).
+  scaled_mean = pl.cdiv(9 * spec.size_out_m, 8 * spec.num_global_groups)
+  dma_floor = _dma_floor(plan, spec=spec, min_tile_m=min_tile_m)
+  target = pair_tile_m * pl.cdiv(
+      max(dma_floor, scaled_mean + min_tile_m), pair_tile_m
+  )
+  # When `target` already spans at least two `bucket_base` buckets (`>= 256`
+  # rows) or expert weights are large (`>= 12 MiB`), keep
+  # `[bucket_base, 2 * bucket_base]` so multi-tile groups avoid reloading large
+  # weights and short tail tiles halve MXU/DMA work. For `< 12 MiB` weights
+  # strictly between `bucket_base` and `2 * bucket_base`, a single exact tile
+  # avoids both `2 * bucket_base` padding and `lax.switch` overhead.
+  if target > bucket_base and (
+      target >= 2 * bucket_base or _is_large_expert_weight(spec)
+  ):
+    return min(bucket_base, max_group_rows), False
+  floor_m = min(max_group_rows, pair_tile_m)
+  ceil_m = min(256, max_group_rows)
+  return max(floor_m, min(ceil_m, target)), True
 
 
 def _resolve_w_tile_n(
@@ -1214,6 +1230,7 @@ def _resolve_tile_m(
     plan: RoutingGmmPlan,
     *,
     bucket_base: int,
+    single_routed_bucket: bool,
     max_group_rows: int,
     w_tile_n: int,
     estimate_vmem: Callable[..., int],
@@ -1222,8 +1239,12 @@ def _resolve_tile_m(
   """Resolves `tile_m` from user plan or VMEM-fitting bucket multiples."""
   if plan.tile_m is not None:
     return plan.tile_m
-  # Largest multiple of bucket_base that stays within max_tile_m and VMEM.
+  # BranchlessBufferedRef unrolls `tile_m` row DMAs regardless of bucket, so a
+  # single bucket avoids `lax.switch` code duplication and VREG pressure. For
+  # multi-bucket IO, `max_num_buckets=2` limits instruction-memory growth.
   max_tile_m, max_num_buckets = _tile_m_limits(plan)
+  if single_routed_bucket:
+    max_num_buckets = 1
   tile_m = bucket_base
   for num_buckets in range(2, max_num_buckets + 1):
     candidate = num_buckets * bucket_base
@@ -1246,6 +1267,14 @@ def _expert_weight_bytes(spec: gmm_spec_lib.RoutingGmmSpec) -> int:
     w2 = spec.w2
     total += w2.in_size * w2.out_size * jax.dtypes.itemsize_bits(w2.dtype) // 8
   return total
+
+
+def _is_large_expert_weight(spec: gmm_spec_lib.RoutingGmmSpec) -> bool:
+  """Whether one expert's weights are large enough to dominate HBM DMA."""
+  # Expert weights >= 12 MiB cap prefetch at 3 buffers (`_w_buffer_range`) and
+  # keep `[bucket_base, 2 * bucket_base]` (`_resolve_bucket_base`) so overflow
+  # tiles do not reload large weights from HBM.
+  return _expert_weight_bytes(spec) >= 12 * 1024 * 1024
 
 
 def _resolve_weight_lookahead(
@@ -1329,13 +1358,18 @@ def calculate_tiling(
   """
   x, w = spec.x, spec.w
   # Step 1: Set default values.
-  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
+  min_tile_m = tpu_info.num_sublanes
+  max_group_rows = _max_group_rows(spec, tpu_info)
   num_xo_buffers = plan.num_xo_buffers or 3
   num_w_buffers = plan.num_w_buffers or 2
   # TODO: Support K dim tiling.
   tile_k = plan.tile_k or spec.size_k
-  bucket_base = _resolve_bucket_base(
-      plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
+  bucket_base, single_routed_bucket = _resolve_bucket_base(
+      plan,
+      spec=spec,
+      matmul_dtype=matmul_dtype,
+      max_group_rows=max_group_rows,
+      min_tile_m=min_tile_m,
   )
 
   # Size w's output tile against size_k2 when w2 is present, or size_out_n when
@@ -1386,11 +1420,14 @@ def calculate_tiling(
   tile_m = _resolve_tile_m(
       plan,
       bucket_base=bucket_base,
+      single_routed_bucket=single_routed_bucket,
       max_group_rows=max_group_rows,
       w_tile_n=w_tile_n,
       estimate_vmem=estimate_vmem,
       vmem_limit_bytes=vmem_limit_bytes,
   )
+  if plan.bucket_base is None:
+    bucket_base = min(bucket_base, tile_m)
 
   # Spend spare VMEM on deeper weight prefetch.
   num_w_buffers = _grow_num_w_buffers(
