@@ -111,55 +111,56 @@ def _decode_rope_tile(
   return pltpu.bitcast(rope_u32, jnp.float32).astype(jnp.bfloat16)[:, :64]
 
 
-def _broadcast_lane(x: jax.Array, col: jax.Array) -> jax.Array:
-  """Broadcasts dynamic lane `col` (0..127) of `x` across all 128 lanes."""
-  x_rot = pltpu.roll(x, lax.bitwise_and(128 - col, 127), 1)
-  return jnp.broadcast_to(x_rot[:, :1], x.shape)
-
-
 def _compute_token_counts(
-    idx_transposed_ref,
+    idx_rows_ref,
     c_vmem_ref,
     *,
     b,
-    col: jax.Array,
+    c_row,
     topk: int,
-    max_c_chunks: int,
-    active_tiles: jax.Array,
+    num_g: int,
 ) -> None:
-  """Computes per-token top-k multiplicity counts via factored one-hot MXU."""
-  k_chunk = min(topk, 256)
-  lane_128 = lax.broadcasted_iota(jnp.int32, (k_chunk, 128), 1)
-  lane_div_16 = lax.shift_right_logical(lane_128, 4)
-  for c in range(max_c_chunks):
+  """Computes per-token top-k multiplicity counts with one-hot MXU matmuls.
 
-    @pl.when(c * 4 < active_tiles)
-    def _update_c_chunk(c=c):
-      acc_c = None
-      for kc in range(topk // k_chunk):
-        idx_sub = idx_transposed_ref[0, pl.ds(kc * k_chunk, k_chunk), :]
-        idx_col = _broadcast_lane(idx_sub, col)
-        b_mat = (lax.bitwise_and(idx_col, 127) == lane_128).astype(jnp.bfloat16)
-        g_col = jnp.where(idx_col >= 0, lax.shift_right_logical(idx_col, 7), -1)
-        a_c = (g_col == (c * 8 + lane_div_16)).astype(jnp.bfloat16)
-        prod = jnp.einsum(
-            "kg,kr->gr",
-            a_c,
-            b_mat,
-            preferred_element_type=jnp.float32,
-        ).reshape(8, 16, 128)
-        acc_c = prod if acc_c is None else (acc_c + prod)
-      c_vmem_ref[b, pl.ds(c * 8, 8), :, :] = acc_c
+  `count[128 * g + r] = sum_k [idx[k] >> 7 == g] * [idx[k] & 127 == r]` is an
+  NT matmul of two one-hot matrices whose contraction dim `k` lies along lanes,
+  so both are built from one sublane-broadcast index row without any lane
+  broadcasts. Negative (invalid) indices match no group and contribute nothing.
+
+  Args:
+    idx_rows_ref: int32[batch, topk // 128, 128] logical top-k indices (VMEM).
+    c_vmem_ref: float32[batch_or_1, num_g, 8, 128] count scratch (VMEM).
+    b: Row of `idx_rows_ref` to read.
+    c_row: Row of `c_vmem_ref` to write.
+    topk: Number of top-k indices per token.
+    num_g: Number of 128-position groups to count.
+  """
+  num_chunks = topk // 128
+  step = 2 if num_chunks % 2 == 0 else 1
+  k_chunk = step * 128
+  num_g_mm = sc_kernel.align_to(num_g, 16)
+  r_iota = lax.broadcasted_iota(jnp.int32, (128, k_chunk), 0)
+  g_iota = lax.broadcasted_iota(jnp.int32, (num_g_mm, k_chunk), 0)
+  counts = jnp.zeros((num_g_mm, 128), jnp.float32)
+  for c in range(0, num_chunks, step):
+    idx_k = jnp.concatenate(
+        [idx_rows_ref[b, pl.ds(c + s, 1), :] for s in range(step)], axis=1
+    )
+    b_mat = (jnp.bitwise_and(idx_k, 127) == r_iota).astype(jnp.bfloat16)
+    a_mat = (jnp.right_shift(idx_k, 7) == g_iota).astype(jnp.bfloat16)
+    counts += jnp.einsum(
+        "gk,rk->gr", a_mat, b_mat, preferred_element_type=jnp.float32
+    )
+  for g in range(num_g):
+    c_vmem_ref[c_row, g] = jnp.broadcast_to(counts[g : g + 1, :], (8, 128))
 
 
 def _load_count_tile(c_vmem_ref, b, t, num_q_heads: int) -> jax.Array:
   """Loads float32[num_q_heads, 256] multiplicity counts for 256-token tile."""
-  c_16x256 = jnp.concatenate(
-      [c_vmem_ref[b, 2 * t], c_vmem_ref[b, 2 * t + 1]], 1
+  c_8x256 = jnp.concatenate(
+      [c_vmem_ref[b, 2 * t], c_vmem_ref[b, 2 * t + 1]], axis=1
   )
-  if num_q_heads == 8:
-    return c_16x256[:8, :]
-  return jnp.tile(c_16x256, (num_q_heads // 16, 1))
+  return jnp.tile(c_8x256, (num_q_heads // 8, 1))
 
 
 def _tc_gather_attention_kernel(
@@ -177,7 +178,7 @@ def _tc_gather_attention_kernel(
     cache_kv_rope_hbm_ref,  # int32[total_num_pages, page_size // 4, 128] (HBM)
     gather_indices_smem_ref,  # int32[batch_size * topk] (SMEM) or None
     packed_q_vmem_ref,  # int32[1, 8, topk] (VMEM) or None
-    idx_transposed_ref,  # int32[1, topk, 128] (VMEM) or None
+    idx_rows_ref,  # int32[batch_size, topk // 128, 128] (VMEM) or None
     swa_acc_ref,  # [batch_size, num_q_heads, head_dim] (VMEM)
     swa_l_ref,  # [batch_size, num_l_heads] or [padded_tokens, num_l_heads]
     swa_m_ref,  # [batch_size, num_l_heads] or [padded_tokens, num_l_heads]
@@ -191,7 +192,7 @@ def _tc_gather_attention_kernel(
     vmem_cache_b_ref,  # quant RoPE pages in VMEM, or None
     stage_nope_x2_ref,  # int32[2, page_size, 128] or None
     stage_rope_x2_ref,  # int32[2, page_size // 4, 128] or None
-    c_vmem_ref,  # float32[batch_or_1, padded_num_g, 16, 128] or None
+    c_vmem_ref,  # float32[batch_or_1, padded_num_g, 8, 128] or None
     s_scratch_ref,  # float32[batch_size, num_q_heads, 256] or None
     p_scratch_ref,  # q_dtype[batch_size, num_q_heads, 256] or None
     acc_scratch_ref,  # float32[batch_or_1, num_q_heads, head_dim]
@@ -206,7 +207,7 @@ def _tc_gather_attention_kernel(
     page_size: int,
     pages_per_seq: int,
     max_num_seqs: int,
-    max_c_chunks: int,
+    num_g: int,
     can_flatten_kv: bool,
     kv_cache_mode: str,
     swa_lm_pipelined: bool,
@@ -257,7 +258,7 @@ def _tc_gather_attention_kernel(
     )
 
   def _softmax_update(s, slot, weight=None):
-    """Updates m and l of `slot`; returns (p, acc rescale factor)."""
+    """Updates m and l of `slot`; returns (p, alpha) to rescale acc by."""
     m_prev = m_scratch_ref[slot]
     m_tile = jnp.broadcast_to(
         jnp.max(s, axis=1, keepdims=True), (num_q_heads, 128)
@@ -272,18 +273,20 @@ def _tc_gather_attention_kernel(
     )
     l_scratch_ref[slot] = l_scratch_ref[slot] * alpha + p_sum
     m_scratch_ref[slot] = m_new
-    return p, jnp.tile(alpha, (1, head_reps))
+    return p, alpha
 
   def _flash_step(s, bkv, weight=None):
     """One FlashAttention-2 step over a KV tile into state slot 0."""
-    p, acc_scale = _softmax_update(s, 0, weight)
+    p, alpha = _softmax_update(s, 0, weight)
     pv = jnp.einsum(
         "nm,md->nd",
         p.astype(bkv.dtype),
         bkv,
         preferred_element_type=jnp.float32,
     )
-    acc_scratch_ref[0] = acc_scratch_ref[0] * acc_scale + pv
+    acc_scratch_ref[0] = (
+        acc_scratch_ref[0] * jnp.tile(alpha, (1, head_reps)) + pv
+    )
 
   def _finalize(slot):
     acc = acc_scratch_ref[slot]
@@ -292,15 +295,9 @@ def _tc_gather_attention_kernel(
       return lax.div(acc, l)
     return (acc * pltpu.reciprocal(l, approx=True)).astype(q_dtype)
 
-  def _count_tokens(slot, tok_idx, active_tiles):
+  def _count_tokens(b, c_row):
     _compute_token_counts(
-        idx_transposed_ref,
-        c_vmem_ref,
-        b=slot,
-        col=lax.bitwise_and(tok_idx, 127),
-        topk=topk,
-        max_c_chunks=max_c_chunks,
-        active_tiles=active_tiles,
+        idx_rows_ref, c_vmem_ref, b=b, c_row=c_row, topk=topk, num_g=num_g
     )
 
   # ---- Double-buffered whole-page HBM -> VMEM staging. ----
@@ -326,18 +323,44 @@ def _tc_gather_attention_kernel(
           dst.at[buf], dst.at[buf], sems.at[sem_row, buf]
       ).wait()
 
-  def _stream_pages(num_pages, page_base, body, *, first_started=False):
-    """Streams pages `page_base + [0, num_pages)`; calls body(lp, kv_bf16)."""
+  def _stream_pages(
+      num_pages,
+      page_base,
+      body,
+      *,
+      start_buf=0,
+      first_started=False,
+      then_start=None,
+  ):
+    """Streams pages `page_base + [0, num_pages)`; calls body(lp, kv_bf16).
+
+    Args:
+      num_pages: Number of pages to stream.
+      page_base: Index into `page_indices_ref` of the first page.
+      body: Called with the local page index and the decoded bf16 page.
+      start_buf: Stage buffer holding (or to hold) the first page.
+      first_started: Whether the first page DMA was already started.
+      then_start: Optional `(cond, lp_global)`; if `cond`, the last page
+        prefetches page `lp_global` into the next stage buffer.
+    """
     if not first_started:
-      _start_page(page_base, 0)
+      _start_page(page_base, start_buf)
 
     @pl.loop(0, num_pages)
     def _page_loop(lp):
-      buf = lax.bitwise_and(lp, 1)
+      buf = lax.bitwise_and(start_buf + lp, 1)
+      next_buf = lax.bitwise_and(start_buf + lp + 1, 1)
 
       @pl.when(lp + 1 < num_pages)
       def _prefetch_next_page():
-        _start_page(page_base + lp + 1, lax.bitwise_and(lp + 1, 1))
+        _start_page(page_base + lp + 1, next_buf)
+
+      if then_start is not None:
+        cond, next_lp_global = then_start
+
+        @pl.when((lp + 1 == num_pages) & cond)
+        def _prefetch_after_last_page():
+          _start_page(next_lp_global, next_buf)
 
       _wait_page(buf)
       nope_bf16 = sc_kernel.dequant_dsv4_fp8(stage_nope_x2_ref.at[buf][...])
@@ -378,7 +401,7 @@ def _tc_gather_attention_kernel(
 
         @pl.when(active_kv_tiles > 0)
         def _():
-          _count_tokens(b, batch_start_seq_idx + b, active_kv_tiles)
+          _count_tokens(b, b)
 
       @pl.loop(active_bs, batch_size)
       def _zero_inactive_scratch(b):
@@ -387,18 +410,14 @@ def _tc_gather_attention_kernel(
         p_scratch_ref[b] = jnp.zeros((num_q_heads, 256), p_scratch_ref.dtype)
         acc_scratch_ref[b] = jnp.zeros((num_q_heads, head_dim), jnp.float32)
 
-      b_q_mask = (
-          lax.broadcasted_iota(
-              jnp.int32, (batch_size, num_q_heads, head_dim), 0
-          )
-          < active_bs
-      )
-
+      # Inactive token rows (`b >= active_bs`) only feed their own discarded
+      # rows of `s` and are never written by `_write_valid_out`, so `q` needs
+      # no masking: `batch_size <= 4` zeroes their counts (`p = 0, alpha = 1`),
+      # and `batch_size > 4` keeps `p = 0` from `_zero_inactive_scratch` and
+      # sets `alpha = 1`.
       @pl.loop(0, active_kv_tiles)
       def _dense_kv_loop(t):
-        q_stacked = jnp.where(b_q_mask, q_ref[...], 0).reshape(
-            batch_size * num_q_heads, head_dim
-        )
+        q_stacked = q_ref[...].reshape(batch_size * num_q_heads, head_dim)
         s_all = _qk(q_stacked, _load_dense_kv(t))
         s_scratch_ref[...] = s_all.reshape(batch_size, num_q_heads, 256)
 
@@ -407,8 +426,10 @@ def _tc_gather_attention_kernel(
           if mask_inactive:
             c_b = jnp.where(b < active_bs, c_b, 0.0)
           s_b = jnp.where(c_b > 0, s_scratch_ref[b], f32_min)
-          p_b, acc_scale = _softmax_update(s_b, b, weight=c_b)
-          acc_scratch_ref[b] = acc_scratch_ref[b] * acc_scale
+          p_b, alpha = _softmax_update(s_b, b, weight=c_b)
+          # `s_b` is dead now; stash `alpha` in its slot so the accumulator is
+          # rescaled in the same pass that adds `p @ v` below.
+          s_scratch_ref[b, :, :128] = alpha
           p_scratch_ref[b] = p_b.astype(p_scratch_ref.dtype)
 
         if batch_size <= 4:
@@ -420,6 +441,12 @@ def _tc_gather_attention_kernel(
           def _softmax_b_loop(b):
             _softmax_one(b, mask_inactive=False)
 
+          @pl.loop(active_bs, batch_size)
+          def _fill_inactive_alpha(b):
+            s_scratch_ref[b, :, :128] = jnp.ones(
+                (num_q_heads, 128), jnp.float32
+            )
+
         p_stacked = p_scratch_ref[...].reshape(batch_size * num_q_heads, 256)
         pv_all = jnp.einsum(
             "nm,md->nd",
@@ -427,7 +454,8 @@ def _tc_gather_attention_kernel(
             _load_dense_kv(t),
             preferred_element_type=jnp.float32,
         )
-        acc_scratch_ref[...] = acc_scratch_ref[...] + pv_all.reshape(
+        alpha = jnp.tile(s_scratch_ref[:, :, :128], (1, 1, head_reps))
+        acc_scratch_ref[...] = acc_scratch_ref[...] * alpha + pv_all.reshape(
             batch_size, num_q_heads, head_dim
         )
 
@@ -438,23 +466,34 @@ def _tc_gather_attention_kernel(
   # ---- Mode: per-token whole-page streaming of the token's sequence. ----
 
   def _seq_pages_body():
-    @pl.loop(0, active_bs)
-    def _seq_token_loop(b):
+    num_seq_tokens = active_pages_ref.shape[0]
+
+    # Pages stream through the two stage buffers in one sequence that spans
+    # token boundaries: the last page of token `b` prefetches the first page of
+    # token `b + 1`, so `start_buf` (carried) is the buffer of a token's page 0.
+    def _seq_token_body(b, start_buf):
       tok_idx = batch_start_seq_idx + b
       seq_id = jnp.clip(seq_ids_ref[tok_idx], 0, max_num_seqs - 1)
       seq_page_base = seq_id * pages_per_seq
       act_pages = active_pages_ref[tok_idx]
+      prev_pages = active_pages_ref[jnp.maximum(tok_idx - 1, 0)]
+      first_page_in_flight = (b > 0) & (prev_pages > 0)
+      next_tok_idx = jnp.minimum(tok_idx + 1, num_seq_tokens - 1)
+      next_seq_id = jnp.clip(seq_ids_ref[next_tok_idx], 0, max_num_seqs - 1)
+      prefetch_next_tok = (b + 1 < active_bs) & (
+          active_pages_ref[next_tok_idx] > 0
+      )
 
       # Start the first page DMA early so it overlaps the state init.
-      @pl.when(act_pages > 0)
-      def _prefetch_first_page():
-        _start_page(seq_page_base, 0)
+      @pl.when((act_pages > 0) & jnp.logical_not(first_page_in_flight))
+      def _fetch_first_page():
+        _start_page(seq_page_base, start_buf)
 
       _init_state(b, 0)
 
       @pl.when(act_pages > 0)
       def _run_seq_pages():
-        _count_tokens(0, tok_idx, act_pages)
+        _count_tokens(b, 0)
 
         def _attend_page(lp, kv_bf16):
           bkv = _mxu_kv(kv_bf16)
@@ -463,10 +502,18 @@ def _tc_gather_attention_kernel(
           _flash_step(s, bkv, weight=c_b)
 
         _stream_pages(
-            act_pages, seq_page_base, _attend_page, first_started=True
+            act_pages,
+            seq_page_base,
+            _attend_page,
+            start_buf=start_buf,
+            first_started=True,
+            then_start=(prefetch_next_tok, next_seq_id * pages_per_seq),
         )
 
       o_ref[b] = _finalize(0)
+      return lax.bitwise_and(start_buf + act_pages, 1)
+
+    lax.fori_loop(0, active_bs, _seq_token_body, jnp.int32(0))
 
   # ---- Modes: 4-buffer lookahead-2 per-row gather of the top-k KV. ----
 
@@ -563,51 +610,54 @@ def _tc_gather_attention_kernel(
           )
 
     dma_unroll = math.gcd(bkv_tile, 32)
+    num_dma_chunks = bkv_tile // dma_unroll
 
-    def _start_bkv_tile(step, buf_idx):
-      idx_base = step * bkv_tile
+    def _issue_bkv_chunk(step, buf_idx, chunk: int):
+      """Issues the gather DMAs for keys [chunk, chunk + 1) * dma_unroll."""
+      k0 = step * bkv_tile + chunk * dma_unroll
+      idxs = [gather_indices_smem_ref[k0 + j] for j in range(dma_unroll)]
+      for j, idx in enumerate(idxs):
+        dst_k = chunk * dma_unroll + j
+        for src, dst, sem_row in zip(_row_srcs(idx), dst_views, sem_rows):
+          pltpu.make_async_copy(
+              src, dst.at[buf_idx, dst_k], sems.at[sem_row, buf_idx]
+          ).start()
 
-      @pl.loop(0, bkv_tile // dma_unroll)
-      def _issue_row_gather(u):
-        k0 = idx_base + u * dma_unroll
-        idxs = [gather_indices_smem_ref[k0 + j] for j in range(dma_unroll)]
-        for j, idx in enumerate(idxs):
-          dst_k = u * dma_unroll + j
-          for src, dst, sem_row in zip(_row_srcs(idx), dst_views, sem_rows):
-            pltpu.make_async_copy(
-                src, dst.at[buf_idx, dst_k], sems.at[sem_row, buf_idx]
-            ).start()
+    def _issue_bkv_tile(step, buf_idx):
+      for chunk in range(num_dma_chunks):
+        _issue_bkv_chunk(step, buf_idx, chunk)
 
     def _wait_bkv_tile(buf_idx):
       for buf, sem_row in zip(dst_bufs, sem_rows):
         dst = buf.at[buf_idx]
         pltpu.make_async_copy(dst, dst, sems.at[sem_row, buf_idx]).wait()
 
-    def _load_bkv_tile(buf_idx, b, t):
+    def _decode_bkv_chunk(buf_idx, chunk: int) -> jax.Array:
+      """Decodes the NoPE part (or full bf16 row) of one chunk of a KV tile."""
       if kv_cache_mode == "dequant_vmem":
-        words = bkv_a_x4_ref.at[buf_idx][...].reshape(bkv_tile, 256)
+        words = bkv_a_x4_ref[
+            buf_idx, pl.ds(chunk * 2 * dma_unroll, 2 * dma_unroll), :
+        ].reshape(dma_unroll, 256)
         return jnp.concatenate(_unpack_bf16_pair(words), axis=-1)
-      bkv_nope = sc_kernel.dequant_dsv4_fp8(bkv_a_x4_ref.at[buf_idx][...])
-      pq_slice = packed_q_vmem_ref[0, :, pl.ds(t * bkv_tile, bkv_tile)]
-      bkv_rope = _decode_rope_tile(bkv_b_x4_ref.at[buf_idx][...], pq_slice, b)
-      return jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+      return sc_kernel.dequant_dsv4_fp8(
+          bkv_a_x4_ref[buf_idx, pl.ds(chunk * dma_unroll, dma_unroll), :]
+      )
 
     @pl.when(total_tiles > 0)
     def _run_active_tiles():
-      _start_bkv_tile(0, 0)
-
-      @pl.when(total_tiles > 1)
-      def _prefetch_second():
-        _start_bkv_tile(1, 1)
+      # Look-ahead DMAs past the last tile are clamped to re-fetch it into an
+      # idle buffer, so the issue never sits behind a branch and can share a
+      # basic block with vector work. The two extra tiles are drained at the
+      # end.
+      last_step = total_tiles - 1
+      _issue_bkv_tile(0, 0)
+      _issue_bkv_tile(jnp.minimum(1, last_step), 1)
 
       @pl.loop(0, total_tiles)
       def _tile_loop(step):
         buf_idx = lax.bitwise_and(step, 3)
-
-        @pl.when(step + 2 < total_tiles)
-        def _prefetch_ahead():
-          _start_bkv_tile(step + 2, lax.bitwise_and(step + 2, 3))
-
+        pf_step = jnp.minimum(step + 2, last_step)
+        pf_buf_idx = lax.bitwise_and(step + 2, 3)
         b, t = _divmod_static(step, num_kv_tiles)
         _wait_bkv_tile(buf_idx)
 
@@ -618,8 +668,28 @@ def _tc_gather_attention_kernel(
         kv_len = kv_lens_ref[batch_start_seq_idx + b]
         k_base = t * bkv_tile
 
+        # Interleave this tile's decode with the look-ahead DMA issue so the
+        # scalar descriptor pushes co-issue with vector dequant work.
+        # VMEM-sourced gathers compete with the decode for VMEM, so issue those
+        # up front.
+        interleave_issue = kv_cache_mode != "quant_vmem"
+        if not interleave_issue:
+          _issue_bkv_tile(pf_step, pf_buf_idx)
+        chunks = []
+        for chunk in range(num_dma_chunks):
+          chunks.append(_decode_bkv_chunk(buf_idx, chunk))
+          if interleave_issue:
+            _issue_bkv_chunk(pf_step, pf_buf_idx, chunk)
+        bkv_all = jnp.concatenate(chunks, axis=0)
+        if kv_cache_mode != "dequant_vmem":
+          pq_slice = packed_q_vmem_ref[0, :, pl.ds(t * bkv_tile, bkv_tile)]
+          bkv_rope = _decode_rope_tile(
+              bkv_b_x4_ref.at[buf_idx][...], pq_slice, b
+          )
+          bkv_all = jnp.concatenate([bkv_all, bkv_rope], axis=-1)
+
         def _update_tile(masked: bool):
-          bkv = _load_bkv_tile(buf_idx, b, t)
+          bkv = bkv_all
           if masked:
             k_span_kv = k_base + lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
             bkv = jnp.where(k_span_kv < kv_len, bkv, 0)
@@ -641,6 +711,9 @@ def _tc_gather_attention_kernel(
         @pl.when(t == num_kv_tiles - 1)
         def _finalize_token():
           o_ref[b] = _finalize(0)
+
+      _wait_bkv_tile(lax.bitwise_and(total_tiles, 3))
+      _wait_bkv_tile(lax.bitwise_and(total_tiles + 1, 3))
 
   if kv_cache_mode == "dense_vmem":
     _dense_vmem_body()
@@ -751,9 +824,7 @@ def sparse_ragged_paged_attention(
   q_elem_bytes = q.dtype.itemsize
   page_table_fits_smem = page_indices.nbytes <= 256 * 1024
   can_use_count_mxu = (
-      (num_q_heads % 16 == 0 or num_q_heads == 8)
-      and num_q_heads <= 256
-      and page_table_fits_smem
+      num_q_heads % 8 == 0 and num_q_heads <= 256 and page_table_fits_smem
   )
   has_kv_reuse = (
       max_num_tokens * topk >= total_seq_tokens * 2
@@ -771,13 +842,16 @@ def sparse_ragged_paged_attention(
   )
   padded_dense_tokens = max(256, sc_kernel.align_to(total_seq_tokens, 256))
   dense_num_g = sc_kernel.align_to(padded_dense_tokens // 128, 8)
+  idx_rows_bytes_per_tok = (
+      sc_kernel.align_to(topk // 128, num_sublanes) * 128 * 4
+  )
   dense_total_vmem = (
       3 * (2 * dense_bs * num_q_heads * head_dim * q_elem_bytes)
       + 2 * sc_kernel.align_to(max_num_tokens, dense_bs) * num_l_heads * 4
-      + 2 * topk * 128 * 4
+      + 2 * dense_bs * idx_rows_bytes_per_tok
       + padded_dense_tokens * head_dim * 2
       + 4 * page_size * 128 * 4
-      + dense_bs * dense_num_g * 16 * 128 * 4
+      + dense_bs * dense_num_g * 8 * 128 * 4
       + dense_bs * num_q_heads * 256 * (4 + q_elem_bytes)
       + dense_bs * num_q_heads * (head_dim + 256) * 4
       + 4 * 1024 * 1024
@@ -842,9 +916,9 @@ def sparse_ragged_paged_attention(
     )
     quant_cache_bytes = total_seq_pages * (page_size + page_size // 4) * 128 * 4
     seq_pages_vmem = (
-        2 * topk * 128 * 4
+        2 * batch_size * idx_rows_bytes_per_tok
         + 4 * page_size * 128 * 4
-        + sc_kernel.align_to(pages_per_seq * 2, 8) * 16 * 128 * 4
+        + sc_kernel.align_to(pages_per_seq * 2, 8) * 8 * 128 * 4
     )
     est_seq_pages = pages_per_seq - 2 if pages_per_seq > 2 else pages_per_seq
     can_use_seq_pages = (
@@ -888,7 +962,7 @@ def sparse_ragged_paged_attention(
   padded_num_g = 8
   gather_indices_arg = gather_indices_spec = None
   packed_q_arg = packed_q_spec = None
-  idx_transposed_arg = idx_transposed_spec = None
+  idx_rows_arg = idx_rows_spec = None
 
   if kv_cache_mode in ("dense_vmem", "seq_pages"):
     is_invalid = is_padding | (
@@ -929,16 +1003,12 @@ def sparse_ragged_paged_attention(
       active_pages_arg = _pad_rows(active_pages_per_tok, padded_tokens)
       padded_num_g = sc_kernel.align_to(pages_per_seq * 2, 8)
 
-    idx_padded_tokens = sc_kernel.align_to(padded_tokens, 128)
-    idx_transposed_arg = (
-        _pad_rows(logical_idx, idx_padded_tokens, value=-1)
-        .reshape(idx_padded_tokens // 128, 128, topk)
-        .transpose(0, 2, 1)
+    idx_rows_arg = _pad_rows(logical_idx, padded_tokens, value=-1).reshape(
+        padded_tokens, topk // 128, 128
     )
-    batches_per_128 = 128 // batch_size
-    idx_transposed_spec = pl.BlockSpec(
-        (1, topk, 128),
-        lambda i, *_: (i // batches_per_128, 0, 0),
+    idx_rows_spec = pl.BlockSpec(
+        (batch_size, topk // 128, 128),
+        lambda i, *_: (i, 0, 0),
         memory_space=pltpu.VMEM,
     )
   else:
@@ -1024,12 +1094,12 @@ def sparse_ragged_paged_attention(
 
   if kv_cache_mode == "dense_vmem":
     vmem_cache_a = pltpu.VMEM((padded_dense_tokens, head_dim), jnp.bfloat16)
-    c_vmem = pltpu.VMEM((batch_size, padded_num_g, 16, 128), jnp.float32)
+    c_vmem = pltpu.VMEM((batch_size, padded_num_g, 8, 128), jnp.float32)
     s_scratch = pltpu.VMEM((batch_size, num_q_heads, 256), jnp.float32)
     p_scratch = pltpu.VMEM((batch_size, num_q_heads, 256), q.dtype)
     state_bs = batch_size
   elif kv_cache_mode == "seq_pages":
-    c_vmem = pltpu.VMEM((1, padded_num_g, 16, 128), jnp.float32)
+    c_vmem = pltpu.VMEM((1, padded_num_g, 8, 128), jnp.float32)
   elif kv_cache_mode == "dequant_vmem":
     padded_seq_tokens = sc_kernel.align_to(total_seq_tokens, 8)
     bkv_a_x4 = pltpu.VMEM((4, 2 * bkv_tile, 128), jnp.int32)
@@ -1074,7 +1144,7 @@ def sparse_ragged_paged_attention(
       pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
       gather_indices_spec,
       packed_q_spec,
-      idx_transposed_spec,
+      idx_rows_spec,
       pl.BlockSpec(
           (batch_size, num_q_heads, head_dim),
           lambda i, *_: (i, 0, 0),
@@ -1107,7 +1177,7 @@ def sparse_ragged_paged_attention(
               page_size=page_size,
               pages_per_seq=pages_per_seq,
               max_num_seqs=max_num_seqs,
-              max_c_chunks=padded_num_g // 8,
+              num_g=padded_num_g,
               can_flatten_kv=can_flatten_kv,
               kv_cache_mode=kv_cache_mode,
               swa_lm_pipelined=swa_lm_pipelined,
@@ -1138,7 +1208,7 @@ def sparse_ragged_paged_attention(
       cache_kv_rope,
       gather_indices_arg,
       packed_q_arg,
-      idx_transposed_arg,
+      idx_rows_arg,
       swa_acc_in,
       swa_l_in,
       swa_m_in,

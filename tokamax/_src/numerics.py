@@ -15,6 +15,7 @@
 """Utilities for numerics."""
 
 import abc
+from collections.abc import Callable
 from concurrent import futures
 import dataclasses
 from typing import Any, cast
@@ -158,14 +159,26 @@ class ArrayInitializer(abc.ABC):
 
 
 class RangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
-  """A abstract array with a known range."""
+  """An abstract integer array with a known `[minval, maxval)` range."""
 
   def __init__(self, shape, dtype, minval, maxval):
     jax.ShapeDtypeStruct.__init__(self, shape, dtype)
     self.minval = minval
     self.maxval = maxval
 
-  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+  def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
+    i32 = np.iinfo(np.int32)
+    if (
+        self.size >= _DEVICE_INIT_THRESHOLD
+        and i32.min <= self.minval
+        and self.maxval <= i32.max
+    ):
+      return _run_on_device(
+          rng,
+          lambda k: _int_initializer(
+              k, self.shape, self.dtype, self.minval, self.maxval
+          ),
+      )
     return _int_initializer(
         rng, self.shape, self.dtype, self.minval, self.maxval
     )
@@ -179,7 +192,18 @@ class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
     self.minval = minval
     self.maxval = maxval
 
-  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+  def __call__(self, rng: np.random.Generator) -> np.ndarray | jax.Array:
+    if self.size >= _DEVICE_INIT_THRESHOLD:
+      return _run_on_device(
+          rng,
+          lambda k: jax.random.uniform(
+              k,
+              self.shape,
+              dtype=_promote_float_dtype(jnp.dtype(self.dtype)),
+              minval=self.minval,
+              maxval=self.maxval,
+          ).astype(self.dtype),
+      )
     return rng.uniform(self.minval, self.maxval, self.shape).astype(self.dtype)
 
 
@@ -188,6 +212,24 @@ class FloatRangedArrayInitializer(jax.ShapeDtypeStruct, ArrayInitializer):
 # Small arrays stay on the host path to avoid per-shape XLA compile overhead
 # across parameterized unit tests.
 _DEVICE_INIT_THRESHOLD = 1024 * 1024
+
+
+def _promote_float_dtype(dtype: jnp.dtype) -> jnp.dtype:
+  try:
+    return jnp.promote_types(dtype, jnp.float32)
+  except jax.dtypes.TypePromotionError:
+    return jnp.dtype(jnp.float32)
+
+
+def _run_on_device(
+    rng: np.random.Generator,
+    init_fn: Callable[[jax.Array], jax.Array],
+    out_sharding: Any = None,
+) -> jax.Array:
+  seed = jnp.int32(rng.integers(0, 2**31))
+  return jax.jit(
+      lambda s: init_fn(jax.random.key(s)), out_shardings=out_sharding
+  )(seed)
 
 
 def _int_initializer(rng, shape, dtype, minval=None, maxval=None):
@@ -227,10 +269,7 @@ def _init_array(
       out_sharding = None
 
   if jnp.issubdtype(dtype, jnp.floating):
-    try:
-      dtype_ = jnp.promote_types(dtype, jnp.float32)
-    except jax.dtypes.TypePromotionError:
-      dtype_ = jnp.float32
+    dtype_ = _promote_float_dtype(dtype)
     init_host = lambda: rng.standard_normal(size=x.shape, dtype=dtype_).astype(
         dtype
     )
@@ -247,10 +286,7 @@ def _init_array(
     raise NotImplementedError(f'dtype {dtype.name} not supported.')
 
   if x.size >= _DEVICE_INIT_THRESHOLD:
-    seed = jnp.int32(rng.integers(0, 2**31))
-    return jax.jit(
-        lambda s: init_dev(jax.random.key(s)), out_shardings=out_sharding
-    )(seed)
+    return _run_on_device(rng, init_dev, out_sharding=out_sharding)
   # TODO: Can we consolidate `device_put` into a single call?
   return jax.device_put(init_host(), out_sharding)
 
@@ -312,7 +348,10 @@ def _init_leaf(rng: np.random.Generator, leaf: Any) -> Any:
     out_sharding = (
         leaf_dict.get('format', sharding) if sharding is not None else None
     )
-    return jax.device_put(leaf(rng), out_sharding)
+    arr = leaf(rng)
+    if isinstance(arr, jax.Array) and out_sharding is None:
+      return arr
+    return jax.device_put(arr, out_sharding)
 
   if isinstance(leaf, qwix.QArray):
     return _init_qarray(rng, leaf)

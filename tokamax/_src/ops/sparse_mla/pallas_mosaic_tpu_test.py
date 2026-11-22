@@ -15,8 +15,14 @@
 """Tests for the Pallas/Mosaic SparseMLA operator on TPU."""
 
 from absl.testing import absltest
+import jax
 from jax.experimental.pallas import tpu as pltpu
 from jax.extend import backend
+import jax.numpy as jnp
+import numpy as np
+from tokamax._src import numerics
+from tokamax._src.ops.sparse_mla import arg_specs
+from tokamax._src.ops.sparse_mla import base
 from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu
 from tokamax._src.ops.sparse_mla import pallas_mosaic_tpu_tc_kernel
 from tokamax._src.ops.sparse_mla import test_base
@@ -72,6 +78,54 @@ class PallasTpuSparseMlaTest(test_base.SparseMlaTestBase):
             vmem_limit_bytes=config.vmem_limit_bytes,
         )
         test_base.assert_matches_reference(actual, inputs, actual_tokens)
+
+  def test_arg_spec_numerics(self):
+    """Checks a realistic ArgSpec initializes cleanly with non-trivial diff."""
+    spec = next(
+        s
+        for s in arg_specs.ARG_SPECS
+        if s.name == "prefill_b1_q1024_kv1024_p256_topk2048_h64"
+    )
+    args = {
+        k: jax.device_put(np.asarray(v)) if isinstance(v, np.ndarray) else v
+        for k, v in numerics.random_initialize(spec.args, seed=0).items()
+    }
+    ref = base.SparseMla()(**args)
+    actual_op = pallas_mosaic_tpu.PallasTpuSparseMla()(**args)
+    self.assertTrue(bool(jnp.all(jnp.isfinite(ref))))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(actual_op))))
+    op_summary = numerics.array_diff_summary(
+        ref, actual_op, rtol=1.6e-2, atol=1e-2
+    )
+    self.assertGreater(op_summary.percent_close, 0.99)
+    tc_out = pallas_mosaic_tpu_tc_kernel.sparse_ragged_paged_attention(
+        args["q"],
+        args["cache_kv_nope"],
+        args["cache_kv_rope"],
+        args["topk_indices"],
+        args["page_indices"],
+        args["cu_q_lens"],
+        args["distribution"],
+        args["attention_sinks"],
+        args["swa_accumution"],
+        args["swa_l"],
+        args["swa_m"],
+        sm_scale=args["sm_scale"],
+    )
+    self.assertTrue(bool(jnp.all(jnp.isfinite(tc_out))))
+    tc_summary = numerics.array_diff_summary(
+        ref, tc_out, rtol=1.6e-2, atol=1e-2
+    )
+    self.assertGreater(tc_summary.percent_close, 0.99)
+    # Perturbing cached KV rows must meaningfully change the output so Perfmon
+    # numerics stay sensitive to gather-index, byte-order, or lane-mapping bugs.
+    bad_args = dict(args)
+    bad_args["cache_kv_nope"] = jnp.roll(args["cache_kv_nope"], 1, axis=1)
+    bad_ref = base.SparseMla()(**bad_args)
+    bad_summary = numerics.array_diff_summary(
+        ref, bad_ref, rtol=1.6e-2, atol=1e-2
+    )
+    self.assertLess(bad_summary.percent_close, 0.5)
 
 
 if __name__ == "__main__":

@@ -192,11 +192,31 @@ class NumericsTest(parameterized.TestCase):
     self.assertGreater(q_rms, 0.8)
     self.assertLess(q_rms, 1.2)
 
-  def test_ranged_array_initializer(self):
-    x = numerics.RangedArrayInitializer((128, 128), jnp.int32, 3, 7)
-    x = numerics.random_initialize(x)
-    self.assertEqual(jnp.min(x), 3)
-    self.assertEqual(jnp.max(x), 6)
+  @parameterized.parameters(((128, 128), 1), ((1024, 1024), 0))
+  def test_ranged_array_initializer(self, shape, expected_device_puts):
+    x = numerics.RangedArrayInitializer(shape, jnp.int32, 3, 7)
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      x = numerics.random_initialize(x)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+    self.assertEqual(x.shape, shape)
+    self.assertEqual(x.dtype, jnp.int32)
+    self.assertGreaterEqual(int(jnp.min(x)), 3)
+    self.assertLess(int(jnp.max(x)), 7)
+
+  @parameterized.parameters(((128, 128), 1), ((1024, 1024), 0))
+  def test_float_ranged_array_initializer(self, shape, expected_device_puts):
+    x = numerics.FloatRangedArrayInitializer(shape, jnp.float32, 0.5, 2.0)
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
+      x = numerics.random_initialize(x)
+    self.assertEqual(mock_device_put.call_count, expected_device_puts)
+    self.assertEqual(x.shape, shape)
+    self.assertEqual(x.dtype, jnp.float32)
+    self.assertGreaterEqual(float(jnp.min(x)), 0.5)
+    self.assertLess(float(jnp.max(x)), 2.0)
 
   @parameterized.parameters(((16, 16), 2), ((1024, 1024), 0))
   def test_host_vs_device_initialization(self, shape, expected_device_puts):

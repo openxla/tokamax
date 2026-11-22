@@ -585,6 +585,17 @@ class CorrectnessTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       dict(
+          testcase_name="dense_vmem_h32_partial",
+          batch_size=1,
+          actual_batch_size=1,
+          q_len=13,
+          page_size=64,
+          kv_len_val=512,
+          topk=512,
+          num_heads=32,
+          expected_mode="dense_vmem",
+      ),
+      dict(
           testcase_name="dense_vmem_h64",
           batch_size=1,
           actual_batch_size=1,
