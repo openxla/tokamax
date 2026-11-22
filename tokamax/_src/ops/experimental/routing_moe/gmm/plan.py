@@ -39,6 +39,27 @@ from tokamax._src.ops.experimental.routing_moe.common import spec as tensor_spec
 from tokamax._src.ops.experimental.routing_moe.gmm import spec as gmm_spec_lib
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _HeuristicPolicy:
+  """Empirical planner thresholds internal to plan.py."""
+
+  vmem_usage_fraction: float = 0.9
+  max_tile_m: int = 256
+  max_num_buckets: int = 2
+  skew_headroom: float = 1.5
+  dma_floor_divisor: int = 16
+  default_num_xo_buffers: int = 3
+  min_num_w_buffers: int = 2
+  default_max_w_buffers: int = 8
+  fused_large_tile_m_cutoff: int = 64
+  fused_large_tile_max_w_buffers: int = 4
+  large_expert_weight_bytes: int = 12 * 1024 * 1024
+  large_expert_max_w_buffers: int = 3
+  lookahead_min_w_buffers: int = 4
+  lookahead_min_mean_tiles: int = 4
+  default_x_quant_block_size: int = 512
+
+
 @dataclass_util.require_none_default
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RoutingGmmPlan:
@@ -74,32 +95,6 @@ class RoutingGmmPlan:
   smem_indices: bool | None = None
   # Scan ahead in weight BufferedRefs to deduplicate consecutive expert tiles.
   weight_lookahead: bool | None = None
-  # These fields bound the heuristic search and are omitted once resolved.
-  vmem_usage_fraction: float | None = None
-  # Upper bound when num_w_buffers is grown into spare VMEM, so that the next
-  # groups' weight DMAs stay in flight during the current group's compute.
-  max_num_w_buffers: int | None = None
-  # Upper bound on tile_m when it spans more than one bucket.
-  max_tile_m: int | None = None
-  # Upper bound on the number of buckets (tile_m / bucket_base).
-  max_num_buckets: int | None = None
-  # Multiplier on the mean rows per expert group when bounding tile_m, so
-  # moderately skewed groups still fit in one tile.
-  # TODO: The default of 1.5 was chosen empirically from TPUv7x routing
-  # skew sweeps and is not derived. Revisit it based on measured routing skew.
-  skew_headroom: float | None = None
-  # tile_m is kept at or above i_local // dma_floor_divisor, where i_local is
-  # the per-shard intermediate width, so per-tile row gather/scatter stays
-  # small next to the group's weight DMA.
-  # TODO: The default of 16 was chosen empirically from TPUv7x sweeps
-  # and is not derived. Revisit it on other chips and weight dtypes.
-  dma_floor_divisor: int | None = None
-
-  def __post_init__(self) -> None:
-    for name in ("skew_headroom", "dma_floor_divisor"):
-      value = getattr(self, name)
-      if value is not None and value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}.")
 
 
 def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
@@ -110,7 +105,7 @@ def vmem_budget_bytes(tpu_info: pltpu.TpuInfo) -> int:
   # - TPU >= 8: SparseCore subcore SPMEM mirrored in TensorCore VMEM (e.g.
   #   2 MiB on 8i, 8 MiB on 8t).
   # Compiler flags or future XLA changes can reserve additional module-level
-  # VMEM; default planning absorbs that headroom via `vmem_usage_fraction`.
+  # VMEM; default planning absorbs that headroom via `_HeuristicPolicy`.
   if tpu_info.generation >= 8:
     sc = tpu_info.sparse_core
     reserved = (
@@ -147,17 +142,7 @@ def _resolve_smem_indices(
   return sum(allocs.values()) <= smem_budget_bytes(tpu_info)
 
 
-@dataclass_util.resolves_from(
-    RoutingGmmPlan,
-    dropped=(
-        "vmem_usage_fraction",
-        "max_num_w_buffers",
-        "max_tile_m",
-        "max_num_buckets",
-        "skew_headroom",
-        "dma_floor_divisor",
-    ),
-)
+@dataclass_util.resolves_from(RoutingGmmPlan)
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ResolvedGmmPlan:
   """Plan with None fields from user-provided plan resolved by heuristic."""
@@ -228,9 +213,10 @@ class ResolvedGmmPlan:
     """Resolves unset plan fields into concrete execution parameters."""
     if plan is None:
       plan = RoutingGmmPlan()
+    policy = _HeuristicPolicy()
 
     matmul_dtype, acc_dtype, x_quant_block_size = _resolve_dtypes(
-        plan, x=spec.x, w=spec.w, tpu_info=tpu_info
+        plan, x=spec.x, w=spec.w, tpu_info=tpu_info, policy=policy
     )
     num_stash_buffers, stash_dtype = _resolve_stash(
         plan, out_quant=out_format.quant
@@ -248,7 +234,6 @@ class ResolvedGmmPlan:
     if spec.w2 is None and plan.w2_matmul_dtype is not None:
       raise ValueError("w2_matmul_dtype requires w2 to be set.")
 
-    vmem_usage_fraction = plan.vmem_usage_fraction or 0.9
     vmem_budget = vmem_budget_bytes(tpu_info)
     vmem_limit_bytes = min(plan.vmem_limit_bytes or vmem_budget, vmem_budget)
     tiling, fuse_up_and_down = resolve_tiling_and_fusion(
@@ -260,8 +245,9 @@ class ResolvedGmmPlan:
         out_quant=out_format.quant,
         num_stash_buffers=num_stash_buffers,
         stash_dtype=stash_dtype,
-        vmem_limit_bytes=int(vmem_usage_fraction * vmem_limit_bytes),
+        vmem_limit_bytes=int(policy.vmem_usage_fraction * vmem_limit_bytes),
         tpu_info=tpu_info,
+        policy=policy,
     )
     if not fuse_up_and_down and plan.w2_matmul_dtype is not None:
       raise ValueError("w2_matmul_dtype requires fuse_up_and_down=True.")
@@ -278,6 +264,7 @@ class ResolvedGmmPlan:
         spec=spec,
         tile_m=tiling.tile_m,
         num_w_buffers=tiling.num_w_buffers,
+        policy=policy,
     )
     resolved = cls(
         tile_m=tiling.tile_m,
@@ -356,6 +343,7 @@ def resolve_tiling_and_fusion(
     stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
+    policy: _HeuristicPolicy | None = None,
 ) -> tuple[Tiling, bool]:
   """Decides together whether to fuse the projections and how to tile them.
 
@@ -377,6 +365,7 @@ def resolve_tiling_and_fusion(
     stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
+    policy: Internal heuristic thresholds; defaults to `_HeuristicPolicy()`.
 
   Returns:
     The tiling, and whether the gate/up and down projections are fused.
@@ -384,6 +373,8 @@ def resolve_tiling_and_fusion(
   Raises:
     ValueError: If `plan.fuse_up_and_down` is True but no fused tiling fits.
   """
+  if policy is None:
+    policy = _HeuristicPolicy()
   if spec.w2 is not None and (
       plan.fuse_up_and_down is None or plan.fuse_up_and_down
   ):
@@ -398,6 +389,7 @@ def resolve_tiling_and_fusion(
         stash_dtype=stash_dtype,
         vmem_limit_bytes=vmem_limit_bytes,
         tpu_info=tpu_info,
+        policy=policy,
     )
     if tiling is not None:
       return tiling, True
@@ -419,6 +411,7 @@ def resolve_tiling_and_fusion(
       stash_dtype=stash_dtype,
       vmem_limit_bytes=vmem_limit_bytes,
       tpu_info=tpu_info,
+      policy=policy,
   )
   return tiling, False
 
@@ -446,21 +439,14 @@ def _token_rows(
 
 
 def _max_group_rows(
-    plan: RoutingGmmPlan,
-    *,
     spec: gmm_spec_lib.RoutingGmmSpec,
     tpu_info: pltpu.TpuInfo,
+    *,
+    policy: _HeuristicPolicy | None = None,
 ) -> int:
-  """Bounds tile_m by expected rows per group and input token count.
-
-  Args:
-    plan: User plan, for `skew_headroom` and `dma_floor_divisor`.
-    spec: Validated input specifications and operator semantics.
-    tpu_info: TPU the kernel runs on.
-
-  Returns:
-    Maximum number of rows a tile needs, rounded up to `num_sublanes`.
-  """
+  """Bounds tile_m by expected rows per group and input token count."""
+  if policy is None:
+    policy = _HeuristicPolicy()
   min_tile_m = tpu_info.num_sublanes
   token_cap = max(min_tile_m, _token_rows(spec.x, tpu_info))
   if spec.size_out_m <= 0 or spec.num_global_groups <= 0:
@@ -473,37 +459,30 @@ def _max_group_rows(
     i_local = spec.size_k
   else:
     i_local = min(spec.size_k, spec.w.out_size)
-  dma_floor = max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
+  dma_floor = max(min_tile_m, i_local // policy.dma_floor_divisor)
   expected_rows = spec.size_out_m / spec.num_global_groups
-  skew_headroom = plan.skew_headroom or 1.5
-  skew_rows = pl.next_power_of_2(math.ceil(skew_headroom * expected_rows))
+  skew_rows = pl.next_power_of_2(
+      math.ceil(policy.skew_headroom * expected_rows)
+  )
   target_rows = min_tile_m * pl.cdiv(max(dma_floor, skew_rows), min_tile_m)
   return min(target_rows, token_cap)
 
 
-def _tile_m_limits(plan: RoutingGmmPlan) -> tuple[int, int]:
-  """Returns the max tile_m and max number of buckets of the heuristic."""
-  # max_tile_m Defaults to 256.
-  # TODO: Lift the 256 cap once larger tiles are validated.
-
-  # max_num_buckets Defaults to 2.
-  # TODO: The default was chosen empirically. Revisit it based on
-  # instruction memory size.
-  return plan.max_tile_m or 256, plan.max_num_buckets or 2
-
-
 def _tile_m_candidates(
-    plan: RoutingGmmPlan, *, bucket_base: int, max_group_rows: int
+    plan: RoutingGmmPlan,
+    *,
+    bucket_base: int,
+    max_group_rows: int,
+    policy: _HeuristicPolicy,
 ) -> list[int]:
   """The tile_m values the heuristic may pick, largest first."""
   if plan.tile_m is not None:
     return [plan.tile_m]
-  max_tile_m, max_num_buckets = _tile_m_limits(plan)
   candidates = set()
-  for num_buckets in range(1, max_num_buckets + 1):
+  for num_buckets in range(1, policy.max_num_buckets + 1):
     tile_m = num_buckets * bucket_base
     # Like _resolve_tile_m, a single bucket is always a candidate.
-    if num_buckets > 1 and tile_m > max_tile_m:
+    if num_buckets > 1 and tile_m > policy.max_tile_m:
       break
     if plan.bucket_base is None:
       tile_m = min(tile_m, max_group_rows)
@@ -601,6 +580,7 @@ def _resolve_dtypes(
     x: tensor_spec.ActivationSpec,
     w: tensor_spec.WeightSpec,
     tpu_info: pltpu.TpuInfo,
+    policy: _HeuristicPolicy,
 ) -> tuple[jnp.dtype, jnp.dtype, int | None]:
   """Resolves execution dtypes and `x` quantization block size."""
   x_quant_block_size = plan.x_quant_block_size
@@ -631,7 +611,7 @@ def _resolve_dtypes(
       and not isinstance(w.quant, tensor_spec.BlockScaledQuantSpec)
   ):
     # TODO: Choose different block size based on HW.
-    x_quant_block_size = 512
+    x_quant_block_size = policy.default_x_quant_block_size
 
   acc_dtype = (
       jnp.bfloat16.dtype
@@ -745,23 +725,23 @@ def _w_buffer_range(
     *,
     spec: gmm_spec_lib.RoutingGmmSpec,
     tile_m: int,
+    policy: _HeuristicPolicy,
 ) -> tuple[int, int]:
   """Returns the min and max number of weight buffers to try."""
-  min_num_w_buffers = plan.num_w_buffers or 2
+  min_num_w_buffers = plan.num_w_buffers or policy.min_num_w_buffers
   if plan.num_w_buffers is not None:
     return min_num_w_buffers, min_num_w_buffers
   # TODO: On fused two-projection kernels at tile_m >= 64, tile
   # compute empirically covers weight DMA latency at 4 buffers while avoiding
   # extra prologue weight prefetches; on large (>= 12 MiB) expert weights, cap
   # at 3 buffers so prologue weight DMAs do not stall slot 0.
-  large_expert_weight_bytes = 12 * 1024 * 1024
-  if _expert_weight_bytes(spec) >= large_expert_weight_bytes:
-    default_max = 3
-  elif spec.w2 is not None and tile_m >= 64:
-    default_max = 4
+  if _expert_weight_bytes(spec) >= policy.large_expert_weight_bytes:
+    default_max = policy.large_expert_max_w_buffers
+  elif spec.w2 is not None and tile_m >= policy.fused_large_tile_m_cutoff:
+    default_max = policy.fused_large_tile_max_w_buffers
   else:
-    default_max = 8
-  return min_num_w_buffers, plan.max_num_w_buffers or default_max
+    default_max = policy.default_max_w_buffers
+  return min_num_w_buffers, default_max
 
 
 def _max_fitting_w_buffers(
@@ -822,6 +802,7 @@ def _fused_tiling(
     stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
+    policy: _HeuristicPolicy,
 ) -> Tiling | None:
   """Returns the tiling of the fused kernel, or None if none fits VMEM.
 
@@ -841,6 +822,7 @@ def _fused_tiling(
     stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
+    policy: Internal heuristic thresholds.
 
   Returns:
     The fused kernel tiling, or None if no fused tiling fits VMEM.
@@ -852,8 +834,8 @@ def _fused_tiling(
     return None
   tile_k, tile_n = spec.size_k, spec.size_out_n
 
-  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
-  num_xo_buffers = plan.num_xo_buffers or 3
+  max_group_rows = _max_group_rows(spec, tpu_info, policy=policy)
+  num_xo_buffers = plan.num_xo_buffers or policy.default_num_xo_buffers
 
   estimate_vmem = functools.partial(
       _vmem_estimate,
@@ -883,7 +865,7 @@ def _fused_tiling(
         tpu_info=tpu_info,
     )
     min_num_w_buffers, max_num_w_buffers = _w_buffer_range(
-        plan, spec=spec, tile_m=tile_m
+        plan, spec=spec, tile_m=tile_m, policy=policy
     )
     num_w_buffers = _max_fitting_w_buffers(
         lambda n: estimate_vmem(
@@ -912,7 +894,10 @@ def _fused_tiling(
       plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=max_group_rows
   )
   largest_tile_m = _tile_m_candidates(
-      plan, bucket_base=bucket_base, max_group_rows=max_group_rows
+      plan,
+      bucket_base=bucket_base,
+      max_group_rows=max_group_rows,
+      policy=policy,
   )[0]
 
   # Step 1: Try fusion + largest possible tile_m.
@@ -951,6 +936,7 @@ def _fused_tiling(
           plan, w=w, matmul_dtype=matmul_dtype, max_group_rows=token_rows
       ),
       max_group_rows=token_rows,
+      policy=policy,
   )[0]
   bucket_base = _resolve_bucket_base(
       dataclasses.replace(plan, tile_m=sliced_tile_m),
@@ -1218,17 +1204,17 @@ def _resolve_tile_m(
     w_tile_n: int,
     estimate_vmem: Callable[..., int],
     vmem_limit_bytes: int,
+    policy: _HeuristicPolicy,
 ) -> int:
   """Resolves `tile_m` from user plan or VMEM-fitting bucket multiples."""
   if plan.tile_m is not None:
     return plan.tile_m
   # Largest multiple of bucket_base that stays within max_tile_m and VMEM.
-  max_tile_m, max_num_buckets = _tile_m_limits(plan)
   tile_m = bucket_base
-  for num_buckets in range(2, max_num_buckets + 1):
+  for num_buckets in range(2, policy.max_num_buckets + 1):
     candidate = num_buckets * bucket_base
     if (
-        candidate > max_tile_m
+        candidate > policy.max_tile_m
         or estimate_vmem(tile_m=candidate, tile_n=w_tile_n) > vmem_limit_bytes
     ):
       break
@@ -1254,6 +1240,7 @@ def _resolve_weight_lookahead(
     spec: gmm_spec_lib.RoutingGmmSpec,
     tile_m: int,
     num_w_buffers: int,
+    policy: _HeuristicPolicy,
 ) -> bool:
   """Resolves whether weight BufferedRefs scan ahead across expert tiles."""
   if plan.weight_lookahead is not None:
@@ -1263,13 +1250,16 @@ def _resolve_weight_lookahead(
   if (
       (spec.gather is not None or spec.scatter is not None)
       and spec.num_global_groups > 0
-      and num_w_buffers >= 4
+      and num_w_buffers >= policy.lookahead_min_w_buffers
   ):
     # TODO: Per-row routed DMAs saturate the scalar ALU when
     # BufferedRef lookahead scans run on short groups; when fewer than 4 weight
     # buffers fit, keep lookahead enabled so multi-tile hot groups never starve
     # next-expert prefetch.
-    return spec.size_out_m > 4 * tile_m * spec.num_global_groups
+    return (
+        spec.size_out_m
+        > policy.lookahead_min_mean_tiles * tile_m * spec.num_global_groups
+    )
   return True
 
 
@@ -1282,11 +1272,14 @@ def _grow_num_w_buffers(
     w_tile_n: int,
     estimate_vmem: Callable[..., int],
     vmem_limit_bytes: int,
+    policy: _HeuristicPolicy,
 ) -> int:
   """Grows weight buffer count into spare VMEM unless the plan fixes it."""
   if plan.num_w_buffers is not None:
     return num_w_buffers
-  _, max_num_w_buffers = _w_buffer_range(plan, spec=spec, tile_m=tile_m)
+  _, max_num_w_buffers = _w_buffer_range(
+      plan, spec=spec, tile_m=tile_m, policy=policy
+  )
   while num_w_buffers < max_num_w_buffers and (
       estimate_vmem(
           tile_m=tile_m, tile_n=w_tile_n, num_w_buffers=num_w_buffers + 1
@@ -1309,6 +1302,7 @@ def calculate_tiling(
     stash_dtype: jnp.dtype | None = None,
     vmem_limit_bytes: int,
     tpu_info: pltpu.TpuInfo,
+    policy: _HeuristicPolicy | None = None,
 ) -> Tiling:
   """Resolves tile sizes and buffer counts of the unfused routing GMM.
 
@@ -1323,15 +1317,18 @@ def calculate_tiling(
     stash_dtype: Stash VMEM dtype when `out_quant` is set, else None.
     vmem_limit_bytes: VMEM budget of the kernel.
     tpu_info: TPU the kernel runs on.
+    policy: Internal heuristic thresholds; defaults to `_HeuristicPolicy()`.
 
   Returns:
     The tiling of the unfused kernel.
   """
+  if policy is None:
+    policy = _HeuristicPolicy()
   x, w = spec.x, spec.w
   # Step 1: Set default values.
-  max_group_rows = _max_group_rows(plan, spec=spec, tpu_info=tpu_info)
-  num_xo_buffers = plan.num_xo_buffers or 3
-  num_w_buffers = plan.num_w_buffers or 2
+  max_group_rows = _max_group_rows(spec, tpu_info, policy=policy)
+  num_xo_buffers = plan.num_xo_buffers or policy.default_num_xo_buffers
+  num_w_buffers = plan.num_w_buffers or policy.min_num_w_buffers
   # TODO: Support K dim tiling.
   tile_k = plan.tile_k or spec.size_k
   bucket_base = _resolve_bucket_base(
@@ -1390,6 +1387,7 @@ def calculate_tiling(
       w_tile_n=w_tile_n,
       estimate_vmem=estimate_vmem,
       vmem_limit_bytes=vmem_limit_bytes,
+      policy=policy,
   )
 
   # Spend spare VMEM on deeper weight prefetch.
@@ -1401,6 +1399,7 @@ def calculate_tiling(
       w_tile_n=w_tile_n,
       estimate_vmem=estimate_vmem,
       vmem_limit_bytes=vmem_limit_bytes,
+      policy=policy,
   )
 
   estimate = estimate_vmem(
