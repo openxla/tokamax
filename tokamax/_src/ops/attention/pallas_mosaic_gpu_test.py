@@ -21,6 +21,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
@@ -257,6 +258,28 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     cfg_dict = dict(block_q=128, block_kv=64, split_k=2, collective=False)
     cfg_dict = {k: v for k, v in cfg_dict.items() if hasattr(cfg_cls, k)}
     self._run_test((2, 1024, 4, 64), impl=op_cls(config=cfg_cls(**cfg_dict)))
+
+  @parameterized.parameters(jnp.bfloat16, jnp.float16)
+  def test_split_k_output_dtype(self, dtype):
+    op_cls = type(self._attention_fn)
+    cfg_cls = op_cls.config_cls
+    if get_origin(cfg_cls) in {Union, UnionType}:
+      cfg_cls = fa._get_kernel_module().Config
+    if not hasattr(cfg_cls, "split_k"):
+      self.skipTest("split_k unsupported for this implementation.")
+    cfg_dict = dict(block_q=128, block_kv=128, split_k=2, collective=False)
+    cfg_dict = {k: v for k, v in cfg_dict.items() if hasattr(cfg_cls, k)}
+    impl = op_cls(config=cfg_cls(**cfg_dict))
+    keys = jax.random.split(jax.random.key(0), 3)
+    q, k, v = (jax.random.normal(x, (2, 256, 4, 128), dtype) for x in keys)
+    out = impl(q, k, v)
+    self.assertEqual(out.dtype, dtype)
+    expected = jax.nn.dot_product_attention(
+        *(x.astype(jnp.float32) for x in (q, k, v))
+    )
+    chex.assert_trees_all_close(
+        out.astype(jnp.float32), expected, atol=0.02, rtol=0.01
+    )
 
   @override
   def _test_small_sequences(self, seq_q, seq_kv):
