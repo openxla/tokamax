@@ -14,8 +14,10 @@
 # ==============================================================================
 """Tests for Pallas Mosaic TPU Ragged Dot."""
 
+import dataclasses
 import functools
 from typing import override
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -258,6 +260,7 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
   )
   def test_heuristics_config(self, m, k, n):
     num_groups = 256
+    num_lanes = pltpu.get_tpu_info().num_lanes
 
     tpu_ragged_dot = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
 
@@ -273,15 +276,15 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     fwd_heuristics = ba_fwd.heuristics_config
     self.assertIsInstance(fwd_heuristics, pallas_mosaic_tpu.Config)
-    self.assertLessEqual(fwd_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(fwd_heuristics.tile_m, min(m, 8 * num_lanes))
     self.assertLessEqual(fwd_heuristics.tile_k, k)
     self.assertLessEqual(fwd_heuristics.tile_n, n)
     self.assertEqual(fwd_heuristics.input_buffer_count, 2)
     # Deflation order GMM: m -> n -> k.
     if fwd_heuristics.tile_n < n:
-      self.assertEqual(fwd_heuristics.tile_m, 128)
+      self.assertEqual(fwd_heuristics.tile_m, num_lanes)
     if fwd_heuristics.tile_k < k:
-      self.assertEqual(fwd_heuristics.tile_n, 128)
+      self.assertEqual(fwd_heuristics.tile_n, num_lanes)
 
     ba_vjp_dlhs = op_lib.BoundArguments(
         op=tpu_ragged_dot,
@@ -298,15 +301,15 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     dlhs_heuristics = ba_vjp_dlhs.heuristics_config
     self.assertIsInstance(dlhs_heuristics, pallas_mosaic_tpu.Config)
-    self.assertLessEqual(dlhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(dlhs_heuristics.tile_m, min(m, 8 * num_lanes))
     self.assertLessEqual(dlhs_heuristics.tile_k, k)
     self.assertLessEqual(dlhs_heuristics.tile_n, n)
     self.assertEqual(dlhs_heuristics.input_buffer_count, 2)
     # Deflation order GMM: m -> n -> k.
     if dlhs_heuristics.tile_n < n:
-      self.assertEqual(dlhs_heuristics.tile_m, 128)
+      self.assertEqual(dlhs_heuristics.tile_m, num_lanes)
     if dlhs_heuristics.tile_k < k:
-      self.assertEqual(dlhs_heuristics.tile_n, 128)
+      self.assertEqual(dlhs_heuristics.tile_n, num_lanes)
 
     # Try DRHS VJP with heuristics config.
     ba_vjp_drhs = op_lib.BoundArguments(
@@ -324,15 +327,252 @@ class PallasMosaicTpuRaggedDotTest(test_base.RaggedDotTestBase):
     )
     drhs_heuristics = ba_vjp_drhs.heuristics_config
     self.assertIsInstance(drhs_heuristics, pallas_mosaic_tpu.Config)
-    self.assertLessEqual(drhs_heuristics.tile_m, min(m, 1024))
+    self.assertLessEqual(drhs_heuristics.tile_m, min(m, 8 * num_lanes))
     self.assertLessEqual(drhs_heuristics.tile_k, k)
     self.assertLessEqual(drhs_heuristics.tile_n, n)
     self.assertEqual(drhs_heuristics.input_buffer_count, 2)
-    # Deflation order TGMM: k -> n -> m.
+    # TGMM picks the largest (k, n) tile that fits with
+    # tile_m <= 2 * num_lanes, then the largest tile_m.
     if drhs_heuristics.tile_n < n:
-      self.assertEqual(drhs_heuristics.tile_k, 128)
-    if drhs_heuristics.tile_m < min(m, 1024):
-      self.assertEqual(drhs_heuristics.tile_n, 128)
+      self.assertEqual(drhs_heuristics.tile_k, num_lanes)
+    if drhs_heuristics.tile_m < min(m, 2 * num_lanes):
+      self.assertEqual(drhs_heuristics.tile_k, num_lanes)
+      self.assertEqual(drhs_heuristics.tile_n, num_lanes)
+
+  @parameterized.parameters(
+      (32, 196608, 1536, 1280),
+      (16, 131072, 1280, 1536),
+      (128, 98304, 2048, 1280),
+      (32, 147456, 1280, 2048),
+      (8, 8192, 4096, 14336),
+  )
+  def test_drhs_heuristics_config_compiles(
+      self, num_groups: int, m: int, k: int, n: int
+  ):
+    lhs = jax.ShapeDtypeStruct((m, k), dtype=jnp.bfloat16)
+    rhs = jax.ShapeDtypeStruct((m, n), dtype=jnp.bfloat16)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32)
+    dims = pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS
+    config = op_lib.BoundArguments(
+        op=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
+        arguments={
+            "lhs": lhs,
+            "rhs": rhs,
+            "group_sizes": group_sizes,
+            "ragged_dot_dimension_numbers": dims,
+        },
+    ).heuristics_config
+    op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(config=config)
+    fn = functools.partial(op, ragged_dot_dimension_numbers=dims)
+    # Compilation fails if the kernel exceeds the scoped VMEM limit.
+    jax.jit(fn).lower(lhs, rhs, group_sizes=group_sizes).compile()
+
+
+_TPU_CHIPS = {
+    "v5e": pltpu.ChipVersion.TPU_V5E,
+    "v5p": pltpu.ChipVersion.TPU_V5P,
+    "v6e": pltpu.ChipVersion.TPU_V6E,
+    "tpu7x": pltpu.ChipVersion.TPU_7X,
+    "tpu8i": pltpu.ChipVersion.TPU_8I,
+}
+
+
+class TgmmHeuristicsTest(parameterized.TestCase):
+  """Tests for the tgmm (drhs) heuristics using mocked TPU info."""
+
+  def _drhs_bound_args(
+      self,
+      m: int,
+      k: int,
+      n: int,
+      *,
+      num_groups: int = 32,
+      lhs_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      rhs_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      preferred_element_type: jax.typing.DTypeLike | None = None,
+  ) -> op_lib.BoundArguments:
+    return op_lib.BoundArguments(
+        op=pallas_mosaic_tpu.PallasMosaicTpuRaggedDot(),
+        arguments={
+            "lhs": jax.ShapeDtypeStruct((m, k), dtype=lhs_dtype),
+            "rhs": jax.ShapeDtypeStruct((m, n), dtype=rhs_dtype),
+            "group_sizes": base.generate_group_sizes(
+                m=m, num_groups=num_groups
+            ),
+            "ragged_dot_dimension_numbers": (
+                pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS
+            ),
+            "preferred_element_type": preferred_element_type,
+        },
+    )
+
+  def _mock_tpu_info(self, tpu: str, num_lanes: int = 128) -> pltpu.TpuInfo:
+    return dataclasses.replace(
+        pltpu.get_tpu_info_for_chip(_TPU_CHIPS[tpu], 1),
+        num_lanes=num_lanes,
+    )
+
+  def _vmem_bytes(
+      self,
+      config: pallas_mosaic_tpu.Config,
+      *,
+      lhs_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      rhs_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+      out_dtype: jax.typing.DTypeLike = jnp.bfloat16,
+  ) -> int:
+    return pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()._tgmm_vmem_bytes(
+        (config.tile_m, config.tile_k, config.tile_n),
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
+        out_dtype=out_dtype,
+        input_buffer_count=config.input_buffer_count,
+    )
+
+  @parameterized.named_parameters(
+      ("v5e", "v5e", 16),
+      ("v5p", "v5p", 16),
+      ("v6e", "v6e", 32),
+      ("tpu7x", "tpu7x", 32),
+      ("tpu8i", "tpu8i", 96),
+  )
+  def test_scoped_vmem_capacity_bytes(self, tpu: str, expected_mib: int):
+    tpu_info = self._mock_tpu_info(tpu)
+    with mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info):
+      self.assertEqual(
+          pallas_mosaic_tpu._scoped_vmem_capacity_bytes(),
+          expected_mib * 1024 * 1024,
+      )
+
+  @parameterized.product(
+      tpu=tuple(_TPU_CHIPS),
+      mkn=(
+          (8, 4096, 4096),
+          (4096, 4096, 4096),
+          (98304, 2048, 1280),
+          (98304, 1280, 2048),
+          (131072, 1536, 1280),
+          (131072, 1280, 1536),
+          (196608, 1536, 1280),
+          (131072, 7168, 1024),
+          (262144, 256, 7168),
+          (327680, 2880, 2880),
+          (8192, 4096, 14336),
+      ),
+  )
+  def test_drhs_config_fits_scoped_vmem(
+      self, tpu: str, mkn: tuple[int, int, int]
+  ):
+    m, k, n = mkn
+    ba = self._drhs_bound_args(m, k, n)
+    tpu_info = self._mock_tpu_info(tpu)
+    with mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info):
+      config = ba.heuristics_config
+      scoped_vmem_bytes = pallas_mosaic_tpu._scoped_vmem_capacity_bytes()
+    self.assertLessEqual(self._vmem_bytes(config), 0.75 * scoped_vmem_bytes)
+    self.assertLessEqual(config.tile_m, min(m, 8 * tpu_info.num_lanes))
+    self.assertLessEqual(config.tile_k, k)
+    self.assertLessEqual(config.tile_n, n)
+    self.assertEqual(config.input_buffer_count, 2)
+
+  @parameterized.product(
+      tpu=tuple(_TPU_CHIPS),
+      dtypes=(
+          (jnp.bfloat16, jnp.bfloat16, jnp.float32),
+          (jnp.bfloat16, jnp.float32, None),
+          (jnp.float32, jnp.bfloat16, None),
+      ),
+  )
+  def test_drhs_f32_output_fits_scoped_vmem(
+      self,
+      tpu: str,
+      dtypes: tuple[
+          jax.typing.DTypeLike,
+          jax.typing.DTypeLike,
+          jax.typing.DTypeLike | None,
+      ],
+  ):
+    lhs_dtype, rhs_dtype, preferred_element_type = dtypes
+    out_dtype = (
+        jnp.result_type(lhs_dtype, rhs_dtype)
+        if preferred_element_type is None
+        else preferred_element_type
+    )
+    ba = self._drhs_bound_args(
+        196608,
+        1536,
+        1280,
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
+        preferred_element_type=preferred_element_type,
+    )
+    tpu_info = self._mock_tpu_info(tpu)
+    with mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info):
+      config = ba.heuristics_config
+      scoped_vmem_bytes = pallas_mosaic_tpu._scoped_vmem_capacity_bytes()
+    self.assertLessEqual(
+        self._vmem_bytes(
+            config,
+            lhs_dtype=lhs_dtype,
+            rhs_dtype=rhs_dtype,
+            out_dtype=out_dtype,
+        ),
+        0.75 * scoped_vmem_bytes,
+    )
+
+  @parameterized.product(
+      dims=("fwd", "dlhs", "drhs"),
+      mkn=(
+          (196608, 1536, 1280),
+          (65536, 7168, 2048),
+          (8192, 4096, 14336),
+          (262144, 256, 7168),
+      ),
+  )
+  def test_configs_respect_num_lanes(
+      self, dims: str, mkn: tuple[int, int, int]
+  ):
+    m, k, n = mkn
+    num_lanes, num_groups = 256, 32
+    lhs_shape, rhs_shape, dim_nums = {
+        "fwd": (
+            (m, k),
+            (num_groups, k, n),
+            pallas_mosaic_tpu.DEFAULT_RAGGED_DOT_DIM_NUMS,
+        ),
+        "dlhs": (
+            (m, n),
+            (num_groups, k, n),
+            pallas_mosaic_tpu.DLHS_RAGGED_DOT_DIM_NUMS,
+        ),
+        "drhs": ((m, k), (m, n), pallas_mosaic_tpu.DRHS_RAGGED_DOT_DIM_NUMS),
+    }[dims]
+    arguments = {
+        "lhs": jax.ShapeDtypeStruct(lhs_shape, dtype=jnp.bfloat16),
+        "rhs": jax.ShapeDtypeStruct(rhs_shape, dtype=jnp.bfloat16),
+        "group_sizes": base.generate_group_sizes(m=m, num_groups=num_groups),
+        "ragged_dot_dimension_numbers": dim_nums,
+    }
+    op = pallas_mosaic_tpu.PallasMosaicTpuRaggedDot()
+    ba = op_lib.BoundArguments(op=op, arguments=arguments)
+    tpu_info = self._mock_tpu_info("tpu7x", num_lanes)
+    with mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info):
+      config = ba.heuristics_config
+      tiling = (config.tile_m, config.tile_k, config.tile_n)
+      if dims == "drhs":
+        scoped_vmem_bytes = pallas_mosaic_tpu._scoped_vmem_capacity_bytes()
+        fits = self._vmem_bytes(config) <= 0.75 * scoped_vmem_bytes
+      else:
+        tile_m, tile_k, tile_n = tiling
+        fits = op._fit_within_tpu_vmem(
+            [(tile_m, tile_k, jnp.bfloat16), (tile_k, tile_n, jnp.bfloat16)],
+            (tile_m, tile_n, jnp.bfloat16),
+            config.input_buffer_count,
+        )
+    self.assertTrue(fits, tiling)
+    self.assertLessEqual(config.tile_m, 8 * num_lanes)
+    for tile in tiling:
+      self.assertGreaterEqual(tile, num_lanes)
+      self.assertEqual(tile % num_lanes, 0, tiling)
 
 
 if __name__ == "__main__":
