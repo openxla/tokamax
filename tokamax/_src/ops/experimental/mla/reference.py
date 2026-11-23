@@ -18,7 +18,6 @@ import functools
 import math
 
 import jax
-from jax import lax
 import jax.numpy as jnp
 
 # Query rows attended per step of `mla_attention`'s per-sequence loop. Bounds
@@ -76,26 +75,32 @@ def update_kv_cache(
   Returns:
     The updated KV cache.
   """
-  page_size = cache_kv.shape[-1]
+  total_num_pages, _, page_size = cache_kv.shape
   max_num_seqs = kv_lens.shape[0]
   pages_per_seq = page_indices.shape[0] // max_num_seqs
 
-  def seq_body(i, cache_kv):
-    q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
-    q_len = q_end - q_start
-    kv_len = kv_lens[i]
-
-    def token_body(j, cache_kv_):
-      token_idx_in_seq = kv_len - q_len + j
-      page_num_in_seq = token_idx_in_seq // page_size
-      page_indices_start = i * pages_per_seq
-      page_idx = page_indices[page_indices_start + page_num_in_seq]
-      slot = token_idx_in_seq % page_size
-      return cache_kv_.at[page_idx, :, slot].set(new_kv[q_start + j])
-
-    return lax.fori_loop(0, q_len, token_body, cache_kv)
-
-  return lax.fori_loop(0, num_seqs, seq_body, cache_kv)
+  # One scatter for all tokens rather than a loop over them: a per-token loop
+  # runs once per new token, which dominates prefill.
+  tokens = jnp.arange(new_kv.shape[0], dtype=jnp.int32)
+  is_valid_seq = jnp.arange(max_num_seqs) < num_seqs
+  # Token t belongs to sequence s when cu_q_lens[s] <= t < cu_q_lens[s + 1].
+  seq = jnp.sum(
+      (cu_q_lens[None, 1:] <= tokens[:, None]) & is_valid_seq[None, :],
+      axis=1,
+      dtype=jnp.int32,
+  )
+  is_valid = (seq < num_seqs) & (tokens >= cu_q_lens[0])
+  seq = jnp.minimum(seq, max_num_seqs - 1)
+  q_start = cu_q_lens[seq]
+  q_len = cu_q_lens[seq + 1] - q_start
+  token_idx_in_seq = kv_lens[seq] - q_len + (tokens - q_start)
+  page_pos = seq * pages_per_seq + token_idx_in_seq // page_size
+  page_idx = page_indices[jnp.clip(page_pos, 0, page_indices.shape[0] - 1)]
+  # Tokens outside the first `num_seqs` sequences get an out-of-bounds page and
+  # are dropped.
+  page_idx = jnp.where(is_valid, page_idx, total_num_pages)
+  slot = token_idx_in_seq % page_size
+  return cache_kv.at[page_idx, :, slot].set(new_kv, mode="drop")
 
 
 @functools.partial(

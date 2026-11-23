@@ -265,6 +265,46 @@ class BaselineMlaTest(parameterized.TestCase):
     self.assertEqual(out.shape, expected.shape)
     np.testing.assert_allclose(out, expected, rtol=1e-4, atol=1e-4)
 
+  @parameterized.named_parameters(
+      dict(testcase_name="partial_seqs_and_padded_rows", num_seqs=3),
+      dict(testcase_name="zero_live_seqs", num_seqs=0),
+  )
+  def test_update_kv_cache_drops_inactive_seqs_and_padded_rows(self, num_seqs):
+    total_num_pages, kv_dim, page_size = 8, 4, 4
+    pages_per_seq = 2
+    # 5 sequence slots: 3 live (including an empty seq and a page-crossing seq)
+    # plus 2 inactive slots (one with valid pages, one with -1 sentinels).
+    kv_lens = np.array([5, 2, 2, 2, 0], dtype=np.int32)
+    cu_q_lens = np.array([0, 3, 3, 5, 7, 7], dtype=np.int32)
+    page_indices = np.array([1, 3, 4, -1, 6, -1, 2, 5, -1, -1], dtype=np.int32)
+    # 10 rows: 5 live tokens, 2 tokens in inactive seq 3, and 3 trailing pads.
+    new_kv = np.arange(1000, 1000 + 10 * kv_dim, dtype=np.float32).reshape(
+        10, kv_dim
+    )
+    init_cache = np.arange(
+        total_num_pages * kv_dim * page_size, dtype=np.float32
+    ).reshape(total_num_pages, kv_dim, page_size)
+
+    expected = init_cache.copy()
+    for i in range(num_seqs):
+      q_start, q_end = int(cu_q_lens[i]), int(cu_q_lens[i + 1])
+      q_len = q_end - q_start
+      for j in range(q_len):
+        token_idx = int(kv_lens[i]) - q_len + j
+        page_idx = int(page_indices[i * pages_per_seq + token_idx // page_size])
+        expected[page_idx, :, token_idx % page_size] = new_kv[q_start + j]
+
+    updated = reference.update_kv_cache(
+        jnp.asarray(new_kv),
+        jnp.asarray(init_cache),
+        jnp.asarray(kv_lens),
+        jnp.asarray(page_indices),
+        jnp.asarray(cu_q_lens),
+        jnp.int32(num_seqs),
+    )
+
+    np.testing.assert_array_equal(np.asarray(updated), expected)
+
   def test_shape_mismatch_validation(self):
     baseline_op = base.MultiHeadLatentAttention()
 
