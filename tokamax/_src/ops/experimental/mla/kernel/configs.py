@@ -320,15 +320,8 @@ class MlaConfigs:
 
   @property
   def p_same_dtype_as_v(self) -> bool:
-    """Whether to cast softmax probabilities P to V's dtype before the PV matmul.
-
-    On PREFILL/MIXED, the score tile is large enough that narrowing P so the MXU
-    sees v.dtype x v.dtype rather than f32 x v.dtype is a major win (-16.1% on
-    chunked_prefill_f8_kv8192). On DECODE (bq_sz = 1), the vector-unit cast pass
-    costs more than the MXU savings (+5.9% to +9.4% slower), so it stays off on
-    DECODE.
-    """
-    return self.mode != MlaCase.DECODE
+    """Whether to cast softmax probabilities P to V's dtype before PV."""
+    return True
 
   @property
   def max_steps_ub(self) -> int:

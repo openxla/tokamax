@@ -204,7 +204,17 @@ def flash_attention_qk_softmax(
   m_next = jnp.stack(m_next_list, axis=0)
 
   # 5. Softmax Probabilities
-  p = jnp.exp2(s - utils.broadcast_minor(m_next, s.shape))
+  # Raw `exp2(s - m_next)` lies in [0, 1], leaving the [1, 240+] FP8 range
+  # unused and rounding weights <= 2^-10 (~0.001) to 0. Subtracting 7 scales
+  # `p` by 2^7 = 128 into [0, 128] (within every FP8 max >= 240) so small
+  # weights survive the cast to `k.dtype`. Both `acc` and `l` scale by 128,
+  # which cancels in `acc / l`.
+  m_exp_bias = (
+      m_next - 7.0
+      if cfgs.p_same_dtype_as_v and jnp.dtype(k.dtype).itemsize == 1
+      else m_next
+  )
+  p = jnp.exp2(s - utils.broadcast_minor(m_exp_bias, s.shape))
   p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=jnp.float32)
   if cfgs.p_same_dtype_as_v:
     p = p.astype(k.dtype)

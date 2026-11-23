@@ -249,6 +249,7 @@ class FlashAttentionMathTest(parameterized.TestCase):
 
     o_vref = self._run_kernel_steps([(q, k, is_last_k)], cfgs)
 
+    tol = 1e-4 if dtype == jnp.float32 else 1e-2
     for lane in range(b):
       expected = _ref_mla_attention(
           q_nope[lane], q_pe[lane], k_nope[lane], k_pe[lane], self.sm_scale
@@ -256,8 +257,8 @@ class FlashAttentionMathTest(parameterized.TestCase):
       np.testing.assert_allclose(
           o_vref[lane].reshape(n_q, self.lkv_dim),
           expected,
-          rtol=1e-4,
-          atol=1e-4,
+          rtol=tol,
+          atol=tol,
       )
 
   def test_decode_single_sequence_across_two_lanes(self):
@@ -634,6 +635,60 @@ class FlashAttentionMathTest(parameterized.TestCase):
           rtol=1e-4,
           atol=1e-4,
       )
+
+  @parameterized.named_parameters(
+      ("decode", configs.MlaCase.DECODE, 1),
+      ("prefill", configs.MlaCase.PREFILL, 2),
+  )
+  def test_fp8_attention_sink_preserves_long_context_tail(
+      self, mode: configs.MlaCase, bq_sz: int
+  ):
+    """FP8 P preserves diffuse context mass behind an attention-sink token."""
+    dtype = jnp.float8_e4m3fn
+    b, s = 1, 2048
+    cfgs = self._make_cfg(
+        batch_size=b,
+        bq_sz=bq_sz,
+        q_split=1,
+        bkv_sz=s,
+        mode=mode,
+        dtype=dtype,
+    )
+    n_q = bq_sz * self.num_q_heads
+
+    # Key 0 on step 0 has logit (64 * 1.75 * 2.0) / 24 = +9.33; the remaining
+    # 4,095 keys across steps 0 and 1 have logit 0.0 (unscaled exp(-9.33) =
+    # 8.8e-5 < 2^-10, which would underflow bare e4m3fn P to 0.0).
+    q_nope = jnp.zeros((b, n_q, self.lkv_dim), dtype=dtype)
+    q_pe = jnp.full((b, n_q, self.r_dim), 1.75, dtype=dtype)
+    k0_nope = jnp.full((b, self.lkv_dim, s), 0.5, dtype=dtype).at[:, :, 0].set(
+        0.0
+    )
+    k0_pe = jnp.zeros((b, self.r_dim, s), dtype=dtype).at[:, :, 0].set(2.0)
+    k1_nope = jnp.full((b, self.lkv_dim, s), 0.5, dtype=dtype)
+    k1_pe = jnp.zeros((b, self.r_dim, s), dtype=dtype)
+
+    q = jnp.concatenate([q_nope, q_pe], axis=-1)
+    k0 = jnp.concatenate([k0_nope, k0_pe], axis=1)
+    k1 = jnp.concatenate([k1_nope, k1_pe], axis=1)
+
+    o_vref = self._run_kernel_steps(
+        [
+            (q, k0, jnp.array([False])),
+            (q, k1, jnp.array([True])),
+        ],
+        cfgs,
+    )
+    expected = _ref_mla_attention(
+        q_nope[0],
+        q_pe[0],
+        jnp.concatenate([k0_nope[0], k1_nope[0]], axis=-1),
+        jnp.concatenate([k0_pe[0], k1_pe[0]], axis=-1),
+        self.sm_scale,
+    )
+    np.testing.assert_allclose(
+        o_vref[0].reshape(n_q, self.lkv_dim), expected, rtol=5e-2, atol=1e-2
+    )
 
 
 if __name__ == "__main__":
