@@ -300,36 +300,48 @@ def _flash_attention_decode(
     kv_abs_start: jax.Array | Sequence[jax.Array] | None = None,
     cfgs: configs.MlaConfigs,
 ) -> None:
-  """Executes unchunked Flash Attention for decode (`q_split == 1`)."""
-  # Because lanes are chained serially within a step and scratch refs only
-  # persist the final lane's carry (`[-1]`), earlier lanes `b < B - 1` that
-  # finish a sequence (`is_last_k[b] == 1`) only hold their final accumulator in
-  # `batched_output[b]` right here, so all `B` lanes are normalized and stored
-  # to `o_vref[...]` in one shot (`BatchingORef.copy_out` only DMAs lanes with
-  # `is_last_k[b] == 1`).
+  """Executes lane-subtiled, software-pipelined Flash Attention for decode."""
+  # Runs QK+Softmax of lane `b_idx` before PV of `b_idx - 1` to overlap VPU
+  # softmax with MXU accumulation. Scratch refs only persist the final lane's
+  # carry, so every lane is normalized and stored to `o_vref` unconditionally
+  # (`BatchingORef.copy_out` only DMAs lanes with `is_last_k[b] == 1`).
+  assert cfgs.bq_sz == 1, f"Decode requires bq_sz == 1, got {cfgs.bq_sz}"
   assert cfgs.q_split == 1, f"Decode requires q_split == 1, got {cfgs.q_split}"
-  k_arr = k[...]
-  k_nope_arr = k_arr[:, : cfgs.aligned_lkv_dim, :]
+  d_nope = cfgs.aligned_lkv_dim
 
-  p, alpha, m_carry, l_next = flash_attention_qk_softmax(
-      q[...],
-      k_arr,
-      m_scratch_ref[...],
-      l_scratch_ref[...],
-      is_last_k=is_last_k,
-      q_abs_start=q_abs_start,
-      kv_abs_start=kv_abs_start,
-      cfgs=cfgs,
-  )
-  batched_output = flash_attention_pv(
-      p, k_nope_arr, alpha, acc_scratch_ref[...], cfgs=cfgs, is_last_k=is_last_k
-  )
-  m_scratch_ref[...] = m_carry
-  l_scratch_ref[...] = l_next[-1]
-  acc_scratch_ref[...] = batched_output[-1]
-  o_vref[...] = _normalize(batched_output, l_next, cfgs=cfgs).reshape(
-      o_vref.shape
-  )
+  m_prev = m_scratch_ref[...]
+  l_prev = l_scratch_ref[...]
+  o_prev = acc_scratch_ref[...]
+  prev_pv = None
+
+  for b_idx in range(cfgs.batch_size):
+    k_b = k[b_idx : b_idx + 1, :, :]
+    cur_p, cur_alpha, m_prev, cur_l_next = flash_attention_qk_softmax(
+        q[b_idx : b_idx + 1, :, :],
+        k_b,
+        m_prev,
+        l_prev,
+        is_last_k=[is_last_k[b_idx]],
+        q_abs_start=None if q_abs_start is None else [q_abs_start[b_idx]],
+        kv_abs_start=None if kv_abs_start is None else [kv_abs_start[b_idx]],
+        cfgs=cfgs,
+    )
+    l_prev = cur_l_next[0]
+
+    if prev_pv is not None:
+      b_prev, p_prev, v_prev, alpha_prev, l_b = prev_pv
+      o_prev = flash_attention_pv(p_prev, v_prev, alpha_prev, o_prev, cfgs)[0]
+      o_vref[b_prev, 0, :, :] = _normalize(o_prev, l_b, cfgs=cfgs)
+    prev_pv = (b_idx, cur_p, k_b[:, :d_nope, :], cur_alpha, l_prev)
+
+  if prev_pv is not None:
+    b_prev, p_prev, v_prev, alpha_prev, l_b = prev_pv
+    o_prev = flash_attention_pv(p_prev, v_prev, alpha_prev, o_prev, cfgs)[0]
+    o_vref[b_prev, 0, :, :] = _normalize(o_prev, l_b, cfgs=cfgs)
+
+  m_scratch_ref[...] = m_prev
+  l_scratch_ref[...] = l_prev
+  acc_scratch_ref[...] = o_prev
 
 
 def _flash_attention_prefill(
