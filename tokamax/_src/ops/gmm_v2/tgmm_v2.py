@@ -198,12 +198,13 @@ def calculate_tgmm_tiling(
   tile_m = min(bf16_bf16_tile_m, dims.size_m)
   tile_m = max(tile_m, dims.size_lhs_sublane)
 
+  tpu_info = pltpu.get_tpu_info()
   num_k_tiles = num_n_tiles = 1
-  num_lanes = pltpu.get_tpu_info().num_lanes
+  num_lanes = tpu_info.num_lanes
   tile_n = gmm_v2.align_to(dims.size_n, num_lanes)
   # To avoid stalling MXU, we add some buffer room where tile_n cannot go
   # smaller than 2x of mxu_column_size.
-  tile_n_lower_bound = pltpu.get_tpu_info().mxu_column_size * 2
+  tile_n_lower_bound = tpu_info.mxu_column_size * 2
   tile_n_lower_bound = min(tile_n_lower_bound, dims.size_n)
   tile_k = gmm_v2.align_to(dims.size_k, num_lanes)
 
@@ -285,11 +286,9 @@ def calculate_tgmm_tiling(
   # the smaller one. Exact splits are preferred over padded splits (e.g. when
   # both k and n are odd multiples of `num_lanes`), which fused outputs don't
   # support. Splitting only shrinks tiles, so VMEM usage stays in limit.
-  num_cores = gmm_v2.get_num_cores(pltpu.get_tpu_info())
+  num_cores = gmm_v2.get_num_cores(tpu_info)
   if num_cores > 1 and num_n_tiles % num_cores and num_k_tiles % num_cores:
-    tile_k_lower_bound = min(
-        pltpu.get_tpu_info().mxu_column_size * 2, dims.size_k
-    )
+    tile_k_lower_bound = min(tpu_info.mxu_column_size * 2, dims.size_k)
     split_k = gmm_v2.split_for_cores(
         dims.size_k,
         num_k_tiles,
@@ -336,11 +335,14 @@ def calculate_tgmm_tiling(
         if split_k is not None:
           num_k_tiles, tile_k = split_k
 
-  # Limit TGMM to 2 M-buckets (tile_m <= 512): larger bucket_m materializes
-  # full-tile int32 masks alongside the accumulator in VREGs, causing severe
-  # register spills. Also cap tile_m at the average group size so small-group
-  # shapes do not pad past typical group boundaries.
-  max_num_buckets = 2
+  # TpuInfo does not expose VREG count or IMEM capacity, so choose the bucket
+  # cap empirically by generation (cf. gmm_v2.calculate_tiling):
+  # - gen <= 6 (32 VREGs): 3+ buckets spill VREGs from full-tile int32 masks.
+  # - gen == 7 (64 VREGs, 64 MiB VMEM): 3 buckets fit in VREGs and IMEM
+  #   (4 buckets overflow 4 MiB IMEM on large BF16 tiles).
+  # - gen >= 8 (128+ MiB VMEM): larger (tile_k, tile_n) tiles overflow IMEM at
+  #   3+ buckets.
+  max_num_buckets = 3 if tpu_info.generation == 7 else 2
   bucket_base = tile_m
   num_groups = max(1, dims.size_group, dims.size_lhs_group)
   max_tile_m = min(dims.size_m, max(bucket_base, dims.size_m // num_groups))
