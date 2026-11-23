@@ -15,7 +15,7 @@
 """Self-contained RpaSchedule tape schema and SMEM/HBM chunk DMA helpers."""
 
 import dataclasses
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import jax
 from jax.experimental import pallas as pl
@@ -407,6 +407,48 @@ class RpaSchedule:
     for copy in dma_list:
       copy.wait()
 
+  def chunk_copies(
+      self,
+      schedule_hbm_ref: "RpaSchedule",
+      aligned_start_step: Any,
+      num_steps: Any,
+      dma_sem: jax.Ref,
+  ) -> list[Any]:
+    """Builds HBM->SMEM (`self`) DMAs for `num_steps` steps.
+
+    Args:
+      schedule_hbm_ref: Source schedule in HBM.
+      aligned_start_step: First step to read. Must be a multiple of
+        `DMA_STEP_ALIGN`.
+      num_steps: Number of steps to read. Reads are padded to `READ_WORD_ALIGN`
+        words and capped at the SMEM chunk length.
+      dma_sem: DMA semaphore signalled by the copies.
+
+    Returns:
+      Async copy descriptors, not yet started.
+    """
+    max_steps = self.max_steps_ub(self.cfgs)
+    copies = []
+    for h_arr, s_arr in zip(schedule_hbm_ref.step_arrays(), self.step_arrays()):
+      s = s_arr.data
+      h = h_arr.data
+      if s.shape[0] == 0:
+        continue
+      element_size = s.shape[0] // max_steps
+      read_size = utils.align_to(element_size * num_steps, self.READ_WORD_ALIGN)
+      read_size = jnp.minimum(read_size, s.shape[0])
+      src_off = pl.multiple_of(
+          jnp.asarray(element_size * aligned_start_step), self.DMA_STEP_ALIGN
+      )
+      copies.append(
+          pltpu.make_async_copy(
+              h.at[pl.ds(src_off, read_size)],
+              s.at[pl.ds(0, read_size)],
+              dma_sem,
+          )
+      )
+    return copies
+
   def read_chunk_from_hbm(
       self,
       schedule_hbm_ref: "RpaSchedule",
@@ -415,35 +457,18 @@ class RpaSchedule:
       dma_sem: jax.Ref,
   ) -> jax.Array:
     """Reads `[start_step, start_step + num_steps)` from HBM into SMEM (`self`)."""
-    max_steps = self.max_steps_ub(self.cfgs)
     aligned_start_step = (
         start_step // self.DMA_STEP_ALIGN
     ) * self.DMA_STEP_ALIGN
     prefix_steps = start_step - aligned_start_step
     total_steps = jnp.asarray(num_steps + prefix_steps)
 
-    dma_list = []
-    for h_arr, s_arr in zip(schedule_hbm_ref.step_arrays(), self.step_arrays()):
-      s = s_arr.data
-      h = h_arr.data
-      if s.shape[0] == 0:
-        continue
-      element_size = s.shape[0] // max_steps
-      read_size = utils.align_to(
-          element_size * total_steps, self.READ_WORD_ALIGN
-      )
-      read_size = jnp.minimum(read_size, s.shape[0])
-      src_off = pl.multiple_of(
-          jnp.asarray(element_size * aligned_start_step), self.DMA_STEP_ALIGN
-      )
-      copy = pltpu.make_async_copy(
-          h.at[pl.ds(src_off, read_size)],
-          s.at[pl.ds(0, read_size)],
-          dma_sem.at[0],
-      )
+    copies = self.chunk_copies(
+        schedule_hbm_ref, aligned_start_step, total_steps, dma_sem.at[0]
+    )
+    for copy in copies:
       copy.start()
-      dma_list.append(copy)
-    for copy in dma_list:
+    for copy in copies:
       copy.wait()
     return total_steps
 
@@ -468,3 +493,85 @@ class RpaSchedule:
     self.compute_waits(0, last_step // cfgs.batch_size)
     self.write_chunk_to_hbm(schedule_hbm_ref, hbm_offset, max_steps, dma_sem)
     return hbm_offset + max_steps, 0
+
+
+class SmemPrefetch(NamedTuple):
+  """Outputs of `smem_prefetch_start`, consumed by the RPA kernel.
+
+  Attributes:
+    schedule: One schedule chunk in SMEM, with the DMAs of the first chunk in
+      flight. Its `actual_steps` is already set.
+    sem: DMA semaphore signalled by those DMAs.
+  """
+
+  schedule: RpaSchedule
+  sem: jax.Array
+
+
+def smem_prefetch_copies(
+    schedule_hbm: RpaSchedule,
+    schedule_smem: RpaSchedule,
+    sem: jax.Ref,
+    *,
+    actual_steps: jax.Array,
+) -> list[Any]:
+  """Builds async HBM->SMEM DMA descriptors for the first schedule chunk.
+
+  Callers skip these DMAs when `actual_steps == 0`.
+  """
+  # Reads are capped at the chunk length, so passing `actual_steps` rather than
+  # `min(actual_steps, max_steps_ub)` is fine.
+  return schedule_smem.chunk_copies(schedule_hbm, 0, actual_steps, sem)
+
+
+def smem_prefetch_start(
+    schedule_hbm: RpaSchedule, *, cfgs: configs.RpaConfigs
+) -> SmemPrefetch:
+  """Starts HBM->SMEM DMAs for the first schedule chunk.
+
+  This is the "start" half of a split-phase prefetch: DMAs are issued into an
+  XLA-owned SMEM output buffer and the kernel returns without waiting. The RPA
+  kernel takes the outputs as scalar-prefetch operands, used in place, and waits
+  on the returned DMA semaphore right before first use.
+
+  Args:
+    schedule_hbm: Output of `scheduler.generate_rpa_metadata`.
+    cfgs: Configuration of the kernel.
+
+  Returns:
+    The SMEM schedule chunk and the DMA semaphore to wait on.
+  """
+  schedule_smem_shape = RpaSchedule.create_shape_dtype(cfgs).scratch_shapes()
+
+  def _kernel(schedule_hbm_ref, schedule_smem_ref, sem):
+    actual_steps = schedule_hbm_ref.actual_steps[0]
+    schedule_smem_ref.actual_steps[0] = actual_steps
+
+    @pl.when(actual_steps > 0)
+    def _():
+      for copy in smem_prefetch_copies(
+          schedule_hbm_ref, schedule_smem_ref, sem, actual_steps=actual_steps
+      ):
+        copy.start()  # Waited on by the RPA kernel.
+
+  schedule_smem, sem = pl.pallas_call(
+      _kernel,
+      in_specs=[schedule_hbm.in_specs()],
+      out_specs=(
+          jax.tree.map(
+              lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
+              schedule_smem_shape,
+          ),
+          pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+      ),
+      out_shape=(schedule_smem_shape, pltpu.SemaphoreType.DMA),
+      # The in-flight DMAs that `rpa_kernel` waits on look like a side effect
+      # (XLA must not dedupe or drop the call). PURE is still safe: each call
+      # has distinct inputs and its outputs are always consumed. Side-effecting
+      # calls also fail SPMD partitioning (e.g. torch_tpu) without a sharding.
+      compiler_params=pltpu.CompilerParams(
+          has_side_effects=pltpu.SideEffectType.PURE,
+      ),
+      name="rpa_smem_prefetch_start",
+  )(schedule_hbm)
+  return SmemPrefetch(schedule=schedule_smem, sem=sem)
