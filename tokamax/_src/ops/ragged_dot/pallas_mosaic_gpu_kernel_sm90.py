@@ -46,6 +46,7 @@ def ragged_dot_kernel(
 
   m, k = lhs.shape
   g, _, n = rhs.shape
+  lhs = common.pad_rows_for_tma(lhs)
 
   block_m = config.block_m
   block_n = config.block_n

@@ -243,6 +243,15 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           f" {lhs.dtype=} {rhs.dtype=} {preferred_element_type=} {precision=}"
       )
 
+    # The kernel wrappers pad the rows of an `lhs` array to a multiple of 8 for
+    # TMA, but a quantized `lhs` is not padded yet.
+    if isinstance(lhs, QArray):
+      m = lhs.qvalue.shape[0]
+      if m > 8 and m % 8 != 0:
+        raise NotImplementedError(
+            f"Quantized `lhs` needs {m=} to be at most 8 or a multiple of 8."
+        )
+
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.array(group_sizes)
 

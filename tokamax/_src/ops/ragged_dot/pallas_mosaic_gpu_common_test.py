@@ -22,6 +22,17 @@ import jax.numpy as jnp
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 
 
+class PadRowsForTmaTest(parameterized.TestCase):
+
+  @parameterized.parameters((5, 5), (8, 8), (14, 16), (16, 16), (1020, 1024))
+  def test_pad_rows_for_tma(self, m, expected_m):
+    x = jnp.ones((m, 4), jnp.bfloat16)
+    actual = common.pad_rows_for_tma(x)
+    self.assertEqual(actual.shape, (expected_m, 4))
+    chex.assert_trees_all_equal(actual[:m], x)
+    self.assertEqual(int(jnp.count_nonzero(actual[m:])), 0)
+
+
 class GroupInfoTest(parameterized.TestCase):
 
   @parameterized.parameters(3, 5, 100)
