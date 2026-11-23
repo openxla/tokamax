@@ -23,13 +23,29 @@ NUM_REGISTERS_PER_SM: Final[int] = 64 * 1024  # P100, V100, A100, H100, B200
 CACHE_LINE_SIZE_BYTES: Final[int] = 128
 
 
-def _compute_capability(device: jax.Device | None = None) -> float | None:
-  """Returns the compute capability of the device."""
+def is_nvidia(device: jax.Device | None = None) -> bool:
+  """Returns True if the device is an NVIDIA GPU and False otherwise."""
 
   if device is None:
     device = backend.get_default_device()
 
   if device.platform != 'gpu':
+    return False
+
+  # XLA reports "NVIDIA Corporation" or "Advanced Micro Devices, Inc". Devices
+  # that report no vendor are treated as NVIDIA, as they were before.
+  vendor = getattr(device, 'device_vendor', None)
+  return vendor is None or vendor.startswith('NVIDIA')
+
+
+def _compute_capability(device: jax.Device | None = None) -> float | None:
+  """Returns the compute capability of an NVIDIA device, or None."""
+
+  if device is None:
+    device = backend.get_default_device()
+
+  # On ROCm, `compute_capability` is the GPU architecture (e.g. "gfx942").
+  if not is_nvidia(device):
     return None
 
   cc = getattr(device, 'compute_capability', None)
@@ -85,7 +101,8 @@ def has_mosaic_gpu_support(device: jax.Device | None = None) -> bool:
     return False
 
   # Only supported for Ampere and above. SM80 support is experimental.
-  return float(device.compute_capability) >= 8.0
+  cc = _compute_capability(device)
+  return cc is not None and cc >= 8.0
 
 
 def has_triton_support(device: jax.Device | None = None) -> bool:
@@ -104,5 +121,6 @@ def has_triton_support(device: jax.Device | None = None) -> bool:
   if not hasattr(device, 'compute_capability'):
     return True
 
-  # Only currently supported for Ampere and above.
-  return float(device.compute_capability) >= 8.0
+  # Only currently supported for NVIDIA Ampere and above.
+  cc = _compute_capability(device)
+  return cc is not None and cc >= 8.0
