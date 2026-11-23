@@ -705,3 +705,18 @@ def zero_initialize_buffers(
   )
   q_ref_flat[...] = jnp.zeros_like(q_ref_flat)
   kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+
+
+def zero_initialize_slot(
+    q_alloc: BatchingQRef,
+    kv_cache_alloc: KVBufferedRefSeqAlongLane | KVBufferedRefHeadAlongSublane,
+    slot: int,
+    *,
+    num_lanes: int,
+) -> None:
+  """Zero-initializes one Q and KV VMEM input slot."""
+  for alloc in (q_alloc, kv_cache_alloc):
+    slot_flat = (
+        alloc.window_ref.at[slot].bitcast(jnp.uint32).reshape(-1, num_lanes)
+    )
+    slot_flat[...] = jnp.zeros_like(slot_flat)

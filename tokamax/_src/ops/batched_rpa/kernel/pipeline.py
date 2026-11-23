@@ -51,6 +51,9 @@ def run_manual_triple_buffer(
     o_bref: memory_ref.BypassRef,
     kv_bref: memory_ref.BypassRef,
     lse_bref: memory_ref.BypassRef | None = None,
+    *,
+    init_slot_fn: Callable[[int], None] | None = None,
+    post_init_fn: Callable[[], None] | None = None,
 ) -> None:
   """Executes an explicit 3-input / 2-output buffered pipeline over `total_steps`.
 
@@ -71,6 +74,12 @@ def run_manual_triple_buffer(
     kv_bref: Input/output ref for KV cache.
     lse_bref: Optional writeback-only ref for log-sum-exp values, or `None` when
       LSE output is disabled.
+    init_slot_fn: Optional callback `init_slot_fn(slot)` invoked right before
+      the prologue `copy_in` of input slot `slot` (`slot` in `{0, 1}`), so slot
+      1 initialization overlaps with slot 0's prologue DMAs.
+    post_init_fn: Optional callback invoked right after both prologue `copy_in`
+      pairs are issued, so the remaining initialization overlaps with both
+      in-flight prologue DMAs.
   """
   in_slots = _in_buffer_count(q_bref)
   out_slots = _out_buffer_count(o_bref)
@@ -83,10 +92,13 @@ def run_manual_triple_buffer(
       bref.open()
 
   with jax.named_scope("ep_initialize"):
-    q_bref.copy_in(0, 0, total_steps)
-    kv_bref.copy_in(0, 0, total_steps)
-    q_bref.copy_in(1, 1, total_steps)
-    kv_bref.copy_in(1, 1, total_steps)
+    for slot in range(2):
+      if init_slot_fn is not None:
+        init_slot_fn(slot)
+      q_bref.copy_in(slot, slot, total_steps)
+      kv_bref.copy_in(slot, slot, total_steps)
+    if post_init_fn is not None:
+      post_init_fn()
 
   @pl.loop(0, total_steps)
   def steady_state(step):

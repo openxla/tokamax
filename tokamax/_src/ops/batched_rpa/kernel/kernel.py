@@ -390,18 +390,29 @@ def rpa_kernel(
     )
     def _run(final_allocs, dma_sem, scratches):
       q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
-      vmem_ldst.SoftmaxScratch.init(
-          scratches[0],
-          scratches[1],
-          scratches[2],
-          attention_sink_ref,
-          cfgs=cfgs,
-      )
-      memory_ref.zero_initialize_buffers(
-          q_alloc, kv_cache_alloc, num_lanes=cfgs.layout.num_lanes
-      )
 
-      def run_schedule_pipeline(schedule_ref, total_steps):
+      def zero_input_slot(slot: int, is_first):
+        @pl.when(is_first)
+        def _():
+          memory_ref.zero_initialize_slot(
+              q_alloc, kv_cache_alloc, slot, num_lanes=cfgs.layout.num_lanes
+          )
+
+      def post_init(is_first):
+        for slot in range(2, cfgs.num_input_slots):
+          zero_input_slot(slot, is_first)
+
+        @pl.when(is_first)
+        def _():
+          vmem_ldst.SoftmaxScratch.init(
+              scratches[0],
+              scratches[1],
+              scratches[2],
+              attention_sink_ref,
+              cfgs=cfgs,
+          )
+
+      def run_schedule_pipeline(schedule_ref, total_steps, *, is_first):
         kv_bound = kv_cache_alloc.bind(
             src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
             dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
@@ -447,6 +458,8 @@ def rpa_kernel(
             o_bound,
             kv_bound,
             lse_bref=lse_bound,
+            init_slot_fn=lambda slot: zero_input_slot(slot, is_first),
+            post_init_fn=lambda: post_init(is_first),
         )
 
       # Wait for the DMAs issued by `smem_prefetch_start` before this kernel
@@ -474,7 +487,7 @@ def rpa_kernel(
               schedule_hbm_ref, start, size, dma_sem
           )
 
-        run_schedule_pipeline(schedule_smem_ref, size)
+        run_schedule_pipeline(schedule_smem_ref, size, is_first=chunk_idx == 0)
 
     _run()
 
