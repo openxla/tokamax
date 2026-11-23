@@ -520,6 +520,27 @@ SHARDS: ShardMap = {
         minutes=10,
         compat_minutes=3,
     ),
+    'experimental-fused-qkv-proj': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_qkv_proj/common_test.py',
+            'tokamax/_src/ops/experimental/fused_qkv_proj/gdn_test.py',
+            'tokamax/_src/ops/experimental/fused_qkv_proj/tiling_test.py',
+        ),
+        minutes=5,
+        compat_minutes=2,
+    ),
+    'experimental-fused-qkv-proj-gqa': Spec(
+        paths=('tokamax/_src/ops/experimental/fused_qkv_proj/gqa_test.py',),
+        minutes=12,
+        compat_minutes=4,
+    ),
+    'experimental-fused-qkv-proj-out-proj': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/fused_qkv_proj/out_proj_test.py',
+        ),
+        minutes=10,
+        compat_minutes=3,
+    ),
     'experimental-mhc-lite': Spec(
         paths=(
             'tokamax/_src/ops/experimental/mhc_lite/api_test.py',
@@ -692,9 +713,7 @@ SHARDS: ShardMap = {
         compat_minutes=1,
     ),
     'experimental-ssd-scan': Spec(
-        paths=(
-            'tokamax/_src/ops/experimental/ssd_scan/ssd_scan_test.py',
-        ),
+        paths=('tokamax/_src/ops/experimental/ssd_scan/ssd_scan_test.py',),
         minutes=1,
         compat_minutes=1,
     ),
