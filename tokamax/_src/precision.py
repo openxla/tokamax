@@ -19,6 +19,7 @@ from typing import Final
 
 import jax
 import jax.numpy as jnp
+from tokamax._src import gpu_utils
 
 
 DotAlgorithm = jax.lax.DotAlgorithm
@@ -127,7 +128,8 @@ def to_dot_algorithm_preset(
           "Unknown GPU compute capability when determining dot precision"
           " preset; assuming compute_capability >= 8.0"
       )
-    elif float(compute_capability) < 8.0:
+    # On ROCm, `compute_capability` is the GPU architecture (e.g. "gfx942").
+    elif gpu_utils.is_nvidia(device) and float(compute_capability) < 8.0:
       backend = "gpu_old"
 
   match dtype:
