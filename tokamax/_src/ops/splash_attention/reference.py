@@ -15,8 +15,10 @@
 """Pure JAX reference implementation for Sparse Flash Attention."""
 
 import dataclasses
+import enum
 import functools
-from typing import Final
+import math
+from typing import Any, Final
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int
@@ -29,6 +31,132 @@ MaskInfo = mask_info_lib.MaskInfo
 DEFAULT_MASK_VALUE: Final[float] = -0.7 * float(
     np.finfo(np.dtype("float32")).max
 )
+
+LOG2E = math.log2(math.e)
+
+
+class QuantizationStrategy(enum.IntEnum):
+  """Quantization strategies for Splash Attention matrix multiplications."""
+
+  UNQUANTIZED = enum.auto()
+  CAST = enum.auto()
+  PER_TENSOR = enum.auto()
+  PER_AXIS = enum.auto()
+
+
+def _apply_quantization_impl(
+    x: jax.Array,
+    quant_dtype: jax.typing.DTypeLike,
+    strategy: QuantizationStrategy,
+    contract_axis: int,
+    apply_log2e_scaling: bool,
+) -> tuple[jax.Array, jax.Array | None]:
+  """Applies quantization to `x` according to `strategy`."""
+  if quant_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+    dtype_max = float(jnp.finfo(quant_dtype).max)
+    dtype_min = float(jnp.finfo(quant_dtype).min)
+  else:
+    raise NotImplementedError(
+        f"Quantization for dtype {quant_dtype} is not implemented."
+    )
+
+  if apply_log2e_scaling:
+    x = x * LOG2E
+
+  match strategy:
+    case QuantizationStrategy.UNQUANTIZED:
+      return x, None
+    case QuantizationStrategy.CAST:
+      clipped = jnp.clip(x, dtype_min, dtype_max)
+      return clipped.astype(quant_dtype), None
+    case QuantizationStrategy.PER_TENSOR:
+      reduce_axes = (-2, -1) if x.ndim >= 2 else (-1,)
+      amax = jnp.max(
+          jnp.abs(x).astype(jnp.float32), axis=reduce_axes, keepdims=True
+      )
+      amax = jnp.maximum(amax, 1e-12)
+      scale = dtype_max / amax
+      scaled_x = (x.astype(jnp.float32) * scale).astype(quant_dtype)
+      return scaled_x, (amax / dtype_max).astype(x.dtype)
+    case QuantizationStrategy.PER_AXIS:
+      amax = jnp.max(jnp.abs(x), axis=contract_axis, keepdims=True).astype(
+          jnp.float32
+      )
+      amax = jnp.maximum(amax, 1e-12)
+      scale = dtype_max / amax
+      scaled_x = (x.astype(jnp.float32) * scale).astype(quant_dtype)
+      return scaled_x, (amax / dtype_max).astype(x.dtype)
+    case _:
+      raise ValueError(f"Unknown quantization {strategy}")
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4, 5))
+def _apply_quantization(
+    x: jax.Array,
+    quant_dtype: jax.typing.DTypeLike,
+    strategy: QuantizationStrategy,
+    contract_axis: int,
+    apply_log2e_scaling: bool,
+    orig_dtype: jax.typing.DTypeLike,
+) -> tuple[jax.Array, jax.Array | None]:
+  del orig_dtype
+  return _apply_quantization_impl(
+      x, quant_dtype, strategy, contract_axis, apply_log2e_scaling
+  )
+
+
+def _apply_quantization_fwd(
+    x: jax.custom_derivatives.CustomVJPPrimal,
+    quant_dtype: jax.typing.DTypeLike,
+    strategy: QuantizationStrategy,
+    contract_axis: int,
+    apply_log2e_scaling: bool,
+    orig_dtype: jax.typing.DTypeLike,
+) -> tuple[tuple[jax.Array, jax.Array | None], None]:
+  del orig_dtype
+  return (
+      _apply_quantization_impl(
+          x.value, quant_dtype, strategy, contract_axis, apply_log2e_scaling
+      ),
+      None,
+  )
+
+
+def _apply_quantization_bwd(
+    quant_dtype: jax.typing.DTypeLike,
+    strategy: QuantizationStrategy,
+    contract_axis: int,
+    apply_log2e_scaling: bool,
+    orig_dtype: jax.typing.DTypeLike,
+    res: None,
+    grads: tuple[Any, Any],
+) -> tuple[jax.Array | None]:
+  """Straight-through backward rule for `apply_quantization`."""
+  del quant_dtype, strategy, contract_axis, res
+  grad_quant_x, _ = grads
+  if isinstance(grad_quant_x, jax.custom_derivatives.SymbolicZero):
+    return (None,)
+  if apply_log2e_scaling:
+    grad_quant_x = grad_quant_x.astype(jnp.float32) * LOG2E
+  return (grad_quant_x.astype(orig_dtype),)
+
+
+_apply_quantization.defvjp(
+    _apply_quantization_fwd, _apply_quantization_bwd, symbolic_zeros=True
+)
+
+
+def apply_quantization(
+    x: jax.Array,
+    quant_dtype: jax.typing.DTypeLike,
+    strategy: QuantizationStrategy,
+    contract_axis: int,
+    apply_log2e_scaling: bool = False,
+) -> tuple[jax.Array, jax.Array | None]:
+  """Quantizes `x` for Splash Attention matmuls with a straight-through VJP."""
+  return _apply_quantization(
+      x, quant_dtype, strategy, contract_axis, apply_log2e_scaling, x.dtype
+  )
 
 
 @jax.tree_util.register_dataclass
@@ -122,9 +250,12 @@ def _attention_reference_impl(
 
 
 def _attention_reference_custom_bwd(
-    do,
+    do_dp,
+    do_dv,
     q,
+    q_dk,
     k,
+    k_dq,
     v,
     mask,
     segment_ids,
@@ -136,6 +267,7 @@ def _attention_reference_custom_bwd(
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
     dropout_rate: float = 0.0,
+    cast_p: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, None, None, jax.Array | None]:
   uncapped_logits = jnp.einsum(
       "qc,kc->qk", q, k, preferred_element_type=jnp.float32
@@ -154,15 +286,20 @@ def _attention_reference_custom_bwd(
   logits = jnp.where(mask, logits, mask_value)
 
   p = jnp.exp(logits - logsumexp[..., None])
-  do = do.astype(jnp.float32)
+  do_dp = do_dp.astype(jnp.float32)
+  do_dv = do_dv.astype(jnp.float32)
   # `pr` is the dropped-and-rescaled weight, `p` the undropped one. dv and dp
   # see the mask because the forward's numerator did; `ds` below deliberately
   # keeps the undropped `p`, since `di` already equals rowsum(dp_dropped * p).
   pr = p
   if dropout_mask is not None:
     pr = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
-  dv = jnp.einsum("pt,pd->td", pr, do).astype(v.dtype)
-  dp = jnp.einsum("pd,td->pt", do, v.astype(jnp.float32))
+  if cast_p:
+    pr = jax.lax.optimization_barrier(pr.astype(jnp.float8_e4m3fn)).astype(
+        jnp.float32
+    )
+  dv = jnp.einsum("pt,pd->td", pr, do_dv).astype(v.dtype)
+  dp = jnp.einsum("pd,td->pt", do_dp, v.astype(jnp.float32))
   if dropout_mask is not None:
     dp = jnp.where(dropout_mask, 0.0, dp) / (1.0 - dropout_rate)
 
@@ -171,7 +308,7 @@ def _attention_reference_custom_bwd(
   # reducing over a sequence dimension. They tend to produce slightly different
   # numerics.
   if backward_impl == "flash":
-    di = jnp.sum(o.astype(jnp.float32) * do, axis=-1)[..., None]
+    di = jnp.sum(o.astype(jnp.float32) * do_dp, axis=-1)[..., None]
   else:
     di = jnp.einsum("st,st->s", dp, p)[:, None]
   ds = (dp - di) * p
@@ -180,15 +317,15 @@ def _attention_reference_custom_bwd(
     d = jnp.tanh(normalized)
     g = ds * (1 - d)
     ds = g + g * d
-  dk = jnp.einsum("sd,st->td", q.astype(jnp.float32), ds).astype(k.dtype)
-  dq = jnp.einsum("st,td->sd", ds, k.astype(jnp.float32)).astype(q.dtype)
+  dk = jnp.einsum("sd,st->td", q_dk.astype(jnp.float32), ds).astype(k.dtype)
+  dq = jnp.einsum("st,td->sd", ds, k_dq.astype(jnp.float32)).astype(q.dtype)
   dsinks = None
   if sinks is not None:
     sinks_exp = -jnp.exp(
         sinks[..., None, None].astype(jnp.float32)
         - logsumexp[..., None].astype(jnp.float32)
     )
-    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do, axis=(-1, -2))
+    dsinks = jnp.sum(sinks_exp.astype(o.dtype) * o * do_dp, axis=(-1, -2))
   return dq, dk, dv, None, None, dsinks
 
 
@@ -265,6 +402,7 @@ def attention_reference(
         "backward_impl",
         "attn_logits_soft_cap",
         "dropout_rate",
+        "cast_p",
     ],
 )
 def attention_reference_vjp(
@@ -283,13 +421,26 @@ def attention_reference_vjp(
     backward_impl: str = "vanilla",
     attn_logits_soft_cap: float | None = None,
     dropout_rate: float = 0.0,
+    do_dv=None,
+    q_dk=None,
+    k_dq=None,
+    cast_p: bool = False,
 ):
   """Wrapper for backward reference that handles GQA/MQA broadcasting and reduction."""
+  do_dp = do
+  if do_dv is None:
+    do_dv = do
+  if q_dk is None:
+    q_dk = q
+  if k_dq is None:
+    k_dq = k
+
   bwd = functools.partial(
       _attention_reference_custom_bwd,
       backward_impl=backward_impl,
       attn_logits_soft_cap=attn_logits_soft_cap,
       dropout_rate=dropout_rate,
+      cast_p=cast_p,
   )
 
   num_q_heads = q.shape[0]
@@ -299,16 +450,33 @@ def attention_reference_vjp(
   assert num_q_heads % num_kv_heads == 0
   head_multiplier = num_q_heads // num_kv_heads
   if is_mqa:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, None, None, None, None, 0, 0, 0, 0))
+    bwd = jax.vmap(
+        bwd, in_axes=(0, 0, 0, 0, None, None, None, None, None, 0, 0, 0, 0)
+    )
   else:
-    bwd = jax.vmap(bwd, in_axes=(0, 0, 0, 0, None, None, 0, 0, 0, 0))
+    bwd = jax.vmap(
+        bwd, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, 0, 0, 0, 0)
+    )
     # Interleave the KV heads to match the corresponding Q heads.
     if is_grouped:
       k = jnp.repeat(k, head_multiplier, axis=0)
+      k_dq = jnp.repeat(k_dq, head_multiplier, axis=0)
       v = jnp.repeat(v, head_multiplier, axis=0)
 
   dq, dk, dv, _, _, dsinks = bwd(
-      do, q, k, v, mask, segment_ids, sinks, o, logsumexp, dropout_mask
+      do_dp,
+      do_dv,
+      q,
+      q_dk,
+      k,
+      k_dq,
+      v,
+      mask,
+      segment_ids,
+      sinks,
+      o,
+      logsumexp,
+      dropout_mask,
   )
 
   if is_mqa:
