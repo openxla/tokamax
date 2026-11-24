@@ -186,11 +186,9 @@ def find_best_block_sizes(
   # Conservatively use 80% of the VMEM budget to prevent OOM.
   capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-  # To maximize MXU, we want bkv_sz to be at least MXU size.
-  bkv_default = mxu_column_size
-  if layout.is_seq_along_lane:
-    # SEQ_ALONG_LANE expects bkv_sz to be page-aligned.
-    bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+  # To maximize MXU, we want bkv_sz to be at least MXU size, and always a
+  # multiple of page_size so k_idx * bkv_sz aligns with k_idx * bkv_p.
+  bkv_default = utils.align_to(mxu_column_size, serve_cfgs.page_size)
   bkv_sz = bkv_stride = bkv_default
   if fixed_bq_sz is None:
     bq_sz = bq_stride = bkv_sz
@@ -314,6 +312,12 @@ def calculate_block_sizes(
 
   decode_batch_size = 8
   prefill_batch_size = 2
+  decode_max_bkv_sz: int | None = None
+  if tpu_info.generation == 7 and model_cfgs.sliding_window == 1024:
+    bkv_stride = utils.align_to(tpu_info.mxu_column_size, serve_cfgs.page_size)
+    decode_max_bkv_sz = utils.align_to(
+        max(bkv_stride, model_cfgs.sliding_window // 2), bkv_stride
+    )
 
   decode_block_sizes = find_best_block_sizes(
       model_cfgs,
@@ -322,6 +326,7 @@ def calculate_block_sizes(
       vmem_limit_bytes,
       max_batch_size=decode_batch_size,
       fixed_bq_sz=decode_query_size,
+      max_bkv_sz=decode_max_bkv_sz,
   )
   prefill_max_bq_sz, prefill_max_bkv_sz = prefill_tile_caps(
       serve_cfgs, tpu_info

@@ -1052,6 +1052,91 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
     )
 
+  @parameterized.product(sliding_window=[None, 1024])
+  def test_page_size_larger_than_mxu_auto_block_sizes(self, sliding_window):
+    if not jtu.is_device_tpu_at_least(version=5):
+      self.skipTest("Expect TPUv5+")
+    rng = np.random.default_rng(5)
+    page_size, dtype = 512, jnp.bfloat16
+    num_kv_heads, num_q_heads, head_dim = 2, 4, 128
+    kv_lens = (1500, 700, 2100)
+    num_seqs = len(kv_lens)
+    pages_per_seq = cdiv(max(kv_lens), page_size) + 1
+    total_pages = num_seqs * pages_per_seq
+    page_table = jnp.asarray(rng.permutation(total_pages), dtype=jnp.int32)
+    cache_shape = wrapper.get_kv_cache_shape(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    ks = [
+        np.asarray(
+            jnp.asarray(
+                rng.standard_normal((n, num_kv_heads, head_dim)) * 0.5, dtype
+            ).astype(jnp.float32)
+        )
+        for n in kv_lens
+    ]
+    vs = [
+        np.asarray(
+            jnp.asarray(
+                rng.standard_normal((n, num_kv_heads, head_dim)) * 0.5, dtype
+            ).astype(jnp.float32)
+        )
+        for n in kv_lens
+    ]
+    q = np.asarray(
+        jnp.asarray(
+            rng.standard_normal((num_seqs, num_q_heads, head_dim)) * 0.5, dtype
+        ).astype(jnp.float32)
+    )
+    sm_scale = head_dim**-0.5
+    common = dict(
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+    )
+    kv_lens_arr = jnp.asarray(kv_lens, jnp.int32)
+    _, cache = wrapper.ragged_paged_attention(
+        jnp.zeros((sum(kv_lens), num_q_heads, head_dim), dtype),
+        jnp.asarray(np.concatenate(ks), dtype),
+        jnp.asarray(np.concatenate(vs), dtype),
+        jnp.zeros(cache_shape, dtype),
+        kv_lens_arr,
+        page_table,
+        jnp.asarray(np.cumsum((0, *kv_lens)), jnp.int32),
+        jnp.array([0, 0, num_seqs], jnp.int32),
+        **common,
+    )
+    out, _ = wrapper.ragged_paged_attention(
+        jnp.asarray(q, dtype),
+        jnp.asarray(np.stack([k[-1] for k in ks]), dtype),
+        jnp.asarray(np.stack([v[-1] for v in vs]), dtype),
+        cache,
+        kv_lens_arr,
+        page_table,
+        jnp.arange(num_seqs + 1, dtype=jnp.int32),
+        jnp.array([num_seqs, num_seqs, num_seqs], jnp.int32),
+        **common,
+    )
+    group = num_q_heads // num_kv_heads
+    ref = np.empty_like(q)
+    for s, kv_len in enumerate(kv_lens):
+      lo = 0 if sliding_window is None else max(0, kv_len - sliding_window)
+      k_rep = np.repeat(ks[s][lo:], group, axis=1)
+      v_rep = np.repeat(vs[s][lo:], group, axis=1)
+      scores = np.einsum("hd,thd->ht", q[s], k_rep) * sm_scale
+      scores -= scores.max(axis=-1, keepdims=True)
+      probs = np.exp(scores)
+      probs /= probs.sum(axis=-1, keepdims=True)
+      ref[s] = np.einsum("ht,thd->hd", probs, v_rep)
+    out_f32 = np.asarray(out, np.float32)
+    self.assertTrue(np.isfinite(out_f32).all())
+    np.testing.assert_allclose(out_f32, ref, atol=3e-2, rtol=2e-2)
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
