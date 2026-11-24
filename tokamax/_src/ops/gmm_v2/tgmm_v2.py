@@ -730,7 +730,7 @@ def tgmm_kernel_main(
 def validate_tgmm_inputs(
     group_sizes: jax.Array,
     num_actual_groups: int,
-    group_offset: jax.Array | None = None,
+    group_offset: jax.Array | int | None = None,
 ) -> None:
   """Validates inputs to 'tgmm_v2'.
 
@@ -766,7 +766,7 @@ def tgmm_v2(
     group_sizes: jax.Array,
     num_actual_groups: int,
     rhs_scale: jax.Array | None = None,  # [1, 1, size_n] (per-N scale)
-    group_offset: jax.Array | None = None,
+    group_offset: jax.Array | int | None = None,
     partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
     tile_info: gmm_v2.TileSizes | TileTgmmFn = (

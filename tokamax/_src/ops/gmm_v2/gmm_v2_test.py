@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import collections
+import inspect
 import math
 from unittest import mock
 
@@ -241,8 +242,8 @@ class GmmTest(parameterized.TestCase):
 
   def test_group_offset_python_int(self):
     # Under `jax.disable_jit()` the kernel entry runs untraced and can receive
-    # `group_offset` as a Python int. Reproduce that by tracing the unjitted
-    # body (`__wrapped__`) inside an outer jit, then compare with an int32[1].
+    # `group_offset` as a Python int. Reproduce that by tracing the unwrapped
+    # body inside an outer jit, then compare with an int32[1].
     batch_size, in_size, out_size, num_groups = 128, 512, 512, 4
     group_offset = 1
     num_local_groups = num_groups - group_offset
@@ -255,10 +256,10 @@ class GmmTest(parameterized.TestCase):
     group_sizes = get_group_sizes(batch_size, num_groups)
 
     def run(lhs, rhs, out_grad, group_offset):
-      out = gmm_v2.gmm_v2.__wrapped__(
+      out = inspect.unwrap(gmm_v2.gmm_v2)(
           lhs, rhs, group_sizes, group_offset=group_offset
       )
-      drhs = tgmm_v2.tgmm_v2.__wrapped__(
+      drhs = inspect.unwrap(tgmm_v2.tgmm_v2)(
           lhs,
           out_grad,
           group_sizes,
@@ -2561,15 +2562,15 @@ class GmmV2GroupOffsetNormalizationTest(parameterized.TestCase):
           group_sizes, num_actual_groups=2, group_offset=2
       )
 
-  @parameterized.parameters(
-      (None, 0),
-      (0, 0),
-      (1, 1),
-      (jnp.int32(1), 1),
-      (jnp.array([1], dtype=jnp.int32), 1),
+  @parameterized.named_parameters(
+      ("none", lambda: None, 0),
+      ("zero_int", lambda: 0, 0),
+      ("pos_int", lambda: 1, 1),
+      ("scalar_array", lambda: jnp.int32(1), 1),
+      ("1d_array", lambda: jnp.array([1], dtype=jnp.int32), 1),
   )
-  def test_normalize_group_offset(self, offset, expected):
-    actual = gmm_v2.normalize_group_offset(offset)
+  def test_normalize_group_offset(self, make_offset, expected):
+    actual = gmm_v2.normalize_group_offset(make_offset())
     self.assertEqual(actual.shape, (1,))
     self.assertEqual(actual.dtype, jnp.int32)
     self.assertEqual(int(actual[0]), expected)

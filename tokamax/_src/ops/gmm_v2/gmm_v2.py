@@ -1708,7 +1708,7 @@ def gmm_v2(
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
-    group_offset: jax.Array | None = None,  # int32[1]
+    group_offset: jax.Array | int | None = None,  # int32[1]
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
     partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
