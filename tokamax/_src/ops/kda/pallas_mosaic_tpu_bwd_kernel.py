@@ -1881,6 +1881,14 @@ def _fused_dhu_wy_intra_cumsum_kernel(
   else:
     dg_ref[:, 0, 0] = dg_reverse_cumsum.astype(dg_ref.dtype)
 
+  if is_varlen:
+    # Padding chunks can carry unwritten (NaN) activations. Clear the
+    # public gradient tiles and recurrent carry after the arithmetic.
+    @pl.when(~is_valid)
+    def _():
+      for ref in (dq_ref, dk_ref, dv_ref, db_ref, dg_ref, dh_scratch):
+        ref[...] = jnp.zeros(ref.shape, ref.dtype)
+
   if dh0_ref is not None:
 
     @pl.when(is_first_chunk)
