@@ -265,11 +265,11 @@ table.ops-table code {
       <td>Fuses MoE expert computation with cross-device reduce-scatter into a single TPU kernel for inference.</td>
     </tr>
     <tr>
-      <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/routing_moe"><code>routing_moe</code></a> (experimental)</td>
+      <td><a href="https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/routing_moe_op"><code>routing_moe</code></a> (experimental)</td>
       <td>TPU</td>
       <td align="center" style="text-align: center;"></td>
       <td align="center" style="text-align: center;"></td>
-      <td>Implements a pipelined MoE layer that overlaps token gather/scatter with expert matrix multiplication.</td>
+      <td>Implements a pipelined expert-parallel MoE layer that overlaps token gather/scatter with expert matrix multiplication.</td>
     </tr>
   </tbody>
 </table>

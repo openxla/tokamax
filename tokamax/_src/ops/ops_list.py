@@ -592,9 +592,17 @@ OPS: tuple[Op, ...] = (
         apis=(),
         impls=(
             Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/experimental/routing_moe_op/base.py",
+            ),
+            Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
-                module="_src/ops/experimental/routing_moe/layer/modular.py",
+                module=(
+                    "_src/ops/experimental/routing_moe_op/pallas_mosaic_tpu.py"
+                ),
+                kernel_dirs=("experimental/routing_moe",),
             ),
         ),
     ),

@@ -23,6 +23,8 @@ from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import Config as MultiH
 from tokamax._src.ops.experimental.mla.pallas_mosaic_tpu import PallasTpuMultiHeadLatentAttention as MultiHeadLatentAttention
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import Config as MlaSwaConfig
 from tokamax._src.ops.experimental.mla_swa.pallas_mosaic_tpu import PallasTpuMlaSwa as MlaSwa
+from tokamax._src.ops.experimental.routing_moe_op.pallas_mosaic_tpu import Config as RoutingMoeConfig
+from tokamax._src.ops.experimental.routing_moe_op.pallas_mosaic_tpu import PallasMosaicTpuRoutingMoe as RoutingMoe
 
 # pylint: enable=g-importing-member,useless-import-alias
 
@@ -35,4 +37,6 @@ __all__ = (
     "MlaSwaConfig",
     "MultiHeadLatentAttention",
     "MultiHeadLatentAttentionConfig",
+    "RoutingMoe",
+    "RoutingMoeConfig",
 )
