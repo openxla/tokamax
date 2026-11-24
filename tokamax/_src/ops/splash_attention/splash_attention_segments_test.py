@@ -531,7 +531,7 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
     self.assertNotIn("gather", overlap_hlo)
     self.assertNotIn("scatter", overlap_hlo)
 
-  def test_dense_refine_downcasts_indices(self):
+  def test_dense_refine_downcasts_indices_and_chunks_within_smem_budget(self):
     # pylint: disable=protected-access
     bq = bkv = 128
     seq_len = 512
@@ -569,6 +569,17 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
     tiles = _scheduled_tiles(empty_with_sinks)
     self.assertCountEqual({r for r, _ in tiles}, range(seq_len // bq))
     self.assertTrue(all(m == 0 for m in tiles.values()))
+
+    q_blocks = kv_blocks = 471
+    entry_bytes = splash._refined_entry_bytes(mask_info, q_blocks, kv_blocks)
+    self.assertEqual(entry_bytes, 13)
+    chunk = splash._q_blocks_per_chunk(
+        mask_info, q_blocks, kv_blocks, is_dkv=False
+    )
+    self.assertLess(chunk, q_blocks)
+    self.assertLessEqual(
+        chunk * kv_blocks * entry_bytes, splash._MAX_SCALAR_PREFETCH_BYTES
+    )
 
   def test_padded_compacted_shards_keep_empty_rows(self):
     # pylint: disable=protected-access
@@ -1065,6 +1076,617 @@ class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
     np.testing.assert_allclose(dq, dq_ref, atol=5e-2, rtol=5e-2)
     np.testing.assert_allclose(dk, dk_ref, atol=5e-2, rtol=5e-2)
     np.testing.assert_allclose(dv, dv_ref, atol=5e-2, rtol=5e-2)
+
+  @parameterized.named_parameters(
+      ("full_mha", False, 2, 2, False, False, False, None),
+      ("full_gqa_sinks", False, 4, 2, False, True, False, None),
+      ("full_gqa_dq1", False, 4, 2, False, False, False, 1),
+      ("full_mqa", False, 4, 1, True, False, False, None),
+      ("full_vmap", False, 2, 2, False, False, True, None),
+      ("causal_gqa_dkv_chunked", True, 4, 2, False, False, False, None),
+  )
+  def test_q_chunked_fwd_and_bwd_match_reference(
+      self,
+      is_causal,
+      num_q_heads,
+      num_kv_heads,
+      is_mqa,
+      use_sinks,
+      use_vmap,
+      dq_reduction_steps,
+  ):
+    seq_len, head_dim, bq, bkv = 640, 128, 128, 128
+    batch_prefix = (2,) if use_vmap else ()
+    kv_shape = (
+        (*batch_prefix, seq_len, head_dim)
+        if is_mqa
+        else (*batch_prefix, num_kv_heads, seq_len, head_dim)
+    )
+    k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(11), 5)
+    q = jax.random.normal(
+        k1, (*batch_prefix, num_q_heads, seq_len, head_dim), jnp.bfloat16
+    ) / np.sqrt(head_dim).astype(jnp.bfloat16)
+    k = jax.random.normal(k2, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
+    v = jax.random.normal(k3, kv_shape, jnp.bfloat16) * jnp.bfloat16(0.5)
+    do = jax.random.normal(
+        k4, (*batch_prefix, num_q_heads, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    sinks = (
+        jax.random.normal(k5, (*batch_prefix, num_q_heads), jnp.float32)
+        if use_sinks
+        else None
+    )
+    base_ids = np.concatenate([
+        np.zeros(60, np.int32),
+        np.full(140, 5, np.int32),
+        np.full(200, 2, np.int32),
+        np.full(176, 5, np.int32),
+        np.zeros(64, np.int32),
+    ])
+    if use_vmap:
+      alt_ids = _ids_from_lengths((320, 320))
+      ids = jnp.stack([jnp.asarray(base_ids), jnp.asarray(alt_ids)])
+    else:
+      ids = jnp.asarray(base_ids)
+    segment_ids = base.SegmentIds(ids, ids)
+
+    mask = (
+        mask_lib.CausalMask(shape=(seq_len, seq_len))
+        if is_causal
+        else mask_lib.FullMask(_shape=(seq_len, seq_len))
+    )
+    config = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+        dq_reduction_steps=dq_reduction_steps,
+    )
+    make_attn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    # 5 q blocks with a 2-block SMEM budget forces uneven 2 + 2 + 1 chunking.
+    with (
+        mock.patch.object(splash, "_MAX_SCALAR_PREFETCH_BYTES", 2 * 5 * 13),
+        mock.patch.object(
+            splash,
+            "_splash_attention_forward_single",
+            wraps=splash._splash_attention_forward_single,  # pylint: disable=protected-access
+        ) as fwd_spy,
+        mock.patch.object(
+            splash,
+            "_splash_attention_bwd_dkv_single",
+            wraps=splash._splash_attention_bwd_dkv_single,  # pylint: disable=protected-access
+        ) as dkv_spy,
+    ):
+      jax.clear_caches()
+      attn = make_attn(mask, config=config)
+      if use_vmap:
+        attn = jax.vmap(attn)
+      o, attn_vjp = jax.vjp(
+          lambda q_, k_, v_, s_: attn(q_, k_, v_, segment_ids, sinks=s_),
+          q,
+          k,
+          v,
+          sinks,
+      )
+      dq, dk, dv, dsinks = attn_vjp(do)
+    jax.clear_caches()
+    fwd_offsets = {
+        c.kwargs.get("q_block_offset", 0) for c in fwd_spy.call_args_list
+    }
+    dkv_offsets = {
+        c.kwargs.get("q_block_offset", 0) for c in dkv_spy.call_args_list
+    }
+    self.assertEqual(fwd_offsets, {0} if is_causal else {0, 2, 4})
+    self.assertEqual(dkv_offsets, {0, 2, 4})
+
+    dense_mask = jnp.asarray(mask[:, :])
+    if use_vmap:
+      for b in range(2):
+        seg_b = base.SegmentIds(ids[b], ids[b])
+        q_b, k_b, v_b, do_b = jax.tree.map(
+            lambda x, idx=b: x[idx].astype(jnp.float32), (q, k, v, do)
+        )
+        o_ref, stats_ref = base.attention_reference(
+            q_b,
+            k_b,
+            v_b,
+            dense_mask,
+            seg_b,
+            None,
+            is_mqa=is_mqa,
+            save_residuals=True,
+        )
+        dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+            do_b,
+            q_b,
+            k_b,
+            v_b,
+            dense_mask,
+            seg_b,
+            None,
+            o_ref,
+            stats_ref["logsumexp"],
+            is_mqa=is_mqa,
+        )
+        np.testing.assert_allclose(o[b], o_ref, atol=2e-2, rtol=2e-2)
+        np.testing.assert_allclose(dq[b], dq_ref, atol=6e-2, rtol=6e-2)
+        np.testing.assert_allclose(dk[b], dk_ref, atol=6e-2, rtol=6e-2)
+        np.testing.assert_allclose(dv[b], dv_ref, atol=6e-2, rtol=6e-2)
+    else:
+      q32, k32, v32, do32 = jax.tree.map(
+          lambda x: x.astype(jnp.float32), (q, k, v, do)
+      )
+      o_ref, stats_ref = base.attention_reference(
+          q32,
+          k32,
+          v32,
+          dense_mask,
+          segment_ids,
+          sinks,
+          is_mqa=is_mqa,
+          save_residuals=True,
+      )
+      dq_ref, dk_ref, dv_ref, dsinks_ref = base.attention_reference_vjp(
+          do32,
+          q32,
+          k32,
+          v32,
+          dense_mask,
+          segment_ids,
+          sinks,
+          o_ref,
+          stats_ref["logsumexp"],
+          is_mqa=is_mqa,
+      )
+      np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+      np.testing.assert_allclose(dq, dq_ref, atol=6e-2, rtol=6e-2)
+      np.testing.assert_allclose(dk, dk_ref, atol=6e-2, rtol=6e-2)
+      np.testing.assert_allclose(dv, dv_ref, atol=6e-2, rtol=6e-2)
+      if use_sinks:
+        np.testing.assert_allclose(dsinks, dsinks_ref, atol=5e-2, rtol=5e-2)
+
+  @parameterized.named_parameters(
+      ("symmetric_128", (180, 200, 260), 128, 128, 2 * 5 * 13, {0, 2, 4}),
+      ("asymmetric_256_128", (180, 260, 328), 256, 128, 2 * 6 * 13, {0, 2}),
+  )
+  def test_q_chunked_dropout_matches_unchunked(
+      self,
+      lengths,
+      bq,
+      bq_dkv,
+      chunk_max_bytes,
+      expected_fwd_offsets,
+  ):
+    seq_len, head_dim, bkv = sum(lengths), 128, 128
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(17), 4)
+    q = jax.random.normal(k1, (2, seq_len, head_dim), jnp.bfloat16) / np.sqrt(
+        head_dim
+    ).astype(jnp.bfloat16)
+    k = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16)
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16)
+    do = jax.random.normal(k4, (2, seq_len, head_dim), jnp.bfloat16)
+    segment_ids = _segment_ids(lengths)
+    prng_key = jax.random.key(23)
+
+    mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+    config = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq_dkv,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+        dropout_rate=0.25,
+        dropout_block_q=128,
+        dropout_block_kv=bkv,
+    )
+
+    def run(max_bytes, exp_fwd_offsets, exp_dkv_offsets):
+      with (
+          mock.patch.object(splash, "_MAX_SCALAR_PREFETCH_BYTES", max_bytes),
+          mock.patch.object(
+              splash,
+              "_splash_attention_forward_single",
+              wraps=splash._splash_attention_forward_single,  # pylint: disable=protected-access
+          ) as fwd_spy,
+          mock.patch.object(
+              splash,
+              "_splash_attention_bwd_dkv_single",
+              wraps=splash._splash_attention_bwd_dkv_single,  # pylint: disable=protected-access
+          ) as dkv_spy,
+      ):
+        jax.clear_caches()
+        attn = splash.make_splash_mha_single_device(mask, config=config)
+        o, attn_vjp = jax.vjp(
+            lambda *qkv: attn(*qkv, segment_ids, prng_key=prng_key), q, k, v
+        )
+        grads = attn_vjp(do)
+      self.assertEqual(
+          {c.kwargs.get("q_block_offset", 0) for c in fwd_spy.call_args_list},
+          exp_fwd_offsets,
+      )
+      self.assertEqual(
+          {c.kwargs.get("q_block_offset", 0) for c in dkv_spy.call_args_list},
+          exp_dkv_offsets,
+      )
+      return (o, *grads)
+
+    o_chunked, dq_chunked, dk_chunked, dv_chunked = run(
+        chunk_max_bytes, expected_fwd_offsets, {0, 2, 4}
+    )
+    o_full, dq_full, dk_full, dv_full = run(
+        splash._MAX_SCALAR_PREFETCH_BYTES, {0}, {0}  # pylint: disable=protected-access
+    )
+    jax.clear_caches()
+
+    np.testing.assert_array_equal(o_chunked, o_full)
+    # Cross-chunk fp32 accumulation reassociates the dK/dV sum across chunks,
+    # which can flip rare entries by 1 bfloat16 ULP (~7.8e-3 rel).
+    np.testing.assert_allclose(dk_chunked, dk_full, atol=1e-4, rtol=1e-2)
+    np.testing.assert_allclose(dv_chunked, dv_full, atol=1e-4, rtol=1e-2)
+    np.testing.assert_allclose(dq_chunked, dq_full, atol=6e-2, rtol=6e-2)
+
+  def test_q_chunked_empty_q_chunk_residuals_and_sinks(self):
+    seq_len, head_dim, bq, bkv = 512, 128, 128, 128
+    k1, k2, k3, k4, k5 = jax.random.split(jax.random.key(31), 5)
+    q = jax.random.normal(k1, (2, seq_len, head_dim), jnp.bfloat16) / np.sqrt(
+        head_dim
+    ).astype(jnp.bfloat16)
+    k = jax.random.normal(
+        k2, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    v = jax.random.normal(
+        k3, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    do = jax.random.normal(
+        k4, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    sinks = jax.random.normal(k5, (2,), jnp.float32)
+
+    kv_ids = jnp.asarray(_ids_from_lengths((160, 160, 192)))
+    # Trailing 2 q blocks use an orphan segment id absent from kv_ids so the
+    # second 2-block q chunk has zero active tiles.
+    q_ids = jnp.concatenate(
+        [kv_ids[:256], jnp.full((256,), 99, dtype=jnp.int32)]
+    )
+    segment_ids = base.SegmentIds(q_ids, kv_ids)
+    mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+
+    config_orphan = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+        max_logit_const=0.5,
+    )
+
+    def run_orphan(max_bytes, expected_offsets):
+      with (
+          mock.patch.object(splash, "_MAX_SCALAR_PREFETCH_BYTES", max_bytes),
+          mock.patch.object(
+              splash,
+              "_splash_attention_forward_single",
+              wraps=splash._splash_attention_forward_single,  # pylint: disable=protected-access
+          ) as fwd_spy,
+          mock.patch.object(
+              splash,
+              "_splash_attention_bwd_dkv_single",
+              wraps=splash._splash_attention_bwd_dkv_single,  # pylint: disable=protected-access
+          ) as dkv_spy,
+      ):
+        jax.clear_caches()
+        attn = splash.make_splash_mha_single_device(
+            mask, config=config_orphan, save_residuals=True
+        )
+        (o, stats), attn_vjp = jax.vjp(
+            lambda *qkv: attn(*qkv, segment_ids), q, k, v
+        )
+        zero_stats = jax.tree.map(jnp.zeros_like, stats)
+        dq, dk, dv = attn_vjp((do, zero_stats))
+      self.assertEqual(
+          {c.kwargs.get("q_block_offset", 0) for c in fwd_spy.call_args_list},
+          expected_offsets,
+      )
+      self.assertEqual(
+          {c.kwargs.get("q_block_offset", 0) for c in dkv_spy.call_args_list},
+          expected_offsets,
+      )
+      return o, stats, dq, dk, dv
+
+    o_c, stats_c, dq_c, dk_c, dv_c = run_orphan(2 * 4 * 13, {0, 2})
+    o_u, stats_u, dq_u, dk_u, dv_u = run_orphan(
+        splash._MAX_SCALAR_PREFETCH_BYTES, {0}  # pylint: disable=protected-access
+    )
+    jax.clear_caches()
+
+    np.testing.assert_array_equal(o_c, o_u)
+    np.testing.assert_array_equal(o_c[:, 256:, :], 0.0)
+    np.testing.assert_array_equal(stats_c["logsumexp"], stats_u["logsumexp"])
+    self.assertTrue(
+        np.all(np.isneginf(np.asarray(stats_c["logsumexp"][:, 256:])))
+    )
+    np.testing.assert_allclose(
+        stats_c["max_logits"], stats_u["max_logits"], atol=1e-6
+    )
+    np.testing.assert_allclose(stats_c["max_logits"][:, 256:], 0.5, atol=1e-5)
+    np.testing.assert_array_equal(dq_c[:, 256:, :], 0.0)
+    np.testing.assert_allclose(dq_c, dq_u, atol=6e-2, rtol=6e-2)
+    np.testing.assert_array_equal(dk_c, dk_u)
+    np.testing.assert_array_equal(dv_c, dv_u)
+
+    config_sinks = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+        fuse_reciprocal=False,
+    )
+    with (
+        mock.patch.object(splash, "_MAX_SCALAR_PREFETCH_BYTES", 2 * 4 * 13),
+        mock.patch.object(
+            splash,
+            "_splash_attention_forward_single",
+            wraps=splash._splash_attention_forward_single,  # pylint: disable=protected-access
+        ) as fwd_spy,
+        mock.patch.object(
+            splash,
+            "_splash_attention_bwd_dkv_single",
+            wraps=splash._splash_attention_bwd_dkv_single,  # pylint: disable=protected-access
+        ) as dkv_spy,
+    ):
+      jax.clear_caches()
+      attn_s = splash.make_splash_mha_single_device(
+          mask, config=config_sinks, save_residuals=True
+      )
+      (o_s, stats_s), vjp_s = jax.vjp(
+          lambda q_, k_, v_, s_: attn_s(q_, k_, v_, segment_ids, sinks=s_),
+          q,
+          k,
+          v,
+          sinks,
+      )
+      dq_s, dk_s, dv_s, dsinks_s = vjp_s(
+          (do, jax.tree.map(jnp.zeros_like, stats_s))
+      )
+    jax.clear_caches()
+    self.assertEqual(
+        {c.kwargs.get("q_block_offset", 0) for c in fwd_spy.call_args_list},
+        {0, 2},
+    )
+    self.assertEqual(
+        {c.kwargs.get("q_block_offset", 0) for c in dkv_spy.call_args_list},
+        {0, 2},
+    )
+
+    dense_mask = jnp.ones((seq_len, seq_len), dtype=bool)
+    q32, k32, v32, do32 = jax.tree.map(
+        lambda x: x.astype(jnp.float32), (q, k, v, do)
+    )
+    o_ref, stats_ref = base.attention_reference(
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        sinks,
+        is_mqa=False,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, dsinks_ref = base.attention_reference_vjp(
+        do32,
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        sinks,
+        o_ref,
+        stats_ref["logsumexp"],
+        is_mqa=False,
+    )
+    np.testing.assert_allclose(o_s, o_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(
+        stats_s["logsumexp"], stats_ref["logsumexp"], atol=2e-2, rtol=2e-2
+    )
+    np.testing.assert_allclose(
+        stats_s["max_logits"], stats_ref["max_logits"], atol=2e-2, rtol=2e-2
+    )
+    np.testing.assert_allclose(dq_s, dq_ref, atol=6e-2, rtol=6e-2)
+    np.testing.assert_allclose(dk_s, dk_ref, atol=6e-2, rtol=6e-2)
+    np.testing.assert_allclose(dv_s, dv_ref, atol=6e-2, rtol=6e-2)
+    np.testing.assert_allclose(dsinks_s, dsinks_ref, atol=5e-2, rtol=5e-2)
+
+  def test_q_chunked_dense_partial_mask_blocks_matches_reference(self):
+    seq_len, head_dim, bq, bkv = 640, 128, 128, 128
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(37), 4)
+    q = jax.random.normal(k1, (2, seq_len, head_dim), jnp.bfloat16) / np.sqrt(
+        head_dim
+    ).astype(jnp.bfloat16)
+    k = jax.random.normal(
+        k2, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    v = jax.random.normal(
+        k3, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    do = jax.random.normal(
+        k4, (2, seq_len, head_dim), jnp.bfloat16
+    ) * jnp.bfloat16(0.5)
+    segment_ids = _segment_ids((180, 220, 240))
+
+    # Sub-block band offset yields empty (0), partial (1), and full (2) tiles
+    # with non-None `mask_next` and `partial_mask_blocks` (no `mask_function`).
+    np_mask = np.tril(np.ones((seq_len, seq_len), dtype=bool), k=32)
+    mask = mask_lib.NumpyMask(np_mask)
+    config = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+        dq_reduction_steps=None,
+    )
+    fwd_info, mask_fn = mask_info_lib.process_mask(
+        mask, (bq, bkv), return_dynamic_grid=False
+    )
+    dkv_info, _ = mask_info_lib.process_mask_dkv(
+        mask, (bq, bkv), return_dynamic_grid=False
+    )
+    self.assertIsNone(mask_fn)
+    self.assertIsNone(fwd_info.active_rows)
+    self.assertIsNotNone(fwd_info.mask_next)
+    self.assertIsNotNone(fwd_info.partial_mask_blocks)
+    self.assertIsNone(dkv_info.active_rows)
+    self.assertIsNotNone(dkv_info.mask_next)
+    self.assertIsNotNone(dkv_info.partial_mask_blocks)
+
+    fwd_entry_bytes = splash._refined_entry_bytes(fwd_info, 5, 5)
+    self.assertEqual(fwd_entry_bytes, 14)
+
+    fwd_info = jax.tree.map(jnp.asarray, fwd_info)
+    dkv_info = jax.tree.map(jnp.asarray, dkv_info)
+    kernel = splash.SplashAttentionKernel(
+        fwd_info,
+        dkv_info,
+        config=config,
+        is_mqa=False,
+        save_residuals=False,
+        mask_value=base.DEFAULT_MASK_VALUE,
+        mask_function=None,
+        fwd_mask_sparsity=1.0,
+        dkv_mask_sparsity=1.0,
+    )
+
+    with (
+        mock.patch.object(
+            splash, "_MAX_SCALAR_PREFETCH_BYTES", 2 * 5 * fwd_entry_bytes
+        ),
+        mock.patch.object(
+            splash,
+            "_splash_attention_forward_single",
+            wraps=splash._splash_attention_forward_single,  # pylint: disable=protected-access
+        ) as fwd_spy,
+        mock.patch.object(
+            splash,
+            "_splash_attention_bwd_dkv_single",
+            wraps=splash._splash_attention_bwd_dkv_single,  # pylint: disable=protected-access
+        ) as dkv_spy,
+    ):
+      jax.clear_caches()
+      o, vjp_fn = jax.vjp(lambda *qkv: kernel(*qkv, segment_ids), q, k, v)
+      dq, dk, dv = vjp_fn(do)
+    jax.clear_caches()
+    self.assertEqual(
+        {c.kwargs.get("q_block_offset", 0) for c in fwd_spy.call_args_list},
+        {0, 2, 4},
+    )
+    self.assertEqual(
+        {c.kwargs.get("q_block_offset", 0) for c in dkv_spy.call_args_list},
+        {0, 2, 4},
+    )
+
+    dense_mask = jnp.asarray(np_mask)
+    q32, k32, v32, do32 = jax.tree.map(
+        lambda x: x.astype(jnp.float32), (q, k, v, do)
+    )
+    o_ref, stats_ref = base.attention_reference(
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        is_mqa=False,
+        save_residuals=True,
+    )
+    dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+        do32,
+        q32,
+        k32,
+        v32,
+        dense_mask,
+        segment_ids,
+        None,
+        o_ref,
+        stats_ref["logsumexp"],
+        is_mqa=False,
+    )
+    assert isinstance(o, jax.Array)
+    np.testing.assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(dq, dq_ref, atol=6e-2, rtol=6e-2)
+    np.testing.assert_allclose(dk, dk_ref, atol=6e-2, rtol=6e-2)
+    np.testing.assert_allclose(dv, dv_ref, atol=6e-2, rtol=6e-2)
+
+  def test_128k_packed_full_attention_fits_smem_and_matches_segment_ref(self):
+    num_docs, doc_len = 256, 512
+    seq_len = num_docs * doc_len
+    bq = bkv = 512
+    head_dim = 128
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(29), 4)
+    scale = jnp.bfloat16(0.5)
+    q = jax.random.normal(k1, (2, seq_len, head_dim), jnp.bfloat16) / np.sqrt(
+        head_dim
+    ).astype(jnp.bfloat16)
+    k = jax.random.normal(k2, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    v = jax.random.normal(k3, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    do = jax.random.normal(k4, (2, seq_len, head_dim), jnp.bfloat16) * scale
+    segment_ids = _segment_ids((doc_len,) * num_docs)
+
+    mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+    config = splash.SplashConfig(
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv,
+        block_q_dkv=bq,
+        block_kv_dkv=bkv,
+        block_kv_dkv_compute=bkv,
+    )
+    attn = splash.make_splash_mha_single_device(mask, config=config)
+    o, attn_vjp = jax.vjp(attn, q, k, v, segment_ids)
+    dq, dk, dv, _ = attn_vjp(do)
+
+    dense_doc_mask = jnp.ones((doc_len, doc_len), dtype=bool)
+    for doc_idx in (0, 127, 255):
+      s0, s1 = doc_idx * doc_len, (doc_idx + 1) * doc_len
+      q_d, k_d, v_d, do_d = jax.tree.map(
+          lambda x, a=s0, b=s1: x[:, a:b, :].astype(jnp.float32), (q, k, v, do)
+      )
+      o_ref, stats_ref = base.attention_reference(
+          q_d,
+          k_d,
+          v_d,
+          dense_doc_mask,
+          None,
+          None,
+          is_mqa=False,
+          save_residuals=True,
+      )
+      dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+          do_d,
+          q_d,
+          k_d,
+          v_d,
+          dense_doc_mask,
+          None,
+          None,
+          o_ref,
+          stats_ref["logsumexp"],
+          is_mqa=False,
+      )
+      np.testing.assert_allclose(o[:, s0:s1, :], o_ref, atol=2e-2, rtol=2e-2)
+      np.testing.assert_allclose(dq[:, s0:s1, :], dq_ref, atol=6e-2, rtol=6e-2)
+      np.testing.assert_allclose(dk[:, s0:s1, :], dk_ref, atol=6e-2, rtol=6e-2)
+      np.testing.assert_allclose(dv[:, s0:s1, :], dv_ref, atol=6e-2, rtol=6e-2)
 
 
 if __name__ == "__main__":
