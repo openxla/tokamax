@@ -1,0 +1,189 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+# Reviews pull requests with Gemini CLI. The reviewer follows
+# .github/skills/tokamax-review/SKILL.md.
+#
+# A review runs when a non-draft pull request is opened or marked ready for
+# review. For a pull request from a fork, the author must have contributed to
+# this repository before. A maintainer can also request a review on any pull
+# request by commenting `@gemini-cli /review`.
+#
+# Pull requests that Copybara opens for internal changes are skipped (a bot
+# opens them, on branches named `test_<number>`). Those changes are reviewed
+# internally.
+#
+# Setup: the workflow needs one credential in the repository settings, for
+# example a `GEMINI_API_KEY` secret. The other `vars.*` and `secrets.*` values
+# that this file reads are optional.
+
+name: 'Gemini CLI Review'
+
+on:
+  pull_request:
+    types: ['opened', 'ready_for_review']
+  # Fork pull requests get no secrets on `pull_request`, so they use
+  # `pull_request_target`. The `zizmor: ignore` below is safe because, for that
+  # event, the job checks out the base commit, not the pull request.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: ['opened', 'ready_for_review']
+  issue_comment: # zizmor: ignore[dangerous-triggers]
+    types: ['created']
+  pull_request_review_comment:
+    types: ['created']
+  pull_request_review:
+    types: ['submitted']
+
+jobs:
+  review:
+    if: |-
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.fork == false &&
+        github.event.pull_request.draft == false &&
+        github.event.sender.type == 'User' &&
+        !startsWith(github.event.pull_request.head.ref, 'test_')
+      ) || (
+        github.event_name == 'pull_request_target' &&
+        github.event.pull_request.head.repo.full_name != github.repository &&
+        github.event.pull_request.draft == false &&
+        github.event.sender.type == 'User' &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.pull_request.author_association)
+      ) || (
+        (
+          github.event_name == 'pull_request_review_comment' ||
+          github.event_name == 'pull_request_review' ||
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+        ) &&
+        github.event.sender.type == 'User' &&
+        startsWith(github.event.comment.body || github.event.review.body, '@gemini-cli /review') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association)
+      )
+    concurrency:
+      group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}'
+      cancel-in-progress: true
+    # Runs on standard GitHub-hosted Ubuntu CPU runners.
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 30
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+    steps:
+      - name: 'Mint identity token'
+        id: 'mint_identity_token'
+        if: |-
+          ${{ vars.APP_ID }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+          permission-contents: 'read'
+          permission-issues: 'write'
+          permission-pull-requests: 'write'
+
+      - name: 'Checkout repository'
+        # SECURITY: for `pull_request_target` runs, always check out the base
+        # commit so the review guidelines come from the base branch.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: 'false'
+          ref: '${{ github.event_name == ''pull_request_target'' && github.event.pull_request.base.sha || '''' }}'
+
+      - name: 'Run Gemini CLI'
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # v0.1.22
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
+        with:
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gemini_debug: '${{ vars.DEBUG == ''true'' || vars.ACTIONS_STEP_DEBUG == ''true'' }}'
+          # The GEMINI_MODEL repository variable overrides this default.
+          gemini_model: '${{ vars.GEMINI_MODEL || ''gemini-4-neon'' }}'
+          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          settings: |-
+            {
+              "model": {
+                "maxSessionTurns": 100
+              },
+              "telemetry": {
+                "enabled": false,
+                "target": "gcp"
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "get_commit",
+                    "get_file_contents",
+                    "issue_read",
+                    "pull_request_read",
+                    "pull_request_review_write",
+                    "search_code"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "exclude": [
+                  "run_shell_command",
+                  "write_file",
+                  "replace"
+                ]
+              }
+            }
+          prompt: |-
+            Review pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}.
+
+            First read `.github/skills/tokamax-review/SKILL.md` in the
+            workspace and follow it.
+
+            Use the GitHub tools for everything on GitHub:
+            - `pull_request_read` returns the description, the changed files,
+              and the diff.
+            - `get_file_contents` with `ref: refs/pull/<number>/head` returns
+              the rest of a changed file.
+
+            Post one review:
+            1. Create a pending review: `pull_request_review_write` with
+               `method: "create"` and no `event`. If creating a pending review
+               fails because one already exists from an earlier interrupted run,
+               call `pull_request_review_write` with `method: "delete_pending"`
+               first and retry.
+            2. Add an inline comment for each finding with
+               `add_comment_to_pending_review`. Comment only on lines that the
+               diff adds or removes.
+            3. Submit the review: `pull_request_review_write` with
+               `method: "submit_pending"`, `event: "COMMENT"`, and a short
+               summary as `body`.
