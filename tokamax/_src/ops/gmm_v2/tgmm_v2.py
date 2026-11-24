@@ -617,10 +617,25 @@ def tgmm_inner_kernel(
   cur_group_id = metadata_ref.gm_id_to_group_id[gm_id]
   group_is_changing = jnp.logical_or(is_last_gm, cur_group_id != next_group_id)
 
-  def run_matmul_step(bucket_m: int):
+  def run_matmul_step(bucket_m: int, *, is_last_bucket: bool):
     @jax.named_scope(f"bm{bucket_m}_matmul_new_group_and_changing")
     def matmul_new_group_and_changing():
       _matmul(is_new_group=True, is_group_changing=True, bucket_m=bucket_m)
+
+    @jax.named_scope(f"bm{bucket_m}_matmul_group_changing")
+    def matmul_group_changing():
+      _matmul(is_new_group=False, is_group_changing=True, bucket_m=bucket_m)
+
+    if not is_last_bucket:
+      # A small bucket (non-last bucket) can only be a group's last tile (hence
+      # group_is_changing = True), because any non-final tile of a group fills
+      # all `tile_m` rows (see `fill_metadata`).
+      lax.cond(
+          new_group,
+          matmul_new_group_and_changing,
+          matmul_group_changing,
+      )
+      return
 
     @jax.named_scope(f"bm{bucket_m}_matmul_new_group")
     def matmul_new_group():
@@ -629,10 +644,6 @@ def tgmm_inner_kernel(
     @jax.named_scope(f"bm{bucket_m}_matmul")
     def matmul():
       _matmul(is_new_group=False, is_group_changing=False, bucket_m=bucket_m)
-
-    @jax.named_scope(f"bm{bucket_m}_matmul_group_changing")
-    def matmul_group_changing():
-      _matmul(is_new_group=False, is_group_changing=True, bucket_m=bucket_m)
 
     lax.cond(
         new_group,
@@ -663,7 +674,11 @@ def tgmm_inner_kernel(
   lax.switch(
       bucket_idx,
       [
-          functools.partial(run_matmul_step, bucket_m=bucket_base * (i + 1))
+          functools.partial(
+              run_matmul_step,
+              bucket_m=bucket_base * (i + 1),
+              is_last_bucket=(i == num_buckets - 1),
+          )
           for i in range(num_buckets)
       ],
   )
