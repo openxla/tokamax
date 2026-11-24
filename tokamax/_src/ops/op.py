@@ -833,9 +833,16 @@ def infer_device_kind(ba: BoundArguments) -> DeviceKind | None:
 
 
 def _abstractify(pytree):
+  """Canonicalizes concrete arrays, sharded shapes, and meshes for cache keys."""
   def abstractify_leaf(x):
-    if isinstance(x, (jax.Array, np.ndarray)):
+    if isinstance(x, batching.BatchedShapeDtype):
+      return batching.BatchedShapeDtype(x.shape, x.dtype, vmap_axes=x.vmap_axes)
+    if isinstance(x, (jax.Array, np.ndarray, jax.ShapeDtypeStruct)):
       return jax.ShapeDtypeStruct(x.shape, x.dtype)
+    if isinstance(x, (jax.sharding.Mesh, jax.sharding.AbstractMesh)):
+      return jax.sharding.AbstractMesh(
+          x.axis_sizes, x.axis_names, axis_types=x.axis_types
+      )
     return x
 
   return jax.tree.map(abstractify_leaf, pytree)
