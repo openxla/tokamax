@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import collections
+import inspect
 import math
 from unittest import mock
 
@@ -259,6 +260,44 @@ class GmmTest(parameterized.TestCase):
     )
 
     assert_arrays_all_close(actual, expected)
+
+  def test_group_offset_python_int(self):
+    # Under `jax.disable_jit()` the kernel entry runs untraced and can receive
+    # `group_offset` as a Python int. Reproduce that by tracing the unwrapped
+    # body inside an outer jit, then compare with an int32[1].
+    batch_size, in_size, out_size, num_groups = 128, 512, 512, 4
+    group_offset = 1
+    num_local_groups = num_groups - group_offset
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    rhs = jax.random.normal(
+        k1, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+    )
+    out_grad = jax.random.normal(k2, (batch_size, out_size), dtype=jnp.bfloat16)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    def run(lhs, rhs, out_grad, group_offset):
+      out = inspect.unwrap(gmm_v2.gmm_v2)(
+          lhs, rhs, group_sizes, group_offset=group_offset
+      )
+      drhs = inspect.unwrap(tgmm_v2.tgmm_v2)(
+          lhs,
+          out_grad,
+          group_sizes,
+          num_local_groups,
+          group_offset=group_offset,
+          preferred_element_type=jnp.bfloat16,
+      )
+      return out, drhs
+
+    def run_with_python_int(lhs, rhs, out_grad):
+      return run(lhs, rhs, out_grad, group_offset)
+
+    expected = jax.jit(run)(
+        lhs, rhs, out_grad, jnp.array([group_offset], dtype=jnp.int32)
+    )
+    actual = jax.jit(run_with_python_int)(lhs, rhs, out_grad)
+    chex.assert_trees_all_equal(actual, expected)
 
   @parameterized.product(
       batch_size=[73, 117],
@@ -3507,6 +3546,34 @@ class TgmmV2CalculateTilingTest(parameterized.TestCase):
     )
 
     self.assertEqual(tiles.tile_m, tiles.bucket_base * expected_num_buckets)
+
+
+class GmmV2GroupOffsetNormalizationTest(parameterized.TestCase):
+  """Tests for group_offset normalization in gmm_v2 and tgmm_v2."""
+
+  def test_validate_tgmm_inputs(self):
+    group_sizes = jnp.array([32, 32, 32], dtype=jnp.int32)
+    for offset in (None, 0, 1, jnp.int32(1), jnp.array([1], jnp.int32)):
+      tgmm_v2.validate_tgmm_inputs(
+          group_sizes, num_actual_groups=2, group_offset=offset
+      )
+    with self.assertRaises(ValueError):
+      tgmm_v2.validate_tgmm_inputs(
+          group_sizes, num_actual_groups=2, group_offset=2
+      )
+
+  @parameterized.named_parameters(
+      ("none", lambda: None, 0),
+      ("zero_int", lambda: 0, 0),
+      ("pos_int", lambda: 1, 1),
+      ("scalar_array", lambda: jnp.int32(1), 1),
+      ("1d_array", lambda: jnp.array([1], dtype=jnp.int32), 1),
+  )
+  def test_normalize_group_offset(self, make_offset, expected):
+    actual = gmm_v2.normalize_group_offset(make_offset())
+    self.assertEqual(actual.shape, (1,))
+    self.assertEqual(actual.dtype, jnp.int32)
+    self.assertEqual(int(actual[0]), expected)
 
 
 class GmmV2VmemStressTest(parameterized.TestCase):

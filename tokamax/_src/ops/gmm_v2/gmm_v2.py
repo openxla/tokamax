@@ -1803,6 +1803,17 @@ def is_manually_cast_matmul_dtype_combo(
   return (jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype)) in manual_cast_dtype_combo
 
 
+def normalize_group_offset(group_offset: jax.Array | int | None) -> jax.Array:
+  """Returns `group_offset` with `None` and scalars converted to `int32[1]`."""
+  if group_offset is None:
+    return jnp.array([0], dtype=jnp.int32)
+  if isinstance(group_offset, int) or jnp.isscalar(group_offset):
+    # Also accept a Python int or 0-d array (e.g. under `jax.disable_jit()`,
+    # where it is not traced).
+    return jnp.asarray(group_offset, dtype=jnp.int32).reshape((1,))
+  return group_offset
+
+
 def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -2153,7 +2164,7 @@ def gmm_v2(
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
-    group_offset: jax.Array | None = None,  # int32[1]
+    group_offset: jax.Array | int | None = None,  # int32[1]
     lhs_scale: jax.Array | None = None,  # [1, 1] (per-tensor)
     partial_sum: jax.Array | None = None,  # [size_m, size_n]
     *,
@@ -2235,11 +2246,7 @@ def gmm_v2(
           partial_sum, ((0, padded_size_m - size_m), (0, 0))
       )
 
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    if jnp.isscalar(group_offset):
-      group_offset = group_offset[None]
+  group_offset = normalize_group_offset(group_offset)
 
   if vmem_limit_bytes is None:
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)

@@ -966,7 +966,7 @@ def tgmm_kernel_main(
 def validate_tgmm_inputs(
     group_sizes: jax.Array,
     num_actual_groups: int,
-    group_offset: jax.Array | None = None,
+    group_offset: jax.Array | int | None = None,
 ) -> None:
   """Validates inputs to 'tgmm_v2'.
 
@@ -978,12 +978,7 @@ def validate_tgmm_inputs(
     num_actual_groups: The number of actual groups.
     group_offset: An optional offset for the group indices.
   """
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  elif jnp.isscalar(group_offset):
-    assert group_offset.size == 1
-    if jnp.isscalar(group_offset):
-      group_offset = group_offset[None]
+  group_offset = gmm_v2.normalize_group_offset(group_offset)
   if group_sizes.size < group_offset[0] + num_actual_groups:
     raise ValueError(
         f"group_sizes.size ({group_sizes.size}) must be >= group_offset"
@@ -1007,7 +1002,7 @@ def tgmm_v2(
     group_sizes: jax.Array,
     num_actual_groups: int,
     rhs_scale: jax.Array | None = None,  # [1, 1, size_n] (per-N scale)
-    group_offset: jax.Array | None = None,
+    group_offset: jax.Array | int | None = None,
     partial_sum: jax.Array | None = None,  # [num_actual_groups, size_k, size_n]
     *,
     tile_info: gmm_v2.TileSizes | TileTgmmFn = (
@@ -1052,11 +1047,7 @@ def tgmm_v2(
     [num_actual_groups, size_k, size_n].
   """
   del precision
-  if group_offset is None:
-    group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    if jnp.isscalar(group_offset):
-      group_offset = group_offset[None]
+  group_offset = gmm_v2.normalize_group_offset(group_offset)
   if vmem_limit_bytes is None:
     vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
