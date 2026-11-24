@@ -29,7 +29,7 @@ import qwix
 from tensorboardX import writer
 import tokamax
 from tokamax._src import quantization
-
+from tokamax._src.ops.gmm_v2 import gmm_v2 as gmm_backend
 from tokamax._src.ops.gmm_v2 import tgmm_v2 as tgmm_backend
 from tokamax._src.ops.gmm_v2 import util as gmm_util
 from tokamax._src.ops.ragged_dot import pallas_mosaic_tpu_v2
@@ -54,6 +54,18 @@ EXAMPLE = {
     'group_sizes': tokamax.RaggedDotGroupSizes(
         jax.ShapeDtypeStruct((256,), dtype=jnp.int32), 262144),
 }
+
+
+def _maybe_quantize_lhs(
+    lhs: jax.Array, rhs_dtype: jnp.dtype
+) -> jax.Array | quantization.AsQArray:
+  """Quantizes `lhs` to fp8 if the TPU can multiply it with `rhs_dtype`."""
+  lhs_dtype = jnp.float8_e4m3fn
+  if pltpu.get_tpu_info().is_matmul_supported(
+      lhs_dtype, rhs_dtype
+  ) or gmm_backend.is_manually_cast_matmul_dtype_combo(lhs_dtype, rhs_dtype):
+    return quantization.AsQArray(lhs, lhs_dtype)
+  return lhs
 
 
 class RaggedDotBenchmark(parameterized.TestCase):
@@ -131,7 +143,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        lhs=_maybe_quantize_lhs(lhs, rhs_q.dtype),
         rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         zero_initialize=True,
@@ -284,7 +296,7 @@ class RaggedDotBenchmark(parameterized.TestCase):
 
     gmm_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot()
     benchmark_config = dict(
-        lhs=quantization.AsQArray(lhs, jnp.float8_e4m3fn),
+        lhs=_maybe_quantize_lhs(lhs, rhs_q.dtype),
         rhs=qwix.QArray(rhs_q, rhs_scale),
         group_sizes=group_sizes,
         group_offset=jnp.array([group_offset], jnp.int32),
