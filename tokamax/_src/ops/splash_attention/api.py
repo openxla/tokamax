@@ -14,7 +14,7 @@
 # ==============================================================================
 """Splash Attention Op API."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Final, Literal
 import immutabledict
 import jax
@@ -23,7 +23,7 @@ from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import reference
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
 
-type Implementation = Literal["mosaic_tpu", "base"]
+type Implementation = Literal["mosaic_tpu", "base"] | Callable[..., Any]
 
 _IMPLEMENTATIONS = dict(
     base=base.SplashAttention(),
@@ -63,6 +63,9 @@ def splash_attention(
     mask_value: float = reference.DEFAULT_MASK_VALUE,
     is_causal: bool = False,
     attn_logits_soft_cap: float | None = None,
+    max_logit_value: (
+        float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+    ) = None,
     dropout_rate: float = 0.0,
     prng_key: jax.Array | None = None,
     implementation: Implementation | Sequence[Implementation] | None = None,
@@ -82,6 +85,10 @@ def splash_attention(
     mask_value: Additive mask value for masked-out positions (defaults to -1e30)
     is_causal: Boolean indicating whether the mask is a causal mask
     attn_logits_soft_cap: Optional logits soft cap.
+    max_logit_value: Optional scalar or per-head fixed softmax shift
+      (upper-bound estimate of unmasked logits) replacing the dynamic row-max
+      reduction (`exp(logits - max_logit_value)`). Values far below the actual
+      maximum logit can overflow `float32` `exp`.
     dropout_rate: Dropout probability in [0, 1).
     prng_key: PRNG key for generating dropout masks when dropout_rate > 0.
     implementation: The implementation to use ('mosaic_tpu', 'base', or None for
@@ -89,7 +96,8 @@ def splash_attention(
       that doesn't raise a NotImplementedError is used.
     q_sharding: NamedSharding for q. Sharding information for the other tensors
       is inferred from this if k_sharding is not provided.
-    k_sharding: NamedSharding for k and v.
+    k_sharding: NamedSharding for k and v. Requires q_sharding to also be
+      specified.
 
   Returns:
     Attention output array.
@@ -114,6 +122,9 @@ def splash_attention(
         raise ValueError(f"Unsupported implementation: {impl}")
       impl = IMPLEMENTATIONS[impl]
 
+    extra_kwargs = {}
+    if max_logit_value is not None or isinstance(impl, base.SplashAttention):
+      extra_kwargs["max_logit_value"] = max_logit_value
     try:
       return impl(
           q,
@@ -130,6 +141,7 @@ def splash_attention(
           prng_key=prng_key,
           q_sharding=q_sharding,
           k_sharding=k_sharding,
+          **extra_kwargs,
       )
     except NotImplementedError as e:
       if len(implementations) == 1:

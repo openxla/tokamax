@@ -1858,13 +1858,13 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
                 kv_seq_shards=shards,
                 return_dynamic_grid=return_dynamic_grid,
             )
-            lazy_info, _ = mask_info_lib.process_mask(
+            lazy_info, mask_fn = mask_info_lib.process_mask(
                 lazy_mask, block_shape, **kwargs
             )
             dense_info, _ = mask_info_lib.process_mask(
                 dense_mask, block_shape, **kwargs
             )
-            lazy_dkv, _ = mask_info_lib.process_mask_dkv(
+            lazy_dkv, mask_fn_dkv = mask_info_lib.process_mask_dkv(
                 lazy_mask, block_shape, **kwargs
             )
             dense_dkv, _ = mask_info_lib.process_mask_dkv(
@@ -1875,13 +1875,14 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
               self._assert_mask_info_match(lazy_info, dense_info)
               self._assert_mask_info_match(lazy_dkv, dense_dkv)
             else:
-              self._assert_array_equal(
-                  lazy_info.q_sequence, lazy_mask.q_sequence
-              )
-              for actual, expected in (
-                  (lazy_info, dense_info),
-                  (lazy_dkv, dense_dkv),
+              for actual, expected, fn in (
+                  (lazy_info, dense_info, mask_fn),
+                  (lazy_dkv, dense_dkv, mask_fn_dkv),
               ):
+                self._assert_array_equal(
+                    actual.q_sequence,
+                    None if fn is None else lazy_mask.q_sequence,
+                )
                 self.assertIsNone(actual.mask_next)
                 self.assertIsNone(actual.partial_mask_blocks)
                 self._assert_array_equal(actual.block_mask, expected.block_mask)

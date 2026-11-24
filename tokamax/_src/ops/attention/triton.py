@@ -879,6 +879,9 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -891,6 +894,8 @@ class TritonFlashAttention(base.DotProductAttention[Config, None]):
   ) -> tuple[Float[Array, "*B T H d"], Residuals | None]:
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
 
     block_d, block_d_out = config.block_d, config.block_d_out
     if not _can_have_block_d(q, k, v) and not (block_d == block_d_out == None):

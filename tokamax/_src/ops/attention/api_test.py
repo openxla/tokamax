@@ -12,15 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import dataclasses
 import functools
 import os
+import typing
+from unittest import mock
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
 from jax import export
+from jax.extend import backend
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src import batching
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
@@ -28,6 +34,11 @@ from tokamax._src import jaxtyping
 from tokamax._src import numerics
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import api
+
+try:
+  from tokamax._src.ops.attention import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+except ImportError:
+  pallas_mosaic_tpu = None
 
 _CUDNN_CUSTOM_CALL_TARGET = 'custom_call_target="__cudnn'
 
@@ -150,6 +161,7 @@ class DotProductAttentionTest(parameterized.TestCase):
           'causal',
           'padding',
           'custom',
+          'sliding_window',
           ('causal', 'padding'),
           ('custom', 'padding'),
           ('bias', 'causal'),
@@ -168,11 +180,6 @@ class DotProductAttentionTest(parameterized.TestCase):
       # TODO: Remove once padding is supported.
       if 'padding' in mask_mode:
         self.skipTest('Padding is not supported on Mosaic TPU attention.')
-      # TODO: Remove once sliding window is supported.
-      if 'sliding_window' in mask_mode:
-        self.skipTest(
-            'Sliding window is not supported on Mosaic TPU attention.'
-        )
 
     dtype = jnp.bfloat16
     cudnn_bias = self.IMPL == 'cudnn' and 'bias' in mask_mode
@@ -346,6 +353,57 @@ class DotProductAttentionTest(parameterized.TestCase):
       )
     else:
       self.assertBetween(mem_increase, minv=(scale * 0.25), maxv=(scale * 1.5))
+
+  def test_max_logit_value(self):
+    if self.IMPL not in (None, 'xla', 'mosaic'):
+      self.skipTest('max_logit_value is not supported by this backend.')
+    if self.IMPL == 'mosaic' and jax.default_backend() != 'tpu':
+      self.skipTest('max_logit_value on mosaic is only supported on TPU.')
+    if self.IMPL is None and jax.default_backend() == 'gpu':
+      self.skipTest('Default GPU backend does not support max_logit_value.')
+
+    dtype = jnp.bfloat16
+    b, t, n, h = 2, 128, 4, 64
+    q_s = jax.ShapeDtypeStruct((b, t, n, h), dtype)
+    q, k, v, dout = numerics.random_initialize((q_s, q_s, q_s, q_s), seed=17)
+    max_logit_value = jnp.array([8.0, 9.0, 10.0, 11.0], dtype=jnp.float32)
+
+    fn_ref = lambda q_, k_, v_: jax.nn.dot_product_attention(
+        q_, k_, v_, is_causal=True, implementation='xla'
+    )
+    fn_ans = lambda q_, k_, v_: api.dot_product_attention(
+        q_,
+        k_,
+        v_,
+        is_causal=True,
+        max_logit_value=max_logit_value,
+        implementation=self.IMPL,
+    )
+    out_ref, vjp_ref = jax.vjp(fn_ref, q, k, v)
+    out_ans, vjp_ans = jax.vjp(fn_ans, q, k, v)
+    chex.assert_trees_all_close(out_ans, out_ref, atol=0.02, rtol=0.02)
+    chex.assert_trees_all_close(
+        vjp_ans(dout), vjp_ref(dout), atol=0.03, rtol=0.03
+    )
+
+    # Non-shift-invariant check: setting head 2's shift to -100.0 overflows
+    # float32 `exp` on head 2 alone while leaving heads (0, 1, 3) finite.
+    bad_mlv = jnp.array([8.0, 9.0, -100.0, 11.0], dtype=jnp.float32)
+    out_bad = api.dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        max_logit_value=bad_mlv,
+        implementation=self.IMPL,
+    )
+    self.assertFalse(bool(jnp.all(jnp.isfinite(out_bad[:, :, 2, :]))))
+    chex.assert_trees_all_close(
+        out_bad[:, :, jnp.array([0, 1, 3]), :],
+        out_ref[:, :, jnp.array([0, 1, 3]), :],
+        atol=0.02,
+        rtol=0.02,
+    )
 
 
 # pylint: enable=invalid-name
@@ -599,9 +657,636 @@ class DotProductAttentionXlaTest(DotProductAttentionTest):
     )
     chex.assert_tree_all_finite(x_dot)
 
+  def test_max_logit_value_underflow_and_masked_rows(self):
+    q = jax.random.normal(jax.random.key(0), (1, 4, 2, 32), dtype=jnp.float32)
+    k = jax.random.normal(jax.random.key(1), (1, 4, 2, 32), dtype=jnp.float32)
+    v = jax.random.normal(jax.random.key(2), (1, 4, 2, 32), dtype=jnp.float32)
+    dout = jnp.ones_like(q)
+
+    for fn in (
+        functools.partial(
+            api.dot_product_attention,
+            max_logit_value=120.0,
+            precision=jax.lax.Precision.HIGHEST,
+            implementation='xla',
+        ),
+        functools.partial(
+            api.base.DotProductAttention(vjp=api.base.DotProductAttentionVjp()),
+            max_logit_value=120.0,
+            precision=jax.lax.Precision.HIGHEST,
+        ),
+    ):
+      out, vjp_fn = jax.vjp(fn, q, k, v)
+      dq, dk, dv = vjp_fn(dout)
+      chex.assert_tree_all_finite((out, dq, dk, dv))
+      chex.assert_trees_all_close(out, jnp.zeros_like(out), atol=1e-7)
+      chex.assert_trees_all_close(dq, jnp.zeros_like(dq), atol=1e-7)
+      chex.assert_trees_all_close(dk, jnp.zeros_like(dk), atol=1e-7)
+      chex.assert_trees_all_close(dv, jnp.zeros_like(dv), atol=1e-7)
+
+    mask = jnp.ones((1, 1, 4, 4), dtype=jnp.bool_).at[:, :, 1, :].set(False)
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      out_m, vjp_m = jax.vjp(
+          functools.partial(
+              api.dot_product_attention,
+              mask=mask,
+              max_logit_value=10,
+              precision=jax.lax.Precision.HIGHEST,
+              implementation='xla',
+          ),
+          q,
+          k,
+          v,
+      )
+      dq_m, dk_m, dv_m = vjp_m(dout)
+    chex.assert_tree_all_finite((out_m, dq_m, dk_m, dv_m))
+    chex.assert_trees_all_close(
+        out_m[:, 1, :, :], jnp.zeros_like(out_m[:, 1, :, :]), atol=1e-7
+    )
+    chex.assert_trees_all_close(
+        dq_m[:, 1, :, :], jnp.zeros_like(dq_m[:, 1, :, :]), atol=1e-7
+    )
+
+  def test_vjp_subclass_without_max_logit_value(self):
+    @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+    class _VjpWithoutMaxLogit(
+        api.base.DotProductAttentionVjp[None, typing.Any]
+    ):
+
+      @typing.override
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          residuals: api.base.Residuals,
+          out: jax.Array,
+          dout: jax.Array,
+          q: jax.Array,
+          k: jax.Array,
+          v: jax.Array,
+          *,
+          precision: tuple[
+              api.base.CanonicalPrecision, api.base.CanonicalPrecision
+          ],
+          logits_dtype: jnp.dtype,
+          logits_scale: float,
+          bias: jax.Array | None,
+          logits_soft_cap: float | None,
+          mask: api.base.Mask,
+          dropout_mask: jax.Array | None,
+          dropout_rate: float,
+          paging_info: api.base.PagingInfo | None,
+          q_indices: jax.Array | None,
+          k_indices: jax.Array | None,
+          normalize_output: bool,
+          return_residuals: bool,
+          config: None,
+      ) -> tuple[api.base.DotProductAttentionGrads, None]:
+        return api.base.DotProductAttentionVjp._fwd(
+            self,
+            residuals,
+            out,
+            dout,
+            q,
+            k,
+            v,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            logits_scale=logits_scale,
+            bias=bias,
+            logits_soft_cap=logits_soft_cap,
+            mask=mask,
+            dropout_mask=dropout_mask,
+            dropout_rate=dropout_rate,
+            paging_info=paging_info,
+            q_indices=q_indices,
+            k_indices=k_indices,
+            normalize_output=normalize_output,
+            return_residuals=return_residuals,
+            config=config,
+        )
+
+    self.assertNotIn('__class__', _VjpWithoutMaxLogit._fwd.__code__.co_freevars)
+    vjp_no_mlv = _VjpWithoutMaxLogit()
+    op_custom = api.base.DotProductAttention(vjp=vjp_no_mlv)
+    op_ref = api.base.DotProductAttention(vjp=api.base.DotProductAttentionVjp())
+    s = jax.ShapeDtypeStruct((1, 8, 2, 16), jnp.float32)
+    q, k, v, dout = numerics.random_initialize((s, s, s, s), seed=19)
+
+    out, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: op_custom(
+            q_,
+            k_,
+            v_,
+            is_causal=True,
+            precision=jax.lax.Precision.HIGHEST,
+        ),
+        q,
+        k,
+        v,
+    )
+    out_ref, vjp_ref = jax.vjp(
+        lambda q_, k_, v_: op_ref(
+            q_,
+            k_,
+            v_,
+            is_causal=True,
+            precision=jax.lax.Precision.HIGHEST,
+        ),
+        q,
+        k,
+        v,
+    )
+    chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+    chex.assert_trees_all_close(vjp_fn(dout), vjp_ref(dout), atol=1e-5)
+
+    out_res, residuals = op_custom(
+        q,
+        k,
+        v,
+        is_causal=True,
+        precision=jax.lax.Precision.HIGHEST,
+        return_residuals=True,
+    )
+    grads_direct = vjp_no_mlv(
+        residuals,
+        out_res,
+        dout,
+        q,
+        k,
+        v,
+        is_causal=True,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    chex.assert_trees_all_close(
+        (grads_direct['q'], grads_direct['k'], grads_direct['v']),
+        vjp_ref(dout),
+        atol=1e-5,
+    )
+    with self.assertRaises(NotImplementedError):
+      vjp_no_mlv.bind(
+          residuals,
+          out_res,
+          dout,
+          q,
+          k,
+          v,
+          precision=jax.lax.Precision.HIGHEST,
+          max_logit_value=1.0,
+      )
+    with self.assertRaises(NotImplementedError):
+      _, bad_vjp = jax.vjp(
+          lambda q_, k_, v_: op_custom(
+              q_,
+              k_,
+              v_,
+              precision=jax.lax.Precision.HIGHEST,
+              max_logit_value=1.0,
+          ),
+          q,
+          k,
+          v,
+      )
+      bad_vjp(dout)
+
+  def test_fwd_subclass_without_max_logit_value(self):
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class _OpWithoutMaxLogit(api.base.DotProductAttention[None, typing.Any]):
+
+      @typing.override
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          q: jax.Array,
+          k: jax.Array,
+          v: jax.Array,
+          *,
+          precision: tuple[
+              api.base.CanonicalPrecision, api.base.CanonicalPrecision
+          ],
+          logits_dtype: jnp.dtype,
+          logits_scale: float,
+          bias: jax.Array | None,
+          logits_soft_cap: float | None,
+          mask: api.base.Mask,
+          dropout_mask: jax.Array | None,
+          dropout_rate: float,
+          paging_info: api.base.PagingInfo | None,
+          q_indices: jax.Array | None,
+          k_indices: jax.Array | None,
+          normalize_output: bool,
+          return_residuals: bool,
+          config: None,
+      ) -> tuple[jax.Array, api.base.Residuals | None]:
+        return api.base.DotProductAttention._fwd(
+            self,
+            q,
+            k,
+            v,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            logits_scale=logits_scale,
+            bias=bias,
+            logits_soft_cap=logits_soft_cap,
+            mask=mask,
+            dropout_mask=dropout_mask,
+            dropout_rate=dropout_rate,
+            paging_info=paging_info,
+            q_indices=q_indices,
+            k_indices=k_indices,
+            normalize_output=normalize_output,
+            return_residuals=return_residuals,
+            config=config,
+        )
+
+    class _OpCustomBindWithoutMaxLogit(_OpWithoutMaxLogit):
+
+      @typing.override
+      def bind(self, *args, **kwargs):  # pyrefly: ignore[bad-override]
+        kwargs.pop('max_logit_value', None)
+        return api.base.DotProductAttention.bind(self, *args, **kwargs)
+
+    self.assertNotIn('__class__', _OpWithoutMaxLogit._fwd.__code__.co_freevars)
+    op_no_mlv = _OpWithoutMaxLogit()
+    op_custom_bind = _OpCustomBindWithoutMaxLogit()
+    op_ref = api.base.DotProductAttention()
+    s = jax.ShapeDtypeStruct((1, 8, 2, 16), jnp.float32)
+    q, k, v = numerics.random_initialize((s, s, s), seed=29)
+    backend_name = next(iter(q.devices())).platform
+    devices = jax.devices(backend_name)
+    mesh = jax.sharding.Mesh(devices[: min(len(devices), 2)], ('x',))
+    q_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(None, None, 'x', None)
+    )
+
+    out = op_no_mlv(
+        q, k, v, is_causal=True, precision=jax.lax.Precision.HIGHEST
+    )
+    out_ref = op_ref(
+        q, k, v, is_causal=True, precision=jax.lax.Precision.HIGHEST
+    )
+    chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+
+    out_sharded = op_no_mlv(
+        q,
+        k,
+        v,
+        is_causal=True,
+        precision=jax.lax.Precision.HIGHEST,
+        q_sharding=q_sharding,
+    )
+    chex.assert_trees_all_close(out_sharded, out_ref, atol=1e-5)
+
+    for op_inst in (op_no_mlv, op_custom_bind):
+      with self.assertRaises(NotImplementedError):
+        op_inst(q, k, v, max_logit_value=5.0)
+      with self.assertRaises(NotImplementedError):
+        op_inst(q, k, v, max_logit_value=5.0, q_sharding=q_sharding)
+    with self.assertRaises(NotImplementedError):
+      op_no_mlv.bind(q, k, v, max_logit_value=5.0)
+
+  def test_max_logit_value_numpy_scalar_and_sharded_ndarray(self):
+    q_s = jax.ShapeDtypeStruct((2, 16, 4, 16), jnp.float32)
+    q, k, v, dout = numerics.random_initialize((q_s, q_s, q_s, q_s), seed=23)
+
+    out_ref, vjp_ref = jax.vjp(
+        lambda q_, k_, v_: api.dot_product_attention(
+            q_,
+            k_,
+            v_,
+            is_causal=True,
+            max_logit_value=5.0,
+            precision=jax.lax.Precision.HIGHEST,
+            implementation='xla',
+        ),
+        q,
+        k,
+        v,
+    )
+    grads_ref = vjp_ref(dout)
+
+    dpa_op = api.base.DotProductAttention()
+    for np_scalar in (np.float32(5.0), np.int32(5)):
+      bound = dpa_op.bind(
+          q,
+          k,
+          v,
+          max_logit_value=np_scalar,  # pyrefly: ignore[bad-argument-type]
+      )
+      self.assertIsInstance(bound.kwargs['max_logit_value'], float)
+      self.assertEqual(bound.kwargs['max_logit_value'], 5.0)
+      with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
+        out_np, vjp_np = jax.vjp(
+            lambda q_, k_, v_, mlv=np_scalar: api.dot_product_attention(
+                q_,
+                k_,
+                v_,
+                is_causal=True,
+                max_logit_value=mlv,  # pyrefly: ignore[bad-argument-type]
+                precision=jax.lax.Precision.HIGHEST,
+                implementation='xla',
+            ),
+            q,
+            k,
+            v,
+        )
+        grads_np = vjp_np(dout)
+      chex.assert_trees_all_close(out_np, out_ref, atol=1e-6)
+      chex.assert_trees_all_close(grads_np, grads_ref, atol=1e-6)
+
+    backend_name = next(iter(q.devices())).platform
+    devices = jax.devices(backend_name)
+    mesh = jax.sharding.Mesh(devices[: min(len(devices), 2)], ('x',))
+    q_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(None, None, 'x', None)
+    )
+    np_mlv = np.array([4.0, 5.0, 6.0, 7.0], dtype=np.float32)
+    out_unsharded = api.dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        max_logit_value=jnp.asarray(np_mlv),
+        precision=jax.lax.Precision.HIGHEST,
+        implementation='xla',
+    )
+    with warnings.catch_warnings(), jaxtyping.disable_jaxtyping():
+      warnings.simplefilter('error', UserWarning)
+      out_np_sharded = api.dot_product_attention(
+          q,
+          k,
+          v,
+          is_causal=True,
+          max_logit_value=np_mlv,  # pyrefly: ignore[bad-argument-type]
+          precision=jax.lax.Precision.HIGHEST,
+          implementation='xla',
+          q_sharding=q_sharding,
+      )
+    chex.assert_trees_all_close(out_np_sharded, out_unsharded, atol=1e-5)
+
+    out_jax_sharded = api.dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        max_logit_value=jnp.asarray(np_mlv),
+        precision=jax.lax.Precision.HIGHEST,
+        implementation='xla',
+        q_sharding=q_sharding,
+    )
+    chex.assert_trees_all_close(out_np_sharded, out_jax_sharded, atol=1e-6)
+
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      out_scalar_sharded = api.dot_product_attention(
+          q,
+          k,
+          v,
+          is_causal=True,
+          max_logit_value=np.int32(5),  # pyrefly: ignore[bad-argument-type]
+          precision=jax.lax.Precision.HIGHEST,
+          implementation='xla',
+          q_sharding=q_sharding,
+      )
+    chex.assert_trees_all_close(out_scalar_sharded, out_ref, atol=1e-5)
+
 
 class DotProductAttentionXlaChunkedTest(DotProductAttentionTest):
   IMPL = 'xla_chunked'
+
+
+class DotProductAttentionVirtualTpuTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if pallas_mosaic_tpu is None or 'mosaic_tpu' not in api.IMPLEMENTATIONS:
+      self.skipTest('mosaic_tpu backend is not linked in this build.')
+
+  @parameterized.parameters('mosaic', 'mosaic_tpu', None, 'callable')
+  def test_virtual_tpu_lowering_on_cpu(self, impl_mode):
+    assert pallas_mosaic_tpu is not None
+    implementation = (
+        pallas_mosaic_tpu.PallasMosaicTpuFlashAttention()
+        if impl_mode == 'callable'
+        else impl_mode
+    )
+    cpu_device = jax.devices('cpu')[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind='TPU7x', num_cores=1, platform='tpu'
+    )
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7,
+    )
+    sharding = jax.sharding.NamedSharding(
+        abstract_mesh, jax.sharding.PartitionSpec('x', None, None, None)
+    )
+    q_sds = jax.ShapeDtypeStruct(
+        (2, 256, 4, 128), jnp.bfloat16, sharding=sharding
+    )
+    kv_sds = jax.ShapeDtypeStruct(
+        (2, 256, 2, 128), jnp.bfloat16, sharding=sharding
+    )
+
+    def loss_fn(q, k, v):
+      return jnp.sum(
+          api.dot_product_attention(
+              q,
+              k,
+              v,
+              is_causal=True,
+              implementation=implementation,
+              q_sharding=sharding,
+          )
+      )
+
+    with mock.patch.object(
+        backend, 'get_default_device', return_value=cpu_device
+    ):
+      lowered = (
+          jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1, 2)))
+          .trace(q_sds, kv_sds, kv_sds)
+          .lower(lowering_platforms=('tpu',))
+      )
+      self.assertIn('tpu_custom_call', lowered.as_text())
+
+  def test_virtual_tpu_abstract_mesh_num_cores_none_and_v4_fallback(self):
+    cpu_device = jax.devices('cpu')[0]
+    tpu_v7_none_cores = jax.sharding.AbstractDevice(
+        device_kind='TPU7x', num_cores=None, platform='tpu'
+    )
+    mesh_v7 = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7_none_cores,
+    )
+    tpu_v4 = jax.sharding.AbstractDevice(
+        device_kind='TPU v4', num_cores=2, platform='tpu'
+    )
+    mesh_v4 = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v4,
+    )
+    q_sds = jax.ShapeDtypeStruct((2, 256, 4, 128), jnp.bfloat16)
+    kv_sds = jax.ShapeDtypeStruct((2, 256, 2, 128), jnp.bfloat16)
+
+    with mock.patch.object(
+        backend, 'get_default_device', return_value=cpu_device
+    ):
+      with jax.sharding.use_abstract_mesh(mesh_v7):
+        lowered_v7 = (
+            jax.jit(
+                jax.value_and_grad(
+                    lambda q, k, v: jnp.sum(
+                        api.dot_product_attention(
+                            q, k, v, is_causal=True, implementation='mosaic'
+                        )
+                    ),
+                    argnums=(0, 1, 2),
+                )
+            )
+            .trace(q_sds, kv_sds, kv_sds)
+            .lower(lowering_platforms=('tpu',))
+        )
+        self.assertIn('tpu_custom_call', lowered_v7.as_text())
+
+      with jax.sharding.use_abstract_mesh(mesh_v4):
+        with self.assertRaisesRegex(
+            NotImplementedError, 'Not supported on TPU v4'
+        ):
+          jax.jit(
+              lambda q, k, v: api.dot_product_attention(
+                  q, k, v, is_causal=True, implementation='mosaic'
+              )
+          ).trace(q_sds, kv_sds, kv_sds)
+
+        lowered_default = (
+            jax.jit(
+                lambda q, k, v: api.dot_product_attention(
+                    q, k, v, is_causal=True, implementation=None
+                )
+            )
+            .trace(q_sds, kv_sds, kv_sds)
+            .lower(lowering_platforms=('tpu',))
+        )
+        self.assertNotIn('tpu_custom_call', lowered_default.as_text())
+
+  def test_mosaic_missing_backend_falls_back_on_default_or_sequence(self):
+    cpu_device = jax.devices('cpu')[0]
+    with jax.default_device(cpu_device):
+      q_arr = jnp.ones((1, 16, 2, 32), jnp.bfloat16)
+    self.assertEqual(q_arr.devices(), {cpu_device})
+    impls_without_tpu = {
+        k: v for k, v in api.IMPLEMENTATIONS.items() if k != 'mosaic_tpu'
+    }
+    with (
+        mock.patch.object(
+            backend, 'get_default_device', return_value=cpu_device
+        ),
+        mock.patch.object(api, 'IMPLEMENTATIONS', impls_without_tpu),
+    ):
+      out_default = api.dot_product_attention(
+          q_arr, q_arr, q_arr, implementation=None
+      )
+      self.assertEqual(out_default.shape, q_arr.shape)
+      out_seq = api.dot_product_attention(
+          q_arr, q_arr, q_arr, implementation=('mosaic', 'xla')
+      )
+      self.assertEqual(out_seq.shape, q_arr.shape)
+      with self.assertRaises(ValueError):
+        api.dot_product_attention(q_arr, q_arr, q_arr, implementation='mosaic')
+
+    gpu_abs = jax.sharding.AbstractDevice(
+        device_kind='NVIDIA H100 80GB HBM3', num_cores=None, platform='gpu'
+    )
+    gpu_mesh = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=gpu_abs,
+    )
+    q_sds = jax.ShapeDtypeStruct((1, 16, 2, 32), jnp.bfloat16)
+    impls_without_gpu = {
+        k: v for k, v in api.IMPLEMENTATIONS.items() if k != 'mosaic_gpu'
+    }
+    with mock.patch.object(api, 'IMPLEMENTATIONS', impls_without_gpu):
+      with jax.sharding.use_abstract_mesh(gpu_mesh):
+        lowered = jax.jit(
+            lambda q, k, v: api.dot_product_attention(
+                q, k, v, implementation=None
+            )
+        ).trace(q_sds, q_sds, q_sds)
+        self.assertIsNotNone(lowered)
+
+  def test_virtual_tpu_full_mask_and_closure_hygiene(self):
+    assert pallas_mosaic_tpu is not None
+    self.assertNotIn(
+        '__class__',
+        pallas_mosaic_tpu.PallasMosaicTpuFlashAttention.replace.__code__.co_freevars,
+    )
+    self.assertNotIn(
+        '__class__',
+        pallas_mosaic_tpu.pallas_mosaic_tpu_vjp.PallasMosaicTpuFlashAttentionVjp.get_autotuning_cache.__code__.co_freevars,
+    )
+    cpu_device = jax.devices('cpu')[0]
+    tpu_v7 = jax.sharding.AbstractDevice(
+        device_kind='TPU7x', num_cores=1, platform='tpu'
+    )
+    mesh_v7 = jax.sharding.AbstractMesh(
+        (2,),
+        ('x',),
+        axis_types=(jax.sharding.AxisType.Auto,),
+        abstract_device=tpu_v7,
+    )
+    q_sds = jax.ShapeDtypeStruct((1, 128, 4, 64), jnp.bfloat16)
+    with (
+        mock.patch.object(
+            backend, 'get_default_device', return_value=cpu_device
+        ),
+        jax.sharding.use_abstract_mesh(mesh_v7),
+        warnings.catch_warnings(),
+    ):
+      warnings.simplefilter('error', UserWarning)
+      for mlv in (10, np.float32(5.0), np.int32(5)):
+        lowered = (
+            jax.jit(
+                jax.value_and_grad(
+                    lambda q, k, v, m=mlv: jnp.sum(
+                        api.dot_product_attention(
+                            q,
+                            k,
+                            v,
+                            local_window_size=128,
+                            is_causal=False,
+                            max_logit_value=m,  # pyrefly: ignore[bad-argument-type]
+                            implementation=('mosaic_tpu', 'xla'),
+                        )
+                    ),
+                    argnums=(0, 1, 2),
+                )
+            )
+            .trace(q_sds, q_sds, q_sds)
+            .lower(lowering_platforms=('tpu',))
+        )
+        self.assertIn('tpu_custom_call', lowered.as_text())
+
+    with jax.default_device(cpu_device):
+      DotProductAttentionXlaTest(
+          'test_max_logit_value_underflow_and_masked_rows'
+      ).test_max_logit_value_underflow_and_masked_rows()
+      DotProductAttentionXlaTest(
+          'test_vjp_subclass_without_max_logit_value'
+      ).test_vjp_subclass_without_max_logit_value()
+      DotProductAttentionXlaTest(
+          'test_fwd_subclass_without_max_logit_value'
+      ).test_fwd_subclass_without_max_logit_value()
+      DotProductAttentionXlaTest(
+          'test_max_logit_value_numpy_scalar_and_sharded_ndarray'
+      ).test_max_logit_value_numpy_scalar_and_sharded_ndarray()
 
 
 if __name__ == '__main__':

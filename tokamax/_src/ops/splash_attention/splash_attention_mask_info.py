@@ -687,15 +687,18 @@ def _process_mask(
 
   full_mask = (state_grid == 2).all()
   if full_mask:
-    return MaskInfo(
-        mask_next=None,
-        active_rows=None,
-        active_cols=None,
-        block_mask=None,
-        num_active_blocks=None,
-        partial_mask_blocks=None,
-        q_sequence=q_sequence,
-    ), None
+    return (
+        MaskInfo(
+            mask_next=None,
+            active_rows=None,
+            active_cols=None,
+            block_mask=None,
+            num_active_blocks=None,
+            partial_mask_blocks=None,
+            q_sequence=None,
+        ),
+        None,
+    )
 
   need_mask_next = mask_function is None and partial_mask_blocks is not None
 

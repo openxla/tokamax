@@ -25,6 +25,7 @@ from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 import qwix
 from tokamax._src import ad
 from tokamax._src import batching
@@ -164,6 +165,12 @@ class Mask:
   q_end: Int[Array, "*#B #H #t"] | None = None
   k_start: Int[Array, "*#B #h #T"] | None = None
   k_end: Int[Array, "*#B #h #T"] | None = None
+  q_seq_axis: str | tuple[str, ...] | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
+  has_auto_q_indices: bool = dataclasses.field(
+      default=False, metadata=dict(static=True)
+  )
 
   def __init__(
       self,
@@ -174,6 +181,8 @@ class Mask:
       q_end: Int[Array, "*#B #H #t"] | None = None,
       k_start: Int[Array, "*#B #h #T"] | None = None,
       k_end: Int[Array, "*#B #h #T"] | None = None,
+      q_seq_axis: str | tuple[str, ...] | None = None,
+      has_auto_q_indices: bool = False,
       is_causal: bool = False,
   ):
     if is_causal:
@@ -186,6 +195,20 @@ class Mask:
     object.__setattr__(self, "q_end", q_end)
     object.__setattr__(self, "k_start", k_start)
     object.__setattr__(self, "k_end", k_end)
+    object.__setattr__(self, "q_seq_axis", q_seq_axis)
+    object.__setattr__(self, "has_auto_q_indices", has_auto_q_indices)
+
+  def get_q_seq_shard_info(self) -> tuple[int, int | jax.Array]:
+    """Returns `(q_seq_shards, q_shard_idx)` when inside a `shard_map`."""
+    if self.q_seq_axis is None:
+      return 1, 0
+    try:
+      return (
+          jax.lax.axis_size(self.q_seq_axis),
+          jax.lax.axis_index(self.q_seq_axis),
+      )
+    except (NameError, ValueError):
+      return 1, 0
 
   @property
   def is_causal(self) -> bool:
@@ -288,6 +311,8 @@ class Mask:
         q_end=combine(jnp.minimum)(self.q_end, other.q_end),
         k_start=combine(jnp.maximum)(self.k_start, other.k_start),
         k_end=combine(jnp.minimum)(self.k_end, other.k_end),
+        q_seq_axis=self.q_seq_axis or other.q_seq_axis,
+        has_auto_q_indices=self.has_auto_q_indices or other.has_auto_q_indices,
     )
 
 
@@ -320,6 +345,22 @@ class PagingInfo:
 type Residuals = tuple[Float[Array, "*B H T"], Float[Array, "*B H T"]]
 
 
+def _max_logit_value_kwarg(
+    op_self: op.Op[Any, Any, Any, Any, Any],
+    max_logit_value: Any,
+) -> dict[str, Any]:
+  """Returns `{"max_logit_value": ...}` only when supported by `_fwd`."""
+  if isinstance(
+      max_logit_value, (int, float, np.integer, np.floating)
+  ) and not isinstance(max_logit_value, bool):
+    max_logit_value = float(max_logit_value)
+  if "max_logit_value" in op_self._fwd_signature.parameters:  # pylint: disable=protected-access
+    return {"max_logit_value": max_logit_value}
+  if max_logit_value is not None:
+    raise NotImplementedError("`max_logit_value` is not supported.")
+  return {}
+
+
 class DotProductAttention[C, K: Hashable](
     op.Op[Any, Float[Array, "*B T H d"], Residuals, C, K]
 ):
@@ -341,6 +382,9 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = ...,
       bias: Float[Array, "*#B #H #T #t"] | None = ...,
       logits_soft_cap: float | None = ...,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = ...,
       mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = ...,
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
@@ -370,6 +414,9 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = ...,
       bias: Float[Array, "*#B #H #T #t"] | None = ...,
       logits_soft_cap: float | None = ...,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = ...,
       mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = ...,
       is_causal: bool = ...,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = ...,
@@ -399,6 +446,9 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = AUTO,
       bias: Float[Array, "*#B #H #T #t"] | None = None,
       logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Bool[Array, "*#B #H #T #t"] | CausalMask | Mask | None = None,
       is_causal: bool = False,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None = None,
@@ -449,6 +499,10 @@ class DotProductAttention[C, K: Hashable](
       logits_soft_cap: If not `None`, perform `logits = logits_soft_cap *
         tanh(logits / logits_soft_cap)`, where `logits` are `logits_scale *
         q @ k.T + bias`.
+      max_logit_value: Optional scalar or per-head fixed softmax shift
+        (upper-bound estimate of unmasked logits) replacing the dynamic row-max
+        reduction (`exp(logits - max_logit_value)`). Values far below the actual
+        maximum logit can overflow `float32` `exp`.
       mask: Optional boolean mask, broadcastable to `[batch, num_heads,
         seq_len_q, seq_len_kv]`. Attention weights are masked out if the
         corresponding mask value is `False`.
@@ -462,7 +516,8 @@ class DotProductAttention[C, K: Hashable](
       q_sharding: NamedSharding for `q`. Sharding information for the other
         tensors will be inferred by this.
       k_sharding: NamedSharding for `k` and also `v`. If `None`,
-        `q_sharding` will be used to derive kv_heads_axis.
+        `q_sharding` will be used to derive kv_heads_axis. Requires
+        `q_sharding` to also be specified.
       q_indices: Optional indices for each token in query sequence.
       k_indices: Optional indices for each token in key/value sequence.
       normalize_output: If `True`, divide the output by softmax denominator.
@@ -475,11 +530,22 @@ class DotProductAttention[C, K: Hashable](
     params = locals().copy()
     params.pop("q_sharding")
     params.pop("k_sharding")
-    mask: Mask = type(self).bind(**params).kwargs["mask"]
+    bound_args = type(self).bind(**params)
+    mask: Mask = bound_args.kwargs["mask"]
+    max_logit_value = bound_args.kwargs.get("max_logit_value", max_logit_value)
     del is_causal  # Combined into `mask`.
 
     def fwd_closed(
-        q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+        q,
+        k,
+        v,
+        bias,
+        mask,
+        dropout_mask,
+        paging_info,
+        q_indices,
+        k_indices,
+        max_logit_value,
     ):
       return op.Op.__call__(
           self,
@@ -499,11 +565,25 @@ class DotProductAttention[C, K: Hashable](
           k_indices=k_indices,
           normalize_output=normalize_output,
           return_residuals=return_residuals,
+          **_max_logit_value_kwarg(self, max_logit_value),
       )
 
     if q_sharding is None:
+      if k_sharding is not None:
+        raise ValueError(
+            "`q_sharding` must be specified when `k_sharding` is provided."
+        )
       return fwd_closed(
-          q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+          q,
+          k,
+          v,
+          bias,
+          mask,
+          dropout_mask,
+          paging_info,
+          q_indices,
+          k_indices,
+          max_logit_value,
       )
 
     mesh, q_spec = q_sharding.mesh, q_sharding.spec
@@ -518,10 +598,13 @@ class DotProductAttention[C, K: Hashable](
       k_batch_axes = batch_axes
       k_heads_axis = heads_axis
       seq_k_axis = None
+      k_head_dim_axis = head_dim_axis
     else:
       if q_sharding.mesh != k_sharding.mesh:
         raise ValueError("q_sharding and k_sharding must have the same mesh.")
       k_spec = k_sharding.spec
+      if len(k_spec) > len(k.shape):
+        raise ValueError("Too many dimensions in k_sharding's pspec.")
       k_axes = tuple(k_spec) + (None,) * (k.ndim - len(k_spec))
       *k_batch_axes, seq_k_axis, k_heads_axis, k_head_dim_axis = k_axes
       if _mesh_axis_size(mesh, seq_k_axis) != 1:
@@ -535,18 +618,25 @@ class DotProductAttention[C, K: Hashable](
     # Ensure that `q_indices` is specified when sharding the q-sequence with
     # causal masking enabled.
     if _mesh_axis_size(mesh, seq_q_axis) != 1:
-      if mask.causal_mask is not None and q_indices is None:
+      has_auto = mask.causal_mask is not None and q_indices is None
+      if has_auto:
         q_indices = jnp.arange(q.shape[-3])
+      mask = dataclasses.replace(
+          mask,
+          q_seq_axis=seq_q_axis,
+          has_auto_q_indices=mask.has_auto_q_indices or has_auto,
+      )
 
     qkv_axes = lambda x, axes: jax.tree.map(lambda _: axes, x)
 
     # TODO: Derive in_axes from the type annotations.
     in_axes = (
         qkv_axes(q, [*batch_axes, seq_q_axis, heads_axis, head_dim_axis]),
-        qkv_axes(k, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
-        qkv_axes(v, [*batch_axes, seq_k_axis, k_heads_axis, head_dim_axis]),
+        qkv_axes(k, [*k_batch_axes, seq_k_axis, k_heads_axis, k_head_dim_axis]),
+        qkv_axes(v, [*k_batch_axes, seq_k_axis, k_heads_axis, k_head_dim_axis]),
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # bias
-        Mask(
+        dataclasses.replace(
+            mask,
             bool_mask=[*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
             causal_mask=CausalMask([], []),  # pyrefly: ignore[bad-argument-type]
             q_start=[*batch_axes, heads_axis, seq_k_axis],  # pyrefly: ignore[bad-argument-type]
@@ -557,15 +647,20 @@ class DotProductAttention[C, K: Hashable](
         [*batch_axes, heads_axis, seq_q_axis, seq_k_axis],  # dropout_mask
         PagingInfo([*batch_axes], [*batch_axes, None], [*k_batch_axes]),  # pyrefly: ignore[bad-argument-type]
         [*batch_axes, heads_axis, seq_q_axis],  # q_indices
-        [*batch_axes, k_heads_axis, seq_k_axis],  # k_indices
+        [*k_batch_axes, k_heads_axis, seq_k_axis],  # k_indices
+        [*batch_axes, heads_axis],  # max_logit_value
     )
     P = jax.sharding.PartitionSpec  # pylint: disable=invalid-name
     residual_spec = P(*batch_axes, heads_axis, seq_q_axis)
     out_specs = (P(*q_axes), residual_spec) if return_residuals else P(*q_axes)
-    is_array = lambda x: isinstance(x, jax.Array)
+    is_array = lambda x: isinstance(x, (jax.Array, np.ndarray))
 
     def bcast(x, axes):
-      return jax.lax.broadcast_to_rank(x, len(axes)) if is_array(x) else x
+      return (
+          jax.lax.broadcast_to_rank(jnp.asarray(x), len(axes))
+          if is_array(x)
+          else x
+      )
 
     def spec(x, axes):
       if not is_array(x):
@@ -582,7 +677,16 @@ class DotProductAttention[C, K: Hashable](
       )(*args)
 
     return fwd_sharded(
-        q, k, v, bias, mask, dropout_mask, paging_info, q_indices, k_indices
+        q,
+        k,
+        v,
+        bias,
+        mask,
+        dropout_mask,
+        paging_info,
+        q_indices,
+        k_indices,
+        max_logit_value,
     )
 
   @override
@@ -600,6 +704,12 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float | type[AUTO] = AUTO,
       bias: Float[Array | AbstractArray, "*#B #H #T #t"] | None = None,
       logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float
+          | Float[Array | AbstractArray, ""]
+          | Float[Array | AbstractArray, "*#B #H"]
+          | None
+      ) = None,
       mask: (
           Bool[Array | AbstractArray, "*#B #H #T #t"] | CausalMask | Mask | None
       ) = None,
@@ -649,7 +759,8 @@ class DotProductAttention[C, K: Hashable](
     if is_causal:
       mask &= CausalMask()
 
-    return super().bind(
+    return op.Op.bind(
+        self,
         q,
         k,
         v,
@@ -666,6 +777,7 @@ class DotProductAttention[C, K: Hashable](
         k_indices=k_indices,
         normalize_output=normalize_output,
         return_residuals=return_residuals,
+        **_max_logit_value_kwarg(self, max_logit_value),
     )
 
   @jaxtyping.jaxtyped
@@ -681,6 +793,9 @@ class DotProductAttention[C, K: Hashable](
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -732,7 +847,17 @@ class DotProductAttention[C, K: Hashable](
     if mask is not None:
       logits = jnp.where(mask, logits, -float("inf"))
 
-    weights, softmax_residuals = _softmax(logits, normalize_output)
+    if max_logit_value is None:
+      weights, softmax_residuals = _softmax(logits, normalize_output)
+    else:
+      dtype = jnp.promote_types(logits.dtype, jnp.float32)
+      m = jnp.broadcast_to(
+          jnp.asarray(max_logit_value, dtype=dtype)[..., None],
+          logits.shape[:-1],
+      )
+      weights, softmax_residuals = _softmax_with_max_logit(
+          logits, m, normalize_output
+      )
 
     if dropout_mask is not None:
       weights *= dropout_mask.astype(weights.dtype) / (1 - dropout_rate)
@@ -792,6 +917,34 @@ def _softmax_jvp(normalize, primals, tangents):
     x_max = residual[0][..., None]
     x_dot_max_mean = jnp.mean(x_dot, axis=-1, keepdims=True, where=(x == x_max))
     y_dot = y * (x_dot - x_dot_max_mean)
+  return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def _softmax_with_max_logit(
+    x: jax.Array, m: jax.Array, normalize: bool
+) -> tuple[jax.Array, Residuals]:
+  """Computes softmax using a caller-supplied logit shift `m`."""
+  dtype = jnp.promote_types(x.dtype, jnp.float32)
+  finfo = jnp.finfo(dtype)
+  m = m.astype(dtype)
+  unnormalized = jnp.exp(x - jnp.maximum(m[..., None], finfo.min))
+  denom = jnp.sum(unnormalized, axis=-1, keepdims=True)
+  out = (unnormalized / (denom + finfo.tiny)) if normalize else unnormalized
+  return out, (m, jnp.squeeze(denom, -1))
+
+
+@_softmax_with_max_logit.defjvp
+def _softmax_with_max_logit_jvp(normalize, primals, tangents):
+  x, m = primals
+  x_dot, m_dot = tangents
+  y, residual = _softmax_with_max_logit(x, m, normalize)
+  if normalize:
+    y_dot = y * (x_dot - (y * x_dot).sum(axis=-1, keepdims=True))
+  else:
+    finfo = jnp.finfo(y.dtype)
+    m_dot_clamped = jnp.where(m >= finfo.min, m_dot, 0.0)
+    y_dot = y * (x_dot - m_dot_clamped[..., None])
   return (y, residual), (y_dot, jax.tree.map(jnp.zeros_like, residual))
 
 
@@ -970,6 +1123,101 @@ class DotProductAttentionVjp[C, K: Hashable](
 ):
   """Dot product attention VJP."""
 
+  @override
+  def bind(
+      self,
+      residuals: tuple[
+          Float[Array | AbstractArray, "*B H T"],
+          Float[Array | AbstractArray, "*B H T"],
+      ],
+      out: Float[Array | AbstractArray, "*B T H d"],
+      dout: Float[Array | AbstractArray, "*B T H d"],
+      q: Float[Array | QArray | AbstractArray, "*B T H D"],
+      k: Float[Array | QArray | AbstractArray, "*b t h D"],
+      v: Float[Array | QArray | AbstractArray, "*b t h d"],
+      *,
+      precision: (
+          jax.lax.PrecisionLike
+          | tuple[jax.lax.PrecisionLike, jax.lax.PrecisionLike]
+      ) = jax.lax.Precision.DEFAULT,
+      logits_dtype: DTypeLike | type[AUTO] = AUTO,
+      logits_scale: float | type[AUTO] = AUTO,
+      bias: Float[Array | AbstractArray, "*#B #H #T #t"] | None = None,
+      logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float
+          | Float[Array | AbstractArray, ""]
+          | Float[Array | AbstractArray, "*#B #H"]
+          | None
+      ) = None,
+      mask: (
+          Bool[Array | AbstractArray, "*#B #H #T #t"] | CausalMask | Mask | None
+      ) = None,
+      is_causal: bool = False,
+      dropout_mask: Bool[Array | AbstractArray, "*#B #H #T #t"] | None = None,
+      dropout_rate: float = 0.0,
+      paging_info: PagingInfo | None = None,
+      q_indices: Int[Array | AbstractArray, "*#B #H T"] | None = None,
+      k_indices: Int[Array | AbstractArray, "*#b #h t"] | None = None,
+      normalize_output: bool = True,
+      return_residuals: bool = False,
+  ) -> op.BoundArguments:
+    """Binds the arguments for the attention VJP function."""
+    if (dropout_rate != 0.0) and (dropout_mask is None):
+      raise ValueError("`dropout_mask` can't be None if `dropout_rate` != 0.0")
+
+    if paging_info is None and k.shape[:-3] != q.shape[:-3]:
+      raise ValueError("`k` batch size must be the same as `q`.")
+
+    if not isinstance(precision, tuple):
+      precision = (precision, precision)
+
+    precision = cast(
+        tuple[CanonicalPrecision, CanonicalPrecision],
+        tuple(map(precision_lib.canonicalize_precision, precision)),  # pyrefly: ignore[bad-argument-type]
+    )
+
+    if logits_dtype is AUTO:
+      qk_prec = precision[0]
+      qk_prec = precision_lib.to_dot_algorithm_preset(q.dtype, k.dtype, qk_prec)
+      assert qk_prec.accumulation_type is not None
+      logits_dtype = qk_prec.accumulation_type
+
+    if logits_scale is AUTO:
+      logits_scale = 1 / math.sqrt(q.shape[-1])
+
+    if isinstance(mask, CausalMask):
+      mask = Mask(causal_mask=mask)
+    elif not isinstance(mask, Mask):
+      mask = Mask(mask)  # pyrefly: ignore[bad-argument-type]
+
+    if is_causal:
+      mask &= CausalMask()
+
+    return op.Op.bind(
+        self,
+        residuals,
+        out,
+        dout,
+        q,
+        k,
+        v,
+        precision=precision,
+        logits_dtype=jnp.dtype(logits_dtype),
+        logits_scale=logits_scale,
+        bias=bias,
+        logits_soft_cap=logits_soft_cap,
+        mask=mask,
+        dropout_mask=dropout_mask,
+        dropout_rate=dropout_rate,
+        paging_info=paging_info,
+        q_indices=q_indices,
+        k_indices=k_indices,
+        normalize_output=normalize_output,
+        return_residuals=return_residuals,
+        **_max_logit_value_kwarg(self, max_logit_value),
+    )
+
   @jaxtyping.jaxtyped
   @override
   def _fwd(
@@ -986,6 +1234,9 @@ class DotProductAttentionVjp[C, K: Hashable](
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -1016,6 +1267,7 @@ class DotProductAttentionVjp[C, K: Hashable](
           logits_scale=logits_scale,
           bias=bias,
           logits_soft_cap=logits_soft_cap,
+          max_logit_value=max_logit_value,
           mask=mask,
           dropout_mask=dropout_mask,
           dropout_rate=dropout_rate,

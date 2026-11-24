@@ -14,6 +14,7 @@
 # ==============================================================================
 """Tokamax operator wrapper for Pallas Mosaic TPU Splash Attention VJP."""
 
+import dataclasses
 from typing import Any
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,8 @@ import torch
 from typing_extensions import override
 
 Config = jax_pallas_mosaic_tpu_vjp.Config
+QKVLayout = jax_pallas_mosaic_tpu_vjp.QKVLayout
+_EXPECTED_BWD_CONFIG_FIELDS = 13
 
 
 class _PallasMosaicTpuSplashAttentionVjp(
@@ -48,22 +51,33 @@ class _PallasMosaicTpuSplashAttentionVjp(
   ) -> tuple[int, ...] | None:
     if config is None:
       return None
+    assert len(dataclasses.fields(config)) == _EXPECTED_BWD_CONFIG_FIELDS, (
+        f"Expected {_EXPECTED_BWD_CONFIG_FIELDS} fields in bwd config, got"
+        f" {len(dataclasses.fields(config))}."
+    )
     return (
         config.block_q_dkv,
         config.block_kv_dkv,
         config.block_kv_dkv_compute,
         -1 if config.dropout_block_q is None else config.dropout_block_q,
         -1 if config.dropout_block_kv is None else config.dropout_block_kv,
+        int(config.q_layout.value),
+        int(config.k_layout.value),
+        int(config.v_layout.value),
         int(config.use_base2_exp),
         -1 if config.dq_reduction_steps is None else config.dq_reduction_steps,
+        int(config.qk_diag_skip),
+        config.qk_diag_grid,
+        int(config.diag_band_skip),
     )
 
   @override
   def reconstruct_config(self, *config_parts: Any) -> Config:
     config = config_parts[0]
     assert config is not None, "Backward config not set."
-    assert len(config) == 7, (
-        f"Expected 7 elements in bwd config, got {len(config)}."
+    assert len(config) == _EXPECTED_BWD_CONFIG_FIELDS, (
+        f"Expected {_EXPECTED_BWD_CONFIG_FIELDS} elements in bwd config, got"
+        f" {len(config)}."
     )
     return Config(
         block_q_dkv=int(config[0]),
@@ -71,8 +85,14 @@ class _PallasMosaicTpuSplashAttentionVjp(
         block_kv_dkv_compute=int(config[2]),
         dropout_block_q=None if config[3] < 0 else int(config[3]),
         dropout_block_kv=None if config[4] < 0 else int(config[4]),
-        use_base2_exp=bool(config[5]),
-        dq_reduction_steps=None if config[6] < 0 else int(config[6]),
+        q_layout=QKVLayout(int(config[5])),
+        k_layout=QKVLayout(int(config[6])),
+        v_layout=QKVLayout(int(config[7])),
+        use_base2_exp=bool(config[8]),
+        dq_reduction_steps=None if config[9] < 0 else int(config[9]),
+        qk_diag_skip=bool(config[10]),
+        qk_diag_grid=int(config[11]),
+        diag_band_skip=bool(config[12]),
     )
 
   @override
