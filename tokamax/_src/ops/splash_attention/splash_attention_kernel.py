@@ -1216,10 +1216,57 @@ def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
   return math.ceil(math.prod(x.shape) * info(x.dtype).bits / 8)
 
 
+_SEGMENT_BITMASK_WORDS = 8
+_SEGMENT_BITMASK_BUCKETS = _SEGMENT_BITMASK_WORDS * 32
+
+
+def _segment_block_bitmask(
+    segs: jax.Array, valid: jax.Array | None = None
+) -> jax.Array:
+  """Returns a `[..., num_blocks, 8]` uint32 modulo-256 bitmask per block."""
+  buckets = segs.astype(jnp.int32) & (_SEGMENT_BITMASK_BUCKETS - 1)
+  words = buckets >> 5
+  bits = jnp.left_shift(jnp.uint32(1), (buckets & 31).astype(jnp.uint32))
+  word_eq = words[..., None] == jnp.arange(
+      _SEGMENT_BITMASK_WORDS, dtype=jnp.int32
+  )
+  if valid is not None:
+    word_eq = word_eq & valid[..., None]
+  return jnp.bitwise_or.reduce(
+      jnp.where(word_eq, bits[..., None], jnp.uint32(0)), axis=-2
+  )
+
+
+def _segment_class_stats(
+    segs: jax.Array, valid: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Returns `(min, max, bitmask)` per block restricted to `valid` entries."""
+  info = jnp.iinfo(segs.dtype)
+  hi_fill = jnp.asarray(info.max, dtype=segs.dtype)
+  lo_fill = jnp.asarray(info.min, dtype=segs.dtype)
+  lo = jnp.min(jnp.where(valid, segs, hi_fill), axis=-1)
+  hi = jnp.max(jnp.where(valid, segs, lo_fill), axis=-1)
+  return lo, hi, _segment_block_bitmask(segs, valid)
+
+
+def _onehot_lookup_words(table: jax.Array, idx: jax.Array) -> jax.Array:
+  """Indexes `table` along axis `-2` via bitwise-OR to avoid XLA gathers."""
+  onehot = idx[..., None] == jnp.arange(table.shape[-2], dtype=idx.dtype)
+  return jnp.bitwise_or.reduce(
+      jnp.where(onehot[..., None], table, jnp.uint32(0)), axis=-2
+  )
+
+
+def _onehot_lookup_bool(table: jax.Array, idx: jax.Array) -> jax.Array:
+  """Indexes a boolean `table` along axis `-1` without an XLA gather."""
+  onehot = idx[..., None] == jnp.arange(table.shape[-1], dtype=idx.dtype)
+  return jnp.any(onehot & table, axis=-1)
+
+
 def _segment_block_overlap(
     segment_ids: base.SegmentIds,
-    q_idx: jax.Array,
-    kv_idx: jax.Array,
+    q_idx: jax.Array | None = None,
+    kv_idx: jax.Array | None = None,
     *,
     q_blocks: int,
     kv_blocks: int,
@@ -1228,35 +1275,75 @@ def _segment_block_overlap(
 ) -> jax.Array:
   """Returns whether each `(q_idx, kv_idx)` tile can share any segment id.
 
-  Conservative: it tests whether the `[min, max]` id intervals of the two
-  blocks intersect. If the blocks really do share an id, that id lies in both
-  intervals, so the intervals must intersect. There are therefore no false
-  negatives and pruning on this result never drops a contributing tile. False
-  positives (e.g. q ids `{1, 5}` against kv id `{3}`) merely leave a fully
-  masked tile scheduled. This argument does not assume ids are sorted.
-
-  The result is reduced over any `vmap` batch dimension so the whole batch
-  shares one schedule, which is what keeps `pallas_call` batch fusion intact.
+  Conservative: partitions ids into positive (`> 0`), zero (`== 0`), and
+  negative (`< 0`) classes, intersecting each non-zero class's `[min, max]`
+  interval and modulo-256 bitmask without assuming sorted ids. Separating sign
+  classes prevents dense unique negative padding (e.g. `-(pos + 1)`) from
+  saturating the positive-id bitmask on unaligned boundary blocks. Reduction
+  over any `vmap` batch dimension keeps `MaskInfo` unbatched so `pallas_call`
+  batch fusion stays intact.
 
   Args:
     segment_ids: Unbatched q / kv segment ids.
-    q_idx: Integer array of q block indices.
-    kv_idx: Integer array of kv block indices, broadcastable against `q_idx`.
+    q_idx: Optional integer array of q block indices. When both `q_idx` and
+      `kv_idx` are None, returns the dense `[q_blocks, kv_blocks]` overlap grid.
+    kv_idx: Optional integer array of kv block indices, broadcastable against
+      `q_idx`.
     q_blocks: Number of q blocks, `q_seq_len // bq`.
     kv_blocks: Number of kv blocks, `kv_seq_len // bkv`.
     bq: q block size.
     bkv: kv block size.
 
   Returns:
-    A boolean array of the broadcast shape of `q_idx` and `kv_idx`.
+    A boolean array of shape `(q_blocks, kv_blocks)` when `q_idx` and `kv_idx`
+    are None, or the broadcast shape of `q_idx` and `kv_idx`.
   """
   q_segs = segment_ids.q.reshape(q_blocks, bq)  # pyrefly: ignore[missing-attribute]
   kv_segs = segment_ids.kv.reshape(kv_blocks, bkv)  # pyrefly: ignore[missing-attribute]
-  q_lo = _onehot_lookup(jnp.min(q_segs, axis=-1), q_idx)
-  q_hi = _onehot_lookup(jnp.max(q_segs, axis=-1), q_idx)
-  kv_lo = _onehot_lookup(jnp.min(kv_segs, axis=-1), kv_idx)
-  kv_hi = _onehot_lookup(jnp.max(kv_segs, axis=-1), kv_idx)
-  return _unvmap_any_p.bind((q_hi >= kv_lo) & (kv_hi >= q_lo))
+
+  def _class_overlap(
+      q_stats: tuple[jax.Array, jax.Array, jax.Array],
+      kv_stats: tuple[jax.Array, jax.Array, jax.Array],
+  ) -> jax.Array:
+    q_lo, q_hi, q_masks = q_stats
+    kv_lo, kv_hi, kv_masks = kv_stats
+    if q_idx is None and kv_idx is None:
+      interval_overlap = (q_hi[:, None] >= kv_lo[None, :]) & (
+          kv_hi[None, :] >= q_lo[:, None]
+      )
+      bitmask_overlap = jnp.any(
+          (q_masks[:, None, :] & kv_masks[None, :, :]) != 0, axis=-1
+      )
+    else:
+      assert q_idx is not None and kv_idx is not None
+      q_lo = _onehot_lookup(q_lo, q_idx)
+      q_hi = _onehot_lookup(q_hi, q_idx)
+      kv_lo = _onehot_lookup(kv_lo, kv_idx)
+      kv_hi = _onehot_lookup(kv_hi, kv_idx)
+      q_masks = _onehot_lookup_words(q_masks, q_idx)
+      kv_masks = _onehot_lookup_words(kv_masks, kv_idx)
+      interval_overlap = (q_hi >= kv_lo) & (kv_hi >= q_lo)
+      bitmask_overlap = jnp.any((q_masks & kv_masks) != 0, axis=-1)
+    return interval_overlap & bitmask_overlap
+
+  pos_overlap = _class_overlap(
+      _segment_class_stats(q_segs, q_segs > 0),
+      _segment_class_stats(kv_segs, kv_segs > 0),
+  )
+  neg_overlap = _class_overlap(
+      _segment_class_stats(q_segs, q_segs < 0),
+      _segment_class_stats(kv_segs, kv_segs < 0),
+  )
+  q_has_zero = jnp.any(q_segs == 0, axis=-1)
+  kv_has_zero = jnp.any(kv_segs == 0, axis=-1)
+  if q_idx is None and kv_idx is None:
+    zero_overlap = q_has_zero[:, None] & kv_has_zero[None, :]
+  else:
+    assert q_idx is not None and kv_idx is not None
+    zero_overlap = _onehot_lookup_bool(
+        q_has_zero, q_idx
+    ) & _onehot_lookup_bool(kv_has_zero, kv_idx)
+  return _unvmap_any_p.bind(pos_overlap | zero_overlap | neg_overlap)
 
 
 def _onehot_lookup(table: jax.Array, idx: jax.Array) -> jax.Array:
@@ -1287,60 +1374,85 @@ def _refine_mask_info_with_segments(
     bq: int,
     bkv: int,
     is_dkv: bool,
+    keep_empty_rows: bool = False,
 ) -> tuple[
     MaskInfo,
     jax.Array | np.ndarray | None,
     jax.Array | np.ndarray | None,
 ]:
-  """Prunes `mask_info` tiles whose q and kv `segment_ids` ranges are disjoint."""
+  """Prunes `mask_info` tiles whose q and kv `segment_ids` are disjoint."""
   num_rows, num_cols = (
       (kv_blocks, q_blocks) if is_dkv else (q_blocks, kv_blocks)
   )
   if mask_info.active_rows is None:
     m_size = num_rows * num_cols
-    rows, cols = jnp.unravel_index(
-        jnp.arange(m_size, dtype=jnp.int32), (num_rows, num_cols)
+    idx = jnp.arange(m_size, dtype=jnp.int32)
+    rows_c, cols_c = jnp.unravel_index(idx, (num_rows, num_cols))
+    block_mask = (
+        jnp.full((m_size,), 2, dtype=jnp.int8)
+        if mask_info.block_mask is None
+        else jnp.asarray(mask_info.block_mask).reshape(m_size)
     )
-    num_active = jnp.array([m_size], dtype=jnp.int32)
+    valid_static = block_mask > 0
+    seg_grid = _segment_block_overlap(
+        segment_ids,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+    )
+    seg_any = (seg_grid.T if is_dkv else seg_grid).reshape(m_size)
+    active = valid_static & seg_any
+    row_has_active = jnp.any(active.reshape(num_rows, num_cols), axis=1)
+    row_has_active_per_tile = jnp.broadcast_to(
+        row_has_active[:, None], (num_rows, num_cols)
+    ).reshape(m_size)
+    is_first_in_row = (idx % num_cols) == 0
+    keep_empty = jnp.asarray(keep_empty_rows)
   else:
     rows = jnp.asarray(mask_info.active_rows, dtype=jnp.int32)
     cols = jnp.asarray(mask_info.active_cols, dtype=jnp.int32)
     m_size = rows.size
     num_active = jnp.asarray(mask_info.num_active_blocks, dtype=jnp.int32)
+    block_mask = (
+        jnp.full((m_size,), 2, dtype=jnp.int8)
+        if mask_info.block_mask is None
+        else jnp.asarray(mask_info.block_mask).reshape(m_size)
+    )
+    idx = jnp.arange(m_size, dtype=jnp.int32)
+    in_schedule = idx < num_active[0]
+    valid_static = (block_mask > 0) & in_schedule
+    rows_c = jnp.clip(rows, 0, num_rows - 1)
+    cols_c = jnp.clip(cols, 0, num_cols - 1)
+    seg_any = _segment_block_overlap(
+        segment_ids,
+        cols_c if is_dkv else rows_c,
+        rows_c if is_dkv else cols_c,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+    )
+    active = valid_static & seg_any
+    # Per-tile row lookups use `row_eq` and compaction uses `lax.sort` so no XLA
+    # gather is emitted (see `_onehot_lookup`).
+    row_eq = in_schedule[:, None] & (
+        rows_c[:, None] == jnp.arange(num_rows, dtype=jnp.int32)[None, :]
+    )
+    row_has_active = jnp.any(row_eq & active[:, None], axis=0)
+    first_in_row = jnp.argmax(row_eq, axis=0).astype(jnp.int32)
+    row_has_active_per_tile = jnp.any(row_eq & row_has_active[None, :], axis=1)
+    is_first_in_row = in_schedule & (
+        idx == jnp.sum(jnp.where(row_eq, first_in_row[None, :], 0), axis=1)
+    )
+    keep_empty = jnp.asarray(keep_empty_rows) & jnp.all(jnp.any(row_eq, axis=0))
 
-  block_mask = (
-      jnp.full((m_size,), 2, dtype=jnp.int8)
-      if mask_info.block_mask is None
-      else jnp.asarray(mask_info.block_mask).reshape(m_size)
-  )
-  idx = jnp.arange(m_size, dtype=jnp.int32)
-  valid_static = (block_mask > 0) & (idx < num_active[0])
-
-  rows_c = jnp.clip(rows, 0, num_rows - 1)
-  cols_c = jnp.clip(cols, 0, num_cols - 1)
-  seg_any = _segment_block_overlap(
-      segment_ids,
-      cols_c if is_dkv else rows_c,
-      rows_c if is_dkv else cols_c,
-      q_blocks=q_blocks,
-      kv_blocks=kv_blocks,
-      bq=bq,
-      bkv=bkv,
-  )
-
-  active = valid_static & seg_any
   # Every output row needs >= 1 scheduled step (with block_mask=0 if inactive)
   # so `bounds_start`/`bounds_end` still zero-initialize and write that row.
-  # Per-tile row lookups go through the `row_eq` one-hot rather than
-  # `table[rows_c]`, and compaction below uses `lax.sort` rather than
-  # `x[argsort(...)]`: this function emits no XLA gather (see `_onehot_lookup`).
-  row_eq = rows_c[:, None] == jnp.arange(num_rows, dtype=jnp.int32)[None, :]
-  row_has_active = jnp.any(row_eq & active[:, None], axis=0)
-  first_in_row = jnp.argmax(row_eq, axis=0).astype(jnp.int32)
   keep = active | (
-      (is_dkv | jnp.any(active))
-      & ~jnp.any(row_eq & row_has_active[None, :], axis=1)
-      & (idx == jnp.sum(jnp.where(row_eq, first_in_row[None, :], 0), axis=1))
+      (is_dkv | keep_empty | jnp.any(active))
+      & ~row_has_active_per_tile
+      & is_first_in_row
   )
 
   block_mask = jnp.where(active, block_mask, 0).astype(block_mask.dtype)
@@ -1366,12 +1478,12 @@ def _refine_mask_info_with_segments(
       jnp.where(is_active_slot, payload[0], -1)
   )
   row_dtype = (
-      jnp.int32
+      (jnp.int16 if num_rows <= np.iinfo(np.int16).max else jnp.int32)
       if mask_info.active_rows is None
       else mask_info.active_rows.dtype
   )
   col_dtype = (
-      jnp.int32
+      (jnp.int16 if num_cols <= np.iinfo(np.int16).max else jnp.int32)
       if mask_info.active_cols is None
       else mask_info.active_cols.dtype
   )
@@ -1490,6 +1602,7 @@ def _splash_attention_forward(
         bq=bq,
         bkv=bkv,
         is_dkv=False,
+        keep_empty_rows=sinks is not None or save_residuals,
     )
   else:
     bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]

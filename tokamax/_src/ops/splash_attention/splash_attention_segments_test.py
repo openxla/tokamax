@@ -168,6 +168,171 @@ class SegmentBlockOverlapTest(parameterized.TestCase):
     )
     np.testing.assert_array_equal(np.asarray(seg_any), True)
 
+  def test_bitmask_and_interval_prune_non_monotonic_and_large_ids(self):
+    bq = bkv = 128
+    blocks = [
+        np.concatenate([np.zeros(64, np.int32), np.full(64, 5, np.int32)]),
+        np.full(128, 2, np.int32),
+        np.full(128, 1, np.int32),
+        np.full(128, 257, np.int32),
+        -np.arange(1, 129, dtype=np.int32),
+        -np.arange(129, 257, dtype=np.int32),
+    ]
+    ids = jnp.asarray(np.concatenate(blocks))
+    n_blocks = len(blocks)
+    seg_ids = base.SegmentIds(ids, ids)
+
+    dense = np.asarray(
+        splash._segment_block_overlap(  # pylint: disable=protected-access
+            seg_ids,
+            q_blocks=n_blocks,
+            kv_blocks=n_blocks,
+            bq=bq,
+            bkv=bkv,
+        )
+    )
+    indexed = np.asarray(
+        splash._segment_block_overlap(  # pylint: disable=protected-access
+            seg_ids,
+            jnp.arange(n_blocks)[:, None],
+            jnp.arange(n_blocks)[None, :],
+            q_blocks=n_blocks,
+            kv_blocks=n_blocks,
+            bq=bq,
+            bkv=bkv,
+        )
+    )
+    np.testing.assert_array_equal(dense, indexed)
+    expected = _tile_properties(np.asarray(ids), np.asarray(ids), bq, bkv)
+    np.testing.assert_array_equal(dense, expected)
+
+  def test_sign_partitioned_overlap_prunes_unaligned_negative_padding(self):
+    # 448 consecutive negative padding IDs (`-(pos + 1)`) fill all 256 modulo
+    # buckets inside a single block; sign-partitioning isolates them so the
+    # mixed boundary block still prunes against earlier positive documents.
+    bq = bkv = 512
+    int32_min = np.iinfo(np.int32).min
+    int32_max = np.iinfo(np.int32).max
+    blocks = [
+        np.full(512, 1, np.int32),
+        np.full(512, 2, np.int32),
+        np.full(512, 256, np.int32),
+        np.zeros(512, np.int32),
+        np.full(512, -256, np.int32),
+        # Mixed boundary block: 64 tokens of doc 15 + 448 unique negative IDs.
+        np.concatenate([
+            np.full(64, 15, np.int32),
+            -(np.arange(211008, 211456, dtype=np.int32) + 1),
+        ]),
+        # Adjacent pure-padding block with strictly lower negative IDs.
+        -(np.arange(211456, 211968, dtype=np.int32) + 1),
+        # Earlier block sharing doc 15 only.
+        np.full(512, 15, np.int32),
+        # Non-monotonic negative block {-1, -5} vs disjoint {-2}.
+        np.concatenate([
+            np.full(256, -1, np.int32),
+            np.full(256, -5, np.int32),
+        ]),
+        np.full(512, -2, np.int32),
+        # int32 extremes across empty positive/negative classes.
+        np.full(512, int32_min, np.int32),
+        np.full(512, int32_max, np.int32),
+    ]
+    ids_np = np.concatenate(blocks)
+    ids = jnp.asarray(ids_np)
+    n_blocks = len(blocks)
+    seg_ids = base.SegmentIds(ids, ids)
+
+    dense = np.asarray(
+        splash._segment_block_overlap(  # pylint: disable=protected-access
+            seg_ids,
+            q_blocks=n_blocks,
+            kv_blocks=n_blocks,
+            bq=bq,
+            bkv=bkv,
+        )
+    )
+    indexed = np.asarray(
+        splash._segment_block_overlap(  # pylint: disable=protected-access
+            seg_ids,
+            jnp.arange(n_blocks)[:, None],
+            jnp.arange(n_blocks)[None, :],
+            q_blocks=n_blocks,
+            kv_blocks=n_blocks,
+            bq=bq,
+            bkv=bkv,
+        )
+    )
+    np.testing.assert_array_equal(dense, indexed)
+    expected = _tile_properties(ids_np, ids_np, bq, bkv)
+    np.testing.assert_array_equal(dense, expected)
+
+    # Confirm the unaligned mixed block with 448 negative IDs matches only
+    # itself and the doc-15 block (pruned against doc 1, 2, 256, 0, pure-pad).
+    self.assertEqual(np.flatnonzero(dense[5]).tolist(), [5, 7])
+    # Cross-sign mod-256 identical residues {0, 256, -256} must not collide.
+    self.assertFalse(dense[2, 3])
+    self.assertFalse(dense[2, 4])
+    self.assertFalse(dense[3, 4])
+    # Verify inside vmap across heterogeneous batch elements (0 vs neg vs pos).
+    ids_b = jnp.stack([
+        jnp.concatenate([
+            np.full(512, 1, np.int32),
+            np.full(512, 2, np.int32),
+        ]),
+        jnp.concatenate([
+            np.concatenate([
+                np.full(64, 15, np.int32),
+                -(np.arange(1, 449, dtype=np.int32)),
+            ]),
+            np.zeros(512, np.int32),
+        ]),
+    ])
+    vmap_dense = jax.vmap(
+        lambda s: splash._segment_block_overlap(  # pylint: disable=protected-access
+            base.SegmentIds(s, s),
+            q_blocks=2,
+            kv_blocks=2,
+            bq=512,
+            bkv=512,
+        )
+    )(ids_b)
+    np.testing.assert_array_equal(
+        np.asarray(vmap_dense[0]), np.array([[True, False], [False, True]])
+    )
+    vmap_indexed = jax.vmap(
+        lambda s: splash._segment_block_overlap(  # pylint: disable=protected-access
+            base.SegmentIds(s, s),
+            jnp.arange(2)[:, None],
+            jnp.arange(2)[None, :],
+            q_blocks=2,
+            kv_blocks=2,
+            bq=512,
+            bkv=512,
+        )
+    )(ids_b)
+    np.testing.assert_array_equal(
+        np.asarray(vmap_indexed[0]), np.array([[True, False], [False, True]])
+    )
+
+    # Also verify unsigned dtype handling (neg class is empty).
+    u_ids = jnp.concatenate([
+        jnp.zeros(512, jnp.uint32),
+        jnp.full(512, 7, jnp.uint32),
+    ])
+    u_dense = np.asarray(
+        splash._segment_block_overlap(  # pylint: disable=protected-access
+            base.SegmentIds(u_ids, u_ids),
+            q_blocks=2,
+            kv_blocks=2,
+            bq=512,
+            bkv=512,
+        )
+    )
+    np.testing.assert_array_equal(
+        u_dense, np.array([[True, False], [False, True]])
+    )
+
 
 class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
   """Schedule tests for `_refine_mask_info_with_segments` (fwd and dkv)."""
@@ -324,9 +489,11 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
   @parameterized.named_parameters(
       ("fwd_dense", False, False),
       ("fwd_compacted", True, False),
+      ("dkv_dense", False, True),
       ("dkv_compacted", True, True),
   )
   def test_lowers_without_gather(self, dynamic, is_dkv):
+    # pylint: disable=protected-access
     # TPU7x offloads large gathers to SparseCore, which fails to lower them for
     # schedule-sized index arrays (T >= 16K), so refine must avoid gathers.
     bq = bkv = 128
@@ -345,6 +512,167 @@ class RefineMaskInfoWithSegmentsTest(parameterized.TestCase):
         .as_text()
     )
     self.assertNotIn("gather", hlo)
+
+    overlap_hlo = (
+        jax.jit(
+            lambda s: splash._segment_block_overlap(
+                s,
+                None if not dynamic else jnp.arange(seq_len // bq),
+                None if not dynamic else jnp.arange(seq_len // bkv),
+                q_blocks=seq_len // bq,
+                kv_blocks=seq_len // bkv,
+                bq=bq,
+                bkv=bkv,
+            )
+        )
+        .lower(_segment_ids(lengths))
+        .as_text()
+    )
+    self.assertNotIn("gather", overlap_hlo)
+    self.assertNotIn("scatter", overlap_hlo)
+
+  def test_dense_refine_downcasts_indices(self):
+    # pylint: disable=protected-access
+    bq = bkv = 128
+    seq_len = 512
+    full_mask = mask_lib.FullMask(_shape=(seq_len, seq_len))
+    mask_info, _ = mask_info_lib.process_mask(
+        full_mask, (bq, bkv), return_dynamic_grid=False
+    )
+    mask_info = jax.tree_util.tree_map(jnp.asarray, mask_info)
+    refined, _, _ = splash._refine_mask_info_with_segments(
+        mask_info,
+        _segment_ids((128, 128, 128, 128)),
+        q_blocks=seq_len // bq,
+        kv_blocks=seq_len // bkv,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+    )
+    assert refined.active_rows is not None and refined.active_cols is not None
+    self.assertEqual(refined.active_rows.dtype, jnp.int16)
+    self.assertEqual(refined.active_cols.dtype, jnp.int16)
+    self.assertEqual(_num_active(refined), 4)
+
+    empty_with_sinks, _, _ = splash._refine_mask_info_with_segments(
+        mask_info,
+        base.SegmentIds(
+            jnp.zeros((seq_len,), jnp.int32), jnp.ones((seq_len,), jnp.int32)
+        ),
+        q_blocks=seq_len // bq,
+        kv_blocks=seq_len // bkv,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=True,
+    )
+    tiles = _scheduled_tiles(empty_with_sinks)
+    self.assertCountEqual({r for r, _ in tiles}, range(seq_len // bq))
+    self.assertTrue(all(m == 0 for m in tiles.values()))
+
+  def test_padded_compacted_shards_keep_empty_rows(self):
+    # pylint: disable=protected-access
+    bq = bkv = 128
+    shard_seq_len = 256
+    q_blocks = kv_blocks = shard_seq_len // bq
+    causal_mask = mask_lib.CausalMask(
+        shape=(2 * shard_seq_len, 2 * shard_seq_len)
+    )
+    sharded_info, _ = mask_info_lib.process_mask(
+        causal_mask,
+        (bq, bkv),
+        q_seq_shards=2,
+        kv_seq_shards=2,
+        return_dynamic_grid=True,
+    )
+
+    def _shard(q_shard: int, kv_shard: int) -> mask_info_lib.MaskInfo:
+      idx = q_shard * 2 + kv_shard
+
+      def _slice(x):
+        if x is None:
+          return None
+        arr = jnp.asarray(x)
+        step = arr.shape[0] // 4
+        return arr[idx * step : (idx + 1) * step]
+
+      return mask_info_lib.MaskInfo(
+          mask_next=_slice(sharded_info.mask_next),
+          active_rows=_slice(sharded_info.active_rows),
+          active_cols=_slice(sharded_info.active_cols),
+          block_mask=_slice(sharded_info.block_mask),
+          num_active_blocks=_slice(sharded_info.num_active_blocks),
+          partial_mask_blocks=sharded_info.partial_mask_blocks,
+          q_sequence=None,
+      )
+
+    disjoint_ids = base.SegmentIds(
+        jnp.zeros((shard_seq_len,), jnp.int32),
+        jnp.ones((shard_seq_len,), jnp.int32),
+    )
+
+    # Above-diagonal causal shard: `num_active_blocks == [0]`, `-1`-padded.
+    upper_right_refined, _, _ = splash._refine_mask_info_with_segments(
+        _shard(0, 1),
+        _segment_ids((128, 128)),
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=True,
+    )
+    self.assertEqual(_num_active(upper_right_refined), 0)
+
+    # Diagonal causal shard: `0 < num_active_blocks < m_size`, `-1`-padded.
+    diag_pruned, _, _ = splash._refine_mask_info_with_segments(
+        _shard(0, 0),
+        disjoint_ids,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=True,
+    )
+    diag_tiles = _scheduled_tiles(diag_pruned)
+    self.assertCountEqual({r for r, _ in diag_tiles}, range(q_blocks))
+    self.assertTrue(all(m == 0 for m in diag_tiles.values()))
+
+    diag_active, _, _ = splash._refine_mask_info_with_segments(
+        _shard(0, 0),
+        _segment_ids((128, 128)),
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=True,
+    )
+    self.assertEqual(_num_active(diag_active), 2)
+    self.assertCountEqual(_scheduled_tiles(diag_active), [(0, 0), (1, 1)])
+
+    # Partially populated schedule missing row 0 collapses to 0 when pruned.
+    missing_row0 = mask_info_lib.MaskInfo(
+        mask_next=None,
+        active_rows=jnp.array([1, -1, -1, -1], dtype=jnp.int8),
+        active_cols=jnp.array([0, -1, -1, -1], dtype=jnp.int8),
+        block_mask=jnp.array([2, -1, -1, -1], dtype=jnp.int8),
+        num_active_blocks=jnp.array([1], dtype=jnp.int32),
+        partial_mask_blocks=None,
+        q_sequence=None,
+    )
+    missing_row0_refined, _, _ = splash._refine_mask_info_with_segments(
+        missing_row0,
+        disjoint_ids,
+        q_blocks=q_blocks,
+        kv_blocks=kv_blocks,
+        bq=bq,
+        bkv=bkv,
+        is_dkv=False,
+        keep_empty_rows=True,
+    )
+    self.assertEqual(_num_active(missing_row0_refined), 0)
 
 
 class SplashAttentionSegmentsNumericsTest(parameterized.TestCase):
