@@ -352,7 +352,10 @@ OPS: tuple[Op, ...] = (
     ),
     Op(
         name="kda",
-        apis=("tokamax.ops.kimi_delta_attention", "tokamax.ops.gated_delta_net"),
+        apis=(
+            "tokamax.ops.kimi_delta_attention",
+            "tokamax.ops.gated_delta_net",
+        ),
         impls=(
             Impl(
                 name="xla",
@@ -592,9 +595,16 @@ OPS: tuple[Op, ...] = (
         apis=(),
         impls=(
             Impl(
+                name="xla",
+                backend=XLA,
+                module="_src/ops/experimental/routing_moe/adaptor/base.py",
+            ),
+            Impl(
                 name="mosaic_tpu",
                 backend=MOSAIC_TPU,
-                module="_src/ops/experimental/routing_moe/layer/modular.py",
+                module=(
+                    "_src/ops/experimental/routing_moe/adaptor/pallas_mosaic_tpu.py"
+                ),
             ),
         ),
     ),

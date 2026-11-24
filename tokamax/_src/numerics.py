@@ -343,11 +343,12 @@ def _init_qarray(rng: np.random.Generator, qarray: qwix.QArray) -> qwix.QArray:
 def _init_leaf(rng: np.random.Generator, leaf: Any) -> Any:
   """Initializes a single abstract array leaf with layout and sharding."""
   if isinstance(leaf, ArrayInitializer):
-    leaf_dict = vars(leaf)
-    sharding = leaf_dict.get('sharding', None)
-    out_sharding = (
-        leaf_dict.get('format', sharding) if sharding is not None else None
-    )
+    sharding = getattr(leaf, 'sharding', None)
+    if sharding is None:
+      out_sharding = None
+    else:
+      fmt = getattr(leaf, 'format', None)
+      out_sharding = fmt if fmt is not None else sharding
     arr = leaf(rng)
     if isinstance(arr, jax.Array) and out_sharding is None:
       return arr

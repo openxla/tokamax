@@ -63,6 +63,30 @@ class _ShardedCustomArrayInitializer(numerics.ArrayInitializer):
     )
 
 
+class _ShardedShapeDtypeInitializer(
+    jax.ShapeDtypeStruct, numerics.ArrayInitializer
+):
+
+  def __init__(
+      self,
+      shape: tuple[int, ...],
+      dtype: jax.typing.DTypeLike,
+      sharding: jax.sharding.Sharding | None = None,
+  ):
+    super().__init__(shape, dtype, sharding=sharding)
+
+  def __call__(self, rng: np.random.Generator) -> np.ndarray:
+    del rng
+    return np.ones(self.shape, dtype=self.dtype)
+
+  def with_sharding(
+      self, sharding: jax.sharding.Sharding
+  ) -> '_ShardedShapeDtypeInitializer':
+    return _ShardedShapeDtypeInitializer(
+        self.shape, self.dtype, sharding=sharding
+    )
+
+
 class NumericsTest(parameterized.TestCase):
 
   def test_initializer_consistency(self):
@@ -283,6 +307,17 @@ class NumericsTest(parameterized.TestCase):
     self.assertIsNone(unsharded_init.sharding)
     self.assertEqual(out_unsharded.shape, (8, 16))
     self.assertTrue((np.array(out_unsharded) == 1.0).all())
+
+  def test_random_initialize_sharded_shape_dtype_initializer(self):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ('x',))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+    init = _ShardedShapeDtypeInitializer(
+        (8, 16), jnp.float32, sharding=sharding
+    )
+    out = numerics.random_initialize(init)
+    self.assertEqual(out.sharding, sharding)
+    self.assertEqual(out.shape, (8, 16))
+    self.assertTrue((np.array(out) == 1.0).all())
 
 
 if __name__ == '__main__':

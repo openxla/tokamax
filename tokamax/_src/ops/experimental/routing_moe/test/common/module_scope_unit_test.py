@@ -125,11 +125,13 @@ class ModuleScopeTest(parameterized.TestCase):
     # leaf files into a flat CAS directory outside the package tree.
     routing_moe_dir = pathlib.Path(__file__).absolute().parents[2]
     packages = ("common", "gmm", "io_relayout", "layer")
+    # `adaptor/` follows Tokamax op-framework conventions (e.g. IMPLEMENTATIONS,
+    # ARG_SPECS, conditional backend imports).
     unexpected_dirs = sorted(
         p.name
         for p in routing_moe_dir.iterdir()
         if p.is_dir()
-        and p.name not in (*packages, "test", "__pycache__")
+        and p.name not in (*packages, "adaptor", "test", "__pycache__")
         and any(p.glob("*.py"))
     )
     self.assertEmpty(

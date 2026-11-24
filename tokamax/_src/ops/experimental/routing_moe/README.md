@@ -17,6 +17,7 @@
   - Supports ragged reduction and optional per-lane FP8 dequantization.
 - Supports quantized FP8 local and remote scatter with lane-strided scales.
 - Supports subchannel weight quantization with dynamic activation quantization.
+- Exposes a Tokamax op wrapper in `adaptor/` for benchmarking, autotuning, and XLA fallback.
 
 ## Roadmap
 
@@ -29,6 +30,12 @@
 
 ```text
 routing_moe/
+├── adaptor/
+│   ├── api.py: Tokamax functional API and backend dispatch.
+│   ├── arg_specs.py: Benchmark and autotuning argument specs.
+│   ├── base.py: Tokamax `RoutingMoe` op base class.
+│   ├── pallas_mosaic_tpu.py: Mosaic TPU op implementation and autotuning config.
+│   └── reference.py: Unsharded XLA reference implementation.
 ├── common/
 │   ├── arg.py: PyTree wrappers pairing tensor data with static specs.
 │   ├── dataclass_util.py: Invariant decorators for unresolved/resolved classes.
@@ -61,8 +68,9 @@ routing_moe/
     │   ├── helper_reference.py: Pure-XLA reference implementations.
     │   ├── helper_util.py: Feature-support checks and benchmarking helpers.
     │   └── *_unit_test.py: Unit tests for shared test helpers.
-    └── {commmon, gmm, io_relayout, layer}/
+    └── {adaptor, common, gmm, io_relayout, layer}/
         ├── *_test_lib.py: Case generation and reference validation helpers.
         ├── *_unit_test.py: Synthetic edge-case and stress tests.
-        └── *_prod_test.py: Production model shapes and benchmarks.
+        ├── *_prod_test.py: Production model shapes and benchmarks.
+        └── *_test.py: Block-scaled and Tokamax op interface/parity tests.
 ```
