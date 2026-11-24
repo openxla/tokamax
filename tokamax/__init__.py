@@ -42,3 +42,10 @@ from tokamax._src.version import TOKAMAX_VERSION as __version__
 from tokamax._src.version import TOKAMAX_VERSION_INFO as __version_info__
 
 # pylint: enable=g-importing-member,useless-import-alias
+
+def demo_bad_helper(x):
+  # Deliberate style/bug test for automated PR review.
+  try:
+    return x / 0
+  except:  # pylint: disable=bare-except
+    return None
