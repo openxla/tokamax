@@ -62,13 +62,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
   align_tile = 8
 
   def kernel(
-      x_gmem,
-      w_gmem,
-      group_id_gmem,
-      start_within_block_gmem,
-      actual_size_gmem,
-      block_start_gmem,
-      out_gmem,
+      grid_loop,
+      *,
       x_smem,
       w_smem,
       acc_smem,
@@ -78,15 +73,19 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       acc_barrier,
       acc_consumed_barrier,
   ):
-    cluster_idx = lax.axis_index("cluster")
+    cluster_idx = lax.axis_index("cluster") if collective else 0
 
-    @plgpu.dynamic_scheduling_loop(
-        ("mn",),
-        thread_axis="wg",
-        cluster_axes=("cluster",) if collective else (),
-        init_carry=0,
-    )
-    def mn_loop(loop_info: plgpu.NDLoopInfo, carry):
+    @grid_loop(init_carry=0)
+    def mn_loop(refs, loop_info: plgpu.NDLoopInfo, carry):
+      (
+          x_gmem,
+          w_gmem,
+          group_id_gmem,
+          start_within_block_gmem,
+          actual_size_gmem,
+          block_start_gmem,
+          out_gmem,
+      ) = refs
       (idx,) = loop_info.index
       tid_m, ni = plgpu.planar_snake(
           idx, (m_iters, n_iters), config.grid_minor_dim, config.grid_tile_width
@@ -227,7 +226,7 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
 
   profile = False
 
-  f = plgpu.kernel(
+  f = mgpu_lib.dynamic_scheduling_persistent_kernel(
       kernel,
       out_type=jax.ShapeDtypeStruct((m, n), out_dtype),
       scratch_types=scratch_shapes,
@@ -235,8 +234,8 @@ def ragged_dot_gpu_non_quant_blackwell_kernel(
       thread_name="wg",
       grid=(m_iters * n_iters,),
       grid_names=("mn",),
-      cluster=(1 + collective,),
-      cluster_names=("cluster",),
+      cluster=(2,) if collective else (),
+      cluster_names=("cluster",) if collective else (),
       kernel_name="ragged_dot_sm100",
       compiler_params=plgpu.CompilerParams(
           approx_math=True,

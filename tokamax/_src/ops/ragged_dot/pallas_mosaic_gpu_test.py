@@ -13,13 +13,19 @@
 # limitations under the License.
 # ==============================================================================
 
+import math
+
 from absl.testing import absltest
+from absl.testing import parameterized
+import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import qwix
 from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
+from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.ragged_dot import test_base
 
 
@@ -31,6 +37,15 @@ _CONFIG = pallas_mosaic_gpu.Config(
     block_k=256,
     num_stages=2,
     split_k=1,
+)
+
+# Per-batch partitions of 2048 rows into 8 groups. Every partition is distinct,
+# is not uniform and has at least one empty group.
+_VMAP_GROUP_SIZES = (
+    (0, 640, 17, 301, 0, 512, 400, 178),
+    (333, 0, 1024, 64, 5, 0, 250, 372),
+    (1000, 48, 0, 8, 700, 120, 0, 172),
+    (64, 800, 0, 33, 400, 0, 600, 151),
 )
 
 
@@ -131,6 +146,81 @@ class PallasMosaicGpuRaggedDotTest(test_base.RaggedDotTestBase):
     configs = op._get_autotuning_configs(ba)
     self.assertIsNotNone(configs)
     self.assertNotEmpty(configs)
+
+  def _check_vmap(self, batch_shape, in_axes, collective):
+    num_groups, m, k, n = 8, 2048, 768, 2048
+    unbatched_shapes = ((m, k), (num_groups, k, n), (num_groups,))
+    shapes = [
+        (*batch_shape, *shape) if axis == 0 else shape
+        for shape, axis in zip(unbatched_shapes, in_axes, strict=True)
+    ]
+    kx, kw = jax.random.split(jax.random.key(0))
+    lhs = jax.random.normal(kx, shapes[0], dtype=jnp.bfloat16)
+    rhs = jax.random.normal(kw, shapes[1], dtype=jnp.bfloat16)
+    partitions = jnp.array(_VMAP_GROUP_SIZES, dtype=jnp.int32)
+    if in_axes[2] is None:
+      group_sizes = partitions[0]
+    else:
+      group_sizes = partitions[: math.prod(batch_shape)].reshape(shapes[2])
+
+    config = None
+    if gpu_utils.is_sm100():
+      config = pallas_mosaic_gpu.Config(
+          block_m=64,
+          block_n=128,
+          block_k=256,
+          num_stages=2,
+          split_k=1,
+          persistent=False,
+          collective=collective,
+          grid_minor_dim=common.MatmulDimension.M,
+          grid_tile_width=4,
+      )
+      # The grid has more tiles than the SMs can hold, so that CTAs run several
+      # tiles. `k // block_k` is 3, so the K-loop pipeline slot of a tile
+      # depends on the number of tiles the CTA ran before.
+      cluster_size = 2 if collective else 1
+      grid_tiles = (
+          math.ceil(m / (config.block_m * cluster_size)) + num_groups - 1
+      ) * math.ceil(n / (config.block_n * cluster_size))
+      self.assertGreater(
+          grid_tiles, jax.devices()[0].core_count // cluster_size
+      )
+    elif not collective:
+      self.skipTest("collective=False only differs on SM100.")
+    op = pallas_mosaic_gpu.PallasMosaicGpuRaggedDot(config=config)
+
+    expected = jnp.stack([
+        test_base.ref(*(
+            x if axis is None else x[idx]
+            for x, axis in zip((lhs, rhs, group_sizes), in_axes, strict=True)
+        ))
+        for idx in np.ndindex(*batch_shape)
+    ]).reshape(*batch_shape, m, n)
+    expected.block_until_ready()
+    # Output elements that the kernel does not write keep the previous content
+    # of the device memory. A freed NaN buffer makes that content differ from
+    # `expected` when the allocator reuses the buffer for the output.
+    poison = jnp.full(expected.shape, jnp.nan, dtype=jnp.bfloat16)
+    poison.block_until_ready()
+    poison.delete()
+
+    fn = lambda a, b, gs: op(a, b, group_sizes=gs)
+    for _ in batch_shape:
+      fn = jax.vmap(fn, in_axes=in_axes)
+    actual = jax.jit(fn)(lhs, rhs, group_sizes).block_until_ready()
+    chex.assert_trees_all_close(actual, expected, atol=0.05, rtol=0.01)
+
+  @parameterized.product(
+      in_axes=[(0, None, 0), (None, 0, None), (0, 0, None), (0, 0, 0)],
+      collective=[True, False],
+  )
+  def test_vmap(self, in_axes, collective):
+    self._check_vmap((2,), in_axes, collective)
+
+  @parameterized.parameters(True, False)
+  def test_nested_vmap(self, collective):
+    self._check_vmap((2, 2), (0, 0, 0), collective)
 
 
 if __name__ == "__main__":
