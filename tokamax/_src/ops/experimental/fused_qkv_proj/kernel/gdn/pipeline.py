@@ -72,10 +72,12 @@ def outer_pipeline(
       grid=(cfg.tile.num_tiles,),
       in_specs=(memory_ref.Inputs.block_specs(cfg),),
       out_specs=(memory_ref.Outputs.block_specs(cfg),),
+      _explicit_indices=True,
   )(inputs, outputs, scratches=(pinned, scratch))
 
 
 def tile_body(
+    _: pltpu.PipelineStep,
     inputs: memory_ref.Inputs[jax.Ref],  # This tile's VMEM blocks.
     outputs: memory_ref.Outputs[jax.Ref],  # This tile's VMEM blocks.
     pinned: model_config.PinnedGdnWeights[jax.Ref],  # VMEM refs.
