@@ -20,11 +20,11 @@ from typing import Annotated, Any, ClassVar, override
 
 import immutabledict
 import jax
-import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_tpu_common as common
@@ -48,7 +48,11 @@ class Config:
   block_kv_dkv_compute: Annotated[
       int, pydantic.Field(multiple_of=common.NUM_LANES, gt=0)
   ]
+  q_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  k_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  v_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
   use_base2_exp: bool = True
+  fold_q_seq_heads: bool = False
 
   def __post_init__(self):
     if self.block_kv_dkv % self.block_kv_dkv_compute:
@@ -67,6 +71,11 @@ class PallasMosaicTpuFlashAttentionVjp(
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  q_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  k_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  v_layout: splash.QKVLayout = splash.QKVLayout.HEAD_DIM_MINOR
+  use_base2_exp: bool = True
+  fold_q_seq_heads: bool = False
 
   @jaxtyping.jaxtyped
   @override
@@ -84,6 +93,9 @@ class PallasMosaicTpuFlashAttentionVjp(
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: base.Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -94,6 +106,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       return_residuals: bool,
       config: Config,
   ) -> tuple[base.DotProductAttentionGrads, None]:
+    del max_logit_value
     if not normalize_output:
       raise NotImplementedError("`normalize_output=False` not supported.")
     if return_residuals:
@@ -109,6 +122,8 @@ class PallasMosaicTpuFlashAttentionVjp(
         dropout_rate=dropout_rate,
         paging_info=paging_info,
         mask=mask,
+        q_indices=q_indices,
+        k_indices=k_indices,
     )
 
     q *= logits_scale
@@ -127,10 +142,14 @@ class PallasMosaicTpuFlashAttentionVjp(
     is_mqa = num_kv_heads == 1
     if num_q_heads % num_kv_heads:
       raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
+    config_dict = dataclasses.asdict(config)
+    fold_q_seq_heads = config_dict.pop("fold_q_seq_heads")
+    if fold_q_seq_heads:
+      common.sp_vjp.check_fold_q_seq_heads(num_q_heads, num_kv_heads, is_mqa)
     splash_config = dataclasses.replace(
         splash.SplashConfig.get_default(),
         attn_logits_soft_cap=logits_soft_cap,
-        **dataclasses.asdict(config),
+        **config_dict,
     )
     splash_maker, splash_mask = common.build_splash_kernel(
         mask=mask,
@@ -139,6 +158,7 @@ class PallasMosaicTpuFlashAttentionVjp(
         kv_seq_len=kv_seq_len,
         is_mqa=is_mqa,
         save_residuals=True,
+        fold_q_seq_heads=fold_q_seq_heads,
     )
     if is_mqa:
       k_splash, v_splash = jnp.squeeze(k_swap, axis=1), jnp.squeeze(
@@ -149,6 +169,13 @@ class PallasMosaicTpuFlashAttentionVjp(
 
     # Always in natural base.
     _, lse = residuals
+    lse = jax.lax.collapse(jax.lax.broadcast_to_rank(lse, 3), 0, -2)
+
+    if fold_q_seq_heads:
+      q_swap = common.sp_vjp.fold_q_heads(q_swap)
+      dout_swap = common.sp_vjp.fold_q_heads(dout_swap)
+      out_swap = common.sp_vjp.fold_q_heads(out_swap)
+      lse = common.sp_vjp.fold_q_residuals(lse)
 
     dstats = dict(logsumexp=None, max_logits=None)
 
@@ -157,11 +184,10 @@ class PallasMosaicTpuFlashAttentionVjp(
       lse = lse * splash.LOG2E
 
     res = (q_swap, k_splash, v_splash, None, None, out_swap, lse)
-    lse_in_axis = 0 if lse.ndim == 3 else None
-    res_in_axes = (0, 0, 0, None, None, 0, lse_in_axis)
+    res_in_axes = (0, 0, 0, None, None, 0, 0)
 
     cotangents = (dout_swap, dstats)
-    dstats_in_axes = jax.tree.map(lambda x: lse_in_axis, dstats)
+    dstats_in_axes = jax.tree.map(lambda x: 0, dstats)
     cotangents_in_axes = (0, dstats_in_axes)
 
     def bwd_fn(res, cotangents, splash_mask):
@@ -187,6 +213,8 @@ class PallasMosaicTpuFlashAttentionVjp(
         bwd_fn, in_axes=(res_in_axes, cotangents_in_axes, mask_in_axes)
     )(res, cotangents, splash_mask)
 
+    if fold_q_seq_heads:
+      dq = common.sp_vjp.unfold_q_heads(dq)
     dq = jnp.swapaxes(dq, 1, 2) * logits_scale
     if is_mqa:
       dk = jnp.swapaxes(jnp.expand_dims(dk, 1), 1, 2)
@@ -205,19 +233,25 @@ class PallasMosaicTpuFlashAttentionVjp(
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     q, k, v, mask = (ba.arguments[x] for x in ("q", "k", "v", "mask"))
     max_tile = common.max_vmem_tile(q, v, mask)
-    block_q_dkv = common.largest_divisor_tile(q.shape[-3], max_tile)
+    q_seq_len = q.shape[-3] * 2 if self.fold_q_seq_heads else q.shape[-3]
+    block_q_dkv = common.largest_divisor_tile(q_seq_len, max_tile)
     block_kv_dkv = common.largest_divisor_tile(k.shape[-3], max_tile)
     return Config(
         block_q_dkv=block_q_dkv,
         block_kv_dkv=block_kv_dkv,
         block_kv_dkv_compute=min(block_kv_dkv, max_tile // 2),
-        use_base2_exp=True,
+        q_layout=self.q_layout,
+        k_layout=self.k_layout,
+        v_layout=self.v_layout,
+        use_base2_exp=self.use_base2_exp,
+        fold_q_seq_heads=self.fold_q_seq_heads,
     )
 
   @override
   def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
-    q, k = ba.arguments['q'], ba.arguments['k']
-    q_seq_len, kv_seq_len = q.shape[-3], k.shape[-3]
+    q, k = ba.arguments["q"], ba.arguments["k"]
+    q_seq_len = q.shape[-3] * 2 if self.fold_q_seq_heads else q.shape[-3]
+    kv_seq_len = k.shape[-3]
     # TODO: Add 256, 8192 once autotuning bugs are fixed.
     tiles = [512, 1024, 2048, 4096]
     configs = set()
@@ -244,10 +278,35 @@ class PallasMosaicTpuFlashAttentionVjp(
                 block_q_dkv=bq,
                 block_kv_dkv=bkv,
                 block_kv_dkv_compute=bkv_c,
+                q_layout=self.q_layout,
+                k_layout=self.k_layout,
+                v_layout=self.v_layout,
+                use_base2_exp=self.use_base2_exp,
+                fold_q_seq_heads=self.fold_q_seq_heads,
             )
         )
+    if not configs:
+      configs.add(self._get_heuristics_config(ba))
     return configs
+
+  def _matches_config(self, cfg: Config) -> bool:
+    return (
+        cfg.q_layout == self.q_layout
+        and cfg.k_layout == self.k_layout
+        and cfg.v_layout == self.v_layout
+        and cfg.use_base2_exp == self.use_base2_exp
+        and cfg.fold_q_seq_heads == self.fold_q_seq_heads
+    )
+
+  @override
+  def get_autotuning_cache(
+      self, device_kind: op.DeviceKind | None = None
+  ) -> dict[Any, op.AutotuningData[Config]]:
+    return common.sp_vjp.filter_autotuning_cache(
+        base.DotProductAttentionVjp.get_autotuning_cache(self, device_kind),
+        self._matches_config,
+    )
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

@@ -14,8 +14,10 @@
 # ==============================================================================
 
 
+import dataclasses
 import functools
 import typing
+import warnings
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -43,7 +45,11 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
         logits_soft_cap=logits_soft_cap,
         logits_scale=0.1,
     )
-    vjp = fa_vjp.PallasMosaicTpuFlashAttentionVjp(config=vjp_config)
+    vjp = (
+        None
+        if vjp_config is None
+        else fa_vjp.PallasMosaicTpuFlashAttentionVjp(config=vjp_config)
+    )
     attention_impl = fa.PallasMosaicTpuFlashAttention(config=config, vjp=vjp)
 
     @jax.jit
@@ -310,6 +316,422 @@ class PallasMosaicTpuFlashAttentionTest(parameterized.TestCase):
     self._test_attention(
         q, k, v, do, mask=None, is_causal=is_causal, logits_soft_cap=None
     )
+
+  @parameterized.parameters(64, 128)
+  def test_seq_minor_layouts_with_default_vjp(self, head_dim):
+    q_s = jax.ShapeDtypeStruct((2, 256, 4, head_dim), jnp.bfloat16)
+    kv_s = jax.ShapeDtypeStruct((2, 256, 2, head_dim), jnp.bfloat16)
+    q, k, v, do = numerics.random_initialize((q_s, kv_s, kv_s, q_s), seed=41)
+    seq_minor = fa.splash.QKVLayout.SEQ_MINOR
+    config = fa.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=seq_minor,
+        k_layout=seq_minor,
+        v_layout=seq_minor,
+        use_experimental_scheduler=True,
+    )
+    op_seq = fa.PallasMosaicTpuFlashAttention(config=config)
+    assert isinstance(op_seq.vjp, fa_vjp.PallasMosaicTpuFlashAttentionVjp)
+    self.assertEqual(op_seq.vjp.q_layout, seq_minor)
+    self.assertEqual(op_seq.vjp.k_layout, seq_minor)
+    self.assertEqual(op_seq.vjp.v_layout, seq_minor)
+    self._test_attention(
+        q,
+        k,
+        v,
+        do,
+        mask=None,
+        is_causal=True,
+        logits_soft_cap=None,
+        config=config,
+    )
+
+  @parameterized.parameters('scalar', '1d', '2d', 'const')
+  def test_max_logit_and_config_options(self, mode):
+    b, t, n_q, n_kv, d = 2, 256, 4, 2, 64
+    q_s = jax.ShapeDtypeStruct((b, t, n_q, d), jnp.float32)
+    kv_s = jax.ShapeDtypeStruct((b, t, n_kv, d), jnp.float32)
+    q, k, v, do = numerics.random_initialize((q_s, kv_s, kv_s, q_s), seed=53)
+
+    max_logit_const = 10.0 if mode == 'const' else None
+    if mode == 'scalar':
+      max_logit_value = 10.0
+    elif mode == '1d':
+      max_logit_value = jnp.array([8.0, 9.0, 10.0, 11.0], dtype=jnp.float32)
+    elif mode == '2d':
+      max_logit_value = jnp.array(
+          [[8.0, 9.0, 10.0, 11.0], [8.5, 9.5, 10.5, 11.5]], dtype=jnp.float32
+      )
+    else:
+      max_logit_value = None
+
+    head_minor = fa.splash.QKVLayout.HEAD_DIM_MINOR
+    config = fa.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=head_minor,
+        k_layout=head_minor,
+        v_layout=head_minor,
+        use_experimental_scheduler=True,
+        max_logit_const=max_logit_const,
+        fuse_reciprocal=False,
+        residual_checkpoint_name='context',
+    )
+    op_tpu = fa.PallasMosaicTpuFlashAttention(config=config)
+    op_ref = fa_base.DotProductAttention()
+
+    mask = fa_base.Mask(
+        causal_mask=fa_base.CausalMask(offset=0, window_size=64)
+    )
+    _, res_default = fa.PallasMosaicTpuFlashAttention()(
+        q, k, v, mask=mask, logits_scale=0.1, return_residuals=True
+    )
+    out_res, res_fixed = op_tpu(
+        q,
+        k,
+        v,
+        mask=mask,
+        logits_scale=0.1,
+        max_logit_value=max_logit_value,
+        return_residuals=True,
+    )
+    expected_val = 10.0 if max_logit_const is not None else max_logit_value
+    expected_max = jnp.broadcast_to(
+        jnp.asarray(expected_val, dtype=jnp.float32)[..., None], (b, n_q, t)
+    )
+    chex.assert_trees_all_close(res_fixed[0], expected_max, atol=1e-4)
+    self.assertFalse(jnp.allclose(res_default[0], res_fixed[0], atol=1e-2))
+
+    out, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: op_tpu(
+            q_,
+            k_,
+            v_,
+            mask=mask,
+            logits_scale=0.1,
+            max_logit_value=max_logit_value,
+        ),
+        q,
+        k,
+        v,
+    )
+    out_base, vjp_base = jax.vjp(
+        lambda q_, k_, v_: op_ref(q_, k_, v_, mask=mask, logits_scale=0.1),
+        q,
+        k,
+        v,
+    )
+    dq, dk, dv = vjp_fn(do)
+    dq_base, dk_base, dv_base = vjp_base(do)
+
+    chex.assert_trees_all_close(out_res, out_base, atol=0.15)
+    chex.assert_trees_all_close(out, out_base, atol=0.15)
+    chex.assert_trees_all_close(dq, dq_base, atol=1.5)
+    chex.assert_trees_all_close(dk, dk_base, atol=1.2)
+    chex.assert_trees_all_close(dv, dv_base, atol=0.15)
+
+  def test_unsupported_inputs_errors(self):
+    q = jnp.ones((2, 128, 4, 64), dtype=jnp.bfloat16)
+    head_minor = fa.splash.QKVLayout.HEAD_DIM_MINOR
+    cfg_both = fa.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=head_minor,
+        k_layout=head_minor,
+        v_layout=head_minor,
+        use_experimental_scheduler=True,
+        max_logit_const=10.0,
+    )
+    with self.assertRaisesRegex(ValueError, 'max_logit_const'):
+      fa.PallasMosaicTpuFlashAttention(config=cfg_both)(
+          q, q, q, max_logit_value=10.0
+      )
+    op_tpu = fa.PallasMosaicTpuFlashAttention()
+    with self.assertRaisesRegex(NotImplementedError, 'normalize_output=False'):
+      op_tpu(q, q, q, normalize_output=False)
+    with self.assertRaisesRegex(NotImplementedError, 'q_indices'):
+      op_tpu(q, q, q, q_indices=jnp.arange(128)[None, :])
+    with self.assertRaisesRegex(NotImplementedError, 'k_indices'):
+      op_tpu(q, q, q, k_indices=jnp.arange(128)[None, :])
+    with self.assertRaisesRegex(NotImplementedError, 'non-negative'):
+      op_tpu(
+          q,
+          q,
+          q,
+          mask=fa_base.Mask(causal_mask=fa_base.CausalMask(offset=-1)),
+      )
+    q_cross = jnp.ones((2, 256, 4, 16), dtype=jnp.bfloat16)
+    k_cross = jnp.ones((2, 128, 4, 16), dtype=jnp.bfloat16)
+    with self.assertRaisesRegex(NotImplementedError, 'all-masked query rows'):
+      op_tpu(
+          q_cross,
+          k_cross,
+          k_cross,
+          mask=fa_base.Mask(
+              causal_mask=fa_base.CausalMask(offset=0, window_size=65)
+          ),
+      )
+    with self.assertRaisesRegex(NotImplementedError, 'all-masked query rows'):
+      op_tpu(
+          q,
+          q,
+          q,
+          mask=fa_base.Mask(
+              causal_mask=fa_base.CausalMask(offset=64, window_size=55)
+          ),
+      )
+
+  @parameterized.parameters(
+      (128, 127, None),
+      (128, 128, None),
+      (128, 128, 256),
+      (256, 255, None),
+  )
+  def test_full_covering_analytic_masks(self, seq_len, offset, window_size):
+    s = jax.ShapeDtypeStruct((1, seq_len, 4, 64), jnp.bfloat16)
+    q, k, v, do = numerics.random_initialize((s, s, s, s), seed=61)
+    mask = fa_base.Mask(
+        causal_mask=fa_base.CausalMask(offset=offset, window_size=window_size)
+    )
+    self._test_attention(
+        q, k, v, do, mask=mask, is_causal=False, logits_soft_cap=None
+    )
+
+  @parameterized.product(
+      fuse_reciprocal=[True, False],
+      use_base2_exp=[True, False],
+  )
+  def test_max_logit_zero_denom_and_underflow(
+      self, fuse_reciprocal, use_base2_exp
+  ):
+    s = jax.ShapeDtypeStruct((1, 128, 4, 64), jnp.float32)
+    q, k, v, do = numerics.random_initialize((s, s, s, s), seed=67)
+    head_minor = fa.splash.QKVLayout.HEAD_DIM_MINOR
+    cfg = fa.Config(
+        block_q=128,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=head_minor,
+        k_layout=head_minor,
+        v_layout=head_minor,
+        use_experimental_scheduler=True,
+        use_base2_exp=use_base2_exp,
+        fuse_reciprocal=fuse_reciprocal,
+    )
+    op_tpu = fa.PallasMosaicTpuFlashAttention(config=cfg)
+    op_ref = fa_base.DotProductAttention()
+
+    row0_mask = (
+        jnp.ones((1, 1, 128, 128), dtype=jnp.bool_).at[:, :, 0, :].set(False)
+    )
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      out_res, (_, lse) = op_tpu(
+          q,
+          k,
+          v,
+          mask=row0_mask,
+          logits_scale=0.1,
+          max_logit_value=10,
+          return_residuals=True,
+      )
+      out, vjp_fn = jax.vjp(
+          lambda q_, k_, v_: op_tpu(
+              q_, k_, v_, mask=row0_mask, logits_scale=0.1, max_logit_value=10
+          ),
+          q,
+          k,
+          v,
+      )
+    dq, dk, dv = vjp_fn(do)
+    self.assertTrue(bool(jnp.all(jnp.isneginf(lse[:, :, 0]))))
+    chex.assert_tree_all_finite((out_res, out, dq, dk, dv))
+    chex.assert_trees_all_close(out[:, 0, :, :], 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dq[:, 0, :, :], 0.0, atol=1e-7)
+
+    out_base, vjp_base = jax.vjp(
+        lambda q_, k_, v_: op_ref(q_, k_, v_, mask=row0_mask, logits_scale=0.1),
+        q,
+        k,
+        v,
+    )
+    dq_base, dk_base, dv_base = vjp_base(do)
+    chex.assert_trees_all_close(
+        out[:, 1:, :, :], out_base[:, 1:, :, :], atol=0.15
+    )
+    chex.assert_trees_all_close(dq[:, 1:, :, :], dq_base[:, 1:, :, :], atol=1.5)
+    chex.assert_trees_all_close(dk, dk_base, atol=1.2)
+    chex.assert_trees_all_close(dv, dv_base, atol=0.15)
+
+    out_uf, vjp_uf = jax.vjp(
+        lambda q_, k_, v_: op_tpu(
+            q_, k_, v_, logits_scale=0.1, max_logit_value=120.0
+        ),
+        q,
+        k,
+        v,
+    )
+    dq_uf, dk_uf, dv_uf = vjp_uf(do)
+    chex.assert_tree_all_finite((out_uf, dq_uf, dk_uf, dv_uf))
+    chex.assert_trees_all_close(out_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dq_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dk_uf, 0.0, atol=1e-7)
+    chex.assert_trees_all_close(dv_uf, 0.0, atol=1e-7)
+
+  @parameterized.parameters(
+      ('gqa_causal_seqminor', 256, (2,), 8, 2, True, None, True, 10.0),
+      ('gqa_causal_dq_red3', 512, (2,), 8, 2, True, None, True, None),
+      ('gqa_sliding_5d', 256, (2, 2), 4, 2, True, 64, False, None),
+      ('mqa_3d_full', 256, (), 4, 1, False, None, False, None),
+  )
+  def test_fold_q_seq_heads_forward_and_vjp(
+      self,
+      _,
+      seq_len,
+      batch_shape,
+      num_q_heads,
+      num_kv_heads,
+      is_causal,
+      window_size,
+      seq_minor,
+      max_logit_value,
+  ):
+    head_dim = 64
+    q_s = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len, num_q_heads, head_dim), jnp.float32
+    )
+    k_s = jax.ShapeDtypeStruct(
+        (*batch_shape, seq_len, num_kv_heads, head_dim), jnp.float32
+    )
+    q, k, v, do = numerics.random_initialize((q_s, k_s, k_s, q_s), seed=83)
+
+    layout = (
+        fa.splash.QKVLayout.SEQ_MINOR
+        if seq_minor
+        else fa.splash.QKVLayout.HEAD_DIM_MINOR
+    )
+    config = fa.Config(
+        block_q=256,
+        block_kv=128,
+        block_kv_compute=128,
+        q_layout=layout,
+        k_layout=layout,
+        v_layout=layout,
+        use_experimental_scheduler=True,
+        fold_q_seq_heads=True,
+    )
+    op_folded = fa.PallasMosaicTpuFlashAttention(config=config)
+    op_unfolded = fa.PallasMosaicTpuFlashAttention(
+        config=dataclasses.replace(config, block_q=128, fold_q_seq_heads=False)
+    )
+    op_ref = fa_base.DotProductAttention()
+
+    mask = None
+    causal_flag = is_causal
+    if window_size is not None:
+      mask = fa_base.Mask(
+          causal_mask=fa_base.CausalMask(offset=0, window_size=window_size)
+      )
+      causal_flag = False
+
+    out_res, res_folded = op_folded(
+        q,
+        k,
+        v,
+        mask=mask,
+        is_causal=causal_flag,
+        logits_scale=0.1,
+        max_logit_value=max_logit_value,
+        return_residuals=True,
+    )
+    _, res_unfolded = op_unfolded(
+        q,
+        k,
+        v,
+        mask=mask,
+        is_causal=causal_flag,
+        logits_scale=0.1,
+        max_logit_value=max_logit_value,
+        return_residuals=True,
+    )
+    _, res_ref = op_ref(
+        q,
+        k,
+        v,
+        mask=mask,
+        is_causal=causal_flag,
+        logits_scale=0.1,
+        max_logit_value=max_logit_value,
+        return_residuals=True,
+    )
+    expected_res_shape = (*batch_shape, num_q_heads, seq_len)
+    self.assertEqual(res_folded[0].shape, expected_res_shape)
+    self.assertEqual(res_folded[1].shape, expected_res_shape)
+    chex.assert_trees_all_close(res_folded, res_unfolded, atol=1e-3, rtol=1e-3)
+    chex.assert_trees_all_close(res_folded[0], res_ref[0], atol=0.05, rtol=0.02)
+    chex.assert_trees_all_close(
+        res_folded[1], res_ref[0] + jnp.log(res_ref[1]), atol=0.05, rtol=0.02
+    )
+
+    out, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: op_folded(
+            q_,
+            k_,
+            v_,
+            mask=mask,
+            is_causal=causal_flag,
+            logits_scale=0.1,
+            max_logit_value=max_logit_value,
+        ),
+        q,
+        k,
+        v,
+    )
+    out_unfolded, vjp_unfolded = jax.vjp(
+        lambda q_, k_, v_: op_unfolded(
+            q_,
+            k_,
+            v_,
+            mask=mask,
+            is_causal=causal_flag,
+            logits_scale=0.1,
+            max_logit_value=max_logit_value,
+        ),
+        q,
+        k,
+        v,
+    )
+    out_base, vjp_base = jax.vjp(
+        lambda q_, k_, v_: op_ref(
+            q_,
+            k_,
+            v_,
+            mask=mask,
+            is_causal=causal_flag,
+            logits_scale=0.1,
+            max_logit_value=max_logit_value,
+        ),
+        q,
+        k,
+        v,
+    )
+    dq, dk, dv = vjp_fn(do)
+    dq_u, dk_u, dv_u = vjp_unfolded(do)
+    dq_base, dk_base, dv_base = vjp_base(do)
+
+    chex.assert_trees_all_close(out, out_unfolded, atol=1e-3, rtol=1e-3)
+    chex.assert_trees_all_close(dq, dq_u, atol=2e-3, rtol=2e-3)
+    chex.assert_trees_all_close(dk, dk_u, atol=2e-3, rtol=2e-3)
+    chex.assert_trees_all_close(dv, dv_u, atol=2e-3, rtol=2e-3)
+    chex.assert_trees_all_close(out_res, out_base, atol=0.15)
+    chex.assert_trees_all_close(out, out_base, atol=0.15)
+    chex.assert_trees_all_close(dq, dq_base, atol=1.5)
+    chex.assert_trees_all_close(dk, dk_base, atol=1.2)
+    chex.assert_trees_all_close(dv, dv_base, atol=0.15)
 
 
 if __name__ == '__main__':

@@ -73,6 +73,9 @@ class PallasMosaicGpuFlashAttentionVjp(
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: base.Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -84,6 +87,8 @@ class PallasMosaicGpuFlashAttentionVjp(
       config: Config | sm100.Config,
   ) -> tuple[base.DotProductAttentionGrads, None]:
     del dropout_rate
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
 
     if not gpu_utils.has_mosaic_gpu_support():
       raise NotImplementedError("Mosaic GPU not supported on this platform.")

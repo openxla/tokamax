@@ -511,3 +511,88 @@ class FullMask(Mask):
 
   def __hash__(self):
     return hash((type(self), self.shape))
+
+
+class _StackedGQAMask(_ComputableMask):
+  """Computable mask for query-head sequence folding."""
+
+  base_mask: _ComputableMask
+  group_size: int
+
+  def __init__(
+      self,
+      base_mask: _ComputableMask,
+      group_size: int = 2,
+      shard_count: int = 1,
+  ):
+    if group_size <= 0:
+      raise ValueError(f'group_size must be positive, got {group_size}')
+    self.base_mask = base_mask
+    self.group_size = group_size
+    shape = (base_mask.shape[0] * group_size, base_mask.shape[1])
+
+    super().__init__(
+        shape=shape,
+        mask_function=base_mask.mask_function,
+        shard_count=shard_count,
+    )
+    self.q_sequence = np.repeat(base_mask.q_sequence, group_size).astype(
+        np.int32
+    )
+
+  def __eq__(self, other: object):
+    if not isinstance(other, type(self)):
+      return NotImplemented
+
+    return (
+        self.shape == other.shape
+        and self.group_size == other.group_size
+        and (
+            self.base_mask is other.base_mask
+            or self.base_mask == other.base_mask
+        )
+        and np.array_equal(self.q_sequence, other.q_sequence)
+    )
+
+  def __hash__(self):
+    return hash((
+        type(self),
+        self.shape,
+        self.group_size,
+        self.base_mask,
+        self.q_sequence.tobytes() if self.q_sequence is not None else None,
+    ))
+
+
+def make_stacked_gqa_mask(
+    mask: Mask, group_size: int = 2, shard_count: int = 1
+) -> Mask:
+  """Wraps `mask` for `group_size`x query-head sequence folding."""
+  if group_size <= 0:
+    raise ValueError(f'group_size must be positive, got {group_size}')
+  if isinstance(mask, FullMask):
+    return FullMask((mask.shape[0] * group_size, mask.shape[1]))
+  if isinstance(mask, LogicalAnd):
+    return LogicalAnd(
+        make_stacked_gqa_mask(
+            mask.left, group_size=group_size, shard_count=shard_count
+        ),
+        make_stacked_gqa_mask(
+            mask.right, group_size=group_size, shard_count=shard_count
+        ),
+    )
+  if isinstance(mask, LogicalOr):
+    return LogicalOr(
+        make_stacked_gqa_mask(
+            mask.left, group_size=group_size, shard_count=shard_count
+        ),
+        make_stacked_gqa_mask(
+            mask.right, group_size=group_size, shard_count=shard_count
+        ),
+    )
+  if isinstance(mask, _ComputableMask):
+    return _StackedGQAMask(mask, group_size=group_size, shard_count=shard_count)
+  raise NotImplementedError(
+      'fold_q_seq_heads requires FullMask or _ComputableMask, got'
+      f' {type(mask)}.'
+  )

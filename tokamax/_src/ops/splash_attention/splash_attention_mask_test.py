@@ -1858,13 +1858,13 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
                 kv_seq_shards=shards,
                 return_dynamic_grid=return_dynamic_grid,
             )
-            lazy_info, _ = mask_info_lib.process_mask(
+            lazy_info, mask_fn = mask_info_lib.process_mask(
                 lazy_mask, block_shape, **kwargs
             )
             dense_info, _ = mask_info_lib.process_mask(
                 dense_mask, block_shape, **kwargs
             )
-            lazy_dkv, _ = mask_info_lib.process_mask_dkv(
+            lazy_dkv, mask_fn_dkv = mask_info_lib.process_mask_dkv(
                 lazy_mask, block_shape, **kwargs
             )
             dense_dkv, _ = mask_info_lib.process_mask_dkv(
@@ -1875,13 +1875,14 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
               self._assert_mask_info_match(lazy_info, dense_info)
               self._assert_mask_info_match(lazy_dkv, dense_dkv)
             else:
-              self._assert_array_equal(
-                  lazy_info.q_sequence, lazy_mask.q_sequence
-              )
-              for actual, expected in (
-                  (lazy_info, dense_info),
-                  (lazy_dkv, dense_dkv),
+              for actual, expected, fn in (
+                  (lazy_info, dense_info, mask_fn),
+                  (lazy_dkv, dense_dkv, mask_fn_dkv),
               ):
+                self._assert_array_equal(
+                    actual.q_sequence,
+                    None if fn is None else lazy_mask.q_sequence,
+                )
                 self.assertIsNone(actual.mask_next)
                 self.assertIsNone(actual.partial_mask_blocks)
                 self._assert_array_equal(actual.block_mask, expected.block_mask)
@@ -1928,6 +1929,121 @@ class SplashAttentionMaskInfoTest(test_utils.SplashAttentionTestCase):
           self._assert_array_equal(
               lazy_info.num_active_blocks, dense_info.num_active_blocks
           )
+
+  def test_stacked_gqa_mask_and_mask_info(self):
+    full = mask_lib.make_stacked_gqa_mask(mask_lib.FullMask((64, 64)))
+    self.assertIsInstance(full, mask_lib.FullMask)
+    self.assertEqual(full.shape, (128, 64))
+
+    with self.assertRaisesRegex(ValueError, "positive"):
+      mask_lib.make_stacked_gqa_mask(
+          mask_lib.CausalMask((64, 64)), group_size=0
+      )
+    with self.assertRaisesRegex(NotImplementedError, "fold_q_seq_heads"):
+      mask_lib.make_stacked_gqa_mask(
+          mask_lib.NumpyMask(np.ones((64, 64), dtype=np.bool_))
+      )
+
+    for shard_count in (1, 2):
+      perm_local = mask_lib.LocalMask((64, 64), window_size=(15, 0), offset=2)
+      perm_local.q_sequence = (
+          np.arange(64, dtype=np.int32).reshape(4, 16).T.ravel()
+      )
+      bases = (
+          ("causal", mask_lib.CausalMask((64, 64), offset=4), True),
+          (
+              "local",
+              mask_lib.LocalMask((64, 64), window_size=(15, 0), offset=2),
+              True,
+          ),
+          (
+              "chunked",
+              mask_lib.ChunkedCausalMask((64, 64), chunk_size=32),
+              True,
+          ),
+          ("local_permuted_q", perm_local, True),
+          (
+              "logical_and",
+              mask_lib.CausalMask((64, 64))
+              & mask_lib.LocalMask((64, 64), window_size=(16, 16), offset=0),
+              False,
+          ),
+          (
+              "logical_or",
+              mask_lib.CausalMask((64, 64), offset=-16)
+              | mask_lib.LocalMask((64, 64), window_size=(8, 0), offset=0),
+              False,
+          ),
+      )
+      for name, base_mask, expect_computable in bases:
+        with self.subTest(name=name, shard_count=shard_count):
+          stacked = mask_lib.make_stacked_gqa_mask(
+              base_mask, group_size=2, shard_count=shard_count
+          )
+          stacked_dup = mask_lib.make_stacked_gqa_mask(
+              base_mask, group_size=2, shard_count=shard_count
+          )
+          self.assertEqual(stacked, stacked_dup)
+          self.assertEqual(hash(stacked), hash(stacked_dup))
+          self.assertEqual(stacked.shape, (128, 64))
+          expected_dense = np.repeat(base_mask[:, :], 2, axis=0)
+          self._assert_array_equal(stacked[:, :], expected_dense)
+
+          dense_mask = mask_lib.NumpyMask(expected_dense)
+          block_shape = (16, 16)
+          lazy_info, mask_fn = mask_info_lib.process_mask(
+              stacked, block_shape, q_seq_shards=shard_count
+          )
+          dense_info, _ = mask_info_lib.process_mask(
+              dense_mask, block_shape, q_seq_shards=shard_count
+          )
+          lazy_dkv, mask_fn_dkv = mask_info_lib.process_mask_dkv(
+              stacked, block_shape, q_seq_shards=shard_count
+          )
+          dense_dkv, _ = mask_info_lib.process_mask_dkv(
+              dense_mask, block_shape, q_seq_shards=shard_count
+          )
+          if expect_computable:
+            self.assertIsNotNone(mask_fn)
+            self.assertIsNotNone(mask_fn_dkv)
+          for actual, expected in (
+              (lazy_info, dense_info),
+              (lazy_dkv, dense_dkv),
+          ):
+            if expect_computable:
+              self.assertIsNone(actual.mask_next)
+              self.assertIsNone(actual.partial_mask_blocks)
+            else:
+              self._assert_array_equal(actual.mask_next, expected.mask_next)
+              self._assert_array_equal(
+                  actual.partial_mask_blocks, expected.partial_mask_blocks
+              )
+            self._assert_array_equal(actual.block_mask, expected.block_mask)
+            self._assert_array_equal(actual.active_rows, expected.active_rows)
+            self._assert_array_equal(actual.active_cols, expected.active_cols)
+            self._assert_array_equal(
+                actual.num_active_blocks, expected.num_active_blocks
+            )
+
+  def test_full_coverage_local_mask_clears_q_sequence(self):
+    local_full = mask_lib.LocalMask(
+        (128, 128), window_size=(128, 128), offset=0
+    )
+    stacked_full = mask_lib.make_stacked_gqa_mask(
+        local_full, group_size=2, shard_count=1
+    )
+    for mask_obj, block_shape in (
+        (local_full, (128, 128)),
+        (stacked_full, (256, 128)),
+    ):
+      for process_fn in (
+          mask_info_lib.process_mask,
+          mask_info_lib.process_mask_dkv,
+      ):
+        info, mask_fn = process_fn(mask_obj, block_shape, q_seq_shards=1)
+        self.assertIsNone(info.block_mask)
+        self.assertIsNone(info.q_sequence)
+        self.assertIsNone(mask_fn)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@
 
 import dataclasses
 import functools
+import typing
+import warnings
 from absl.testing import absltest
 from absl.testing import parameterized
 import chex
@@ -515,6 +517,14 @@ class SplashAttentionBaseTest(parameterized.TestCase):
           k_sharding=NamedSharding(mesh2, P("y", None, None)),
       )
 
+    with self.assertRaisesRegex(ValueError, "q_sharding must be specified"):
+      self.op(
+          q,
+          k,
+          v,
+          k_sharding=NamedSharding(mesh, P("x", None, None)),
+      )
+
   @parameterized.parameters(
       (("x", None, None), False, False),
       ((None, "x", None), False, False),
@@ -704,6 +714,495 @@ class SplashAttentionBaseTest(parameterized.TestCase):
         else upstream_grad
     ).astype(x.dtype)
     chex.assert_trees_all_close(grad_x, expected_grad, rtol=2e-2, atol=1e-2)
+
+  @parameterized.parameters("scalar", "0d", "1d", "2d", "sharded_heads")
+  def test_max_logit_value_and_vjp(self, mode):
+    batch_size, num_q_heads, num_kv_heads = 2, 4, 2
+    seq_len, head_dim = 64, 32
+    dtype = jnp.float32
+
+    q_s = jax.ShapeDtypeStruct(
+        (batch_size, num_q_heads, seq_len, head_dim), dtype
+    )
+    k_s = jax.ShapeDtypeStruct(
+        (batch_size, num_kv_heads, seq_len, head_dim), dtype
+    )
+    do_s = q_s
+    sinks_s = jax.ShapeDtypeStruct((num_q_heads,), dtype)
+    q, k, v, do, sinks = numerics.random_initialize(
+        (q_s, k_s, k_s, do_s, sinks_s), seed=31
+    )
+    q = q * (head_dim**-0.5)
+
+    if mode == "scalar":
+      max_logit_value = 10.0
+    elif mode == "0d":
+      max_logit_value = jnp.asarray(10.0, dtype=dtype)
+    elif mode in ("1d", "sharded_heads"):
+      max_logit_value = jnp.array([8.0, 9.0, 10.0, 11.0], dtype=dtype)
+    else:
+      max_logit_value = jnp.array(
+          [[8.0, 9.0, 10.0, 11.0], [8.5, 9.5, 10.5, 11.5]], dtype=dtype
+      )
+
+    q_sharding = None
+    if mode == "sharded_heads":
+      mesh = jax.sharding.Mesh(
+          jax.devices()[: min(jax.device_count(), 2)], ("x",)
+      )
+      q_sharding = jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec(None, "x", None, None)
+      )
+
+    # Default float32 matmuls use bf16 on TPU and tf32 on GPU, which masks
+    # shift-invariance with coarse p @ v rounding noise.
+    with jax.default_matmul_precision("highest"):
+      _, res_default = self.op(
+          q, k, v, mask=base.CAUSAL_MASK, sinks=sinks, return_residuals=True
+      )
+      out_res, res_fixed = self.op(
+          q,
+          k,
+          v,
+          mask=base.CAUSAL_MASK,
+          sinks=sinks,
+          max_logit_value=max_logit_value,
+          q_sharding=q_sharding,
+          return_residuals=True,
+      )
+      expected_max = jnp.broadcast_to(
+          jnp.asarray(max_logit_value, dtype=dtype)[..., None],
+          (batch_size, num_q_heads, seq_len),
+      )
+      chex.assert_trees_all_close(res_fixed[0], expected_max, atol=1e-6)
+      self.assertFalse(jnp.allclose(res_default[0], res_fixed[0], atol=1e-2))
+
+      fn_ref = lambda q_, k_, v_, s_: self.op(
+          q_, k_, v_, mask=base.CAUSAL_MASK, sinks=s_
+      )
+      fn_mlv = lambda q_, k_, v_, s_, mlv_: self.op(
+          q_,
+          k_,
+          v_,
+          mask=base.CAUSAL_MASK,
+          sinks=s_,
+          max_logit_value=mlv_,
+          q_sharding=q_sharding,
+      )
+      out_ref, vjp_ref = jax.vjp(fn_ref, q, k, v, sinks)
+      dq_ref, dk_ref, dv_ref, dsinks_ref = vjp_ref(do)
+      if isinstance(max_logit_value, jax.Array):
+        out, vjp_fn = jax.vjp(fn_mlv, q, k, v, sinks, max_logit_value)
+        dq, dk, dv, dsinks, dmlv = vjp_fn(do)
+        chex.assert_trees_all_close(dmlv, jnp.zeros_like(max_logit_value))
+      else:
+        out, vjp_fn = jax.vjp(
+            lambda q_, k_, v_, s_: fn_mlv(q_, k_, v_, s_, max_logit_value),
+            q,
+            k,
+            v,
+            sinks,
+        )
+        dq, dk, dv, dsinks = vjp_fn(do)
+
+    # Non-CPU VJP recomputes p = exp(logits - lse) through hardware exp/log
+    # approximations (~1.7e-4 relative error on TPU v4 when shifted by 10.0).
+    vjp_tol = (
+        dict(atol=1e-5)
+        if jax.default_backend() == "cpu"
+        else dict(atol=5e-4, rtol=5e-4)
+    )
+    chex.assert_trees_all_close(out_res, out_ref, atol=1e-5)
+    chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+    chex.assert_trees_all_close(dq, dq_ref, **vjp_tol)
+    chex.assert_trees_all_close(dk, dk_ref, **vjp_tol)
+    chex.assert_trees_all_close(dv, dv_ref, **vjp_tol)
+    chex.assert_trees_all_close(dsinks, dsinks_ref, **vjp_tol)
+
+  def test_subclass_without_max_logit_value(self):
+    @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+    class _VjpWithoutMaxLogit(base.SplashAttentionVjp[None]):
+
+      @typing.override
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          residuals: base.Residuals,
+          out: jax.Array,
+          dout: jax.Array,
+          q: jax.Array,
+          k: jax.Array,
+          v: jax.Array,
+          *,
+          mask: base.Mask,
+          segment_ids: base.SegmentIds | None = None,
+          sinks: jax.Array | None = None,
+          is_mqa: bool = False,
+          mask_value: float = base.DEFAULT_MASK_VALUE,
+          attn_logits_soft_cap: float | None = None,
+          dropout_rate: float = 0.0,
+          prng_key: jax.Array | None = None,
+          return_residuals: bool = False,
+          config: None = None,
+      ) -> tuple[base.SplashAttentionGrads, None]:
+        return base.SplashAttentionVjp._fwd(
+            self,
+            residuals,
+            out,
+            dout,
+            q,
+            k,
+            v,
+            mask=mask,
+            segment_ids=segment_ids,
+            sinks=sinks,
+            is_mqa=is_mqa,
+            mask_value=mask_value,
+            attn_logits_soft_cap=attn_logits_soft_cap,
+            dropout_rate=dropout_rate,
+            prng_key=prng_key,
+            return_residuals=return_residuals,
+            config=config,
+        )
+
+    @dataclasses.dataclass(frozen=True)
+    class _OpWithoutMaxLogit(base.SplashAttention[None]):
+
+      def __post_init__(self):
+        if self.vjp is None:
+          object.__setattr__(self, "vjp", _VjpWithoutMaxLogit())
+
+      @typing.override
+      def _fwd(  # pyrefly: ignore[bad-override]
+          self,
+          q: jax.Array,
+          k: jax.Array,
+          v: jax.Array,
+          *,
+          mask: base.Mask,
+          segment_ids: base.SegmentIds | None = None,
+          sinks: jax.Array | None = None,
+          is_mqa: bool = False,
+          mask_value: float = base.DEFAULT_MASK_VALUE,
+          attn_logits_soft_cap: float | None = None,
+          dropout_rate: float = 0.0,
+          prng_key: jax.Array | None = None,
+          return_residuals: bool = False,
+          config: None = None,
+      ) -> tuple[jax.Array, base.Residuals | None]:
+        return base.SplashAttention._fwd(
+            self,
+            q,
+            k,
+            v,
+            mask=mask,
+            segment_ids=segment_ids,
+            sinks=sinks,
+            is_mqa=is_mqa,
+            mask_value=mask_value,
+            attn_logits_soft_cap=attn_logits_soft_cap,
+            dropout_rate=dropout_rate,
+            prng_key=prng_key,
+            return_residuals=return_residuals,
+            config=config,
+        )
+
+    self.assertNotIn("__class__", _VjpWithoutMaxLogit._fwd.__code__.co_freevars)
+    vjp_no_mlv = _VjpWithoutMaxLogit()
+    op_no_mlv = _OpWithoutMaxLogit(vjp=vjp_no_mlv)
+    q_s = jax.ShapeDtypeStruct((1, 4, 64, 32), jnp.float32)
+    q, k, v, do = numerics.random_initialize((q_s, q_s, q_s, q_s), seed=17)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ("x",))
+    q_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(None, "x", None, None)
+    )
+    with jax.default_matmul_precision("highest"):
+      out, vjp_fn = jax.vjp(
+          lambda q_, k_, v_: op_no_mlv(q_, k_, v_, mask=base.CAUSAL_MASK),
+          q,
+          k,
+          v,
+      )
+      out_ref, vjp_ref = jax.vjp(
+          lambda q_, k_, v_: self.op(q_, k_, v_, mask=base.CAUSAL_MASK),
+          q,
+          k,
+          v,
+      )
+      chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+      chex.assert_trees_all_close(vjp_fn(do), vjp_ref(do), atol=1e-5)
+
+      out_sharded, residuals = op_no_mlv(
+          q,
+          k,
+          v,
+          mask=base.CAUSAL_MASK,
+          q_sharding=q_sharding,
+          return_residuals=True,
+      )
+      chex.assert_trees_all_close(out_sharded, out_ref, atol=1e-5)
+      grads_direct = vjp_no_mlv(
+          residuals, out_sharded, do, q, k, v, mask=base.CAUSAL_MASK
+      )
+      chex.assert_trees_all_close(
+          (grads_direct["q"], grads_direct["k"], grads_direct["v"]),
+          vjp_ref(do),
+          atol=1e-5,
+      )
+
+    with self.assertRaises(NotImplementedError):
+      op_no_mlv(q, k, v, max_logit_value=1.0)
+    with self.assertRaises(NotImplementedError):
+      op_no_mlv(q, k, v, max_logit_value=1.0, q_sharding=q_sharding)
+    with self.assertRaises(NotImplementedError):
+      op_no_mlv.bind(q, k, v, max_logit_value=1.0)
+    with self.assertRaises(NotImplementedError):
+      vjp_no_mlv.bind(residuals, out, do, q, k, v, max_logit_value=1.0)
+
+  def test_max_logit_value_masked_and_underflow_rows(self):
+    num_heads, seq_len, head_dim = 2, 16, 32
+    s = jax.ShapeDtypeStruct((num_heads, seq_len, head_dim), jnp.float32)
+    q, k, v, do = numerics.random_initialize((s, s, s, s), seed=71)
+    q = q * (head_dim**-0.5)
+
+    row0_mask = (
+        jnp.ones((seq_len, seq_len), dtype=jnp.bool_).at[0, :].set(False)
+    )
+    all_masked = jnp.zeros((seq_len, seq_len), dtype=jnp.bool_)
+
+    with jax.default_matmul_precision("highest"):
+      out_row0, vjp_row0 = jax.vjp(
+          lambda q_, k_, v_: self.op(
+              q_, k_, v_, mask=row0_mask, max_logit_value=10.0
+          ),
+          q,
+          k,
+          v,
+      )
+      dq_r0, dk_r0, dv_r0 = vjp_row0(do)
+      chex.assert_tree_all_finite((out_row0, dq_r0, dk_r0, dv_r0))
+      chex.assert_trees_all_close(out_row0[:, 0, :], 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dq_r0[:, 0, :], 0.0, atol=1e-7)
+
+      out_ref_r0, vjp_ref_r0 = jax.vjp(
+          lambda q_, k_, v_: self.op(q_, k_, v_, mask=row0_mask), q, k, v
+      )
+      dq_ref_r0, _, _ = vjp_ref_r0(do)
+      vjp_tol = (
+          dict(atol=1e-5)
+          if jax.default_backend() == "cpu"
+          else dict(atol=5e-4, rtol=5e-4)
+      )
+      chex.assert_trees_all_close(
+          out_row0[:, 1:, :], out_ref_r0[:, 1:, :], atol=1e-5
+      )
+      chex.assert_trees_all_close(
+          dq_r0[:, 1:, :], dq_ref_r0[:, 1:, :], **vjp_tol
+      )
+
+      out_all, vjp_all = jax.vjp(
+          lambda q_, k_, v_: self.op(
+              q_, k_, v_, mask=all_masked, max_logit_value=10.0
+          ),
+          q,
+          k,
+          v,
+      )
+      dq_all, dk_all, dv_all = vjp_all(do)
+      chex.assert_tree_all_finite((out_all, dq_all, dk_all, dv_all))
+      chex.assert_trees_all_close(out_all, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dq_all, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dk_all, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dv_all, 0.0, atol=1e-7)
+
+      sinks = jnp.full((num_heads,), -200.0, dtype=jnp.float32)
+      out_uf, vjp_uf = jax.vjp(
+          lambda q_, k_, v_, s_: self.op(
+              q_,
+              k_,
+              v_,
+              mask=base.FULL_MASK,
+              sinks=s_,
+              max_logit_value=120.0,
+          ),
+          q,
+          k,
+          v,
+          sinks,
+      )
+      dq_uf, dk_uf, dv_uf, dsinks_uf = vjp_uf(do)
+      chex.assert_tree_all_finite((out_uf, dq_uf, dk_uf, dv_uf, dsinks_uf))
+      chex.assert_trees_all_close(out_uf, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dq_uf, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dk_uf, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dv_uf, 0.0, atol=1e-7)
+      chex.assert_trees_all_close(dsinks_uf, 0.0, atol=1e-7)
+
+  def test_max_logit_value_int_and_numpy_sharding(self):
+    q_s = jax.ShapeDtypeStruct((2, 4, 32, 16), jnp.float32)
+    q, k, v, do = numerics.random_initialize((q_s, q_s, q_s, q_s), seed=83)
+    q = q * 0.25
+
+    with warnings.catch_warnings():
+      warnings.simplefilter("error", UserWarning)
+      out_int, vjp_int = jax.vjp(
+          lambda q_, k_, v_: self.op(
+              q_, k_, v_, mask=base.CAUSAL_MASK, max_logit_value=10
+          ),
+          q,
+          k,
+          v,
+      )
+      grads_int = vjp_int(do)
+    out_flt, vjp_flt = jax.vjp(
+        lambda q_, k_, v_: self.op(
+            q_, k_, v_, mask=base.CAUSAL_MASK, max_logit_value=10.0
+        ),
+        q,
+        k,
+        v,
+    )
+    chex.assert_trees_all_close(out_int, out_flt, atol=1e-6)
+    chex.assert_trees_all_close(grads_int, vjp_flt(do), atol=1e-6)
+
+    np_mlv = np.array([8.0, 9.0, 10.0, 11.0], dtype=np.float32)
+    np_sinks = np.array([0.1, -0.2, 0.3, -0.4], dtype=np.float32)
+    np_mask = np.tril(np.ones((32, 32), dtype=np.bool_))
+    mesh = jax.sharding.Mesh(
+        jax.devices()[: min(jax.device_count(), 2)], ("x",)
+    )
+    q_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(None, "x", None, None)
+    )
+    out_unsharded = self.op(  # pyrefly: ignore[no-matching-overload]
+        q, k, v, mask=np_mask, sinks=np_sinks, max_logit_value=np_mlv
+    )
+    out_sharded = self.op(  # pyrefly: ignore[no-matching-overload]
+        q,
+        k,
+        v,
+        mask=np_mask,
+        sinks=np_sinks,
+        max_logit_value=np_mlv,
+        q_sharding=q_sharding,
+    )
+    chex.assert_trees_all_close(out_sharded, out_unsharded, atol=1e-5)
+
+    jax_mask = jnp.asarray(np_mask)
+    jax_sinks = jnp.asarray(np_sinks)
+    jax_mlv = jnp.asarray(np_mlv)
+    out_jax_sharded = self.op(
+        q,
+        k,
+        v,
+        mask=jax_mask,
+        sinks=jax_sinks,
+        max_logit_value=jax_mlv,
+        q_sharding=q_sharding,
+    )
+    chex.assert_trees_all_close(out_jax_sharded, out_unsharded, atol=1e-5)
+
+  def test_local_mask_preserved_analytically(self):
+    with self.assertRaisesRegex(ValueError, "offset"):
+      base.Mask(offset=4)
+
+    q_s = jax.ShapeDtypeStruct((2, 4, 64, 32), jnp.float32)
+    q, k, v, do = numerics.random_initialize((q_s, q_s, q_s, q_s), seed=41)
+    local_mask = mask_lib.LocalMask((64, 64), window_size=(15, 0), offset=4)
+
+    # Default canonicalization and un-opted-in subclasses materialize local
+    # masks to `bool_mask` for backwards compatibility.
+    default_canon = base._canonicalize_mask(local_mask)  # pylint: disable=protected-access
+    self.assertIsNotNone(default_canon.bool_mask)
+    self.assertIsNone(default_canon.window_size)
+
+    bound_legacy = self.op.bind(q, k, v, mask=local_mask)
+    legacy_mask = bound_legacy.arguments["mask"]
+    self.assertIsNotNone(legacy_mask.bool_mask)
+    self.assertIsNone(legacy_mask.window_size)
+    assert isinstance(self.op.vjp, base.SplashAttentionVjp)
+    legacy_vjp_mask = self.op.vjp.bind(
+        (jnp.zeros((2, 4, 64)), jnp.zeros((2, 4, 64))),
+        q,
+        do,
+        q,
+        k,
+        v,
+        mask=local_mask,
+    ).arguments["mask"]
+    self.assertIsNotNone(legacy_vjp_mask.bool_mask)
+    self.assertIsNone(legacy_vjp_mask.window_size)
+
+    window_causal = base.Mask(is_causal=True, window_size=(15, 0), offset=4)
+    materialized = self.op.bind(q, k, v, mask=window_causal).arguments["mask"]
+    self.assertIsNotNone(materialized.bool_mask)
+    self.assertFalse(materialized.is_causal)
+    self.assertIsNone(materialized.window_size)
+
+    @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+    class _AnalyticLocalVjp(base.SplashAttentionVjp[None]):
+      supports_analytic_local_mask: typing.ClassVar[bool] = True
+
+    @dataclasses.dataclass(frozen=True)
+    class _AnalyticLocalOp(base.SplashAttention[None]):
+      supports_analytic_local_mask: typing.ClassVar[bool] = True
+
+      def __post_init__(self):
+        if self.vjp is None:
+          object.__setattr__(self, "vjp", _AnalyticLocalVjp())
+
+    analytic_vjp = _AnalyticLocalVjp()
+    analytic_op = _AnalyticLocalOp(vjp=analytic_vjp)
+    bound = analytic_op.bind(q, k, v, mask=local_mask)
+    canon = bound.arguments["mask"]
+    self.assertIsInstance(canon, base.Mask)
+    self.assertIsNone(canon.bool_mask)
+    self.assertEqual(canon.window_size, (15, 0))
+    self.assertEqual(canon.offset, 4)
+    self.assertTrue(bool(canon))
+    chex.assert_trees_all_close(
+        canon.as_array(64, 64), jnp.asarray(local_mask[:, :]), atol=0
+    )
+    analytic_vjp_mask = analytic_vjp.bind(
+        (jnp.zeros((2, 4, 64)), jnp.zeros((2, 4, 64))),
+        q,
+        do,
+        q,
+        k,
+        v,
+        mask=local_mask,
+    ).arguments["mask"]
+    self.assertIsNone(analytic_vjp_mask.bool_mask)
+    self.assertEqual(analytic_vjp_mask.window_size, (15, 0))
+    self.assertEqual(analytic_vjp_mask.offset, 4)
+
+    out, vjp_fn = jax.vjp(
+        lambda q_, k_, v_: analytic_op(q_, k_, v_, mask=local_mask), q, k, v
+    )
+    out_ref, vjp_ref = jax.vjp(
+        lambda q_, k_, v_: self.op(
+            q_, k_, v_, mask=jnp.asarray(local_mask[:, :])
+        ),
+        q,
+        k,
+        v,
+    )
+    chex.assert_trees_all_close(out, out_ref, atol=1e-5)
+    chex.assert_trees_all_close(vjp_fn(do), vjp_ref(do), atol=1e-5)
+
+    # Custom permuted `q_sequence` must fall back to exact boolean mask rather
+    # than dropping `q_sequence`.
+    perm_local_mask = mask_lib.LocalMask(
+        (64, 64), window_size=(15, 0), offset=4
+    )
+    perm_local_mask.q_sequence = (
+        np.arange(64, dtype=np.int32).reshape(4, 16).T.ravel()
+    )
+    bound_perm = analytic_op.bind(q, k, v, mask=perm_local_mask)
+    self.assertIsNotNone(bound_perm.arguments["mask"].bool_mask)
+    out_perm = analytic_op(q, k, v, mask=perm_local_mask)
+    out_perm_ref = self.op(q, k, v, mask=jnp.asarray(perm_local_mask[:, :]))
+    chex.assert_trees_all_close(out_perm, out_perm_ref, atol=1e-5)
 
 
 if __name__ == "__main__":

@@ -18,12 +18,12 @@ import dataclasses
 import itertools
 from typing import Annotated, ClassVar, Final, override
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import pallas_mosaic_tpu_vjp
@@ -53,12 +53,22 @@ class Config:
   v_layout: QKVLayout
   use_experimental_scheduler: bool
   use_base2_exp: bool = True
+  max_logit_const: float | None = None
+  fuse_reciprocal: bool = True
+  residual_checkpoint_name: str | None = None
+  fold_q_seq_heads: bool = False
   qk_diag_skip: bool = False
   qk_diag_grid: int = 2
   sv_diag_skip: bool = False
   diag_band_skip: bool = False
 
   def __post_init__(self):
+    if self.fold_q_seq_heads and (
+        self.qk_diag_skip or self.sv_diag_skip or self.diag_band_skip
+    ):
+      raise ValueError(
+          "Diagonal skip options are incompatible with `fold_q_seq_heads=True`."
+      )
     if self.block_kv % self.block_kv_compute:
       raise ValueError(
           f"{self.block_kv=} must be a multiple of {self.block_kv_compute=}."
@@ -114,14 +124,34 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  supports_analytic_local_mask: ClassVar[bool] = True
+
+  def _default_vjp(
+      self,
+  ) -> pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp:
+    if self.config is None:
+      return pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp()
+    return pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp(
+        q_layout=self.config.q_layout,
+        k_layout=self.config.k_layout,
+        v_layout=self.config.v_layout,
+        use_base2_exp=self.config.use_base2_exp,
+        fold_q_seq_heads=self.config.fold_q_seq_heads,
+    )
 
   def __post_init__(self):
     if self.vjp is None:
-      object.__setattr__(
-          self,
-          "vjp",
-          pallas_mosaic_tpu_vjp.PallasMosaicTpuSplashAttentionVjp(),
-      )
+      object.__setattr__(self, "vjp", self._default_vjp())
+
+  @override
+  def replace(self, **kwargs):
+    if (
+        "config" in kwargs
+        and "vjp" not in kwargs
+        and self.vjp == self._default_vjp()
+    ):
+      return dataclasses.replace(self, **kwargs, vjp=None)
+    return base.SplashAttention.replace(self, **kwargs)
 
   @jaxtyping.jaxtyped
   @override
@@ -137,11 +167,29 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
       is_mqa: bool = False,
       mask_value: float = reference.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[Float[Array, "*B H T d"], base.Residuals | None]:
+    if config.max_logit_const is not None and max_logit_value is not None:
+      raise ValueError(
+          "Cannot set both `config.max_logit_const` and `max_logit_value`."
+      )
+    config_dict = dataclasses.asdict(config)
+    fold_q_seq_heads = config_dict.pop("fold_q_seq_heads")
+    num_kv_heads = 1 if is_mqa else k.shape[-3]
+    if fold_q_seq_heads:
+      pallas_mosaic_tpu_vjp.check_fold_q_seq_heads(
+          q.shape[-3],
+          num_kv_heads,
+          is_mqa,
+          sinks=sinks,
+          dropout_rate=dropout_rate,
+      )
     splash_config = dataclasses.replace(
         splash_attention_kernel.SplashConfig.get_default(),
         attn_logits_soft_cap=attn_logits_soft_cap,
@@ -149,7 +197,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
         block_q_dkv=None,
         block_kv_dkv=None,
         block_kv_dkv_compute=None,
-        **dataclasses.asdict(config),
+        **config_dict,
     )
 
     q_seq_shards, q_shard_idx = (
@@ -157,23 +205,13 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     )
     q_seq_len = q.shape[-2]
     kv_seq_len = k.shape[-2]
-    mask_shape = (q_seq_len * q_seq_shards, kv_seq_len)
-
-    if isinstance(mask, mask_lib.Mask):
-      splash_mask = mask
-    elif isinstance(mask, base.Mask):
-      if mask.bool_mask is not None and mask.is_causal:
-        splash_mask = mask.as_array(q_seq_len, kv_seq_len)
-      elif mask.bool_mask is not None:
-        splash_mask = mask.bool_mask
-      elif mask.is_causal:
-        splash_mask = mask_lib.CausalMask(
-            shape=mask_shape, offset=mask.offset, shard_count=q_seq_shards
-        )
-      else:
-        splash_mask = mask_lib.FullMask(mask_shape)
-    else:
-      splash_mask = mask
+    splash_mask = pallas_mosaic_tpu_vjp.build_splash_mask(
+        mask,
+        q_seq_len,
+        kv_seq_len,
+        q_seq_shards,
+        fold_q_seq_heads=fold_q_seq_heads,
+    )
 
     if is_mqa and k.ndim == q.ndim:
       k_in = jnp.squeeze(k, axis=-3)
@@ -189,20 +227,37 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
     )
 
     if segment_ids is not None:
-      segment_ids = reference.SegmentIds(
-          q=jax.lax.broadcast_to_rank(segment_ids.q, q.ndim - 2)
-          if isinstance(segment_ids.q, (jax.Array, np.ndarray))
-          else segment_ids.q,
-          kv=jax.lax.broadcast_to_rank(segment_ids.kv, q.ndim - 2)
-          if isinstance(segment_ids.kv, (jax.Array, np.ndarray))
-          else segment_ids.kv,
-      )
+      seg_q = segment_ids.q
+      if isinstance(seg_q, (jax.Array, np.ndarray)):
+        seg_q = jax.lax.broadcast_to_rank(seg_q, q.ndim - 2)
+        if fold_q_seq_heads:
+          seg_q = jnp.repeat(seg_q, 2, axis=-1)
+      seg_kv = segment_ids.kv
+      if isinstance(seg_kv, (jax.Array, np.ndarray)):
+        seg_kv = jax.lax.broadcast_to_rank(seg_kv, q.ndim - 2)
+      segment_ids = reference.SegmentIds(q=seg_q, kv=seg_kv)
     sinks = broadcast_to_rank(sinks, q.ndim - 2)
 
-    if isinstance(splash_mask, (jax.Array, np.ndarray)):
-      splash_mask = broadcast_to_rank(jnp.asarray(splash_mask), q.ndim - 1)
+    q_in = pallas_mosaic_tpu_vjp.fold_q_heads(q) if fold_q_seq_heads else q
 
-      def single_fwd(q, k, v, mask, segment_ids, sinks):
+    max_logit_val = None
+    if max_logit_value is not None:
+      max_logit_arr = jnp.asarray(max_logit_value, dtype=jnp.float32)
+      if (
+          fold_q_seq_heads
+          and max_logit_arr.ndim > 0
+          and max_logit_arr.shape[-1] != 1
+      ):
+        raise NotImplementedError(
+            "`fold_q_seq_heads` requires `max_logit_value` to be scalar or"
+            " broadcastable along heads."
+        )
+      max_logit_val = jnp.broadcast_to(max_logit_arr, q_in.shape[:-2])
+
+    if isinstance(splash_mask, (jax.Array, np.ndarray)):
+      splash_mask = broadcast_to_rank(jnp.asarray(splash_mask), q_in.ndim - 1)
+
+      def single_fwd(q, k, v, mask, segment_ids, sinks, max_logit_val):
         splash_maker = (
             splash_attention_kernel.make_dynamic_splash_mqa
             if is_mqa
@@ -220,11 +275,12 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
             v,
             segment_ids=segment_ids,
             sinks=sinks,
+            max_logit_value=max_logit_val,
             prng_key=prng_key,
         )
 
       splash_output = base.vmap_batch_dims(single_fwd)(
-          q, k_in, v_in, splash_mask, segment_ids, sinks
+          q_in, k_in, v_in, splash_mask, segment_ids, sinks, max_logit_val
       )
     else:
       splash_maker = (
@@ -256,26 +312,34 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
             **attn_fn.kwargs,
         )
 
-      def single_fwd_static(q, k, v, segment_ids, sinks):
+      def single_fwd_static(q, k, v, segment_ids, sinks, max_logit_val):
         return attn_fn(
             q,
             k,
             v,
             segment_ids=segment_ids,
             sinks=sinks,
+            max_logit_value=max_logit_val,
             prng_key=prng_key,
         )
 
       splash_output = base.vmap_batch_dims(single_fwd_static)(
-          q, k_in, v_in, segment_ids, sinks
+          q_in, k_in, v_in, segment_ids, sinks, max_logit_val
       )
 
     if return_residuals:
       out, stats = splash_output
-      residuals = (stats["max_logits"], stats["logsumexp"])
+      max_logits = stats["max_logits"]
+      logsumexp = stats["logsumexp"]
+      if fold_q_seq_heads:
+        max_logits = pallas_mosaic_tpu_vjp.unfold_q_residuals(max_logits)
+        logsumexp = pallas_mosaic_tpu_vjp.unfold_q_residuals(logsumexp)
+      residuals = (max_logits, logsumexp)
     else:
       out = splash_output
       residuals = None
+    if fold_q_seq_heads:
+      out = pallas_mosaic_tpu_vjp.unfold_q_heads(out)
     return out, residuals
 
   @override
@@ -331,6 +395,7 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
         and mask.is_causal
         and mask.offset == 0
         and mask.bool_mask is None
+        and mask.window_size is None
     ):
       is_causal = True
 
@@ -451,4 +516,4 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

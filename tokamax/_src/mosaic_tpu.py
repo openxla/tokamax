@@ -21,12 +21,39 @@ from typing import Any, Callable, Sequence
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
+from jax.extend import backend
 import jax.numpy as jnp
 import qwix
+from tokamax._src import config as config_lib
+from tokamax._src.ops import op as op_lib
 
 QArray = qwix.QArray
 
 LANES = 128
+
+
+def has_mosaic_tpu_support(
+    device: jax.Device | jax.sharding.AbstractDevice | None = None,
+    *,
+    min_generation: int = 5,
+) -> bool:
+  """Returns whether Pallas Mosaic TPU is supported on `device`."""
+  if config_lib.cross_compile.value:
+    return True
+  if device is None:
+    abstract_device = jax.sharding.get_abstract_mesh().abstract_device
+    device = (
+        abstract_device
+        if abstract_device is not None
+        else backend.get_default_device()
+    )
+  if device.platform != "tpu":
+    return False
+  try:
+    with op_lib.abstract_device_context((device,)):
+      return pltpu.get_tpu_info().generation >= min_generation
+  except ValueError:
+    return False
 
 
 @functools.lru_cache

@@ -813,6 +813,9 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask | None,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -831,6 +834,8 @@ class TritonFlashAttentionVjp(base.DotProductAttentionVjp[Config, None]):
 
     if paging_info is not None:
       raise NotImplementedError("Paged attention not supported.")
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
 
     mask_, is_causal, q_start, q_end, k_start, k_end = _decompose_mask(
         mask, q, k, q_indices, k_indices

@@ -34,8 +34,9 @@ except ImportError:
 
 try:
   from tokamax._src.ops.attention import pallas_mosaic_tpu_vjp  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+  from tokamax.ops import tpu as tpu_ops  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
 except ImportError:
-  pass
+  tpu_ops = None
 
 
 class TokamaxTest(absltest.TestCase):
@@ -133,6 +134,25 @@ class TokamaxTest(absltest.TestCase):
   def test_version(self):
     self.assertEqual(tokamax.__version__, version.TOKAMAX_VERSION)
     self.assertEqual(tokamax.__version_info__, version.TOKAMAX_VERSION_INFO)
+
+  def test_tpu_attention_exports(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("TPU exports only linked on TPU.")
+    assert tpu_ops is not None
+    for name in (
+        "FlashAttention",
+        "FlashAttentionConfig",
+        "FlashAttentionVjp",
+        "FlashAttentionVjpConfig",
+        "QKVLayout",
+        "SplashAttention",
+        "SplashAttentionConfig",
+        "SplashAttentionVjp",
+        "SplashAttentionVjpConfig",
+    ):
+      self.assertTrue(hasattr(tpu_ops, name), name)
+    self.assertEqual(tpu_ops.QKVLayout.SEQ_MINOR.name, "SEQ_MINOR")
+    self.assertEqual(tpu_ops.QKVLayout.HEAD_DIM_MINOR.name, "HEAD_DIM_MINOR")
 
 
 if __name__ == "__main__":

@@ -212,14 +212,15 @@ class _HashableNDArray:
 def _q_block_stats(
     q_sequence: np.ndarray, q_blocks_count: int, q_block_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-  """Computes per-block min, max, and step-1 contiguity for `q_sequence`."""
+  """Computes per-block min, max, and unit-step monotonicity for `q_sequence`."""
   q_seq = np.asarray(q_sequence).reshape(q_blocks_count, q_block_size)
   q_min = q_seq.min(axis=1).astype(np.int64)
   q_max = q_seq.max(axis=1).astype(np.int64)
   if q_block_size == 1:
     q_contig = np.ones(q_blocks_count, dtype=np.bool_)
   else:
-    q_contig = (q_seq[:, 1:] == q_seq[:, :-1] + 1).all(axis=1)
+    diff = q_seq[:, 1:] - q_seq[:, :-1]
+    q_contig = ((diff >= 0) & (diff <= 1)).all(axis=1)
   return q_min, q_max, q_contig
 
 
@@ -229,15 +230,31 @@ def _classify_mask_blocks(
     kv_blocks_count: int,
     q_block_size: int,
     kv_block_size: int,
+    q_sequence: np.ndarray | None = None,
 ) -> np.ndarray:
   """Classifies mask blocks as 0 (empty), 1 (partial), 2 (full), or -1."""
   # pylint: disable=unidiomatic-typecheck
   blocked_shape = (q_blocks_count, kv_blocks_count)
 
+  if type(mask) is mask_lib._StackedGQAMask:  # pylint: disable=protected-access
+    seq = mask.q_sequence if q_sequence is None else q_sequence
+    return _classify_mask_blocks(
+        mask.base_mask,
+        q_blocks_count,
+        kv_blocks_count,
+        q_block_size,
+        kv_block_size,
+        q_sequence=seq,
+    )
+
   if type(mask) is mask_lib.FullMask:
     return np.full(blocked_shape, 2, dtype=np.int32)
 
-  if type(mask) is mask_lib.NumpyMask and mask.array.flags['C_CONTIGUOUS']:
+  if (
+      q_sequence is None
+      and type(mask) is mask_lib.NumpyMask
+      and mask.array.flags['C_CONTIGUOUS']
+  ):
     blocks = mask.array.reshape(
         q_blocks_count, q_block_size, kv_blocks_count, kv_block_size
     ).swapaxes(1, 2)
@@ -247,7 +264,12 @@ def _classify_mask_blocks(
 
   if type(mask) is mask_lib.LogicalOr:
     left = _classify_mask_blocks(
-        mask.left, q_blocks_count, kv_blocks_count, q_block_size, kv_block_size
+        mask.left,
+        q_blocks_count,
+        kv_blocks_count,
+        q_block_size,
+        kv_block_size,
+        q_sequence=q_sequence,
     )
     right = _classify_mask_blocks(
         mask.right,
@@ -255,6 +277,7 @@ def _classify_mask_blocks(
         kv_blocks_count,
         q_block_size,
         kv_block_size,
+        q_sequence=q_sequence,
     )
     grid = np.full(blocked_shape, -1, dtype=np.int32)
     grid[(left == 0) & (right == 0)] = 0
@@ -264,7 +287,12 @@ def _classify_mask_blocks(
 
   if type(mask) is mask_lib.LogicalAnd:
     left = _classify_mask_blocks(
-        mask.left, q_blocks_count, kv_blocks_count, q_block_size, kv_block_size
+        mask.left,
+        q_blocks_count,
+        kv_blocks_count,
+        q_block_size,
+        kv_block_size,
+        q_sequence=q_sequence,
     )
     right = _classify_mask_blocks(
         mask.right,
@@ -272,6 +300,7 @@ def _classify_mask_blocks(
         kv_blocks_count,
         q_block_size,
         kv_block_size,
+        q_sequence=q_sequence,
     )
     grid = np.full(blocked_shape, -1, dtype=np.int32)
     grid[(left == 0) | (right == 0)] = 0
@@ -283,9 +312,8 @@ def _classify_mask_blocks(
   kv_max = kv_min + (kv_block_size - 1)
 
   if type(mask) is mask_lib.CausalMask:
-    q_min, q_max, _ = _q_block_stats(
-        mask.q_sequence, q_blocks_count, q_block_size
-    )
+    seq = mask.q_sequence if q_sequence is None else q_sequence
+    q_min, q_max, _ = _q_block_stats(seq, q_blocks_count, q_block_size)
     offset = int(mask.offset)
     grid = np.ones(blocked_shape, dtype=np.int32)
     grid[(q_max + offset)[:, None] < kv_min[None, :]] = 0
@@ -299,9 +327,8 @@ def _classify_mask_blocks(
     if left_w is not None and right_w is not None and left_w + right_w < 0:
       return np.zeros(blocked_shape, dtype=np.int32)
 
-    q_min, q_max, q_contig = _q_block_stats(
-        mask.q_sequence, q_blocks_count, q_block_size
-    )
+    seq = mask.q_sequence if q_sequence is None else q_sequence
+    q_min, q_max, q_contig = _q_block_stats(seq, q_blocks_count, q_block_size)
     offset = int(mask.offset)
 
     if left_w is None:
@@ -329,9 +356,8 @@ def _classify_mask_blocks(
     return grid
 
   if type(mask) is mask_lib.ChunkedCausalMask:
-    q_min, q_max, q_contig = _q_block_stats(
-        mask.q_sequence, q_blocks_count, q_block_size
-    )
+    seq = mask.q_sequence if q_sequence is None else q_sequence
+    q_min, q_max, q_contig = _q_block_stats(seq, q_blocks_count, q_block_size)
     chunk_size = int(mask.chunk_size)
     q_chunk_min = q_min // chunk_size
     q_chunk_max = q_max // chunk_size
@@ -687,15 +713,18 @@ def _process_mask(
 
   full_mask = (state_grid == 2).all()
   if full_mask:
-    return MaskInfo(
-        mask_next=None,
-        active_rows=None,
-        active_cols=None,
-        block_mask=None,
-        num_active_blocks=None,
-        partial_mask_blocks=None,
-        q_sequence=q_sequence,
-    ), None
+    return (
+        MaskInfo(
+            mask_next=None,
+            active_rows=None,
+            active_cols=None,
+            block_mask=None,
+            num_active_blocks=None,
+            partial_mask_blocks=None,
+            q_sequence=None,
+        ),
+        None,
+    )
 
   need_mask_next = mask_function is None and partial_mask_blocks is not None
 

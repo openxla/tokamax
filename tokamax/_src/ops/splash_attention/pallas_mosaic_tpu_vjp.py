@@ -14,24 +14,131 @@
 # ==============================================================================
 """Pallas/Mosaic kernel wrapper for Splash Attention VJP."""
 
+from collections.abc import Callable, Mapping
 import dataclasses
 import itertools
-from typing import Annotated, ClassVar, Final, override
+from typing import Annotated, Any, ClassVar, Final, override
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
-from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import splash_attention_kernel
 from tokamax._src.ops.splash_attention import splash_attention_mask as mask_lib
+from tokamax._src.ops.splash_attention import splash_attention_mask_info as mask_info_lib
 
 NUM_LANES: Final[int] = 128
 LOG2E = splash_attention_kernel.LOG2E
+QKVLayout = splash_attention_kernel.QKVLayout
+_MISSING = object()
+
+
+class _FilteredAutotuningCache[_ConfigT](
+    dict[Any, op.AutotuningData[_ConfigT]]
+):
+  """Dict view of an autotuning cache filtering entries by a config predicate."""
+
+  def __init__(
+      self,
+      raw_cache: dict[Any, op.AutotuningData[_ConfigT]],
+      predicate: Callable[[_ConfigT], bool],
+  ):
+    filtered_items = []
+    for k, data in raw_cache.items():
+      matching = op.AutotuningData(
+          {cfg: ev for cfg, ev in data.items() if predicate(cfg)}
+      )
+      if matching:
+        filtered_items.append((k, matching))
+    super().__init__(filtered_items)
+    self._raw = raw_cache
+    self._predicate = predicate
+
+  def _update_raw_entry(
+      self, key: Any, matching: Mapping[_ConfigT, Any]
+  ) -> None:
+    """Merges `matching` entries into `self._raw` without clobbering others."""
+    if key in self._raw:
+      preserved = {
+          cfg: ev
+          for cfg, ev in self._raw[key].items()
+          if not self._predicate(cfg)
+      }
+    else:
+      preserved = {}
+    merged = {**preserved, **matching}
+    if merged:
+      self._raw[key] = op.AutotuningData(merged)
+    elif key in self._raw:
+      del self._raw[key]
+
+  @override
+  def __setitem__(self, key: Any, value: op.AutotuningData[_ConfigT]) -> None:
+    matching_dict = {
+        cfg: ev for cfg, ev in value.items() if self._predicate(cfg)
+    }
+    self._update_raw_entry(key, matching_dict)
+    if matching_dict:
+      super().__setitem__(key, op.AutotuningData(matching_dict))
+    elif key in self:
+      super().__delitem__(key)
+
+  @override
+  def __delitem__(self, key: Any) -> None:
+    super().__delitem__(key)
+    self._update_raw_entry(key, {})
+
+  @override
+  def pop(self, key: Any, default: Any = _MISSING) -> Any:
+    if key in self:
+      val = super().pop(key)
+      self._update_raw_entry(key, {})
+      return val
+    if default is _MISSING:
+      raise KeyError(key)
+    return default
+
+  @override
+  def setdefault(
+      self, key: Any, default: op.AutotuningData[_ConfigT] | None = None
+  ) -> Any:
+    if key in self:
+      return self[key]
+    if default is None:
+      return None
+    self[key] = default
+    if key in self:
+      return self[key]
+    return default
+
+  @override
+  def update(self, other: Any = (), /, **kwargs: Any) -> None:
+    items = other.items() if isinstance(other, Mapping) else other
+    for k, v in items:
+      self[k] = v
+    for k, v in kwargs.items():
+      self[k] = v
+
+  @override
+  def clear(self) -> None:
+    for k in list(self):
+      del self[k]
+
+  def __ior__(self, other: Any):
+    self.update(other)
+    return self
+
+
+def filter_autotuning_cache[_ConfigT](
+    raw_cache: dict[Any, op.AutotuningData[_ConfigT]],
+    predicate: Callable[[_ConfigT], bool],
+) -> dict[Any, op.AutotuningData[_ConfigT]]:
+  """Returns a view of `raw_cache` keeping only configs matching `predicate`."""
+  return _FilteredAutotuningCache(raw_cache, predicate)
 
 
 def slice_mask_info(
@@ -62,6 +169,125 @@ def slice_mask_info(
   )
 
 
+def fold_q_heads(x: jax.Array) -> jax.Array:
+  """Folds head pairs `(*B, H, T, D) -> (*B, H // 2, 2 * T, D)`."""
+  *batch, heads, seq_len, dim = x.shape
+  return (
+      x.reshape(*batch, heads // 2, 2, seq_len, dim)
+      .swapaxes(-3, -2)
+      .reshape(*batch, heads // 2, seq_len * 2, dim)
+  )
+
+
+def unfold_q_heads(x: jax.Array) -> jax.Array:
+  """Unfolds head pairs `(*B, H // 2, 2 * T, D) -> (*B, H, T, D)`."""
+  *batch, half_heads, folded_seq, dim = x.shape
+  return (
+      x.reshape(*batch, half_heads, folded_seq // 2, 2, dim)
+      .swapaxes(-3, -2)
+      .reshape(*batch, half_heads * 2, folded_seq // 2, dim)
+  )
+
+
+def fold_q_residuals(x: jax.Array) -> jax.Array:
+  """Folds residual pairs `(*B, H, T) -> (*B, H // 2, 2 * T)`."""
+  *batch, heads, seq_len = x.shape
+  return (
+      x.reshape(*batch, heads // 2, 2, seq_len)
+      .swapaxes(-2, -1)
+      .reshape(*batch, heads // 2, seq_len * 2)
+  )
+
+
+def unfold_q_residuals(x: jax.Array) -> jax.Array:
+  """Unfolds residual pairs `(*B, H // 2, 2 * T) -> (*B, H, T)`."""
+  *batch, half_heads, folded_seq = x.shape
+  return (
+      x.reshape(*batch, half_heads, folded_seq // 2, 2)
+      .swapaxes(-2, -1)
+      .reshape(*batch, half_heads * 2, folded_seq // 2)
+  )
+
+
+def check_fold_q_seq_heads(
+    num_q_heads: int,
+    num_kv_heads: int,
+    is_mqa: bool,
+    *,
+    sinks: jax.Array | None = None,
+    dropout_rate: float = 0.0,
+) -> None:
+  """Validates `fold_q_seq_heads=True` preconditions for TPU Splash kernels."""
+  if is_mqa:
+    if num_q_heads % 2 != 0:
+      raise NotImplementedError(
+          "`fold_q_seq_heads` requires an even number of query heads for MQA."
+      )
+  elif num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+    raise ValueError(
+        f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads"
+        f" ({num_kv_heads})."
+    )
+  elif (num_q_heads // num_kv_heads) % 2 != 0:
+    raise NotImplementedError(
+        "`fold_q_seq_heads` requires `(num_q_heads // num_kv_heads)` to be"
+        " even."
+    )
+  if sinks is not None:
+    raise NotImplementedError("`fold_q_seq_heads` does not support `sinks`.")
+  if dropout_rate != 0.0:
+    raise NotImplementedError("`fold_q_seq_heads` does not support dropout.")
+
+
+def build_splash_mask(
+    mask: base.Mask | mask_lib.Mask,
+    q_seq_len: int,
+    kv_seq_len: int,
+    q_seq_shards: int,
+    *,
+    fold_q_seq_heads: bool = False,
+):
+  """Builds a kernel mask object or boolean array from `mask`."""
+  mask_shape = (q_seq_len * q_seq_shards, kv_seq_len)
+  if isinstance(mask, mask_lib.Mask):
+    splash_mask = mask
+  elif isinstance(mask, base.Mask):
+    if mask.bool_mask is not None and (
+        mask.is_causal or mask.window_size is not None
+    ):
+      splash_mask = mask.as_array(q_seq_len, kv_seq_len)
+    elif mask.bool_mask is not None:
+      splash_mask = mask.bool_mask
+    elif mask.window_size is not None:
+      left, right = mask.window_size
+      if mask.is_causal:
+        right = 0 if right is None else min(right, 0)
+      splash_mask = mask_lib.LocalMask(
+          shape=mask_shape,
+          window_size=(left, right),
+          offset=mask.offset,
+          shard_count=q_seq_shards,
+      )
+    elif mask.is_causal:
+      splash_mask = mask_lib.CausalMask(
+          shape=mask_shape, offset=mask.offset, shard_count=q_seq_shards
+      )
+    else:
+      splash_mask = mask_lib.FullMask(mask_shape)
+  else:
+    splash_mask = mask
+
+  if fold_q_seq_heads:
+    if isinstance(splash_mask, (jax.Array, np.ndarray)):
+      raise NotImplementedError(
+          "`fold_q_seq_heads` does not support boolean array masks."
+      )
+    splash_mask = mask_lib.make_stacked_gqa_mask(
+        splash_mask, shard_count=q_seq_shards
+    )
+  return splash_mask
+
+
 @pydantic.dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Config:
   """Configuration for Splash Attention Pallas TPU VJP kernel."""
@@ -77,13 +303,21 @@ class Config:
   dropout_block_kv: (
       Annotated[int, pydantic.Field(multiple_of=NUM_LANES, gt=0)] | None
   ) = None
+  q_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  v_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
   use_base2_exp: bool = True
+  fold_q_seq_heads: bool = False
   dq_reduction_steps: int | None = None
   qk_diag_skip: bool = False
   qk_diag_grid: int = 2
   diag_band_skip: bool = False
 
   def __post_init__(self):
+    if self.fold_q_seq_heads and (self.qk_diag_skip or self.diag_band_skip):
+      raise ValueError(
+          "Diagonal skip options are incompatible with `fold_q_seq_heads=True`."
+      )
     if self.block_kv_dkv % self.block_kv_dkv_compute:
       block_kv_dkv = self.block_kv_dkv
       block_kv_dkv_compute = self.block_kv_dkv_compute
@@ -143,6 +377,12 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
 
   config_cls: ClassVar[type[Config]] = Config
   supports_symbolic_shapes: ClassVar[bool] = False
+  supports_analytic_local_mask: ClassVar[bool] = True
+  q_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  v_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
+  use_base2_exp: bool = True
+  fold_q_seq_heads: bool = False
 
   @jaxtyping.jaxtyped
   @override
@@ -161,13 +401,29 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       is_mqa: bool = False,
       mask_value: float = base.DEFAULT_MASK_VALUE,
       attn_logits_soft_cap: float | None = None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       dropout_rate: float = 0.0,
       prng_key: jax.Array | None = None,
       return_residuals: bool = False,
       config: Config,
   ) -> tuple[base.SplashAttentionGrads, None]:
+    del max_logit_value
     if return_residuals:
       raise NotImplementedError("`return_residuals` not supported.")
+
+    config_dict = dataclasses.asdict(config)
+    fold_q_seq_heads = config_dict.pop("fold_q_seq_heads")
+    num_kv_heads = 1 if is_mqa else k.shape[-3]
+    if fold_q_seq_heads:
+      check_fold_q_seq_heads(
+          q.shape[-3],
+          num_kv_heads,
+          is_mqa,
+          sinks=sinks,
+          dropout_rate=dropout_rate,
+      )
 
     _, lse = residuals
     if config.use_base2_exp:
@@ -178,23 +434,13 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     )
     q_seq_len = q.shape[-2]
     kv_seq_len = k.shape[-2]
-    mask_shape = (q_seq_len * q_seq_shards, kv_seq_len)
-
-    if isinstance(mask, mask_lib.Mask):
-      splash_mask = mask
-    elif isinstance(mask, base.Mask):
-      if mask.bool_mask is not None and mask.is_causal:
-        splash_mask = mask.as_array(q_seq_len, kv_seq_len)
-      elif mask.bool_mask is not None:
-        splash_mask = mask.bool_mask
-      elif mask.is_causal:
-        splash_mask = mask_lib.CausalMask(
-            shape=mask_shape, offset=mask.offset, shard_count=q_seq_shards
-        )
-      else:
-        splash_mask = mask_lib.FullMask(mask_shape)
-    else:
-      splash_mask = mask
+    splash_mask = build_splash_mask(
+        mask,
+        q_seq_len,
+        kv_seq_len,
+        q_seq_shards,
+        fold_q_seq_heads=fold_q_seq_heads,
+    )
 
     if is_mqa and k.ndim == q.ndim:
       k_in = jnp.squeeze(k, axis=-3)
@@ -210,7 +456,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         block_q=config.block_q_dkv,
         block_kv=config.block_kv_dkv,
         block_kv_compute=config.block_kv_dkv_compute,
-        **dataclasses.asdict(config),
+        **config_dict,
     )
 
     orig_sinks_shape = None if sinks is None else sinks.shape
@@ -221,15 +467,26 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     )
 
     if segment_ids is not None:
-      segment_ids = base.SegmentIds(
-          q=jax.lax.broadcast_to_rank(segment_ids.q, q.ndim - 2)
-          if isinstance(segment_ids.q, (jax.Array, np.ndarray))
-          else segment_ids.q,
-          kv=jax.lax.broadcast_to_rank(segment_ids.kv, q.ndim - 2)
-          if isinstance(segment_ids.kv, (jax.Array, np.ndarray))
-          else segment_ids.kv,
-      )
+      seg_q = segment_ids.q
+      if isinstance(seg_q, (jax.Array, np.ndarray)):
+        seg_q = jax.lax.broadcast_to_rank(seg_q, q.ndim - 2)
+        if fold_q_seq_heads:
+          seg_q = jnp.repeat(seg_q, 2, axis=-1)
+      seg_kv = segment_ids.kv
+      if isinstance(seg_kv, (jax.Array, np.ndarray)):
+        seg_kv = jax.lax.broadcast_to_rank(seg_kv, q.ndim - 2)
+      segment_ids = base.SegmentIds(q=seg_q, kv=seg_kv)
     sinks_bcast = broadcast_to_rank(sinks, q.ndim - 2)
+
+    if fold_q_seq_heads:
+      q_in = fold_q_heads(q)
+      out_in = fold_q_heads(out)
+      dout_in = fold_q_heads(dout)
+      lse = fold_q_residuals(lse)
+    else:
+      q_in = q
+      out_in = out
+      dout_in = dout
 
     if isinstance(splash_mask, (jax.Array, np.ndarray)):
       splash_mask = broadcast_to_rank(jnp.asarray(splash_mask), q.ndim - 1)
@@ -273,7 +530,15 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         return dq, dk, dv, dsinks
 
       dq, dk, dv, dsinks = base.vmap_batch_dims(single_bwd_dynamic)(
-          dout, q, k_in, v_in, out, lse, splash_mask, segment_ids, sinks_bcast
+          dout_in,
+          q_in,
+          k_in,
+          v_in,
+          out_in,
+          lse,
+          splash_mask,
+          segment_ids,
+          sinks_bcast,
       )
     else:
       splash_maker = (
@@ -287,11 +552,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
           mask_value=mask_value,
           q_seq_shards=q_seq_shards,
       )
-      dkv_mask_info = (
-          slice_mask_info(attn_fn.dkv_mask_info, q_shard_idx, q_seq_shards)
-          if attn_fn.dkv_mask_info is not None
-          else None
-      )
+      dkv_mask_info = None
+      if attn_fn.dkv_mask_info is not None:
+        dkv_mask_info = slice_mask_info(
+            attn_fn.dkv_mask_info, q_shard_idx, q_seq_shards
+        )
 
       def single_bwd_static(dout, q, k, v, out, lse, segment_ids, sinks):
         res = (
@@ -322,8 +587,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         return dq, dk, dv, dsinks
 
       dq, dk, dv, dsinks = base.vmap_batch_dims(single_bwd_static)(
-          dout, q, k_in, v_in, out, lse, segment_ids, sinks_bcast
+          dout_in, q_in, k_in, v_in, out_in, lse, segment_ids, sinks_bcast
       )
+
+    if fold_q_seq_heads:
+      dq = unfold_q_heads(dq)
 
     if is_mqa and k.ndim == q.ndim:
       dk = jnp.expand_dims(dk, axis=-3)
@@ -349,7 +617,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     k = ba.arguments["k"]
     is_mqa = ba.arguments.get("is_mqa", False)
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[-2]
+    q_seq_len = q.shape[-2] * 2 if self.fold_q_seq_heads else q.shape[-2]
     kv_seq_len = k.shape[-2]
 
     # Use larger block sizes for longer sequences if possible
@@ -379,7 +647,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
         block_kv_dkv_compute=block_kv_dkv_compute,
         dropout_block_q=dropout_block_q,
         dropout_block_kv=dropout_block_kv,
-        use_base2_exp=True,
+        q_layout=self.q_layout,
+        k_layout=self.k_layout,
+        v_layout=self.v_layout,
+        use_base2_exp=self.use_base2_exp,
+        fold_q_seq_heads=self.fold_q_seq_heads,
         dq_reduction_steps=dq_reduction_steps,
     )
 
@@ -390,19 +662,21 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
     is_mqa = ba.arguments.get("is_mqa", False)
     mask = ba.arguments.get("mask")
     dropout_rate = ba.arguments.get("dropout_rate", 0.0)
-    q_seq_len = q.shape[-2]
+    q_seq_len = q.shape[-2] * 2 if self.fold_q_seq_heads else q.shape[-2]
     kv_seq_len = k.shape[-2]
 
     is_causal = False
-    if isinstance(mask, mask_lib.CausalMask) and mask.offset == 0:
-      is_causal = True
-    elif (
-        isinstance(mask, base.Mask)
-        and mask.is_causal
-        and mask.offset == 0
-        and mask.bool_mask is None
-    ):
-      is_causal = True
+    if not self.fold_q_seq_heads:
+      if isinstance(mask, mask_lib.CausalMask) and mask.offset == 0:
+        is_causal = True
+      elif (
+          isinstance(mask, base.Mask)
+          and mask.is_causal
+          and mask.window_size is None
+          and mask.offset == 0
+          and mask.bool_mask is None
+      ):
+        is_causal = True
 
     tiles = [128, 256, 512, 1024, 2048]
     # TODO: Unify forward and VJP autotuning so that they use the
@@ -462,6 +736,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                 block_kv_dkv_compute=bkv_c,
                 dropout_block_q=dbq,
                 dropout_block_kv=dbkv,
+                q_layout=self.q_layout,
+                k_layout=self.k_layout,
+                v_layout=self.v_layout,
+                use_base2_exp=self.use_base2_exp,
+                fold_q_seq_heads=self.fold_q_seq_heads,
                 dq_reduction_steps=dq_reduction_steps,
             )
         )
@@ -479,6 +758,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
+                    fold_q_seq_heads=self.fold_q_seq_heads,
                     dq_reduction_steps=dq_reduction_steps,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -495,6 +779,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
+                    fold_q_seq_heads=self.fold_q_seq_heads,
                     dq_reduction_steps=dq_reduction_steps,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -512,6 +801,11 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
                     block_kv_dkv_compute=bkv_c,
                     dropout_block_q=dbq,
                     dropout_block_kv=dbkv,
+                    q_layout=self.q_layout,
+                    k_layout=self.k_layout,
+                    v_layout=self.v_layout,
+                    use_base2_exp=self.use_base2_exp,
+                    fold_q_seq_heads=self.fold_q_seq_heads,
                     dq_reduction_steps=1,
                     qk_diag_skip=True,
                     qk_diag_grid=qk_grid_size,
@@ -522,6 +816,24 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
       configs.add(self._get_heuristics_config(ba))
     return configs
 
+  def _matches_config(self, cfg: Config) -> bool:
+    return (
+        cfg.q_layout == self.q_layout
+        and cfg.k_layout == self.k_layout
+        and cfg.v_layout == self.v_layout
+        and cfg.use_base2_exp == self.use_base2_exp
+        and cfg.fold_q_seq_heads == self.fold_q_seq_heads
+    )
+
+  @override
+  def get_autotuning_cache(
+      self, device_kind: op.DeviceKind | None = None
+  ) -> dict[Any, op.AutotuningData[Config]]:
+    return filter_autotuning_cache(
+        base.SplashAttentionVjp.get_autotuning_cache(self, device_kind),
+        self._matches_config,
+    )
+
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)

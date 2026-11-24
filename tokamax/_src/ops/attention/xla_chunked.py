@@ -371,6 +371,9 @@ class XlaChunkedDotProductAttention(
       logits_scale: float,
       bias: Float[Array, "*#B #H #T #t"] | None,
       logits_soft_cap: float | None,
+      max_logit_value: (
+          float | Float[Array, ""] | Float[Array, "*#B #H"] | None
+      ) = None,
       mask: Mask,
       dropout_mask: Bool[Array, "*#B #H #T #t"] | None,
       dropout_rate: float,
@@ -383,6 +386,8 @@ class XlaChunkedDotProductAttention(
   ) -> tuple[Float[Array, "*B T H d"], None]:
     if return_residuals:
       raise NotImplementedError("`return_residuals=True` not supported.")
+    if max_logit_value is not None:
+      raise NotImplementedError("`max_logit_value` is not supported.")
 
     q, k, v = map(quantization.as_array, (q, k, v))
     if k.shape[-2] not in (1, q.shape[-2]):

@@ -17,6 +17,8 @@
 # pylint: disable=g-importing-member,useless-import-alias
 from tokamax._src.ops.attention.pallas_mosaic_tpu import Config as FlashAttentionConfig
 from tokamax._src.ops.attention.pallas_mosaic_tpu import PallasMosaicTpuFlashAttention as FlashAttention
+from tokamax._src.ops.attention.pallas_mosaic_tpu_vjp import Config as FlashAttentionVjpConfig
+from tokamax._src.ops.attention.pallas_mosaic_tpu_vjp import PallasMosaicTpuFlashAttentionVjp as FlashAttentionVjp
 from tokamax._src.ops.batched_rpa.pallas_mosaic_tpu import Config as BatchedRpaConfig
 from tokamax._src.ops.batched_rpa.pallas_mosaic_tpu import PallasTpuBatchedRpa as BatchedRpa
 from tokamax._src.ops.causal_conv1d_gated_delta_rule.pallas_mosaic_tpu import Config as CausalConv1dGatedDeltaRuleConfig
@@ -58,6 +60,9 @@ from tokamax._src.ops.sparse_mla.pallas_mosaic_tpu import Config as SparseMlaCon
 from tokamax._src.ops.sparse_mla.pallas_mosaic_tpu import PallasTpuSparseMla as SparseMla
 from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import Config as SplashAttentionConfig
 from tokamax._src.ops.splash_attention.pallas_mosaic_tpu import PallasMosaicTpuSplashAttention as SplashAttention
+from tokamax._src.ops.splash_attention.pallas_mosaic_tpu_vjp import Config as SplashAttentionVjpConfig
+from tokamax._src.ops.splash_attention.pallas_mosaic_tpu_vjp import PallasMosaicTpuSplashAttentionVjp as SplashAttentionVjp
+from tokamax._src.ops.splash_attention.splash_attention_kernel import QKVLayout
 from tokamax._src.ops.topk.pallas_mosaic_tpu import Config as TopKConfig
 from tokamax._src.ops.topk.pallas_mosaic_tpu import PallasTpuTopK as TopK
 from tokamax._src.ops.triangle_multiplication.pallas_mosaic_tpu import Config as TriangleMultiplicationConfig
@@ -78,6 +83,8 @@ __all__ = (
     "Dsv4CompressorConfig",
     "FlashAttention",
     "FlashAttentionConfig",
+    "FlashAttentionVjp",
+    "FlashAttentionVjpConfig",
     "GatedDeltaNet",
     "GatedDeltaNetConfig",
     "GroupedLowrankProj",
@@ -96,6 +103,7 @@ __all__ = (
     "MhcPre",
     "ProjAndSaveState",
     "ProjAndSaveStateConfig",
+    "QKVLayout",
     "RaggedDot",
     "RaggedDotConfig",
     "RaggedGather",
@@ -107,6 +115,8 @@ __all__ = (
     "SparseMlaConfig",
     "SplashAttention",
     "SplashAttentionConfig",
+    "SplashAttentionVjp",
+    "SplashAttentionVjpConfig",
     "TopK",
     "TopKConfig",
     "TriangleMultiplication",

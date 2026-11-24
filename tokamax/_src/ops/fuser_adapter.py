@@ -188,6 +188,10 @@ def call_fusible_op[_T, _C](
     op_instance: _FusibleOp[_T, _C],
     bound_args: _BoundArgs[_C],
     return_residuals: bool = False,
+    *,
+    device_ctx: Callable[
+        [], contextlib.AbstractContextManager[Any]
+    ] = contextlib.nullcontext,
 ) -> _T:
   """Executes `op_instance` as a `@fuser.fusible` primitive.
 
@@ -195,6 +199,8 @@ def call_fusible_op[_T, _C](
     op_instance: The Tokamax `Op` instance invoked inside `@op_fusion.fuse`.
     bound_args: `BoundArguments` capturing the op's positional/keyword inputs.
     return_residuals: Whether residuals were requested by the caller.
+    device_ctx: Optional context manager factory entered during config lookup
+      and deferred `_fusible_fwd` lowering.
 
   Returns:
     The result of tracing `op_instance._fusible_fwd` through `fuser.fusible`.
@@ -207,7 +213,7 @@ def call_fusible_op[_T, _C](
         "`return_residuals=True` is not supported in fusible mode."
     )
 
-  with _IN_OP_FUSION_CONTEXT(False):
+  with _IN_OP_FUSION_CONTEXT(False), device_ctx():
     config = bound_args.default_config
   args, kwargs = _unwrap_jax_array_wrappers(
       (bound_args.args, bound_args.kwargs)
@@ -217,7 +223,7 @@ def call_fusible_op[_T, _C](
 
   def raw_fusible_call(*in_fusions_and_out_fusions: Any) -> _T:
     *in_fusions, out_fusions = in_fusions_and_out_fusions
-    with _IN_OP_FUSION_CONTEXT(False):
+    with _IN_OP_FUSION_CONTEXT(False), device_ctx():
       f_args, f_kwargs = args_tree.unflatten(merge(in_fusions, other))
       if op_instance.fusible_argnames is not None:
         # Evaluate non-fusible inputs (e.g. `group_sizes`) outside the kernel
