@@ -27,6 +27,7 @@ TensorCore VREGs using:
      fewer than 8 query rows are active (`B in {1, 2, 4}` decode).
 """
 
+from collections.abc import Callable, Sequence
 import functools
 import itertools
 import math
@@ -79,11 +80,11 @@ def topk_capacity(k: int) -> tuple[int, int]:
 
 
 def sublane_partition_count(bq_total: int, bkv_sz: int) -> int:
-  """Number of sublanes cooperating per query row (`1, 2, 4, or 8`)."""
-  if bq_total >= 5:
+  """Number of sublanes cooperating per query row (`1, 2, or 8`)."""
+  if bq_total >= 5 or (bq_total >= 2 and bkv_sz <= 2048):
     return 1
   bq_pow2 = next_power_of_2(max(1, bq_total))
-  max_parts = max(1, 8 // bq_pow2)
+  max_parts = 8 if bq_pow2 == 1 else 2
   num_tiles = max(1, bkv_sz // 128)
   return math.gcd(max_parts, num_tiles)
 
@@ -178,26 +179,27 @@ def better_pair(
 
 
 def _compare_swap_lane_stage(
-    ord_b: list[jax.Array],
-    idx_b: list[jax.Array],
+    ord_b: Sequence[jax.Array],
+    idx_b: Sequence[jax.Array],
     *,
     d: int,
-    stage_log: int | None,
+    lane_stage_log: int | None,
     descending: bool,
+    split_dir: bool = False,
 ) -> tuple[list[jax.Array], list[jax.Array]]:
   """Executes one intra-VREG (`d < 128`) bitonic stage across all `R` blocks."""
   num_blocks = len(ord_b)
+  half = num_blocks // 2
   lanes = _lanes_2d()
   partner_idx = lax.bitwise_xor(lanes, jnp.int32(d))
   is_upper = lax.bitwise_and(lanes, jnp.int32(d)) != 0
 
-  shared_want_max: jax.Array | None = None
-  if stage_log is None:
+  if lane_stage_log is None:
     shared_want_max = ~is_upper if descending else is_upper
-  elif stage_log < 7:
+  else:
     parity = (
         lax.bitwise_and(
-            lax.shift_right_arithmetic(lanes, jnp.int32(stage_log)),
+            lax.shift_right_arithmetic(lanes, jnp.int32(lane_stage_log)),
             jnp.int32(1),
         )
         == 0
@@ -208,14 +210,9 @@ def _compare_swap_lane_stage(
   new_ord: list[jax.Array] = []
   new_idx: list[jax.Array] = []
   for r in range(num_blocks):
-    if shared_want_max is not None:
-      want_max = shared_want_max
-    else:
-      assert stage_log is not None
-      blk_parity = (((r * 128) >> stage_log) & 1) == 0
-      dir_desc = blk_parity if descending else (not blk_parity)
-      want_max = ~is_upper if dir_desc else is_upper
-
+    want_max = (
+        ~shared_want_max if (split_dir and r >= half) else shared_want_max
+    )
     o_self, i_self = ord_b[r], idx_b[r]
     o_part = _gather_lanes(o_self, partner_idx)
     i_part = _gather_lanes(i_self, partner_idx)
@@ -233,38 +230,142 @@ def _compare_swap_lane_stage(
 
 
 def _compare_swap_block_stage(
-    ord_b: list[jax.Array],
-    idx_b: list[jax.Array],
+    ord_b: Sequence[jax.Array],
+    idx_b: Sequence[jax.Array],
     *,
     r_step: int,
     stage_log: int | None,
+    log_b: int,
     descending: bool,
+    split_dir: bool = False,
 ) -> tuple[list[jax.Array], list[jax.Array]]:
-  """Executes one inter-VREG (`d = 128 * r_step`) stage with zero permutes."""
+  """Executes one inter-VREG block stage (`r_step < R`) with zero permutes."""
   num_blocks = len(ord_b)
+  half = num_blocks // 2
   new_ord = list(ord_b)
   new_idx = list(idx_b)
+  dir_desc_v: jax.Array | None = None
+  if stage_log is not None and stage_log >= log_b:
+    lanes = _lanes_2d()
+    parity = (
+        lax.bitwise_and(
+            lax.shift_right_arithmetic(lanes, jnp.int32(stage_log - log_b)),
+            jnp.int32(1),
+        )
+        == 0
+    )
+    dir_desc_v = parity if descending else ~parity
+
   for r0 in range(num_blocks):
     if (r0 & r_step) != 0:
       continue
     r1 = r0 | r_step
-    if stage_log is None:
-      dir_desc = descending
-    else:
-      pos0 = r0 * 128
-      parity = ((pos0 >> stage_log) & 1) == 0
-      dir_desc = parity if descending else (not parity)
-
+    flip = split_dir and (r0 >= half)
     o0, i0 = ord_b[r0], idx_b[r0]
     o1, i1 = ord_b[r1], idx_b[r1]
-    swap = (
-        better_pair(o1, i1, o0, i0) if dir_desc else better_pair(o0, i0, o1, i1)
-    )
+    if dir_desc_v is not None:
+      dd_v = ~dir_desc_v if flip else dir_desc_v
+      r1_better = better_pair(o1, i1, o0, i0)
+      swap = lax.bitwise_xor(~dd_v, r1_better)
+    else:
+      dir_desc = descending != flip
+      if stage_log is not None:
+        dir_desc = (((r0 >> stage_log) & 1) == 0) == dir_desc
+      swap = (
+          better_pair(o1, i1, o0, i0)
+          if dir_desc
+          else better_pair(o0, i0, o1, i1)
+      )
     new_ord[r0] = jnp.where(swap, o1, o0)
     new_ord[r1] = jnp.where(swap, o0, o1)
     new_idx[r0] = jnp.where(swap, i1, i0)
     new_idx[r1] = jnp.where(swap, i0, i1)
   return new_ord, new_idx
+
+
+# Multi-block bitonic primitives keep `128 * R` items (`R = 2**log_b`) per
+# sublane in column-first ("lane-major") order `pos = (lane << log_b) | r`:
+#   * bits `[0, log_b)` index register block `r` (`0` cross-lane permutes);
+#   * bits `[log_b, log_b + 7)` index lane `0..127` (`1` dynamic_gather).
+# `lane_major_to_block_major` converts final results back to `r * 128 + lane`.
+# In `bitonic_topk_2r_to_r` and `bitonic_topk_4r_to_r`, the top 1 or 2 bits of
+# the sort network are mapped to lane bits `0` (and `1`) so the final top-half
+# split pairs adjacent lanes via `_compact_half_blocks`.
+
+
+def lane_major_to_block_major(
+    blocks: tuple[jax.Array, ...],
+) -> tuple[jax.Array, ...]:
+  """Transposes `R` blocks from lane-major `lane * R + r` to `r * 128 + lane`.
+
+  Args:
+    blocks: Power-of-two `R` `(8, 128)` blocks in lane-major order.
+
+  Returns:
+    `R` `(8, 128)` blocks in contiguous block-major (`r * 128 + lane`) order.
+  """
+  num_blocks = len(blocks)
+  if num_blocks <= 1:
+    return blocks
+  log_b = (num_blocks - 1).bit_length()
+  lanes = _lanes_2d()
+  l_rot = lax.bitwise_or(
+      lax.shift_right_arithmetic(lanes, jnp.int32(log_b)),
+      lax.shift_left(
+          lax.bitwise_and(lanes, jnp.int32(num_blocks - 1)),
+          jnp.int32(7 - log_b),
+      ),
+  )
+  cur = [_gather_lanes(blk, l_rot) for blk in blocks]
+  for s in range(log_b):
+    step = 1 << s
+    mask = lax.bitwise_and(lanes, jnp.int32(step)) != 0
+    partner = lax.bitwise_xor(lanes, jnp.int32(step))
+    nxt = list(cur)
+    for r0 in range(num_blocks):
+      if (r0 & step) != 0:
+        continue
+      r1 = r0 | step
+      cross = jnp.where(mask, cur[r0], cur[r1])
+      cross_p = _gather_lanes(cross, partner)
+      nxt[r0] = jnp.where(mask, cross_p, cur[r0])
+      nxt[r1] = jnp.where(mask, cur[r1], cross_p)
+    cur = nxt
+  return tuple(cur)
+
+
+def _run_bitonic_step(
+    ords: Sequence[jax.Array],
+    idxs: Sequence[jax.Array],
+    *,
+    j: int,
+    log_b: int,
+    lane_bit: int | None = None,
+    lane_stage_log: int | None = None,
+    block_stage_log: int | None = None,
+    descending: bool = True,
+    split_dir: bool = False,
+) -> tuple[list[jax.Array], list[jax.Array]]:
+  """Runs bitonic step `j` via a lane gather (`j >= log_b`) or block swap."""
+  if j >= log_b:
+    bit = (j - log_b) if lane_bit is None else lane_bit
+    return _compare_swap_lane_stage(
+        ords,
+        idxs,
+        d=1 << bit,
+        lane_stage_log=lane_stage_log,
+        descending=descending,
+        split_dir=split_dir,
+    )
+  return _compare_swap_block_stage(
+      ords,
+      idxs,
+      r_step=1 << j,
+      stage_log=block_stage_log,
+      log_b=log_b,
+      descending=descending,
+      split_dir=split_dir,
+  )
 
 
 def bitonic_merge_blocks(
@@ -273,32 +374,73 @@ def bitonic_merge_blocks(
     *,
     descending: bool = True,
 ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
-  """Sorts a bitonic sequence held in `R` `(8, 128)` blocks per sublane."""
+  """Sorts a lane-major bitonic sequence held in `R` `(8, 128)` blocks."""
   num_blocks = len(ord_blocks)
-  total_len = 128 * num_blocks
-  total_log = (total_len - 1).bit_length()
-  ord_b = list(ord_blocks)
-  idx_b = list(idx_blocks)
+  log_b = (num_blocks - 1).bit_length()
+  total_log = 7 + log_b
+  ord_b: Sequence[jax.Array] = ord_blocks
+  idx_b: Sequence[jax.Array] = idx_blocks
 
   for j in range(total_log - 1, -1, -1):
-    d = 1 << j
-    if d >= 128:
-      ord_b, idx_b = _compare_swap_block_stage(
-          ord_b,
-          idx_b,
-          r_step=d // 128,
-          stage_log=None,
-          descending=descending,
-      )
-    else:
-      ord_b, idx_b = _compare_swap_lane_stage(
-          ord_b,
-          idx_b,
-          d=d,
-          stage_log=None,
-          descending=descending,
-      )
+    ord_b, idx_b = _run_bitonic_step(
+        ord_b, idx_b, j=j, log_b=log_b, descending=descending
+    )
   return tuple(ord_b), tuple(idx_b)
+
+
+def _bitonic_sort_stages(
+    ord_b: list[jax.Array],
+    idx_b: list[jax.Array],
+    *,
+    log_b: int,
+    descending: bool,
+    split_dir: bool = False,
+) -> tuple[list[jax.Array], list[jax.Array]]:
+  """Runs all column-first bitonic sort stages over `ord_b` / `idx_b`."""
+  total_log = 7 + log_b
+  for s in range(1, total_log + 1):
+    stage_log = None if s == total_log else s
+    lane_stage_log = None if stage_log is None else (stage_log - log_b)
+    for j in range(s - 1, -1, -1):
+      ord_b, idx_b = _run_bitonic_step(
+          ord_b,
+          idx_b,
+          j=j,
+          log_b=log_b,
+          lane_stage_log=lane_stage_log,
+          block_stage_log=stage_log,
+          descending=descending,
+          split_dir=split_dir,
+      )
+  return ord_b, idx_b
+
+
+def _compact_half_blocks(
+    ords: Sequence[jax.Array],
+    idxs: Sequence[jax.Array],
+    *,
+    d: int,
+) -> tuple[list[jax.Array], list[jax.Array]]:
+  """Packs lane-`d` winners of the two `R`-block halves into `R` blocks."""
+  r_half = len(ords) // 2
+  lanes = _lanes_2d()
+  p_idx = lax.bitwise_xor(lanes, jnp.int32(d))
+  even_lane = lax.bitwise_and(lanes, jnp.int32(d)) == 0
+
+  def _winner(o: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
+    op = _gather_lanes(o, p_idx)
+    ip = _gather_lanes(i, p_idx)
+    take = better_pair(op, ip, o, i)
+    return jnp.where(take, op, o), jnp.where(take, ip, i)
+
+  packed_o: list[jax.Array] = []
+  packed_i: list[jax.Array] = []
+  for r in range(r_half):
+    wo0, wi0 = _winner(ords[r], idxs[r])
+    wo1, wi1 = _winner(ords[r + r_half], idxs[r + r_half])
+    packed_o.append(jnp.where(even_lane, wo0, wo1))
+    packed_i.append(jnp.where(even_lane, wi0, wi1))
+  return packed_o, packed_i
 
 
 def bitonic_sort_blocks(
@@ -307,34 +449,192 @@ def bitonic_sort_blocks(
     *,
     descending: bool = True,
 ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
-  """Bitonic-sorts `128 * R` values per sublane held in `R` `(8, 128)` VREGs."""
-  num_blocks = len(ord_blocks)
-  total_len = 128 * num_blocks
-  total_log = (total_len - 1).bit_length()
-  ord_b = list(ord_blocks)
-  idx_b = list(idx_blocks)
+  """Column-first bitonic sort of `128 * R` values into `lane * R + r` order.
 
-  for s in range(1, total_log + 1):
-    stage_log = None if s == total_log else s
-    for j in range(s - 1, -1, -1):
-      d = 1 << j
-      if d >= 128:
-        ord_b, idx_b = _compare_swap_block_stage(
-            ord_b,
-            idx_b,
-            r_step=d // 128,
-            stage_log=stage_log,
-            descending=descending,
-        )
-      else:
-        ord_b, idx_b = _compare_swap_lane_stage(
-            ord_b,
-            idx_b,
-            d=d,
-            stage_log=stage_log,
-            descending=descending,
-        )
+  Args:
+    ord_blocks: Power-of-two `R` `(8, 128)` `int32` order-key blocks.
+    idx_blocks: Indices matching `ord_blocks`.
+    descending: Whether to sort in descending `(score, -index)` order.
+
+  Returns:
+    `(sorted_ord, sorted_idx)` in lane-major (`lane * R + r`) order.
+  """
+  log_b = (len(ord_blocks) - 1).bit_length()
+  ord_b, idx_b = _bitonic_sort_stages(
+      list(ord_blocks), list(idx_blocks), log_b=log_b, descending=descending
+  )
   return tuple(ord_b), tuple(idx_b)
+
+
+def bitonic_topk_2r_to_r(
+    ord_a: tuple[jax.Array, ...],
+    idx_a: tuple[jax.Array, ...],
+    ord_b: tuple[jax.Array, ...],
+    idx_b: tuple[jax.Array, ...],
+    *,
+    descending: bool = True,
+) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+  """Fused Top-`128 * R` bitonic sort-and-compact of two `R`-block chunks.
+
+  Args:
+    ord_a: First chunk of power-of-two `R` `(8, 128)` order-key blocks.
+    idx_a: Indices matching `ord_a`.
+    ord_b: Second chunk of `R` `(8, 128)` order-key blocks.
+    idx_b: Indices matching `ord_b`.
+    descending: Sort order of the returned top `128 * R` entries.
+
+  Returns:
+    `(top_ord, top_idx)` of `R` `(8, 128)` blocks in lane-major order.
+  """
+  r_out = len(ord_a)
+  assert len(ord_b) == r_out
+  log_b = (r_out - 1).bit_length()
+  log_2b = log_b + 1
+  total_log = 7 + log_2b
+  ords = list(ord_a) + list(ord_b)
+  idxs = list(idx_a) + list(idx_b)
+
+  # Route the MSB of the `2R`-block bitonic network to lane bit `0` (`d = 1`)
+  # so `_compact_half_blocks(..., d=1)` can pack both halves' lane winners.
+  for s in range(1, total_log):
+    if s < log_2b:
+      lane_stage_log = None
+    elif s < total_log - 1:
+      lane_stage_log = s - log_2b + 1
+    else:
+      lane_stage_log = 0
+    block_stage_log = s if lane_stage_log is None else (log_2b + lane_stage_log)
+    for j in range(s - 1, -1, -1):
+      ords, idxs = _run_bitonic_step(
+          ords,
+          idxs,
+          j=j,
+          log_b=log_2b,
+          lane_bit=j - log_2b + 1,
+          lane_stage_log=lane_stage_log,
+          block_stage_log=block_stage_log,
+          descending=True,
+      )
+
+  packed_o, packed_i = _compact_half_blocks(ords, idxs, d=1)
+  return bitonic_merge_blocks(
+      tuple(packed_o), tuple(packed_i), descending=descending
+  )
+
+
+def bitonic_topk_4r_to_r(
+    ords_4r: tuple[jax.Array, ...],
+    idxs_4r: tuple[jax.Array, ...],
+    *,
+    descending: bool = True,
+) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+  """Fused Top-`128 * R` bitonic sort-and-compact of `4 * R` blocks.
+
+  Args:
+    ords_4r: `4 * R` (`R` a power of two) `(8, 128)` order-key blocks.
+    idxs_4r: Indices matching `ords_4r`.
+    descending: Sort order of the returned top `128 * R` entries.
+
+  Returns:
+    `(top_ord, top_idx)` of `R` `(8, 128)` blocks in lane-major order.
+  """
+  num_in = len(ords_4r)
+  assert num_in % 4 == 0 and len(idxs_4r) == num_in
+  r_out = num_in // 4
+  log_b = (r_out - 1).bit_length()
+  log_2b = log_b + 1
+  log_4b = log_b + 2
+  total_log = 7 + log_4b
+  ords = list(ords_4r)
+  idxs = list(idxs_4r)
+
+  # Map the top two position bits (`total_log - 2`, `total_log - 1`) to lane
+  # bits `0` and `1` so the two 2x compactions pair lanes at `d = 2` then `1`.
+  def _lane_bit(pos_bit: int) -> int:
+    if pos_bit < total_log - 2:
+      return pos_bit - log_4b + 2
+    if pos_bit == total_log - 2:
+      return 0
+    return 1
+
+  for s in range(1, total_log - 1):
+    dir_pos_bit = s if s < total_log - 2 else (total_log - 1)
+    if dir_pos_bit < log_4b:
+      lane_stage_log = None
+      block_stage_log = dir_pos_bit
+    else:
+      lane_stage_log = _lane_bit(dir_pos_bit)
+      block_stage_log = log_4b + lane_stage_log
+    for j in range(s - 1, -1, -1):
+      ords, idxs = _run_bitonic_step(
+          ords,
+          idxs,
+          j=j,
+          log_b=log_4b,
+          lane_bit=_lane_bit(j) if j >= log_4b else None,
+          lane_stage_log=lane_stage_log,
+          block_stage_log=block_stage_log,
+          descending=True,
+      )
+
+  mid_o, mid_i = _compact_half_blocks(ords, idxs, d=2)
+
+  for j in range(log_b + 6, -1, -1):
+    mid_o, mid_i = _run_bitonic_step(
+        mid_o,
+        mid_i,
+        j=j,
+        log_b=log_2b,
+        lane_bit=j - log_b,
+        lane_stage_log=0,
+        block_stage_log=log_2b,
+        descending=True,
+    )
+
+  packed_o, packed_i = _compact_half_blocks(mid_o, mid_i, d=1)
+  return bitonic_merge_blocks(
+      tuple(packed_o), tuple(packed_i), descending=descending
+  )
+
+
+def bitonic_sort_blocks_pair(
+    ord_a: tuple[jax.Array, ...],
+    idx_a: tuple[jax.Array, ...],
+    ord_b: tuple[jax.Array, ...],
+    idx_b: tuple[jax.Array, ...],
+    *,
+    desc_a: bool = True,
+    desc_b: bool = False,
+) -> tuple[
+    tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]],
+    tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]],
+]:
+  """Sorts two independent `R`-block chunks in lock-step into lane-major order.
+
+  Args:
+    ord_a: First chunk of power-of-two `R` `(8, 128)` order-key blocks.
+    idx_a: Indices matching `ord_a`.
+    ord_b: Second chunk of `R` `(8, 128)` order-key blocks.
+    idx_b: Indices matching `ord_b`.
+    desc_a: Sort direction for `(ord_a, idx_a)`.
+    desc_b: Sort direction for `(ord_b, idx_b)`.
+
+  Returns:
+    `((sorted_a_ord, sorted_a_idx), (sorted_b_ord, sorted_b_idx))`, each in
+    lane-major (`lane * R + r`) order.
+  """
+  num_blocks = len(ord_a)
+  ords, idxs = _bitonic_sort_stages(
+      list(ord_a) + list(ord_b),
+      list(idx_a) + list(idx_b),
+      log_b=(num_blocks - 1).bit_length(),
+      descending=desc_a,
+      split_dir=desc_a != desc_b,
+  )
+  return (
+      (tuple(ords[:num_blocks]), tuple(idxs[:num_blocks])),
+      (tuple(ords[num_blocks:]), tuple(idxs[num_blocks:])),
+  )
 
 
 def bitonic_topk_merge_blocks(
@@ -362,8 +662,9 @@ def extract_row_kth_threshold(
     k: int,
 ) -> jax.Array:
   """Broadcasts each sublane's `(k - 1)`-th sorted key to `(8, 128)`."""
-  k_blk = (k - 1) // 128
-  k_lane = (k - 1) % 128
+  num_blocks = len(top_ord)
+  k_blk = (k - 1) % num_blocks
+  k_lane = (k - 1) // num_blocks
   lane_idx = jnp.full((8, 128), k_lane, dtype=jnp.int32)
   return _gather_lanes(top_ord[k_blk], lane_idx)
 
@@ -655,7 +956,7 @@ def finalize_topk_vmem(
         final_i,
         num_partitions=num_partitions,
     )
-  return final_o, final_i
+  return lane_major_to_block_major(final_o), lane_major_to_block_major(final_i)
 
 
 # --------------------------------------------------------------------------- #
@@ -847,11 +1148,23 @@ def finalize_lane_lists_vmem(
         )
         for g in q_groups
     ]
-    merged = []
-    for cur_o, cur_i, blk_o, blk_i in loaded:
-      asc_o, asc_i = bitonic_sort_blocks(blk_o, blk_i, descending=False)
-      merged.append(bitonic_topk_merge_blocks(cur_o, cur_i, asc_o, asc_i))
-    for g, (m_o, m_i) in zip(q_groups, merged):
+    if len(loaded) == 2 and num_blocks <= 4:
+      (cur0_o, cur0_i, blk0_o, blk0_i), (cur1_o, cur1_i, blk1_o, blk1_i) = (
+          loaded
+      )
+      (asc0_o, asc0_i), (asc1_o, asc1_i) = bitonic_sort_blocks_pair(
+          blk0_o, blk0_i, blk1_o, blk1_i, desc_a=False, desc_b=False
+      )
+      merged = [
+          bitonic_topk_merge_blocks(cur0_o, cur0_i, asc0_o, asc0_i),
+          bitonic_topk_merge_blocks(cur1_o, cur1_i, asc1_o, asc1_i),
+      ]
+    else:
+      merged = []
+      for cur_o, cur_i, blk_o, blk_i in loaded:
+        asc_o, asc_i = bitonic_sort_blocks(blk_o, blk_i, descending=False)
+        merged.append(bitonic_topk_merge_blocks(cur_o, cur_i, asc_o, asc_i))
+    for g, (m_o, m_i) in zip(q_groups, merged, strict=True):
       for r in range(num_blocks):
         top_ord_ref[g, r] = m_o[r]
         top_idx_ref[g, r] = m_i[r]
@@ -892,7 +1205,9 @@ def finalize_lane_lists_vmem(
           final_i,
           num_partitions=num_partitions,
       )
-    results.append((final_o, final_i))
+    results.append(
+        (lane_major_to_block_major(final_o), lane_major_to_block_major(final_i))
+    )
   return results
 
 
@@ -997,8 +1312,9 @@ def _subsample_prebracket(
   )
 
   def _pick_rank(rank: jax.Array) -> jax.Array:
-    blk_idx = rank >> 7
-    lane_idx = rank & 127
+    # `sorted_o` is in lane-major (`lane * n_s + r`) order.
+    blk_idx = rank & (n_s - 1)
+    lane_idx = rank >> 3
     picked = sorted_o[0]
     for s in range(1, n_s):
       picked = jnp.where(blk_idx == s, sorted_o[s], picked)
@@ -1268,40 +1584,22 @@ def _fill_buckets(
   return list(ords), list(idxs), cnt
 
 
-def _merge_tree(chunks, descending: bool = True):
-  """Sorted top `128 * R` of a list of unsorted `R`-block chunks.
-
-  The chunks are sorted independently and merged pairwise, so the sorting
-  networks of different chunks can be interleaved by the scheduler. `None`
-  entries are empty chunks and cost nothing.
-
-  Args:
-    chunks: `(ords, idxs)` chunks of `R` `(8, 128)` blocks each, or `None`; a
-      power-of-2 number of them.
-    descending: Sort order of the result.
-
-  Returns:
-    `(ords, idxs)` of the sorted top `128 * R` per sublane, or `None` if every
-    chunk is empty.
-  """
-  if len(chunks) == 1:
-    if chunks[0] is None:
-      return None
-    return bitonic_sort_blocks(
-        tuple(chunks[0][0]), tuple(chunks[0][1]), descending=descending
+def _top_of_chunks(ords0, idxs0, ext_o, ext_i, num_blocks: int):
+  """Sorted descending top `128 * num_blocks` of two unsorted chunks."""
+  if num_blocks <= 4 and len(ext_o) == num_blocks:
+    return bitonic_topk_2r_to_r(
+        tuple(ords0),
+        tuple(idxs0),
+        tuple(ext_o),
+        tuple(ext_i),
+        descending=True,
     )
-  half = len(chunks) // 2
-  if all(c is None for c in chunks[half:]):
-    return _merge_tree(chunks[:half], descending)
-  if all(c is None for c in chunks[:half]):
-    return _merge_tree(chunks[half:], descending)
-  hi = _merge_tree(chunks[:half], True)
-  lo = _merge_tree(chunks[half:], False)
-  assert hi is not None and lo is not None
-  hi_o, hi_i = hi
-  lo_o, lo_i = lo
+  top_o, top_i = bitonic_sort_blocks(
+      tuple(ords0), tuple(idxs0), descending=True
+  )
+  cand_o, cand_i = sort_blocks_padded(ext_o, ext_i, num_blocks)
   return bitonic_topk_merge_blocks(
-      hi_o, hi_i, lo_o, lo_i, descending=descending
+      top_o, top_i, cand_o, cand_i, descending=True
   )
 
 
@@ -1318,14 +1616,12 @@ def _gather_into_top(
     q_group: jax.Array | int,
     num_blocks: int,
     block_ctx=None,
-    max_chunks: int | None = None,
     extra_chunk=None,
 ) -> None:
   """Writes the sorted top `128 * num_blocks` selected keys to the top refs.
 
-  Gathers + sorts up to a few rounds of `num_blocks` candidates per lane at
-  once (the number of rounds is set by the busiest lane, `lane_cnt`), then
-  merges any remaining rounds one at a time.
+  Gathers + sorts the first round of `num_blocks` candidates per lane, then
+  merges any remaining rounds one at a time in a bounded loop.
 
   Args:
     load_tile: `(block, tile) -> (8, 128)` int32 order keys.
@@ -1339,16 +1635,9 @@ def _gather_into_top(
     q_group: Query group (first index) of the refs to write.
     num_blocks: Number of `(8, 128)` blocks in the Top-K state.
     block_ctx: Optional per-block context, see `_fill_buckets`.
-    max_chunks: Most rounds to gather and sort at once.
-    extra_chunk: Optional unsorted `(ords, idxs)` chunk of at most
-      `num_blocks` blocks to merge in as well.
+    extra_chunk: Optional unsorted `(ords, idxs)` chunk of at most `num_blocks`
+      blocks to merge in as well.
   """
-  if extra_chunk is not None:
-    pad = num_blocks - len(extra_chunk[0])
-    extra_chunk = (
-        list(extra_chunk[0]) + [_empty_ord_block()] * pad,
-        list(extra_chunk[1]) + [_empty_idx_block()] * pad,
-    )
 
   def _fill_ranks(base_rank, count: int):
     ords, idxs = [], []
@@ -1367,35 +1656,16 @@ def _gather_into_top(
       idxs += i
     return ords, idxs
 
-  if max_chunks is None:
-    max_chunks = max(1, min(4, 16 // num_blocks))
-  num_rounds = (jnp.max(lane_cnt) + (num_blocks - 1)) // num_blocks
-  chunk_options = sorted({1, min(2, max_chunks), max_chunks})
-  for i, num_chunks in enumerate(chunk_options):
-    conds = []
-    if i > 0:
-      conds.append(num_rounds > chunk_options[i - 1])
-    if i < len(chunk_options) - 1:
-      conds.append(num_rounds <= num_chunks)
-
-    def _gather_rounds(num_chunks=num_chunks):
-      ords, idxs = _fill_ranks(0, num_chunks * num_blocks)
-      chunks = [
-          (ords[c * num_blocks : (c + 1) * num_blocks],
-           idxs[c * num_blocks : (c + 1) * num_blocks])
-          for c in range(num_chunks)
-      ]
-      if extra_chunk is not None:
-        chunks.append(extra_chunk)
-      chunks += [None] * (next_power_of_2(len(chunks)) - len(chunks))
-      top = _merge_tree(chunks)
-      assert top is not None
-      _write_top(top_ord_ref, top_idx_ref, q_group, *top)
-
-    if conds:
-      pl.when(functools.reduce(jnp.logical_and, conds))(_gather_rounds)
-    else:
-      _gather_rounds()
+  ords0, idxs0 = _fill_ranks(0, num_blocks)
+  if extra_chunk is not None:
+    top_o, top_i = _top_of_chunks(
+        ords0, idxs0, extra_chunk[0], extra_chunk[1], num_blocks
+    )
+  else:
+    top_o, top_i = bitonic_sort_blocks(
+        tuple(ords0), tuple(idxs0), descending=True
+    )
+  _write_top(top_ord_ref, top_idx_ref, q_group, top_o, top_i)
 
   max_cnt = jnp.max(lane_cnt)
 
@@ -1422,7 +1692,8 @@ def _gather_into_top(
       _merge_into_top(top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs)
     return None
 
-  lax.fori_loop(max_chunks, num_rounds, _extra_round, None)
+  num_rounds = (max_cnt + (num_blocks - 1)) // num_blocks
+  lax.fori_loop(1, num_rounds, _extra_round, None)
 
 
 def _empty_ord_block() -> jax.Array:
@@ -1434,26 +1705,72 @@ def _empty_idx_block() -> jax.Array:
 
 
 def _write_top(top_ord_ref, top_idx_ref, q_group, top_o, top_i) -> None:
-  for r, (o, i) in enumerate(zip(top_o, top_i)):
+  for r, (o, i) in enumerate(zip(top_o, top_i, strict=True)):
     top_ord_ref[q_group, r] = o
     top_idx_ref[q_group, r] = i
+
+
+def sort_blocks_padded(
+    ords: Sequence[jax.Array],
+    idxs: Sequence[jax.Array],
+    num_blocks: int,
+    *,
+    descending: bool = False,
+) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+  """Sorts `1 <= m <= num_blocks` blocks and pads to `num_blocks` blocks.
+
+  Args:
+    ords: `m` `(8, 128)` `int32` order-key blocks (`1 <= m <= num_blocks`).
+    idxs: Indices matching `ords`.
+    num_blocks: Target power-of-two block count.
+    descending: Sort direction of the returned `num_blocks` blocks.
+
+  Returns:
+    `(sorted_ord, sorted_idx)` of `num_blocks` blocks in lane-major order,
+    padded with empty sentinels.
+  """
+  m = len(ords)
+  if m == num_blocks:
+    return bitonic_sort_blocks(tuple(ords), tuple(idxs), descending=descending)
+  if m < num_blocks and num_blocks % m == 0:
+    ratio = num_blocks // m
+    c_o, c_i = bitonic_sort_blocks(
+        tuple(ords), tuple(idxs), descending=descending
+    )
+    lanes = _lanes_2d()
+    span = 128 // ratio
+    if descending:
+      in_range = lanes < span
+      base_src = lax.bitwise_and(lanes * jnp.int32(ratio), jnp.int32(127))
+    else:
+      base_lane = 128 - span
+      in_range = lanes >= base_lane
+      base_src = lax.bitwise_and(
+          (lanes - jnp.int32(base_lane)) * jnp.int32(ratio), jnp.int32(127)
+      )
+    empty_o = _empty_ord_block()
+    empty_i = _empty_idx_block()
+    cand_o = []
+    cand_i = []
+    for b in range(ratio):
+      src = lax.bitwise_or(base_src, jnp.int32(b))
+      for r in range(m):
+        cand_o.append(jnp.where(in_range, _gather_lanes(c_o[r], src), empty_o))
+        cand_i.append(jnp.where(in_range, _gather_lanes(c_i[r], src), empty_i))
+    return tuple(cand_o), tuple(cand_i)
+  pad = num_blocks - m
+  return bitonic_sort_blocks(
+      tuple(ords) + (_empty_ord_block(),) * pad,
+      tuple(idxs) + (_empty_idx_block(),) * pad,
+      descending=descending,
+  )
 
 
 def _merge_into_top(
     top_ord_ref, top_idx_ref, q_group, num_blocks: int, ords, idxs
 ) -> None:
   """Merges up to `num_blocks` unsorted candidate blocks into the top refs."""
-  sort_blocks = max(1, next_power_of_2(len(ords)))
-  sort_pad = sort_blocks - len(ords)
-  cand_o, cand_i = bitonic_sort_blocks(
-      tuple(ords) + (_empty_ord_block(),) * sort_pad,
-      tuple(idxs) + (_empty_idx_block(),) * sort_pad,
-      descending=False,
-  )
-  rem_pad = num_blocks - sort_blocks
-  if rem_pad > 0:
-    cand_o = (_empty_ord_block(),) * rem_pad + cand_o
-    cand_i = (_empty_idx_block(),) * rem_pad + cand_i
+  cand_o, cand_i = sort_blocks_padded(ords, idxs, num_blocks)
   cur_o = tuple(top_ord_ref[q_group, r] for r in range(num_blocks))
   cur_i = tuple(top_idx_ref[q_group, r] for r in range(num_blocks))
   _write_top(
@@ -1538,8 +1855,20 @@ def select_topk_vmem(
   )
 
 
-def summarize_key_block(load_tile, tiles_per_block: int):
-  """Per-lane max key of a block and the first tile holding it."""
+def summarize_key_block(
+    load_tile: Callable[[int], jax.Array],
+    tiles_per_block: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Returns `(best_key, first_tile_idx)` across the tiles of one key block.
+
+  Args:
+    load_tile: `tile -> (8, 128)` `int32` order keys for `tile` in
+      `[0, tiles_per_block)`.
+    tiles_per_block: Static number of `(8, 128)` tiles in the block.
+
+  Returns:
+    `(best_key, first_tile_idx)`, each `(8, 128)` `int32`.
+  """
   best = load_tile(0)
   arg = jnp.zeros((8, 128), jnp.int32)
   for t in range(1, tiles_per_block):
@@ -1602,8 +1931,42 @@ def select_topk_two_level(
       slack=max(64, k_cap // (4 if num_blocks <= 8 else 32)),
   )
   heavy_ties = jnp.any(row_cnt > 2 * k_cap)
+  thr = jnp.where(row_cnt < k, jnp.int32(MIN_VALID_ORD), t)
+  res_buckets = min(num_blocks, 4)
+  max_inline_residuals = 4 * res_buckets
 
-  @pl.when(heavy_ties)
+  def _residual(x, idx, arg, tt):
+    del idx
+    return (x >= thr) & (arg != tt)
+
+  def _fill_residuals(base_rank):
+    return _fill_buckets(
+        load_tile,
+        idx_tile,
+        n_blocks,
+        tiles_per_block,
+        _residual,
+        base_rank,
+        res_buckets,
+        load_cell_arg,
+    )
+
+  def _skip_residuals():
+    # Ignored because `heavy_ties` already selects `_exact_on_keys`.
+    return (
+        jnp.int32(0),
+        [_empty_ord_block()] * res_buckets,
+        [_empty_idx_block()] * res_buckets,
+    )
+
+  def _scan_residuals():
+    res_o, res_i, res_cnt = _fill_residuals(0)
+    return jnp.max(res_cnt), res_o, res_i
+
+  max_res, res_o, res_i = lax.cond(heavy_ties, _skip_residuals, _scan_residuals)
+  use_fallback = heavy_ties | (max_res > max_inline_residuals)
+
+  @pl.when(use_fallback)
   def _exact_on_keys():
     select_topk_vmem(
         load_tile,
@@ -1618,76 +1981,28 @@ def select_topk_two_level(
         idx_bits=idx_bits,
     )
 
-  @pl.when(jnp.logical_not(heavy_ties))
-  def _two_level():
-    # Rows with fewer than `k` valid cells keep every valid key.
-    thr = jnp.where(row_cnt < k, jnp.int32(MIN_VALID_ORD), t)
+  @pl.when(jnp.logical_not(use_fallback))
+  def _cells_and_residuals():
+    _gather_into_top(
+        lambda b, _: load_cell_max(b),
+        lambda b, _: idx_tile(b, 0) + load_cell_arg(b) * 128,
+        n_blocks,
+        1,
+        lambda x, idx, ctx, tt: x >= thr,
+        lane_cnt,
+        top_ord_ref,
+        top_idx_ref,
+        q_group=q_group,
+        num_blocks=num_blocks,
+        extra_chunk=(res_o, res_i),
+    )
 
-    def _residual(x, idx, arg, tt):
-      del idx
-      return (x >= thr) & (arg != tt)
+    def _extra(rnd, _):
+      ords, idxs, _ = _fill_residuals(rnd * res_buckets)
+      _merge_into_top(top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs)
+      return None
 
-    res_buckets = min(num_blocks, 4)
-
-    def _fill_residuals(base_rank):
-      return _fill_buckets(
-          load_tile,
-          idx_tile,
-          n_blocks,
-          tiles_per_block,
-          _residual,
-          base_rank,
-          res_buckets,
-          load_cell_arg,
-      )
-
-    res_o, res_i, res_cnt = _fill_residuals(0)
-    max_res = jnp.max(res_cnt)
-    many_residuals = max_res > 4 * res_buckets
-
-    @pl.when(many_residuals)
-    def _tied_cells():
-      # Many keys tie with their cell max: run the exact search on the keys.
-      select_topk_vmem(
-          load_tile,
-          idx_tile,
-          n_blocks,
-          tiles_per_block,
-          top_ord_ref,
-          top_idx_ref,
-          q_group=q_group,
-          k=k,
-          num_blocks=num_blocks,
-          idx_bits=idx_bits,
-      )
-
-    @pl.when(jnp.logical_not(many_residuals))
-    def _cells_and_residuals():
-      _gather_into_top(
-          lambda b, _: load_cell_max(b),
-          lambda b, _: idx_tile(b, 0) + load_cell_arg(b) * 128,
-          n_blocks,
-          1,
-          lambda x, idx, ctx, tt: x >= thr,
-          lane_cnt,
-          top_ord_ref,
-          top_idx_ref,
-          q_group=q_group,
-          num_blocks=num_blocks,
-          max_chunks=4 if num_blocks <= 8 else 2,
-          extra_chunk=(res_o, res_i),
-      )
-
-      def _extra(rnd, _):
-        ords, idxs, _ = _fill_residuals(rnd * res_buckets)
-        _merge_into_top(
-            top_ord_ref, top_idx_ref, q_group, num_blocks, ords, idxs
-        )
-        return None
-
-      lax.fori_loop(
-          1, (max_res + (res_buckets - 1)) // res_buckets, _extra, None
-      )
+    lax.fori_loop(1, (max_res + (res_buckets - 1)) // res_buckets, _extra, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -1928,6 +2243,7 @@ def pack_nonnegative_tc(vals: jax.Array) -> jax.Array:
     _, packed_vals = bitonic_sort_blocks(
         tuple(key_blocks), val_blocks, descending=True
     )
+    packed_vals = lane_major_to_block_major(packed_vals)
     out_vmem[...] = jnp.concatenate(packed_vals, axis=1)
 
   packed = pl.pallas_call(
@@ -2190,6 +2506,7 @@ def dcp_merge_and_compact_tc(
     _, packed_vals = bitonic_sort_blocks(
         tuple(pack_keys), tuple(pack_vals), descending=True
     )
+    packed_vals = lane_major_to_block_major(packed_vals)
     out_vmem[...] = jnp.concatenate(packed_vals, axis=1)
 
   packed = pl.pallas_call(

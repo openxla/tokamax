@@ -104,6 +104,173 @@ class TcTopKTest(parameterized.TestCase):
     np.testing.assert_array_equal(rec_bits, vals.view(np.int32))
 
   @parameterized.product(
+      num_blocks=[1, 2, 4, 8],
+      descending=[True, False],
+  )
+  def test_lane_major_bitonic_sort_and_transpose(self, num_blocks, descending):
+    rng = np.random.default_rng(101 + num_blocks * 7 + int(descending))
+    num_cols = num_blocks * 128
+    # Mix random values with exact ties to exercise tie-breaking on indices.
+    scores = rng.integers(-4, 5, size=(8, num_cols)).astype(np.float32)
+    scores[0] = rng.standard_normal(num_cols).astype(np.float32)
+
+    @jax.jit
+    def _run(scores_arr):
+      lanes = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+      valid = jnp.ones((8, 128), dtype=jnp.bool_)
+      ords = tuple(
+          tc_topk.f32_to_ord_i32(scores_arr[:, r * 128 : (r + 1) * 128], valid)
+          for r in range(num_blocks)
+      )
+      idxs = tuple(jnp.int32(r * 128) + lanes for r in range(num_blocks))
+      lm_o, lm_i = tc_topk.bitonic_sort_blocks(
+          ords, idxs, descending=descending
+      )
+      bm_o = tc_topk.lane_major_to_block_major(lm_o)
+      bm_i = tc_topk.lane_major_to_block_major(lm_i)
+      return lm_i, jnp.concatenate(bm_o, axis=1), jnp.concatenate(bm_i, axis=1)
+
+    lm_i, bm_o, bm_i = _run(jnp.asarray(scores))
+    want_idx, want_bits = _reference_topk(scores, num_cols)
+    if not descending:
+      want_idx = want_idx[:, ::-1]
+      want_bits = want_bits[:, ::-1]
+
+    # Verify lane-major layout (`pos = lane * num_blocks + r`) before transpose.
+    lm_stacked = np.stack([np.asarray(blk) for blk in lm_i], axis=-1)
+    np.testing.assert_array_equal(lm_stacked.reshape(8, num_cols), want_idx)
+    # Verify block-major layout (`pos = r * 128 + lane`) after transpose.
+    np.testing.assert_array_equal(np.asarray(bm_i), want_idx)
+    got_bits = tc_topk.ord_i32_to_f32_bits(bm_o, jnp.ones_like(bm_o, jnp.bool_))
+    np.testing.assert_array_equal(np.asarray(got_bits), want_bits)
+
+  @parameterized.product(
+      num_blocks=[1, 2, 4],
+      desc_a=[True, False],
+      desc_b=[True, False],
+  )
+  def test_bitonic_sort_blocks_pair_matches_single(
+      self, num_blocks, desc_a, desc_b
+  ):
+    rng = np.random.default_rng(
+        211 + num_blocks * 11 + 2 * int(desc_a) + int(desc_b)
+    )
+    num_cols = num_blocks * 128
+    scores_a = rng.integers(-3, 4, size=(8, num_cols)).astype(np.float32)
+    scores_b = rng.standard_normal((8, num_cols), dtype=np.float32)
+
+    @jax.jit
+    def _run(sa, sb):
+      lanes = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+      valid = jnp.ones((8, 128), dtype=jnp.bool_)
+      a_o = tuple(
+          tc_topk.f32_to_ord_i32(sa[:, r * 128 : (r + 1) * 128], valid)
+          for r in range(num_blocks)
+      )
+      b_o = tuple(
+          tc_topk.f32_to_ord_i32(sb[:, r * 128 : (r + 1) * 128], valid)
+          for r in range(num_blocks)
+      )
+      idxs = tuple(jnp.int32(r * 128) + lanes for r in range(num_blocks))
+      got_a, got_b = tc_topk.bitonic_sort_blocks_pair(
+          a_o, idxs, b_o, idxs, desc_a=desc_a, desc_b=desc_b
+      )
+      want_a = tc_topk.bitonic_sort_blocks(a_o, idxs, descending=desc_a)
+      want_b = tc_topk.bitonic_sort_blocks(b_o, idxs, descending=desc_b)
+      return got_a, got_b, want_a, want_b
+
+    (ga_o, ga_i), (gb_o, gb_i), (wa_o, wa_i), (wb_o, wb_i) = _run(
+        jnp.asarray(scores_a), jnp.asarray(scores_b)
+    )
+    for got, want in zip(
+        ga_o + ga_i + gb_o + gb_i, wa_o + wa_i + wb_o + wb_i, strict=True
+    ):
+      np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+  @parameterized.product(
+      num_blocks=[1, 2, 4],
+      arity=[2, 4],
+      descending=[True, False],
+  )
+  def test_bitonic_topk_2r_and_4r_to_r(self, num_blocks, arity, descending):
+    rng = np.random.default_rng(
+        307 + num_blocks * 13 + arity * 3 + int(descending)
+    )
+    in_blocks = arity * num_blocks
+    num_cols = in_blocks * 128
+    k = num_blocks * 128
+    scores = rng.standard_normal((8, num_cols), dtype=np.float32)
+    scores[1] = rng.integers(-2, 3, size=(num_cols,)).astype(np.float32)
+
+    @jax.jit
+    def _run(scores_arr):
+      lanes = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+      valid = jnp.ones((8, 128), dtype=jnp.bool_)
+      ords = tuple(
+          tc_topk.f32_to_ord_i32(scores_arr[:, m * 128 : (m + 1) * 128], valid)
+          for m in range(in_blocks)
+      )
+      idxs = tuple(jnp.int32(m * 128) + lanes for m in range(in_blocks))
+      if arity == 2:
+        top_o, top_i = tc_topk.bitonic_topk_2r_to_r(
+            ords[:num_blocks],
+            idxs[:num_blocks],
+            ords[num_blocks:],
+            idxs[num_blocks:],
+            descending=descending,
+        )
+      else:
+        top_o, top_i = tc_topk.bitonic_topk_4r_to_r(
+            ords, idxs, descending=descending
+        )
+      bm_o = tc_topk.lane_major_to_block_major(top_o)
+      bm_i = tc_topk.lane_major_to_block_major(top_i)
+      return jnp.concatenate(bm_o, axis=1), jnp.concatenate(bm_i, axis=1)
+
+    got_ord, got_idx = _run(jnp.asarray(scores))
+    got_bits = tc_topk.ord_i32_to_f32_bits(
+        got_ord, jnp.ones_like(got_ord, jnp.bool_)
+    )
+    want_idx, want_bits = _reference_topk(scores, k)
+    if not descending:
+      want_idx = want_idx[:, ::-1]
+      want_bits = want_bits[:, ::-1]
+    np.testing.assert_array_equal(np.asarray(got_idx), want_idx)
+    np.testing.assert_array_equal(np.asarray(got_bits), want_bits)
+
+  @parameterized.named_parameters(
+      ("exact_m4_desc", 4, 4, True),
+      ("divisor_m1_of_4_asc", 1, 4, False),
+      ("divisor_m2_of_4_desc", 2, 4, True),
+      ("non_divisor_m3_of_4_asc", 3, 4, False),
+      ("non_divisor_m3_of_4_desc", 3, 4, True),
+  )
+  def test_sort_blocks_padded(self, m_blocks, num_blocks, descending):
+    rng = np.random.default_rng(401 + m_blocks * 19 + int(descending))
+    scores = rng.standard_normal((8, m_blocks * 128), dtype=np.float32)
+
+    @jax.jit
+    def _run(scores_arr):
+      lanes = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+      valid = jnp.ones((8, 128), dtype=jnp.bool_)
+      ords = [
+          tc_topk.f32_to_ord_i32(scores_arr[:, m * 128 : (m + 1) * 128], valid)
+          for m in range(m_blocks)
+      ]
+      idxs = [jnp.int32(m * 128) + lanes for m in range(m_blocks)]
+      lm_o, lm_i = tc_topk.sort_blocks_padded(
+          ords, idxs, num_blocks, descending=descending
+      )
+      bm_i = tc_topk.lane_major_to_block_major(lm_i)
+      return jnp.concatenate(bm_i, axis=1), lm_o
+
+    got_idx, _ = _run(jnp.asarray(scores))
+    want_idx, _ = _reference_topk(scores, num_blocks * 128)
+    if not descending:
+      want_idx = want_idx[:, ::-1]
+    np.testing.assert_array_equal(np.asarray(got_idx), want_idx)
+
+  @parameterized.product(
       k=[1, 5, 16, 64, 128, 300, 512, 1024, 2048],
       num_cols=[64, 128, 1024, 2304, 16384],
   )

@@ -833,6 +833,11 @@ class StreamIndexTopKTest(parameterized.TestCase):
 
   def test_pallas_smem_oom_when_unclamped(self):
     """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM."""
+    if not tc_topk.has_full_sparsecore_topk():
+      self.skipTest(
+          "The TensorCore top-k path builds its schedule in the kernel and"
+          " does not use metadata.compute_metadata."
+      )
     orig_compute_metadata = metadata.compute_metadata
 
     def _mock_compute_metadata(*args, **kwargs):
