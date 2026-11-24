@@ -241,6 +241,47 @@ class PallasMosaicTpuV2OpParameterPipingTest(parameterized.TestCase):
         )
       chex.assert_trees_all_close(via_op, via_kernel, atol=2e-2, rtol=2e-2)
 
+  @parameterized.parameters(500, 1024)
+  def test_tgmm_drhs_with_per_group_rhs_scale_pipes(self, n):
+    lhs_dtype, rhs_quant_dtype = jnp.float8_e4m3fn, jnp.float8_e5m2
+    m, k, num_groups = 256, 1024, 16
+    k0, k1, k2 = jax.random.split(jax.random.key(0), 3)
+
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16).astype(lhs_dtype)
+    grad = jax.random.normal(k1, (m, n), jnp.float32)
+    grad_q, _ = gmm_util.quantize_tensor(
+        grad,
+        rhs_quant_dtype,  # pyrefly: ignore[bad-argument-type]
+        axis=0,
+        block_size=m,
+    )
+    grad_scale = jax.random.uniform(
+        k2, (num_groups, 1, n), dtype=jnp.float32, minval=0.1, maxval=2.0
+    )
+    group_sizes = gmm_util.get_group_sizes(m, num_groups)
+
+    drhs_op = pallas_mosaic_tpu_v2.PallasMosaicTpuV2RaggedDot(
+        num_actual_groups=num_groups
+    )
+    via_op = drhs_op(
+        lhs,
+        qwix.QArray(grad_q, grad_scale),
+        group_sizes=group_sizes,
+        ragged_dot_dimension_numbers=(
+            pallas_mosaic_tpu_v2.DRHS_RAGGED_DOT_DIM_NUMS
+        ),
+        preferred_element_type=jnp.bfloat16,
+    )
+    via_kernel = tgmm_backend.tgmm_v2(
+        lhs,
+        grad_q,
+        group_sizes=group_sizes,
+        rhs_scale=grad_scale,
+        num_actual_groups=num_groups,
+        preferred_element_type=jnp.bfloat16,
+    )
+    chex.assert_trees_all_close(via_op, via_kernel, atol=2e-2, rtol=2e-2)
+
   def test_gmm_weight_quantized_pipes(self):
     # Mirrors test_gmm_weight_quantized: jnp.float8_e4m3fn
     # `rhs` + `rhs_scale` +
