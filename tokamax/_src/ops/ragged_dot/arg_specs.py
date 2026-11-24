@@ -16,6 +16,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tokamax._src.autotuning import arg_spec
 from tokamax._src.ops.ragged_dot import base
 
@@ -60,6 +61,18 @@ SPEC_SHAPES = {
         ('primary', 'ci_tests'),
     ),
 }
+
+
+def _uniform_weight_group_sizes(
+    m: int, num_groups: int, seed: int = 0
+) -> tuple[int, ...]:
+  # Similar to `gmm_v2.util.get_group_sizes`, the sizes are
+  # much more skewed than those of `base.generate_group_sizes`.
+  rng = np.random.default_rng(seed)
+  weights = rng.uniform(size=num_groups - 1).astype(np.float32)
+  weights /= weights.sum()
+  sizes = np.floor(weights * m).astype(np.int32)
+  return tuple(map(int, np.append(sizes, m - sizes.sum())))
 
 
 def _make_spec(
@@ -132,15 +145,24 @@ def _make_maxtext_gmm_v2_spec(
   lhs = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
   if quantized:
     args = dict(
-        lhs=AsQArray(lhs, jnp.float8_e4m3fn),  # pyrefly: ignore[bad-argument-type]
+        lhs=AsQArray(
+            lhs,  # pyrefly: ignore[bad-argument-type]
+            jnp.float8_e4m3fn,
+            calibration_method='fixed,-224,224',
+        ),
         rhs=QArray(
             qvalue=jax.ShapeDtypeStruct((num_groups, k, n), jnp.float8_e4m3fn),  # pyrefly: ignore[bad-argument-type]
+            # Here the scale is 3-D, as produced by qwix.
+            # `gmm_v2_perf_test` passes the kernel a 4-D scale with an explicit
+            # jnp.expand_dims so its measurement does not include this expansion
             scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
-                (num_groups, k // block_size, n), jnp.bfloat16
+                (num_groups, k // block_size, n), jnp.float32
             ),
         ),
+        # Same distribution as `gmm_v2_perf_test`.
         group_sizes=base.GroupSizes(
-            jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32), m
+            jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
+            _uniform_weight_group_sizes(m, num_groups),
         ),
         zero_initialize=True,
         preferred_element_type=jnp.bfloat16,
@@ -230,29 +252,45 @@ def _make_ullm_gmm_v2_spec(
     block_size: int,
     fuse_act: str | None = None,
     num_groups: int = 64,
+    num_global_groups: int | None = None,
+    group_offset: int | None = None,
+    scale_dtype: jnp.dtype = jnp.bfloat16,  # pyrefly: ignore[bad-function-definition]
     project: str = 'ullm',
     tags: tuple[arg_spec.Tag, ...] = ('primary', 'forward_only'),
 ) -> arg_spec.ArgSpec:
-  """Make a ULLM MoE GMM v2 spec."""
+  """Make a ULLM MoE GMM v2 spec.
+
+  With `num_global_groups` and `group_offset`, `group_sizes` covers all experts
+  but only the `num_groups` local experts from `group_offset` are computed.
+  """
   num_q_blocks = k // block_size
+  if num_global_groups is None:
+    num_global_groups = num_groups
   group_sizes = base.GroupSizes(
-      jax.ShapeDtypeStruct((num_groups,), dtype=jnp.int32),
-      tuple([m // num_groups] * num_groups),
+      jax.ShapeDtypeStruct((num_global_groups,), dtype=jnp.int32),
+      tuple([m // num_global_groups] * num_global_groups),
   )
+  extra_args = {}
+  if group_offset is not None:
+    extra_args['group_offset'] = np.array([group_offset], np.int32)
   args = dict(
       lhs=AsQArray(
           jax.ShapeDtypeStruct((m, k), jnp.bfloat16), jnp.float8_e4m3fn  # pyrefly: ignore[bad-argument-type]
       ),
       rhs=QArray(
           qvalue=jax.ShapeDtypeStruct((num_groups, k, n), weight_dtype),  # pyrefly: ignore[bad-argument-type]
+          # Here the scale is 3-D, as produced by qwix.
+          # `gmm_v2_perf_test` passes the kernel a 4-D scale with an explicit
+          # jnp.expand_dims so its measurement does not include this expansion.
           scale=jax.ShapeDtypeStruct(  # pyrefly: ignore[bad-argument-type]
-              (num_groups, num_q_blocks, n), jnp.bfloat16
+              (num_groups, num_q_blocks, n), scale_dtype
           ),
       ),
       group_sizes=group_sizes,
       zero_initialize=False,
       fuse_gateup_activation=fuse_act,
       preferred_element_type=jnp.bfloat16,
+      **extra_args,
   )
   return arg_spec.ArgSpec(
       name=name,
@@ -324,6 +362,29 @@ ARG_SPECS = (
             block_size=256,
             quantized=True,
         ),
+        # drhs (tgmm) of the spec above, with an fp8 gradient.
+        arg_spec.ArgSpec(
+            name='tgmm_v2_maxtext_262144x7168_256x7168x1024',
+            args=dict(
+                lhs=jax.ShapeDtypeStruct((262144, 7168), jnp.float8_e4m3fn),
+                rhs=QArray(
+                    qvalue=jax.ShapeDtypeStruct((262144, 1024), jnp.float8_e5m2),  # pyrefly: ignore[bad-argument-type]
+                    scale=jax.ShapeDtypeStruct((1, 1024), jnp.float32),  # pyrefly: ignore[bad-argument-type]
+                ),
+                # Same distribution as `gmm_v2_perf_test`.
+                group_sizes=base.GroupSizes(
+                    jax.ShapeDtypeStruct((256,), dtype=jnp.int32),
+                    _uniform_weight_group_sizes(262144, 256),
+                ),
+                ragged_dot_dimension_numbers=base.RAGGED_CONTRACTING_DOT_DIM_NUMS,
+                preferred_element_type=jnp.bfloat16,
+            ),
+            project='maxtext',
+            # `forward_only` stops the autotuning pipeline from deriving VJP
+            # specs from this spec, which is already a backward op.
+            tags=('primary', 'forward_only'),
+            excluded_platforms=('gpu',),
+        ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp8_prefill_gate_up',
             m=81920,
@@ -332,6 +393,9 @@ ARG_SPECS = (
             fuse_act='silu',
             weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
             block_size=4096,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp8_prefill_down',
@@ -341,6 +405,9 @@ ARG_SPECS = (
             fuse_act=None,
             weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
             block_size=1024,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp8_decode_gate_up',
@@ -350,6 +417,9 @@ ARG_SPECS = (
             fuse_act='silu',
             weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
             block_size=4096,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp8_decode_down',
@@ -359,6 +429,9 @@ ARG_SPECS = (
             fuse_act=None,
             weight_dtype=jnp.float8_e4m3fn,  # pyrefly: ignore[bad-argument-type]
             block_size=1024,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp4_prefill_gate_up',
@@ -368,6 +441,9 @@ ARG_SPECS = (
             fuse_act='silu',
             weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
             block_size=64,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp4_prefill_down',
@@ -377,6 +453,9 @@ ARG_SPECS = (
             fuse_act=None,
             weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
             block_size=64,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp4_decode_gate_up',
@@ -386,6 +465,9 @@ ARG_SPECS = (
             fuse_act='silu',
             weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
             block_size=64,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         _make_ullm_gmm_v2_spec(
             'gmm_v2_ullm_fp4_decode_down',
@@ -395,6 +477,9 @@ ARG_SPECS = (
             fuse_act=None,
             weight_dtype=jnp.float4_e2m1fn,  # pyrefly: ignore[bad-argument-type]
             block_size=64,
+            num_global_groups=512,
+            group_offset=256,
+            scale_dtype=jnp.float32,  # pyrefly: ignore[bad-argument-type]
         ),
         # Qwen 3.5 MoE GMM v2 benchmark shapes:
         _make_ullm_gmm_v2_spec(
