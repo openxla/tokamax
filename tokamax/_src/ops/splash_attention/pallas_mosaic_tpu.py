@@ -18,12 +18,12 @@ import dataclasses
 import itertools
 from typing import Annotated, ClassVar, Final, override
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 import pydantic
 from tokamax._src import jaxtyping
+from tokamax._src import mosaic_tpu
 from tokamax._src.ops import op
 from tokamax._src.ops.splash_attention import base
 from tokamax._src.ops.splash_attention import pallas_mosaic_tpu_vjp
@@ -451,4 +451,4 @@ class PallasMosaicTpuSplashAttention(base.SplashAttention[Config]):
 
   @override
   def supported_on(self, device: jax.Device) -> bool:
-    return device.platform == "tpu" and pltpu.get_tpu_info().generation >= 5
+    return mosaic_tpu.has_mosaic_tpu_support(device)
