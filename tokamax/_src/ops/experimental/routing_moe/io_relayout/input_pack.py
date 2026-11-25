@@ -72,20 +72,19 @@ class ResolvedInputPackPlan:
     """Selects a sublane-aligned tile size within VMEM capacity."""
     x_dtype = jax.dtypes.canonicalize_dtype(dtype)
     sublane_size = tpu_info.get_sublane_tiling(x_dtype)
-    # Floor so `tile_rows <= batch_size` whenever `batch_size >= sublane_size`;
-    # the remaining `batch_size % tile_rows` rows are handled by the tail.
     batch_sublanes = max(1, batch_size // sublane_size)
     if requested_tile_rows is None:
-      # Cap at ceil(batch_sublanes / 2) when possible so num_tiles >= 2 and HBM
-      # DMAs overlap with VPU relayout via double buffering.
+      # Cap at ceil(total_sublanes / 2) when possible so HBM DMAs overlap with
+      # VPU relayout via double buffering without creating a tiny 3rd tile.
+      total_sublanes = pl.cdiv(batch_size, sublane_size)
       max_tile_sublanes = max(
           1,
-          min(max_tile_rows // sublane_size, (batch_sublanes + 1) // 2),
+          min(max_tile_rows // sublane_size, pl.cdiv(total_sublanes, 2)),
       )
       # Prefer an exact divisor of `batch_sublanes` when it is at least half of
-      # `max_tile_sublanes` (e.g. batch=768 -> tile=384) to avoid a tail;
-      # otherwise use `max_tile_sublanes` and let the tail handle the remaining
-      # rows instead of degrading to 1-sublane tiles on prime/irregular batches.
+      # `max_tile_sublanes` (e.g. batch=768 -> tile=384) to avoid a partial last
+      # tile; otherwise use `max_tile_sublanes` instead of degrading to
+      # 1-sublane tiles on prime/irregular batches.
       gcd_sublanes = math.gcd(batch_sublanes, max_tile_sublanes)
       if batch_size % sublane_size == 0 and gcd_sublanes >= max(
           1, max_tile_sublanes // 2
@@ -105,11 +104,10 @@ class ResolvedInputPackPlan:
 
     # Each buffer slot holds one input tile `(tile_rows, dim_size)` and one
     # bank-conflict-padded output tile `(tile_rows, vmem_chunks, packing,
-    # lanes)` in VMEM, and a ragged tail needs at most one more slot. When
-    # `dim_size` is large, the initial `tile_rows` may exceed VMEM capacity;
-    # repeatedly halve the sublane count per tile (preserving sublane
-    # alignment) until all scratch tensors fit within the VMEM budget
-    # (`max_scratch_vmem_ratio` of capacity, leaving headroom for
+    # lanes)` in VMEM. When `dim_size` is large, the initial `tile_rows` may
+    # exceed VMEM capacity; repeatedly halve the sublane count per tile
+    # (preserving sublane alignment) until all scratch tensors fit within the
+    # VMEM budget (`max_scratch_vmem_ratio` of capacity, leaving headroom for
     # compiler-managed VMEM allocations).
     packing = layout_util.get_packing(x_dtype)
     bytes_per_row = (
@@ -121,8 +119,7 @@ class ResolvedInputPackPlan:
     )
 
     def scratch_bytes(tile_rows: int) -> int:
-      num_slots = num_buffers + (batch_size % tile_rows != 0)
-      return num_slots * tile_rows * bytes_per_row
+      return num_buffers * tile_rows * bytes_per_row
 
     while (
         tile_rows > sublane_size
@@ -156,22 +153,19 @@ class ResolvedInputPackPlan:
     if max_tile_rows <= 0:
       raise ValueError(f"max_tile_rows ({max_tile_rows}) must be positive.")
 
-    scoped_vmem_reserved_bytes = (
-        64 * 1024
-        if plan.scoped_vmem_reserved_bytes is None
-        else plan.scoped_vmem_reserved_bytes
-    )
+    scoped_vmem_reserved_bytes = plan.scoped_vmem_reserved_bytes
+    if scoped_vmem_reserved_bytes is None:
+      scoped_vmem_reserved_bytes = 64 * 1024
     if scoped_vmem_reserved_bytes < 0:
       raise ValueError(
           f"scoped_vmem_reserved_bytes ({scoped_vmem_reserved_bytes}) must be"
           " non-negative."
       )
 
-    max_scratch_vmem_ratio = (
-        0.75
-        if plan.max_scratch_vmem_ratio is None
-        else plan.max_scratch_vmem_ratio
-    )
+    max_scratch_vmem_ratio = plan.max_scratch_vmem_ratio
+    if max_scratch_vmem_ratio is None:
+      max_scratch_vmem_ratio = 0.75
+
     if not 0 < max_scratch_vmem_ratio <= 1:
       raise ValueError(
           f"max_scratch_vmem_ratio ({max_scratch_vmem_ratio}) must be in"
@@ -189,10 +183,7 @@ class ResolvedInputPackPlan:
         max_tile_rows=max_tile_rows,
         max_scratch_vmem_ratio=max_scratch_vmem_ratio,
     )
-    num_tiles = batch_size // tile_rows
-    # Allocate at least one slot so scratch shapes stay non-empty when
-    # `batch_size < tile_rows` (i.e. `batch_size < sublane_size`) and every row
-    # goes through the tail.
+    num_tiles = pl.cdiv(batch_size, tile_rows)
     num_buffers = max(1, min(num_tiles, max_num_buffers))
     return cls(
         tile_rows=tile_rows,
@@ -301,37 +292,11 @@ class _InputPackConfig:
 
   @property
   def num_tiles(self) -> int:
-    return self.batch_size // self.tile_rows
+    return pl.cdiv(self.batch_size, self.tile_rows)
 
   @property
   def num_active_buffers(self) -> int:
     return min(self.num_buffers, self.num_tiles)
-
-  @property
-  def tail_row_start(self) -> int:
-    return self.num_tiles * self.tile_rows
-
-  @property
-  def tail_rows(self) -> int:
-    return self.batch_size - self.tail_row_start
-
-  @property
-  def padded_tail_rows(self) -> int:
-    """Rounds `tail_rows` up to the input's HBM sublane tiling.
-
-    The tail DMA must be aligned to that tiling. XLA tiles a `(batch_size, D)`
-    kernel input by `num_sublanes` rows, or by a larger tile that already
-    divides the tail, when `batch_size >= num_sublanes`; otherwise by the
-    smallest power of two that covers `batch_size`, but at least `packing` rows.
-    """
-    if self.batch_size >= self.num_sublanes:
-      return pl.cdiv(self.tail_rows, self.num_sublanes) * self.num_sublanes
-    return max(self.packing, pl.next_power_of_2(self.batch_size))
-
-  @property
-  def num_sems(self) -> int:
-    # One extra DMA semaphore per direction for the tail.
-    return self.num_buffers + (self.tail_rows != 0)
 
   @property
   def out_shape(self) -> tuple[int, ...]:
@@ -360,7 +325,7 @@ class _InputPackConfig:
 
   def scratch_types(self) -> dict[str, pl.MemoryRef]:
     """Scratch buffers of `_input_pack_kernel`, keyed by its parameter names."""
-    scratch: dict[str, pl.MemoryRef] = dict(
+    return dict(
         in_scratch_ref=pltpu.VMEM(
             (self.num_buffers, self.tile_rows, self.dim_size), self.dtype
         ),
@@ -374,23 +339,9 @@ class _InputPackConfig:
             ),
             self.dtype,
         ),
-        send_sem_ref=pltpu.SemaphoreType.DMA((self.num_sems,)),
-        recv_sem_ref=pltpu.SemaphoreType.DMA((self.num_sems,)),
+        send_sem_ref=pltpu.SemaphoreType.DMA((self.num_buffers,)),
+        recv_sem_ref=pltpu.SemaphoreType.DMA((self.num_buffers,)),
     )
-    if self.tail_rows:
-      scratch["tail_in_scratch_ref"] = pltpu.VMEM(
-          (self.padded_tail_rows, self.dim_size), self.dtype
-      )
-      scratch["tail_out_scratch_ref"] = pltpu.VMEM(
-          (
-              self.padded_tail_rows,
-              self.vmem_chunks,
-              self.packing,
-              self.num_lanes,
-          ),
-          self.dtype,
-      )
-    return scratch
 
 
 def _input_pack_kernel(
@@ -402,23 +353,13 @@ def _input_pack_kernel(
     send_sem_ref: hijax.TransformedRef,
     recv_sem_ref: hijax.TransformedRef,
     cfg: _InputPackConfig,
-    tail_in_scratch_ref: hijax.TransformedRef | None = None,
-    tail_out_scratch_ref: hijax.TransformedRef | None = None,
 ) -> None:
   """Double-buffered HBM-to-VMEM relayout from large to compact layout.
 
-  The first `num_tiles * tile_rows` rows go through the double-buffered tile
-  loop. When `batch_size` is not a multiple of `tile_rows`, the remaining
-  `tail_rows` rows are handled by a separate tail stage instead of padding the
-  input and slicing the output in HBM:
-
-  * Input: the HBM input is physically padded to its sublane tiling, so a
-    `pl.multiple_of`-aligned dynamic slice reads the tail as one aligned
-    `(padded_tail_rows, dim_size)` DMA without an HBM copy (only tail-only
-    batches smaller than `padded_tail_rows` pad `x` in HBM). The extra rows are
-    relaid out but never written back.
-  * Output: the output's row dimension is untiled, so exactly `tail_rows` rows
-    are written back.
+  When `batch_size` is not a multiple of `tile_rows`, the final tile reads the
+  remaining rows rounded up to `num_sublanes` from the physically sublane-padded
+  HBM input, relayouts the full VMEM tile, and writes only the remaining valid
+  rows to the untiled output.
 
   Args:
     in_hbm_ref: 2D input HBM ref `(batch_size, dim_size)`.
@@ -428,118 +369,76 @@ def _input_pack_kernel(
     send_sem_ref: DMA semaphores for output writes.
     recv_sem_ref: DMA semaphores for input reads.
     cfg: Static kernel configuration.
-    tail_in_scratch_ref: Optional VMEM input scratch ref for tail rows.
-    tail_out_scratch_ref: Optional VMEM output scratch ref for tail rows.
   """
 
-  def start_copy_in(tile_idx: jax.Array | int, slot: jax.Array | int):
-    row_slice = pl.ds(tile_idx * cfg.tile_rows, cfg.tile_rows)
-    pltpu.make_async_copy(
-        in_hbm_ref.at[row_slice],
-        in_scratch_ref.at[slot],
-        recv_sem_ref.at[slot],
-    ).start()
+  # -------- Define DMA helper functions --------
 
-  def wait_copy_in(slot: jax.Array | int) -> None:
-    dummy_in_ref = in_scratch_ref.at[0]
-    pltpu.make_async_copy(
-        dummy_in_ref,
-        dummy_in_ref,
-        recv_sem_ref.at[slot],
-    ).wait()
+  def num_dma_rows(
+      tile_idx: jax.Array | int, total_rows: int
+  ) -> jax.Array | int:
+    if total_rows % cfg.tile_rows == 0:
+      return cfg.tile_rows
+    return jnp.minimum(cfg.tile_rows, total_rows - tile_idx * cfg.tile_rows)
 
-  def start_copy_out(tile_idx: jax.Array | int, slot: jax.Array | int):
-    row_slice = pl.ds(tile_idx * cfg.tile_rows, cfg.tile_rows)
-    pltpu.make_async_copy(
-        out_scratch_ref.at[slot, :, : cfg.num_packed_chunks],
-        out_hbm_ref.at[row_slice],
-        send_sem_ref.at[slot],
-    ).start(priority=1)
-
-  def wait_copy_out(slot: jax.Array | int) -> None:
-    dummy_out_ref = out_scratch_ref.at[0, :, : cfg.num_packed_chunks]
-    pltpu.make_async_copy(
-        dummy_out_ref,
-        dummy_out_ref,
-        send_sem_ref.at[slot],
-    ).wait()
-
-  def tail_copy_in():
-    assert tail_in_scratch_ref is not None
-    tail_start = pl.multiple_of(
-        jnp.int32(cfg.tail_row_start), cfg.num_sublanes
-    )
-    # The tail uses the semaphore after the `num_buffers` tile semaphores.
+  def copy_in(tile_idx: jax.Array | int, slot: jax.Array | int):
+    start_row = tile_idx * cfg.tile_rows
+    num_rows = num_dma_rows(tile_idx, max(cfg.batch_size, cfg.tile_rows))
+    num_rows = pl.cdiv(num_rows, cfg.num_sublanes) * cfg.num_sublanes
     return pltpu.make_async_copy(
-        in_hbm_ref.at[pl.ds(tail_start, cfg.padded_tail_rows)],
-        tail_in_scratch_ref,
-        recv_sem_ref.at[cfg.num_buffers],
+        in_hbm_ref.at[pl.ds(start_row, num_rows)],
+        in_scratch_ref.at[slot, pl.ds(0, num_rows)],
+        recv_sem_ref.at[slot],
     )
 
-  def tail_copy_out():
-    assert tail_out_scratch_ref is not None
+  def copy_out(tile_idx: jax.Array | int, slot: jax.Array | int):
+    start_row = tile_idx * cfg.tile_rows
+    num_rows = num_dma_rows(tile_idx, cfg.batch_size)
     return pltpu.make_async_copy(
-        tail_out_scratch_ref.at[: cfg.tail_rows, : cfg.num_packed_chunks],
-        out_hbm_ref.at[pl.ds(cfg.tail_row_start, cfg.tail_rows)],
-        send_sem_ref.at[cfg.num_buffers],
+        out_scratch_ref.at[slot, pl.ds(0, num_rows), : cfg.num_packed_chunks],
+        out_hbm_ref.at[pl.ds(start_row, num_rows)],
+        send_sem_ref.at[slot],
     )
 
+  # -------- Actual Kernel Part --------
+
+  # Prologue.
+  for slot in range(cfg.num_active_buffers):
+    copy_in(slot, slot).start()
+
+  # Body.
+  @pl.loop(0, cfg.num_tiles)
   @jax.named_scope("step")
-  def step(tile_idx: jax.Array):
+  def step(tile_idx: jax.Array) -> None:
     """Executes one double-buffered pipeline iteration for `tile_idx`."""
     slot = tile_idx % cfg.num_buffers
 
     # Step 1: Wait for previous output tile DMA on this buffer slot before
     # overwriting `out_scratch_ref.at[slot]`.
-    pl.when(tile_idx >= cfg.num_buffers)(functools.partial(wait_copy_out, slot))
+    @pl.when(tile_idx >= cfg.num_buffers)
+    def _():
+      copy_out(tile_idx - cfg.num_buffers, slot).wait()
 
     # Step 2: Wait for current input tile DMA and load into VREGs.
-    wait_copy_in(slot)
+    copy_in(tile_idx, slot).wait()
 
     # Step 3: Relayout from large VREG layout to bank-conflict-free VMEM.
     val = in_scratch_ref.at[slot][...]
     layout_util.store_large_to_compact(out_scratch_ref.at[slot], val)
 
     # Step 4: Write current compact tile to HBM.
-    start_copy_out(tile_idx, slot)
+    copy_out(tile_idx, slot).start(priority=1)
 
     # Step 5: Prefetch next input tile into this buffer slot now that `val`
     # has been loaded into VREGs.
     next_tile_idx = tile_idx + cfg.num_buffers
-    pl.when(next_tile_idx < cfg.num_tiles)(
-        functools.partial(start_copy_in, next_tile_idx, slot)
-    )
 
-  with jax.named_scope("prologue"):
-    for slot in range(cfg.num_active_buffers):
-      start_copy_in(slot, slot)
-    # The tail's input is independent of the tile loop, so fetch it up front
-    # to overlap with the pipelined tiles.
-    if cfg.tail_rows:
-      tail_copy_in().start()
+    @pl.when(next_tile_idx < cfg.num_tiles)
+    def _():
+      copy_in(next_tile_idx, slot).start()
 
-  if cfg.num_tiles:
-    with jax.named_scope("main_loop"):
-      pl.loop(0, cfg.num_tiles)(step)
-
-  # Tail: relayout the remainder rows and start their output DMA.
-  if cfg.tail_rows:
-    with jax.named_scope("tail"):
-      assert tail_in_scratch_ref is not None
-      assert tail_out_scratch_ref is not None
-      tail_copy_in().wait()
-      layout_util.store_large_to_compact(
-          tail_out_scratch_ref, tail_in_scratch_ref[...]
-      )
-      tail_copy_out().start(priority=1)
-
-  with jax.named_scope("epilogue"):
-    for tile_idx in range(
-        cfg.num_tiles - cfg.num_active_buffers, cfg.num_tiles
-    ):
-      wait_copy_out(tile_idx % cfg.num_buffers)
-    if cfg.tail_rows:
-      tail_copy_out().wait()
+  # Epilogue.
+  for tile_idx in range(cfg.num_tiles - cfg.num_active_buffers, cfg.num_tiles):
+    copy_out(tile_idx, tile_idx % cfg.num_buffers).wait()
 
 
 @jax.jit(static_argnames=("out_format", "plan"))
@@ -558,8 +457,8 @@ def input_pack(
   )
   # TODO: Remove this padding and use `pl.pad_ref` in
   # `_input_pack_kernel` once the minimum JAX version is >= 0.12.1.
-  if cfg.tail_rows and x.shape[0] < cfg.padded_tail_rows:
-    x = jnp.pad(x, ((0, cfg.padded_tail_rows - x.shape[0]), (0, 0)))
+  if x.shape[0] < cfg.tile_rows:
+    x = jnp.pad(x, ((0, cfg.tile_rows - x.shape[0]), (0, 0)))
   # No layout constraint on `x`: the kernel is equally fast with any sublane
   # tiling, and leaving the choice to XLA avoids a relayout copy for inputs in
   # XLA's default layout and lets producers in the same jit match the kernel.
