@@ -200,6 +200,11 @@ class TypeAdapter[T]:
   def validate_python(self, object: Any, /) -> T:
     return self._impl.validate_python(object)
 
+  def validate_json(
+      self, data: str | bytes | bytearray, /, **kwargs
+  ) -> T:
+    return self._impl.validate_json(data, **kwargs)
+
 
 get_adapter = functools.lru_cache(TypeAdapter)
 
@@ -248,6 +253,7 @@ class Dataclass:
     assert schema['type'] == 'dataclass'
     args_schema = schema['schema']
     assert args_schema['type'] == 'dataclass-args'
+    args_schema['extra_behavior'] = 'forbid'
 
     origin = typing.get_origin(source) or source
     hints = typing.get_type_hints(origin, include_extras=True)
@@ -310,7 +316,8 @@ class MeshShape:
             axis_names=list_field(cs.str_schema()),
             axis_sizes=list_field(cs.int_schema()),
             axis_types=list_field(cs.str_schema()),
-        )
+        ),
+        extra_behavior='forbid',
     )
     from_dict_schema = cs.chain_schema(
         [dict_schema, cs.no_info_plain_validator_function(to_abstract_mesh)]
@@ -414,7 +421,8 @@ class ShapeDtype:
       if (match := cls.PATTERN.match(value)) is None:
         raise ValueError(f'Invalid ShapeDtype: {value}')
       dtype, shape, _, vmap_axes = handler(match.groups())
-      dtype = cls.SHORT_DTYPE_NAMES_MAP[dtype]
+      if (dtype := cls.SHORT_DTYPE_NAMES_MAP.get(dtype)) is None:
+        raise ValueError(f'Invalid ShapeDtype: {value}')
       if vmap_axes is None:
         return jax.ShapeDtypeStruct(shape, dtype)
       return batching.BatchedShapeDtype(shape, dtype, vmap_axes=vmap_axes)
@@ -452,5 +460,7 @@ def get_arg_spec_model(name: str, signature: inspect.Signature) -> type[Any]:
       annotation = annotate(p.annotation)
     fields[param_name] = annotation
   ty = TypedDict(name, fields, total=False)  # pyrefly: ignore[invalid-argument]
-  ty.__pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  ty.__pydantic_config__ = pydantic.ConfigDict(
+      arbitrary_types_allowed=True, extra='forbid'
+  )
   return ty

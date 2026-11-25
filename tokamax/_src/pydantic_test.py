@@ -296,6 +296,61 @@ class PydanticTest(parameterized.TestCase):
     )
     self.assertEqual(mesh, adapter.validate_json(adapter.dump_json(mesh)))
 
+  def test_extra_field_fails_deserialization(self):
+    attn_op = attn_base.DotProductAttention()
+    arg_spec_adapter = op_lib._get_arg_spec_adapter(attn_op)  # pylint: disable=protected-access
+    for bad_spec in (
+        {"unknown_arg": 1},
+        {"mask": {"is_causal": True}},
+        {"mask": {"is_causal": False}},
+        {"mask": {"causal_mask": {"offset": 0, "window_size": None, "extra": 1}}},
+        {"mask": {"bool_mask": "bad_dtype[2,4]"}},
+    ):
+      with self.assertRaises(pydantic.ValidationError):
+        arg_spec_adapter.validate_python(bad_spec)
+      with self.assertRaises(pydantic.ValidationError):
+        arg_spec_adapter.validate_json(json.dumps(bad_spec))
+
+    q = jax.ShapeDtypeStruct((2, 16, 4, 32), jnp.bfloat16)
+    ba = attn_op.bind(q, q, q)
+    ba_dict = json.loads(op_lib.BOUND_ARGS_ADAPTER.dump_json(ba))
+    for bad_ba in (
+        ba_dict | {"extra_top_level": 1},
+        {
+            "op": ba_dict["op"] | {"extra_op_field": 1},
+            "arguments": ba_dict["arguments"],
+        },
+        {
+            "op": ba_dict["op"],
+            "arguments": ba_dict["arguments"] | {"mask": {"is_causal": True}},
+        },
+    ):
+      with self.assertRaises(pydantic.ValidationError):
+        op_lib.BOUND_ARGS_ADAPTER.validate_python(bad_ba)
+      with self.assertRaises(pydantic.ValidationError):
+        op_lib.BOUND_ARGS_ADAPTER.validate_json(json.dumps(bad_ba))
+
+    dc_adapter = pydantic.TypeAdapter(pydantic_lib.annotate(_MyDataclass))
+    bad_dc = {"array": "f32[1,2]", "metadata": 42, "extra": 1}
+    with self.assertRaises(pydantic.ValidationError):
+      dc_adapter.validate_python(bad_dc)
+    with self.assertRaises(pydantic.ValidationError):
+      dc_adapter.validate_json(json.dumps(bad_dc))
+
+    mesh_adapter = pydantic.TypeAdapter(
+        pydantic_lib.annotate(jax.sharding.AbstractMesh)
+    )
+    bad_mesh = {
+        "axis_names": ["x"],
+        "axis_sizes": [2],
+        "axis_types": ["Auto"],
+        "extra": True,
+    }
+    with self.assertRaises(pydantic.ValidationError):
+      mesh_adapter.validate_python(bad_mesh)
+    with self.assertRaises(pydantic.ValidationError):
+      mesh_adapter.validate_json(json.dumps(bad_mesh))
+
 
 if __name__ == "__main__":
   absltest.main()

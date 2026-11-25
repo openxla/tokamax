@@ -463,7 +463,9 @@ class Op[**P, T, R, C, K: Hashable](abc.ABC):
     del params["config"]
     return sig.replace(parameters=tuple(params.values()))
 
-  __pydantic_config__ = pydantic.ConfigDict(arbitrary_types_allowed=True)
+  __pydantic_config__ = pydantic.ConfigDict(
+      arbitrary_types_allowed=True, extra="forbid"
+  )
 
   def supported_on(self, device: jax.Device) -> bool:
     """Returns whether this op runs on the given device."""
@@ -760,7 +762,7 @@ class BoundArguments[C, K: Hashable]:
         op=cs.typed_dict_field(op_schema),
         arguments=cs.typed_dict_field(cs.any_schema()),
     )
-    dict_schema = cs.typed_dict_schema(dict_fields)
+    dict_schema = cs.typed_dict_schema(dict_fields, extra_behavior="forbid")
 
     def serialize(value, handler, info) -> dict[str, Any]:
       arg_spec_adapter = _get_arg_spec_adapter(value.op)
