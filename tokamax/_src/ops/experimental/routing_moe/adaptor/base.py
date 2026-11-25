@@ -25,6 +25,7 @@ from tokamax._src.ops.experimental.routing_moe.adaptor import reference
 from typing_extensions import override
 
 _Config = TypeVar("_Config")
+AbstractArray = jax.ShapeDtypeStruct | jax.core.ShapedArray
 
 
 class RoutingMoe(op.Op[Any, jax.Array, None, _Config, Any]):
@@ -34,16 +35,16 @@ class RoutingMoe(op.Op[Any, jax.Array, None, _Config, Any]):
   @override
   def bind(
       self,
-      hidden_states: Float[Array, "T H"],
-      topk_weights: Float[Array, "T K"],
-      topk_indices: Int[Array, "T K"],
-      w1: Array,
-      w2: Array,
-      w1_scale: Array | None = None,
-      w2_scale: Array | None = None,
-      w1_bias: Array | None = None,
-      w2_bias: Array | None = None,
-      mesh: jax.sharding.Mesh | None = None,
+      hidden_states: Float[Array | AbstractArray, "T H"],
+      topk_weights: Float[Array | AbstractArray, "T K"],
+      topk_indices: Int[Array | AbstractArray, "T K"],
+      w1: Array | AbstractArray,
+      w2: Array | AbstractArray,
+      w1_scale: Array | AbstractArray | None = None,
+      w2_scale: Array | AbstractArray | None = None,
+      w1_bias: Array | AbstractArray | None = None,
+      w2_bias: Array | AbstractArray | None = None,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
       activation: str = "silu",
       tp_axis: str | None = None,
       ep_axis: str | None = None,
@@ -81,8 +82,8 @@ class RoutingMoe(op.Op[Any, jax.Array, None, _Config, Any]):
         return_residuals=return_residuals,
     )
 
-  @override
   @jaxtyping.jaxtyped
+  @override
   def _fwd(
       self,
       hidden_states: Float[Array, "T H"],
@@ -94,7 +95,7 @@ class RoutingMoe(op.Op[Any, jax.Array, None, _Config, Any]):
       w2_scale: Array | None = None,
       w1_bias: Array | None = None,
       w2_bias: Array | None = None,
-      mesh: jax.sharding.Mesh | None = None,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
       activation: str = "silu",
       tp_axis: str | None = None,
       ep_axis: str | None = None,

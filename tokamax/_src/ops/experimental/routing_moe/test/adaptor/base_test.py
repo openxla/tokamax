@@ -443,6 +443,29 @@ class RoutingMoeBaseTest(parameterized.TestCase):
     self.assertTrue(np.all(weights1 > 0))
     np.testing.assert_allclose(weights1.sum(axis=-1), 1.0, atol=1e-5)
 
+  def test_eval_shape_accepts_abstract_mesh(self):
+    mesh = jax.sharding.AbstractMesh(
+        (2,), ("d",), axis_types=(jax.sharding.AxisType.Auto,)
+    )
+    out = jax.eval_shape(
+        lambda x, tw, ti, w1, w2: base.RoutingMoe()(
+            hidden_states=x,
+            topk_weights=tw,
+            topk_indices=ti,
+            w1=w1,
+            w2=w2,
+            mesh=mesh,
+            ep_axis="d",
+        ),
+        jax.ShapeDtypeStruct((8, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, 2), jnp.float32),
+        jax.ShapeDtypeStruct((8, 2), jnp.int32),
+        jax.ShapeDtypeStruct((4, 32, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4, 16, 32), jnp.bfloat16),
+    )
+    self.assertEqual(out.shape, (8, 32))
+    self.assertEqual(out.dtype, jnp.bfloat16)
+
 
 if __name__ == "__main__":
   absltest.main()

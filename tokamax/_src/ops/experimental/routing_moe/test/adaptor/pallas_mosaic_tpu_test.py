@@ -14,8 +14,6 @@
 # ==============================================================================
 """Tests for the Pallas Mosaic TPU implementation of the Routing MoE op."""
 
-import inspect
-
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -27,10 +25,8 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 import numpy as np
-from tokamax._src.ops import op
 from tokamax._src.ops.experimental.routing_moe.adaptor import api
 from tokamax._src.ops.experimental.routing_moe.adaptor import arg_specs
-from tokamax._src.ops.experimental.routing_moe.adaptor import base
 from tokamax._src.ops.experimental.routing_moe.adaptor import pallas_mosaic_tpu
 from tokamax._src.ops.experimental.routing_moe.adaptor import reference
 
@@ -440,14 +436,11 @@ class AutotuningConfigsTest(absltest.TestCase):
   """Tests for autotuning config binding."""
 
   def test_all_specs_bind_and_produce_autotuning_configs(self):
-    base_op = base.RoutingMoe()
     mosaic_op = pallas_mosaic_tpu.PallasMosaicTpuRoutingMoe()
-    bind_signature = inspect.signature(base_op.bind)
     self.assertNotEmpty(arg_specs.ARG_SPECS)
     for spec in arg_specs.ARG_SPECS:
       with self.subTest(spec.full_name):
-        bind_signature.bind(**spec.args)
-        bound = op.BoundArguments(op=mosaic_op, arguments=spec.args)
+        bound = mosaic_op.bind(**spec.args)
         configs = mosaic_op._get_autotuning_configs(bound)
         self.assertNotEmpty(configs)
         self.assertLessEqual(len(configs), 32)

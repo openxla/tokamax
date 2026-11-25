@@ -73,7 +73,7 @@ class PallasMosaicTpuRoutingMoe(base.RoutingMoe):
       w2_scale: Array | None = None,
       w1_bias: Array | None = None,
       w2_bias: Array | None = None,
-      mesh: jax.sharding.Mesh | None = None,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
       activation: str = "silu",
       tp_axis: str | None = None,
       ep_axis: str | None = None,
@@ -86,8 +86,8 @@ class PallasMosaicTpuRoutingMoe(base.RoutingMoe):
     del return_residuals
     if config is None:
       config = Config()
-    if mesh is None:
-      raise NotImplementedError("Routing MoE requires a device mesh.")
+    if not isinstance(mesh, jax.sharding.Mesh):
+      raise NotImplementedError("Routing MoE requires a concrete device mesh.")
     if w1_bias is not None or w2_bias is not None:
       raise NotImplementedError("Bias is currently not supported.")
 

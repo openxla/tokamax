@@ -120,7 +120,7 @@ def routing_moe_reference(
     w2_scale: jax.Array | None = None,
     w1_bias: jax.Array | None = None,
     w2_bias: jax.Array | None = None,
-    mesh: jax.sharding.Mesh | None = None,
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
     activation: str = "silu",
     tp_axis: str | None = None,
     ep_axis: str | None = None,
