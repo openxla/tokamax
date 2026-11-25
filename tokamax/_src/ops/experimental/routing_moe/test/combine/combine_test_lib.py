@@ -24,7 +24,7 @@ from tokamax._src import test_utils
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
@@ -117,14 +117,14 @@ class ReduceCase:
     if self.in_dtype.itemsize == 1:
       return quantize_to_compact(self.rows, self.in_dtype, valid=valid)
     rows = jnp.where(valid[:, None], self.rows, jnp.nan)
-    return input_pack.input_pack(rows)
+    return pack.input_pack(rows)
 
   @property
   def rows_clean_compact(self) -> jax.Array:
     """`rows` in the compact layout with no NaN, for the XLA baseline."""
     if self.in_dtype.itemsize == 1:
       return quantize_to_compact(self.rows, self.in_dtype).data
-    return input_pack.input_pack(self.rows).data
+    return pack.input_pack(self.rows).data
 
   @property
   def dequantized_rows(self) -> jax.Array:

@@ -419,10 +419,16 @@ SHARDS: ShardMap = {
         ),
         minutes=9,
     ),
-    'experimental-routing-moe-output-reduce': Spec(
+    'experimental-routing-moe-combine': Spec(
         paths=(
-            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_prod_test.py',
-            'tokamax/_src/ops/experimental/routing_moe/test/io_relayout/output_reduce_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/combine/combine_prod_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/combine/combine_unit_test.py',
+        ),
+        minutes=8,
+    ),
+    'experimental-routing-moe-pack': Spec(
+        paths=(
+            'tokamax/_src/ops/experimental/routing_moe/test/pack/pack_unit_test.py',
         ),
         minutes=8,
     ),

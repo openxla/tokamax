@@ -21,14 +21,14 @@ from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tokamax._src.ops.experimental.routing_moe.combine import kernel
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce as kernel
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
+from tokamax._src.ops.experimental.routing_moe.test.combine import combine_test_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_shapes
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
-from tokamax._src.ops.experimental.routing_moe.test.io_relayout import output_reduce_test_lib
 
 jax.config.parse_flags_with_absl()
 
@@ -46,7 +46,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
       *,
       in_dtype: jax.typing.DTypeLike = jnp.bfloat16,
   ) -> None:
-    case = output_reduce_test_lib.ReduceCase.make_case(
+    case = combine_test_lib.ReduceCase.make_case(
         case_spec, in_dtype=in_dtype, seed=42
     )
     if case_spec.sharding.ep == 1:
@@ -119,7 +119,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
     in_dtype = jnp.dtype(in_dtype)
     ep_size = 8
     shape = helper_shapes.MoEShape("ep", 512, 10, 2048, 1024)
-    case = output_reduce_test_lib.ReduceCase.make_case(
+    case = combine_test_lib.ReduceCase.make_case(
         helper_cases.Case(
             "ep",
             shape,
@@ -138,11 +138,11 @@ class OutputReduceUnitTest(parameterized.TestCase):
       )
       valid = w_shard.reshape(-1) != 0
       if in_dtype.itemsize == 1:
-        rows_shard = output_reduce_test_lib.quantize_to_compact(
+        rows_shard = combine_test_lib.quantize_to_compact(
             case.rows, in_dtype, valid=valid
         )
       else:
-        rows_shard = input_pack.input_pack(
+        rows_shard = pack.input_pack(
             jnp.where(valid[:, None], case.rows, jnp.nan)
         )
       out_shard = kernel.output_reduce_unpack(
@@ -166,13 +166,13 @@ class OutputReduceUnitTest(parameterized.TestCase):
     """Zero weights produce zeros without reading the (NaN) rows."""
     num_tokens, top_k, hidden_size = 256, 10, 2048
     if jnp.dtype(in_dtype) == jnp.bfloat16:
-      rows_nan = input_pack.input_pack(
+      rows_nan = pack.input_pack(
           jnp.full(
               (num_tokens * top_k, hidden_size), jnp.nan, dtype=jnp.bfloat16
           )
       )
     else:
-      rows_nan = output_reduce_test_lib.quantize_to_compact(
+      rows_nan = combine_test_lib.quantize_to_compact(
           jnp.zeros((num_tokens * top_k, hidden_size), dtype=jnp.bfloat16),
           in_dtype,
           valid=jnp.zeros((num_tokens * top_k,), dtype=bool),
@@ -185,7 +185,7 @@ class OutputReduceUnitTest(parameterized.TestCase):
 
   def test_unsupported_rows_dtype_raises(self):
     num_tokens, top_k, hidden_size = 16, 4, 512
-    rows_i8 = input_pack.input_pack(
+    rows_i8 = pack.input_pack(
         jnp.zeros((num_tokens * top_k, hidden_size), dtype=jnp.int8)
     )
     weights = jnp.ones((num_tokens, top_k), dtype=jnp.float32)

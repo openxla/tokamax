@@ -26,7 +26,7 @@ from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 from tokamax._src.ops.experimental.routing_moe.test.gmm import gmm_test_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_reference
@@ -117,7 +117,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
     w_dtype, tol = dtype_and_tol
     x, w1, _, routing = _make_block_scaled_inputs(num_tokens, w_dtype=w_dtype)
     out = kernel.routing_gmm(
-        input_pack.input_pack(x),
+        pack.input_pack(x),
         w1,
         gather=routing.gather,
         fuse_act="silu",
@@ -136,7 +136,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
     assert w1.bias is not None
     w1 = dataclasses.replace(w1, bias=w1.bias * 10)
     out = kernel.routing_gmm(
-        input_pack.input_pack(x),
+        pack.input_pack(x),
         w1,
         gather=routing.gather,
         fuse_act="silu",
@@ -153,7 +153,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
   def test_gather_gmm_mixed_dtypes_f32_acc_and_large_tokens(self):
     x, w1, _, routing = _make_block_scaled_inputs(160, w_dtype=jnp.float8_e5m2)
     out = kernel.routing_gmm(
-        input_pack.input_pack(x),
+        pack.input_pack(x),
         w1,
         gather=routing.gather,
         fuse_act="silu",
@@ -176,7 +176,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
     )
     x_sorted = x[routing.gather_indices]
     out = kernel.routing_gmm(
-        input_pack.input_pack(x_sorted),
+        pack.input_pack(x_sorted),
         w2,
         scatter=routing.scatter,
         **routing.kernel_kwargs,
@@ -196,7 +196,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
     )
     x_sorted = x[routing.gather_indices]
     out = kernel.routing_gmm(
-        input_pack.input_pack(x_sorted),
+        pack.input_pack(x_sorted),
         w2,
         scatter=routing.scatter,
         out_format=_FP8_OUT_FORMAT,
@@ -280,7 +280,7 @@ class RoutingGmmBlockScaledTest(parameterized.TestCase):
         prepare_scales=prepare_scales,
     )
     out = kernel.routing_gmm(
-        input_pack.input_pack(x),
+        pack.input_pack(x),
         w1,
         w2=w2,
         gather=routing.gather,

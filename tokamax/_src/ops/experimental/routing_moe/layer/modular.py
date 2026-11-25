@@ -20,13 +20,13 @@ import functools
 import jax
 from jax import numpy as jnp
 from jax import sharding
+from tokamax._src.ops.experimental.routing_moe.combine import kernel as combine
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel as gmm
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan_lib
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
-from tokamax._src.ops.experimental.routing_moe.io_relayout import output_reduce
 from tokamax._src.ops.experimental.routing_moe.layer import config
 from tokamax._src.ops.experimental.routing_moe.layer import plan as moe_plan_lib
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 
 
 def _prepare_ep_inputs(
@@ -111,7 +111,7 @@ def _routing_moe_local(
   # repacking triggers both input and output relayout. Thus, we need to perform
   # repacking after all-gather.
   # TODO: Support all-gather with compact layout.
-  x_compact = input_pack.input_pack(x, cfg.gmm_in_format)
+  x_compact = pack.input_pack(x, cfg.gmm_in_format)
 
   # Step 4: Sort indices and compute expert group sizes.
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
@@ -151,9 +151,9 @@ def _routing_moe_local(
   # Step 6: Postprocess outputs from routing gmm. With remote_scatter or
   # without EP sharding, every row in gmm_res is valid on this shard.
   if cfg.plan.remote_scatter or cfg.ep_axis is None:
-    out = output_reduce.output_reduce_unpack(gmm_res, topk_weights)
+    out = combine.output_reduce_unpack(gmm_res, topk_weights)
   else:
-    out = output_reduce.output_reduce_unpack(
+    out = combine.output_reduce_unpack(
         gmm_res,
         topk_weights,
         topk_indices,

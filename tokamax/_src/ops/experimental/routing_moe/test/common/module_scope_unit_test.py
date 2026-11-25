@@ -124,7 +124,7 @@ class ModuleScopeTest(parameterized.TestCase):
     # Use `.absolute()` rather than `.resolve()` because test runfiles symlink
     # leaf files into a flat CAS directory outside the package tree.
     routing_moe_dir = pathlib.Path(__file__).absolute().parents[2]
-    packages = ("common", "gmm", "io_relayout", "layer")
+    packages = ("combine", "common", "gmm", "layer", "pack")
     # `adaptor/` follows Tokamax op-framework conventions (e.g. IMPLEMENTATIONS,
     # ARG_SPECS, conditional backend imports).
     unexpected_dirs = sorted(

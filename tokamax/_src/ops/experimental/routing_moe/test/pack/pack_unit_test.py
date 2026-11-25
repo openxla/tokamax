@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.pack import kernel
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
 jax.config.parse_flags_with_absl()
@@ -103,7 +103,7 @@ class InputPackUnitTest(parameterized.TestCase):
     )
     expected = x.reshape(expected_shape)
 
-    actual = input_pack.input_pack(x)
+    actual = kernel.input_pack(x)
 
     self.assertEqual(actual.data.shape, expected_shape)
     self.assertEqual(actual.data.dtype, dtype)
@@ -328,8 +328,8 @@ class InputPackUnitTest(parameterized.TestCase):
     )
     expected = x.reshape(expected_shape)
 
-    actual = input_pack.input_pack(
-        x, plan=input_pack.InputPackPlan(tile_rows=tile_size)
+    actual = kernel.input_pack(
+        x, plan=kernel.InputPackPlan(tile_rows=tile_size)
     )
 
     self.assertEqual(actual.data.shape, expected_shape)
@@ -352,8 +352,8 @@ class InputPackUnitTest(parameterized.TestCase):
     )
 
     for _ in range(2):
-      actual = input_pack.input_pack(
-          x, plan=input_pack.InputPackPlan(tile_rows=256)
+      actual = kernel.input_pack(
+          x, plan=kernel.InputPackPlan(tile_rows=256)
       )
       np.testing.assert_array_equal(np.asarray(actual.data), expected)
 
@@ -371,7 +371,7 @@ class InputPackUnitTest(parameterized.TestCase):
     dim_size = 1024
     shape = (batch_size, dim_size)
     compiled = (
-        jax.jit(lambda x: input_pack.input_pack(x).data)
+        jax.jit(lambda x: kernel.input_pack(x).data)
         .lower(jax.ShapeDtypeStruct(shape, dtype))
         .compile()
     )
@@ -397,8 +397,8 @@ class InputPackUnitTest(parameterized.TestCase):
     # is a multiple of 32, and an 8-row (or smaller) tiling otherwise.
     shape = (batch_size, dim_size)
     x = _random_input(jax.random.key(11), shape, dtype)
-    actual = input_pack.input_pack(
-        x, plan=input_pack.InputPackPlan(tile_rows=tile_size)
+    actual = kernel.input_pack(
+        x, plan=kernel.InputPackPlan(tile_rows=tile_size)
     )
     expected_shape = layout_util.to_compact_shape(shape, x.dtype)
     self.assertEqual(actual.data.shape, expected_shape)
@@ -407,22 +407,22 @@ class InputPackUnitTest(parameterized.TestCase):
 
   def test_input_pack_invalid_shapes_raise_value_error(self):
     with self.assertRaisesRegex(ValueError, "Expected 2D input"):
-      input_pack.input_pack(jnp.zeros((16, 16, 256), dtype=jnp.bfloat16))
+      kernel.input_pack(jnp.zeros((16, 16, 256), dtype=jnp.bfloat16))
     with self.assertRaisesRegex(
         ValueError, "must be divisible by packing \\* num_lanes"
     ):
-      input_pack.input_pack(jnp.zeros((32, 128), dtype=jnp.bfloat16))
+      kernel.input_pack(jnp.zeros((32, 128), dtype=jnp.bfloat16))
     with self.assertRaisesRegex(
         ValueError, "must be a positive multiple of sublane_size"
     ):
-      input_pack.input_pack(
+      kernel.input_pack(
           jnp.zeros((64, 1024), dtype=jnp.bfloat16),
-          plan=input_pack.InputPackPlan(tile_rows=10),
+          plan=kernel.InputPackPlan(tile_rows=10),
       )
     with self.assertRaisesRegex(ValueError, "num_buffers.*must be positive"):
-      input_pack.input_pack(
+      kernel.input_pack(
           jnp.zeros((64, 1024), dtype=jnp.bfloat16),
-          plan=input_pack.InputPackPlan(num_buffers=0),
+          plan=kernel.InputPackPlan(num_buffers=0),
       )
 
   @parameterized.product(
@@ -451,7 +451,7 @@ class InputPackUnitTest(parameterized.TestCase):
     tile_results = {}
     for ts in tile_sizes:
       fn_pack = functools.partial(
-          input_pack.input_pack, plan=input_pack.InputPackPlan(tile_rows=ts)
+          kernel.input_pack, plan=kernel.InputPackPlan(tile_rows=ts)
       )
       pack_us = _measure_us(fn_pack, x)
       pack_gbps = (total_bytes / (pack_us * 1e-6)) / 1e9
@@ -501,7 +501,7 @@ class InputPackUnitTest(parameterized.TestCase):
     xla_us = _measure_us(
         functools.partial(_xla_reshape, out_shape=out_shape), x
     )
-    pack_us = _measure_us(lambda x: input_pack.input_pack(x).data, x)
+    pack_us = _measure_us(lambda x: kernel.input_pack(x).data, x)
     logging.info(
         "BENCHMARK_RAGGED dtype=%s batch=%4d dim=%4d | xla_reshape=%.2f us"
         " (%.1f GB/s) | input_pack=%.2f us (%.1f GB/s)",

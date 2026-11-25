@@ -13,18 +13,19 @@
 - Supports in-kernel random local HBM gather/scatter and remote EP HBM scatter.
 - Fuses gate/up, activation, and down projections when tiles fit in VMEM.
   - Falls back to a two-kernel split through compact HBM layout otherwise.
-- Provides `output_reduce_unpack` for top-k reduction and layout unpacking.
+- Provides `combine/kernel.py` for top-k reduction and layout unpacking.
   - Supports ragged reduction and optional per-lane FP8 dequantization.
+- Provides `pack/kernel.py` for efficient layout conversion.
 - Supports quantized FP8 local and remote scatter with lane-strided scales.
 - Supports subchannel weight quantization with dynamic activation quantization.
 - Exposes a Tokamax op wrapper in `adaptor/` for benchmarking, autotuning, and XLA fallback.
 
 ## Roadmap
 
-- Support FP8 input using `io_relayout/input_pack.py`.
-- Support K dimension tiling, including `k2` tiling for fused up/down kernels.
+- Support FP8 input using `pack/kernel.py`.
+- Support K dimension tiling.
 - Support compile-time heuristics for near-optimal OOTB routing strategies.
-- Optimizations low-batch decode.
+- Optimizations for low-batch decode.
 
 ## Folder Structure
 
@@ -36,6 +37,8 @@ routing_moe/
 │   ├── base.py: Tokamax `RoutingMoe` op base class.
 │   ├── pallas_mosaic_tpu.py: Mosaic TPU op implementation and autotuning config.
 │   └── reference.py: Unsharded XLA reference implementation.
+├── combine/
+│   └── kernel.py: Handles top-k reduce and compact -> large relayout.
 ├── common/
 │   ├── arg.py: PyTree wrappers pairing tensor data with static specs.
 │   ├── dataclass_util.py: Invariant decorators for unresolved/resolved classes.
@@ -52,14 +55,13 @@ routing_moe/
 │   ├── pipeline.py: Main orchestrator for stateful DMA and stateless compute.
 │   ├── plan.py: Tunable execution parameters with no impact on outputs.
 │   └── spec.py: Validated problem specification of the routing GMM kernel.
-├── io_relayout/
-│   ├── input_pack.py: Handles large -> compact layout transformation.
-│   └── output_reduce.py: Handles top-k reduce and compact -> large relayout.
 ├── layer/
 │   ├── config.py: Compile-time static configuration object for MoE layer.
 │   ├── modular.py: Modular MoE entry point for pre-computed top-k routing.
 │   ├── monolithic.py: Monolithic MoE entry point computing routing + MoE.
 │   └── plan.py: Tunable MoE execution parameters with no impact on outputs.
+├── pack/
+│   └── kernel.py: Handles large -> compact layout transformation.
 └── test/
     ├── helper/
     │   ├── helper_shapes.py: Static model configs (dims, experts, top-k).
@@ -68,7 +70,7 @@ routing_moe/
     │   ├── helper_reference.py: Pure-XLA reference implementations.
     │   ├── helper_util.py: Feature-support checks and benchmarking helpers.
     │   └── *_unit_test.py: Unit tests for shared test helpers.
-    └── {adaptor, common, gmm, io_relayout, layer}/
+    └── {adaptor, combine, common, gmm, layer, pack}/
         ├── *_test_lib.py: Case generation and reference validation helpers.
         ├── *_unit_test.py: Synthetic edge-case and stress tests.
         ├── *_prod_test.py: Production model shapes and benchmarks.

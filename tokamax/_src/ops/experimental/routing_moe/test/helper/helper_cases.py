@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MoE test cases shared across gmm, io_relayout, and layer."""
+"""MoE test cases shared across combine, gmm, layer, and pack."""
 
 import dataclasses
 import itertools

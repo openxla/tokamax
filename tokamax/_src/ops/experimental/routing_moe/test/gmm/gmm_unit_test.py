@@ -26,7 +26,7 @@ from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 from tokamax._src.ops.experimental.routing_moe.test.gmm import gmm_test_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
@@ -272,7 +272,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     routing = case.routing
     zeros = 4
     actual = kernel.routing_gmm(
-        input_pack.input_pack(case.x_sorted.at[:zeros].set(0)),
+        pack.input_pack(case.x_sorted.at[:zeros].set(0)),
         case.w1,
         scatter=routing.scatter,
         out_format=_FP8_OUT_FORMAT,
@@ -292,7 +292,7 @@ class RoutingGmmUnitTest(parameterized.TestCase):
     routing = case.routing
     x = case.x_sorted * 2**13
     actual = kernel.routing_gmm(
-        input_pack.input_pack(x),
+        pack.input_pack(x),
         case.w1,
         scatter=routing.scatter,
         out_format=_FP8_OUT_FORMAT,

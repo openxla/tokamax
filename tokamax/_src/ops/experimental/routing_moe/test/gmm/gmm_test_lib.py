@@ -25,7 +25,7 @@ from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.gmm import kernel
 from tokamax._src.ops.experimental.routing_moe.gmm import plan as gmm_plan
-from tokamax._src.ops.experimental.routing_moe.io_relayout import input_pack
+from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_inputs
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
@@ -83,12 +83,12 @@ class GmmCase:
   @property
   def x_compact(self) -> arg.ActivationWrapper[jax.Array]:
     """`x` in the compact layout."""
-    return input_pack.input_pack(self.x)
+    return pack.input_pack(self.x)
 
   @property
   def x_sorted_compact(self) -> arg.ActivationWrapper[jax.Array]:
     """`x_sorted` in the compact layout."""
-    return input_pack.input_pack(self.x_sorted)
+    return pack.input_pack(self.x_sorted)
 
   @classmethod
   def make_case(
