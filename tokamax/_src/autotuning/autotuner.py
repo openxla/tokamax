@@ -110,9 +110,11 @@ def _benchmark(fn_factory, config, args, kwargs, auto_input_layouts=False):
       config,
       args,
       kwargs,
-      seed=0,
+      seed=None if auto_input_layouts else 0,
       auto_input_layouts=auto_input_layouts,
   )
+  if auto_input_layouts:
+    x = numerics.random_initialize(x, seed=0)
   return runner(x)
 
 

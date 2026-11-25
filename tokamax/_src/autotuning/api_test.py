@@ -239,11 +239,19 @@ class AutotuningTest(parameterized.TestCase):
     _, autotune_data = result.data[0]
     self.assertIn(_HEURISTICS_CONFIG, autotune_data)
 
-  @parameterized.parameters(True, False)
-  def test_autotune_auto_input_layouts(self, enabled):
+  @parameterized.product(
+      enabled=[True, False],
+      use_compile_executor=[True, False],
+  )
+  def test_autotune_auto_input_layouts(self, enabled, use_compile_executor):
     def fn_factory(scale):
       return lambda x: jnp.sin(x.T) * scale
 
+    t = (
+        autotuner.Autotuner()
+        if use_compile_executor
+        else autotuner.Autotuner(compile_executor_fn=None)
+    )
     with (
         config_lib.autotuning_auto_input_layouts(enabled),
         mock.patch.object(
@@ -252,8 +260,8 @@ class AutotuningTest(parameterized.TestCase):
             wraps=benchmarking.compile_benchmark,
         ) as compile_benchmark,
     ):
-      results = autotuner.Autotuner().autotune(
-          fn_factory, {1.0, 2.0}, jnp.ones((256, 512))
+      results = t.autotune(
+          fn_factory, {1.0, 2.0}, jax.ShapeDtypeStruct((256, 512), jnp.float32)
       )
     self.assertLen(results.prune_errors(), 2)
     self.assertLen(compile_benchmark.call_args_list, 2)
