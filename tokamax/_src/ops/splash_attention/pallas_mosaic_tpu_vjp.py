@@ -257,7 +257,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
             prng_key,
         )
         splash_fn_kwargs = attn_fn.kwargs
-        _, _, dq, dk, dv, _, dsinks, _, _ = (
+        _, _, dq, dk, dv, _, dsinks, *_ = (
             splash_attention_kernel._splash_attention_bwd(  # pylint: disable=protected-access
                 save_residuals=False,
                 mask_value=mask_value,
@@ -306,7 +306,7 @@ class PallasMosaicTpuSplashAttentionVjp(base.SplashAttentionVjp[Config]):
             prng_key,
         )
         splash_fn_kwargs = attn_fn.kwargs
-        _, _, dq, dk, dv, _, dsinks, _, _ = (
+        _, _, dq, dk, dv, _, dsinks, *_ = (
             splash_attention_kernel._splash_attention_bwd(  # pylint: disable=protected-access
                 save_residuals=False,
                 mask_value=mask_value,

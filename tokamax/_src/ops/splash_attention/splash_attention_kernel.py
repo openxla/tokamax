@@ -49,7 +49,7 @@ LOG2E = math.log2(math.e)
 
 
 def _is_fp8(x) -> bool:
-  return x.dtype == jnp.float8_e4m3fn
+  return x.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
 
 
 def _unquantized_dtype(x):
@@ -141,6 +141,39 @@ def from_head_minor(vals: tuple[Any, ...], layout: QKVLayout):
   if layout == QKVLayout.HEAD_DIM_MINOR:
     return vals
   return (*vals[:-2], vals[-1], vals[-2])
+
+
+_SUPPORTED_QUANT_STRATEGIES = (
+    QuantizationStrategy.UNQUANTIZED,
+    QuantizationStrategy.CAST,
+    QuantizationStrategy.PER_TENSOR,
+    QuantizationStrategy.PER_AXIS,
+)
+
+
+def _check_quant_strategy(field_name: str, val: Any) -> None:
+  """Validates that a SplashConfig quantization strategy field is supported."""
+  if (
+      not isinstance(val, QuantizationStrategy)
+      or val not in _SUPPORTED_QUANT_STRATEGIES
+  ):
+    supported = [s.name for s in _SUPPORTED_QUANT_STRATEGIES]
+    raise ValueError(
+        f"Unsupported {field_name}={val!r}; expected one of {supported}."
+    )
+
+
+def _config_json_default(obj: Any) -> str:
+  """Serializes non-JSON-native SplashConfig fields for XProf metadata."""
+  if isinstance(obj, (np.dtype, jnp.dtype)):
+    return obj.name
+  if isinstance(obj, enum.Enum):
+    return obj.name
+  if isinstance(obj, pltpu.InterpretParams):
+    return str(obj)
+  raise TypeError(
+      f"Object of type {type(obj).__name__} is not JSON serializable"
+  )
 
 
 def _generate_blockwise_dropout_mask(
@@ -319,7 +352,7 @@ class SplashConfig:
   fuse_reciprocal: bool = True  # whether to compute o / lse inside the kernel
   use_base2_exp: bool = True
   max_logit_const: float | None = None
-  interpret: bool = False
+  interpret: bool | pltpu.InterpretParams = False
   # The fused bwd kernel accumulates dq at every grid step. To safely avoid
   # read/write conflicts we conservatively avoid *any* in-kernel reductions.
   # This parameter allows to override this behavior and specifies the number of
@@ -399,6 +432,7 @@ class SplashConfig:
   # block in a single contiguous run, allowing dq_reduction_steps=1 to write dq
   # directly from VMEM without HBM read-modify-write aliasing.
   dkv_q_blocks_are_contiguous: bool = False
+  p_fwd_quant_mode: QuantizationStrategy = QuantizationStrategy.UNQUANTIZED
 
   @property
   def active_dropout_block_q(self) -> int:
@@ -419,6 +453,8 @@ class SplashConfig:
       object.__setattr__(self, "block_kv_compute", self.block_kv)
     if self.block_kv_dkv_compute is None:
       object.__setattr__(self, "block_kv_dkv_compute", self.block_kv_dkv)
+
+    _check_quant_strategy("p_fwd_quant_mode", self.p_fwd_quant_mode)
 
     if self.dq_reduction_steps not in (None, 1, 3):
       raise ValueError(
@@ -738,6 +774,9 @@ def flash_attention_kernel(
     mask_ref,
     q_sequence_ref,
     max_logit_value_ref,
+    q_scales_ref,
+    k_scales_ref,
+    v_scales_ref,
     # Outputs
     o_ref,
     logsumexp_ref,
@@ -1005,11 +1044,13 @@ def flash_attention_kernel(
           q_ref[(slice(None), slice(None), slice(r0, r1)) if sliced_q else ...]
           .mT
       )
-    if config.use_base2_exp and not config.q_prescaled_log2e:
-      if q.dtype == jnp.float8_e4m3fn:
-        q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
-      else:
-        q *= LOG2E
+    if (
+        config.use_base2_exp
+        and not config.q_prescaled_log2e
+        and q_scales_ref is None
+        and not _is_fp8(q)
+    ):
+      q *= LOG2E
 
     head_dim_qk = q.shape[-1]
     # Collapse the head and sequence dimensions for a larger matmul.
@@ -1024,6 +1065,10 @@ def flash_attention_kernel(
 
     qk_flat = qk_matmul(q_flat, k, qk_dims, diag=diag)
     qk = qk_flat.reshape((num_stacked_q_heads, nq, nk))
+    if q_scales_ref is not None:
+      qk *= jnp.tile(q_scales_ref[rows], (1, 1, nk // NUM_LANES))
+    if k_scales_ref is not None:
+      qk *= k_scales_ref[:1, slice_k]
 
     qk = _apply_mask_and_soft_cap(
         qk,
@@ -1114,14 +1159,24 @@ def flash_attention_kernel(
       v = v_ref[:, slice_k]
       sv_dims = NT_DIM_NUMBERS
 
-    o_curr_flat = sv_matmul(
+    p_flat, p_scales = base.apply_quantization(
         s_curr_flat,
+        quant_dtype=jnp.float8_e4m3fn,
+        strategy=config.p_fwd_quant_mode,
+        contract_axis=-1,
+    )
+    o_curr_flat = sv_matmul(
+        p_flat,
         v,
         sv_dims,
         has_partial_mask=has_partial_mask and band is None,
         diag=diag,
     )
+    if p_scales is not None:
+      o_curr_flat *= p_scales
     o_curr = o_curr_flat.reshape((num_stacked_q_heads, nq, head_dim_v))
+    if v_scales_ref is not None:
+      o_curr *= v_scales_ref[:1, :]
 
     if max_logit_estimate is None:
       alpha_o = jnp.tile(alpha, (1, 1, head_dim_v_repeats))  # pyrefly: ignore[bad-argument-type]
@@ -1592,12 +1647,25 @@ def _splash_attention_forward(
     fwd_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
+    q_scales: jax.Array | None = None,
+    k_scales: jax.Array | None = None,
+    v_scales: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   bq, bkv = config.block_q, config.block_kv
   bkv_compute = config.block_kv_compute
   num_stacked_q_heads = config.num_stacked_q_heads
   prng_key = _check_dropout_args(config, prng_key)
+  if (
+      (_is_fp8(q) or q_scales is not None)
+      and config.use_base2_exp
+      and not config.q_prescaled_log2e
+  ):
+    raise ValueError(
+        "FP8 `q` (or `q_scales`) with use_base2_exp=True requires"
+        " q_prescaled_log2e=True (apply_log2e_scaling=True in"
+        " apply_quantization)."
+    )
 
   if num_stacked_q_heads > 1 and (
       sinks is not None or max_logit_value is not None
@@ -1695,6 +1763,12 @@ def _splash_attention_forward(
       for qb0 in range(0, q_steps, chunk_q_steps):
         qb1 = min(qb0 + chunk_q_steps, q_steps)
         q0, q1 = qb0 * bq, qb1 * bq
+        chunk_q_scales = (
+            q_scales[:, q0:q1, :]
+            if q_scales is not None
+            and q_scales.shape == (num_q_heads, q_seq_len, 1)
+            else q_scales
+        )
         chunk_ret = _splash_attention_forward_single(
             _slice_dense_mask_info_q(
                 mask_info, qb0, qb1, q_steps, kv_steps, bq, is_dkv=False
@@ -1715,6 +1789,9 @@ def _splash_attention_forward(
             q_block_offset=qb0,
             total_q_steps=q_steps,
             apply_checkpoint=False,
+            q_scales=chunk_q_scales,
+            k_scales=k_scales,
+            v_scales=v_scales,
         )
         if save_residuals:
           chunk_out, chunk_stats = chunk_ret
@@ -1757,6 +1834,9 @@ def _splash_attention_forward(
       max_logit_value=max_logit_value,
       pallas_prng_key=prng_key,
       apply_checkpoint=True,
+      q_scales=q_scales,
+      k_scales=k_scales,
+      v_scales=v_scales,
   )
 
 
@@ -1779,6 +1859,9 @@ def _splash_attention_forward_single(
     q_block_offset: int = 0,
     total_q_steps: int | None = None,
     apply_checkpoint: bool = True,
+    q_scales: jax.Array | None = None,
+    k_scales: jax.Array | None = None,
+    v_scales: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   """Runs a single forward `pallas_call` for `q` (or one q chunk)."""
   num_q_heads, q_seq_len, head_dim_qk = q.shape
@@ -1932,6 +2015,114 @@ def _splash_attention_forward_single(
   else:
     in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
 
+  if q_scales is not None:
+    q_scales_valid_shapes = [(num_q_heads, 1, 1), (num_q_heads, q_seq_len, 1)]
+    assert q_scales.shape in q_scales_valid_shapes, (
+        "Only per-tensor or per-axis quantization is valid for Q. Got scales"
+        f" of shape: {q_scales.shape}"
+    )
+
+    if q_scales.shape == (num_q_heads, 1, 1):
+      q_scales = jnp.broadcast_to(q_scales, shape=(num_q_heads, q_seq_len, 1))
+
+    q_scales = q_scales.astype(jnp.float32)
+    q_scales = jnp.broadcast_to(q_scales, (num_q_heads, q_seq_len, NUM_LANES))
+    q_scales_block_shape = (num_stacked_q_heads, bq, NUM_LANES)
+    q_scales_index_map = unravel(lambda h_block, i, j: (h_block, i, 0))
+    in_specs += [
+        pl.BlockSpec(
+            block_shape=q_scales_block_shape,
+            index_map=q_scales_index_map,
+        )
+    ]
+  else:
+    in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
+
+  if k_scales is not None:
+    k_scales_per_axis_shape = (
+        (kv_seq_len, 1) if is_mqa else (num_kv_heads, kv_seq_len, 1)
+    )
+    k_scales_per_tensor_shape = (1, 1) if is_mqa else (num_kv_heads, 1, 1)
+    if k_scales.shape == k_scales_per_tensor_shape:
+      k_scales = jnp.broadcast_to(k_scales, shape=k_scales_per_axis_shape)
+    assert k_scales.shape == k_scales_per_axis_shape, (
+        "Invalid shapes for k_scales, only per-axis"
+        f" ({k_scales_per_axis_shape}) or per-tensor"
+        f" ({k_scales_per_tensor_shape}) scales are supported. Got scales of"
+        f" shape {k_scales.shape}"
+    )
+
+    def create_kv_scales_index_map():
+      def index_map(h_block, i, j):
+        del i  # Unused.
+        first_h_in_block = h_block * num_stacked_q_heads
+        prefix = (
+            () if is_mqa else (_div(first_h_in_block, q_heads_per_kv_head),)
+        )
+        return (*prefix, 0, j)
+
+      return index_map
+
+    k_scales = jnp.swapaxes(k_scales.astype(jnp.float32), -1, -2)
+    k_scales = jnp.broadcast_to(
+        k_scales, (*k_scales.shape[:-2], NUM_SUBLANES, kv_seq_len)
+    )
+    k_scales_block_shape = (
+        (NUM_SUBLANES, bkv) if is_mqa else (None, NUM_SUBLANES, bkv)
+    )
+    k_scales_index_map = unravel(create_kv_scales_index_map())
+    in_specs += [
+        pl.BlockSpec(
+            block_shape=k_scales_block_shape,
+            index_map=k_scales_index_map,
+        )
+    ]
+  else:
+    in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
+
+  if v_scales is not None:
+    v_scales_per_axis_shape = (
+        (1, head_dim_v) if is_mqa else (num_kv_heads, 1, head_dim_v)
+    )
+    v_scales_per_tensor_shape = (1, 1) if is_mqa else (num_kv_heads, 1, 1)
+    if v_scales.shape == v_scales_per_tensor_shape:
+      v_scales = jnp.broadcast_to(v_scales, shape=v_scales_per_axis_shape)
+    assert v_scales.shape == v_scales_per_axis_shape, (
+        f"Invalid shape for v_scales, only per-axis ({v_scales_per_axis_shape})"
+        f" or per-tensor ({v_scales_per_tensor_shape}) scales are supported."
+        f" Got scales with shape: {v_scales.shape}"
+    )
+
+    def create_v_scales_index_map():
+      def index_map(h_block, i, j):
+        del i, j  # Unused.
+        first_h_in_block = h_block * num_stacked_q_heads
+        prefix = (
+            () if is_mqa else (_div(first_h_in_block, q_heads_per_kv_head),)
+        )
+        return (*prefix, 0, 0)
+
+      return index_map
+
+    v_scales = jnp.broadcast_to(
+        v_scales.astype(jnp.float32),
+        (*v_scales.shape[:-2], NUM_SUBLANES, head_dim_v),
+    )
+    v_scales_block_shape = (
+        (NUM_SUBLANES, head_dim_v)
+        if is_mqa
+        else (None, NUM_SUBLANES, head_dim_v)
+    )
+    v_scales_index_map = unravel(create_v_scales_index_map())
+    in_specs += [
+        pl.BlockSpec(
+            block_shape=v_scales_block_shape,
+            index_map=v_scales_index_map,
+        )
+    ]
+  else:
+    in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
+
   out_shapes = [
       jax.ShapeDtypeStruct(
           (num_q_heads, q_seq_len, head_dim_v), _unquantized_dtype(q)
@@ -1977,7 +2168,11 @@ def _splash_attention_forward_single(
       is_segmented=segment_ids is not None,
       phase="fwd",
   )
-  metadata = {"xprof_metadata": json.dumps(dataclasses.asdict(config))}
+  metadata = {
+      "xprof_metadata": json.dumps(
+          dataclasses.asdict(config), default=_config_json_default
+      )
+  }
 
   def _fwd_cost_estimate(
       q: jax.Array,
@@ -2102,6 +2297,9 @@ def _splash_attention_forward_single(
         mask_info.partial_mask_blocks,
         q_sequence,
         max_logit_value,
+        q_scales,
+        k_scales,
+        v_scales,
     )
   out, logsumexp, l_linear, max_logits = all_out
 
@@ -2183,6 +2381,9 @@ def _splash_attention_custom(
     dkv_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
+    q_scales: jax.Array | None = None,
+    k_scales: jax.Array | None = None,
+    v_scales: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   # The forward function does not use the dq and dkv MaskInfos, it just forwards
   # them to the backward function as residuals. This is a way to communicate
@@ -2210,6 +2411,9 @@ def _splash_attention_custom(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
       prng_key=prng_key,
+      q_scales=q_scales,
+      k_scales=k_scales,
+      v_scales=v_scales,
   )
   if save_residuals:
     out, stats = ret
@@ -2238,6 +2442,9 @@ def _splash_attention_fwd(
     dkv_mask_sparsity: float,
     max_logit_value: jax.Array | None = None,
     prng_key: jax.Array | None = None,
+    q_scales: jax.Array | None = None,
+    k_scales: jax.Array | None = None,
+    v_scales: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array], base.SplashResidualsType]:
 
   # TODO: add some higher order AD check that isn't save_residuals based.
@@ -2259,7 +2466,11 @@ def _splash_attention_fwd(
       fwd_mask_sparsity=fwd_mask_sparsity,
       max_logit_value=max_logit_value,
       prng_key=prng_key,
+      q_scales=q_scales,
+      k_scales=k_scales,
+      v_scales=v_scales,
   )
+  del q_scales, k_scales, v_scales
   logsumexp = stats["logsumexp"]  # save in the config base for the bwd pass
   if config.use_base2_exp:  # for user, output values in natural base
     stats["logsumexp"] = stats["logsumexp"] / LOG2E
@@ -2338,11 +2549,8 @@ def _flash_attention_dq_kernel(
 
   def body(has_partial_mask: bool = False):
     q = q_ref[...] if config.q_layout == HEAD_DIM_MINOR else q_ref[...].mT
-    if config.use_base2_exp and not config.q_prescaled_log2e:
-      if q.dtype == jnp.float8_e4m3fn:
-        q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
-      else:
-        q *= LOG2E
+    if config.use_base2_exp and not config.q_prescaled_log2e and not _is_fp8(q):
+      q *= LOG2E
     # We keep k and v possibly transposed, since they are RHS of dots.
     k = k_ref[...]
     v = v_ref[...]
@@ -2547,11 +2755,8 @@ def _flash_attention_dkv_kernel(
     dropout_mask = None
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
-    if config.use_base2_exp and not config.q_prescaled_log2e:
-      if q.dtype == jnp.float8_e4m3fn:
-        scaled_q = (q.astype(jnp.bfloat16) * LOG2E).astype(jnp.float8_e4m3fn)
-      else:
-        scaled_q = q * LOG2E
+    if config.use_base2_exp and not config.q_prescaled_log2e and not _is_fp8(q):
+      scaled_q = q * LOG2E
     else:
       scaled_q = q
 
@@ -3554,6 +3759,9 @@ def _splash_attention_bwd(
     jax.Array | None,  # segment_ids
     jax.Array | None,  # max_logit_estimate
     jax.Array | None,  # prng_key
+    jax.Array | None,  # q_scales
+    jax.Array | None,  # k_scales
+    jax.Array | None,  # v_scales
 ]:
   # If `save_residuals` is True, `_splash_attention_fwd` returns `(out, stats)`,
   # so we unpack the gradients, otherwise it returns `out` and `grads` is just
@@ -3613,6 +3821,9 @@ def _splash_attention_bwd(
       dsinks,  # sinks
       None,  # max_logit_estimate
       None,  # prng_key
+      None,  # q_scales
+      None,  # k_scales
+      None,  # v_scales
   )
 
 
@@ -3649,6 +3860,9 @@ def _splash_attention(
     fwd_mask_sparsity: float,
     dkv_mask_sparsity: float,
     prng_key: jax.Array | None = None,
+    q_scales: jax.Array | None = None,
+    k_scales: jax.Array | None = None,
+    v_scales: jax.Array | None = None,
 ) -> base.SplashCustomReturnType:
   return _splash_attention_custom(
       fwd_mask_info,
@@ -3667,6 +3881,9 @@ def _splash_attention(
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
       prng_key=prng_key,
+      q_scales=q_scales,
+      k_scales=k_scales,
+      v_scales=v_scales,
   )
 
 

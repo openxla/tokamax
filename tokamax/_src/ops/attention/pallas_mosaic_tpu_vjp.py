@@ -183,7 +183,7 @@ class PallasMosaicTpuFlashAttentionVjp(
       )
     mask_in_axes = 0 if len(splash_mask.shape) == 3 else None
     # vmap over batch dimension
-    _, _, dq, dk, dv, _, _, _, _ = jax.vmap(
+    _, _, dq, dk, dv, *_ = jax.vmap(
         bwd_fn, in_axes=(res_in_axes, cotangents_in_axes, mask_in_axes)
     )(res, cotangents, splash_mask)
 

@@ -51,6 +51,13 @@ hp.settings.load_profile(name="deterministic")
 partial = functools.partial
 type Draw = hps.DrawFn
 
+ALL_QUANT_STRATEGIES = (
+    base.QuantizationStrategy.UNQUANTIZED,
+    base.QuantizationStrategy.CAST,
+    base.QuantizationStrategy.PER_TENSOR,
+    base.QuantizationStrategy.PER_AXIS,
+)
+
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -78,6 +85,11 @@ def segment_ids_strategy(draw, seq_len: int) -> base.SegmentIds:
 
 def seed_strategy() -> hps.SearchStrategy[int]:
   return hps.integers(min_value=0, max_value=4)
+
+
+def quant_mode_strategy() -> hps.SearchStrategy[base.QuantizationStrategy]:
+  """Draws a quantization strategy, rather than sweeping all of them."""
+  return hps.sampled_from(ALL_QUANT_STRATEGIES)
 
 
 class Mask:
@@ -362,6 +374,14 @@ def _generate_inputs(
   return (q, k, v, sinks, segment_ids, do)
 
 
+def compute_nmse(actual: jax.Array, desired: jax.Array) -> jax.Array:
+  actual_f32 = actual.astype(jnp.float32)
+  desired_f32 = desired.astype(jnp.float32)
+  error_energy = jnp.sum((actual_f32 - desired_f32) ** 2)
+  ref_energy = jnp.sum(desired_f32**2)
+  return error_energy / (ref_energy + 1e-12)
+
+
 def attn_logits_soft_cap_strategy() -> hps.SearchStrategy[float | None]:
   return hps.one_of(hps.just(None), hps.floats(min_value=1.0, max_value=50.0))
 
@@ -527,6 +547,172 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
   @parameterized.product(
       is_mqa=(False, True),
+      attn_logits_soft_cap=(None,),
+      use_base2_exp=(False, True),
+  )
+  @hp.given(hps.data())
+  def test_splash_attention_fwd_quantized(
+      self,
+      is_mqa,
+      use_base2_exp,
+      attn_logits_soft_cap,
+      data,
+  ):
+    model_config = data.draw(model_config_strategy())
+    q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
+    is_segmented = False
+    use_sinks = False
+    is_dynamic_mask = False
+    q, k, v, sinks, segment_ids, _ = _generate_inputs(
+        data, model_config, is_mqa, is_segmented, use_sinks
+    )
+    q = q / np.sqrt(model_config.head_dim_qk).astype(q.dtype)
+    q_quant_mode = data.draw(quant_mode_strategy(), label="q_quant_mode")
+    q, q_scales = base.apply_quantization(
+        q,
+        quant_dtype=jnp.float8_e4m3fn,
+        strategy=q_quant_mode,
+        contract_axis=-1,
+        apply_log2e_scaling=use_base2_exp,
+    )
+    if q_quant_mode in (
+        base.QuantizationStrategy.PER_TENSOR,
+        base.QuantizationStrategy.PER_AXIS,
+    ):
+      self.assertIsNotNone(q_scales)
+      self.assertEqual(q_scales.dtype, model_config.dtype)
+    else:
+      self.assertIsNone(q_scales)
+
+    k_quant_mode = data.draw(quant_mode_strategy(), label="k_quant_mode")
+    k, k_scales = base.apply_quantization(
+        k,
+        quant_dtype=jnp.float8_e4m3fn,
+        strategy=k_quant_mode,
+        contract_axis=-1,
+    )
+    if k_quant_mode in (
+        base.QuantizationStrategy.PER_TENSOR,
+        base.QuantizationStrategy.PER_AXIS,
+    ):
+      self.assertIsNotNone(k_scales)
+      self.assertEqual(k_scales.dtype, model_config.dtype)
+    else:
+      self.assertIsNone(k_scales)
+
+    v_quant_mode = data.draw(quant_mode_strategy(), label="v_quant_mode")
+    v, v_scales = base.apply_quantization(
+        v,
+        quant_dtype=jnp.float8_e4m3fn,
+        strategy=v_quant_mode,
+        contract_axis=-2,
+    )
+    if v_quant_mode in (
+        base.QuantizationStrategy.PER_TENSOR,
+        base.QuantizationStrategy.PER_AXIS,
+    ):
+      self.assertIsNotNone(v_scales)
+      self.assertEqual(v_scales.dtype, model_config.dtype)
+    else:
+      self.assertIsNone(v_scales)
+
+    p_fwd_quant_mode = data.draw(
+        quant_mode_strategy(), label="p_fwd_quant_mode"
+    )
+    mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
+    check_mask_no_empty_rows(mask, segment_ids)
+    if is_dynamic_mask:
+      mask = jnp.array(mask[:, :])
+    config = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
+    if is_mqa:
+      if not is_dynamic_mask:
+        make_mask_fn = splash.make_splash_mqa_single_device
+      else:
+        make_mask_fn = splash.make_dynamic_splash_mqa
+    else:
+      if not is_dynamic_mask:
+        make_mask_fn = splash.make_splash_mha_single_device
+      else:
+        make_mask_fn = splash.make_dynamic_splash_mha
+
+    q_heads_per_kv_head = model_config.num_q_heads // model_config.num_kv_heads
+    if sinks is None and q_heads_per_kv_head % 2 == 0:
+      num_stacked_q_heads = 2
+    else:
+      num_stacked_q_heads = 1
+
+    config = dataclasses.replace(
+        config,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        use_base2_exp=use_base2_exp,
+        q_prescaled_log2e=use_base2_exp,
+        interpret=self.INTERPRET,
+        num_stacked_q_heads=num_stacked_q_heads,
+        p_fwd_quant_mode=p_fwd_quant_mode,
+    )
+
+    attn = make_mask_fn(mask, config=config, save_residuals=True)
+    attn_ref = partial(
+        base.attention_reference,
+        is_mqa=is_mqa,
+        save_residuals=True,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+
+    o, stats = attn(
+        q,
+        k,
+        v,
+        segment_ids,
+        sinks,
+        q_scales=q_scales,
+        k_scales=k_scales,
+        v_scales=v_scales,
+    )
+
+    # Divide by LOG2E to undo the pre-scaling on q; base.attention_reference
+    # uses natural exp and does not apply log2e scaling.
+    q_dequant = (
+        q.astype(jnp.float32) * q_scales.astype(jnp.float32)
+        if q_scales is not None
+        else q.astype(jnp.float32)
+    ) / (splash.LOG2E if use_base2_exp else 1.0)
+    k_dequant = (
+        k.astype(jnp.float32) * k_scales.astype(jnp.float32)
+        if k_scales is not None
+        else k.astype(jnp.float32)
+    )
+    v_dequant = (
+        v.astype(jnp.float32) * v_scales.astype(jnp.float32)
+        if v_scales is not None
+        else v.astype(jnp.float32)
+    )
+
+    o_ref, stats_ref = attn_ref(
+        q_dequant,
+        k_dequant,
+        v_dequant,
+        jnp.array(mask[:, :]),
+        segment_ids,
+        sinks,
+    )
+
+    o_nmse = compute_nmse(o, o_ref)
+    o_tol = 0.01
+    self.assertLess(
+        o_nmse,
+        o_tol,
+        f"Forward output O NMSE {o_nmse:.6f} exceeded threshold {o_tol}",
+    )
+
+    lse_nmse = compute_nmse(stats["logsumexp"], stats_ref["logsumexp"])
+    lse_tol = 0.01
+    self.assertLess(
+        lse_nmse, lse_tol, f"Forward LSE NMSE exceeded threshold {lse_tol}"
+    )
+
+  @parameterized.product(
+      is_mqa=(False, True),
       is_segmented=(False, True),
       is_dynamic_mask=(False, True),
       # use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
@@ -551,7 +737,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     fuse_reciprocal = data.draw(hp.strategies.booleans())
     use_base2_exp = data.draw(hp.strategies.booleans())
     dkv_reuse_scaled_q = data.draw(hp.strategies.booleans())
-    q_prescaled_log2e = data.draw(hp.strategies.booleans()) and use_base2_exp
 
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
@@ -560,18 +745,27 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     q = q / np.sqrt(model_config.head_dim_qk).astype(q.dtype)
     q_quant_mode = data.draw(hp.strategies.booleans())
-    if q_quant_mode:
-      q = q.astype(jnp.float8_e4m3fn)
+    if use_base2_exp:
+      q_prescaled_log2e = (
+          True if q_quant_mode else data.draw(hp.strategies.booleans())
+      )
+    else:
+      q_prescaled_log2e = False
     k_quant_mode = data.draw(hp.strategies.booleans())
     if k_quant_mode:
       k = k.astype(jnp.float8_e4m3fn)
     has_fp8_input = q_quant_mode or k_quant_mode
 
     # The reference kernel does the LOG2(E) scaling inside the kernel, so if
-    # q_prescaled_log2e is on we make a copy.
-    q_in = q
+    # q_prescaled_log2e is on we make a prescaled copy for the kernel.
     if q_prescaled_log2e:
       q_in = q * math.log2(math.e)
+      if q_quant_mode:
+        q_in = q_in.astype(jnp.float8_e4m3fn)
+    else:
+      q_in = q.astype(jnp.float8_e4m3fn) if q_quant_mode else q
+    if q_quant_mode:
+      q = q.astype(jnp.float8_e4m3fn)
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     mask = data.draw(mask_strategy(q_seq_len, kv_seq_len)).get_mask()
     check_mask_no_empty_rows(mask, segment_ids)
@@ -2165,9 +2359,11 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     seq_len, num_heads, block = 1024, 2, 512
     head_dim_qk, head_dim_v = 192, 128
     k1, k2, k3, k4 = random.split(random.key(2), 4)
-    q = (random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
-        qk_dtype
-    )
+    is_fp8 = qk_dtype == "float8_e4m3fn"
+    q_f32 = random.normal(k1, (num_heads, seq_len, head_dim_qk)) * 0.5
+    if is_fp8:
+      q_f32 = q_f32 * math.log2(math.e)
+    q = q_f32.astype(qk_dtype)
     k = (random.normal(k2, (num_heads, seq_len, head_dim_qk)) * 0.5).astype(
         qk_dtype
     )
@@ -2205,6 +2401,7 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
           v_layout=kv_layout,
           use_fused_bwd_kernel=True,
           use_base2_exp=True,
+          q_prescaled_log2e=is_fp8,
           attn_logits_soft_cap=soft_cap,
           qk_diag_grid=qk_diag_grid,
           interpret=self.INTERPRET,
