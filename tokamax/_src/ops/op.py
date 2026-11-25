@@ -748,6 +748,23 @@ class BoundArguments[C, K: Hashable]:
         self.op, *self.args, kwargs=kwargs, seed=None
     )
     out, residuals = jax.eval_shape(f, x)
+    has_batched = any(
+        isinstance(a, batching.BatchedShapeDtype)
+        for a in jax.tree.leaves(dict(self.arguments))
+    )
+    if has_batched:
+      vmap_axis_sizes = self.vmap_axis_sizes
+      vmap_axes = tuple((0, s) for s in vmap_axis_sizes)
+      n = len(vmap_axis_sizes)
+      def to_batched(leaf: Any) -> Any:
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+          return batching.BatchedShapeDtype(
+              leaf.shape[n:], leaf.dtype, vmap_axes=vmap_axes
+          )
+        return leaf
+
+      out = jax.tree.map(to_batched, out)
+      residuals = jax.tree.map(to_batched, residuals)
     vjp_arg_spec = dict(self.arguments)
     vjp_arg_spec["residuals"] = residuals
     vjp_arg_spec["out"] = vjp_arg_spec["dout"] = out

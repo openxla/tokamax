@@ -758,6 +758,19 @@ class BoundArgumentsTest(parameterized.TestCase):
     with config_lib.ignore_autotuning_cache(False):
       self.assertIsNotNone(ba.cached_autotuning_data)
 
+  def test_vjp_arg_spec_preserves_batched_shape_dtype(self):
+    vjp_op = attn_base.DotProductAttentionVjp()
+    attn_op = attn_base.DotProductAttention(vjp=vjp_op)
+    q = _bsd((4, 16, 4, 32), jnp.bfloat16, vmap_axes=(0,))
+    derived_vjp_spec = attn_op.bind(q, q, q).vjp_arg_spec
+
+    f, x = op_lib.benchmarking.standardize_function(
+        attn_op, q, q, q, mode="forward_and_vjp", seed=None
+    )
+    bound_args = hlo_utils.get_bound_args(jax.jit(f).lower(x))
+    [actual_vjp_ba] = [ba for ba in bound_args if ba.op == vjp_op]
+    self.assertEqual(derived_vjp_spec, dict(actual_vjp_ba.arguments))
+
 
 if __name__ == "__main__":
   absltest.main()
