@@ -236,6 +236,14 @@ class _PallasMosaicTpuBatchedRpa(
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Runs the Pallas Mosaic TPU batched ragged paged attention kernel.
+
+    Note:
+      `kv_cache` (argument 3) is donated (`donate_argnums=(3,)`) and updated in
+      place to avoid copying the KV cache pool. The input `kv_cache` tensor
+      handle is left invalid after this call; callers must use the returned
+      `(out, kv_cache)` pair.
+    """
 
     assert self._torch_tokamax_op is not None, (
         "Forward op not registered. self.op_impl_jax was not set in the"

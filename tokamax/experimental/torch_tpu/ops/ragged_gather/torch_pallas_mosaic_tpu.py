@@ -59,7 +59,14 @@ class _PallasMosaicTpuRaggedGather(
           return_residuals=return_residuals,
           config=config,
       )
-    sc_info = pltpu.get_tpu_info().sparse_core
+    try:
+      sc_info = pltpu.get_tpu_info().sparse_core
+    except ValueError as e:
+      raise ValueError(
+          "trim_rows=False requires a TPU backend or"
+          " `jax.sharding.use_abstract_mesh` to determine SparseCore output"
+          " padding."
+      ) from e
     if sc_info is None:
       return x.new_empty((indices.shape[0], *x.shape[1:]))
     out_size = indices.shape[0]

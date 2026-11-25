@@ -532,7 +532,11 @@ class TorchOp(Generic[_Config]):
       inputs: The inputs to the forward pass.
       output: The output of the forward pass.
     """
-    ctx.save_for_backward(*inputs, *output)
+    ctx.save_for_backward(*(
+        t
+        for t in jax.tree.leaves((inputs, output))
+        if isinstance(t, torch.Tensor)
+    ))
 
   @abstractmethod
   def backward(self, *args: Any, **kwargs: Any) -> Any:
