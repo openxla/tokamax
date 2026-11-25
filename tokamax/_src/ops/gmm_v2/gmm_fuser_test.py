@@ -119,6 +119,79 @@ class GmmFuserTest(parameterized.TestCase):
     expected = gmm_v2.gmm_v2(lhs, rhs, group_sizes) + residual
     chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
 
+  @parameterized.named_parameters(
+      dict(testcase_name="full_tile_n", n=256, tile_n=256, expected_error=None),
+      dict(
+          testcase_name="half_tile_n",
+          n=256,
+          tile_n=128,
+          expected_error="split over partial blocks not supported",
+      ),
+      dict(
+          testcase_name="non_divisible_tile_n",
+          n=768,
+          tile_n=512,
+          expected_error="Width-changing output fusion requires raw_out",
+      ),
+  )
+  def test_gmm_v2_fusible_swiglu_split_epilogue(
+      self, n, tile_n, expected_error
+  ):
+    """Test `h = GMM(lhs, rhs); gate, up = split(h); silu(gate) * up`."""
+    m, k, num_groups = 256, 256, 4
+    k0, k1 = jax.random.split(jax.random.key(7), 2)
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    group_sizes = util.get_group_sizes(m, num_groups)
+
+    def swiglu(h):
+      gate, up = jax.lax.split(h, (n // 2, n // 2), axis=-1)
+      # Cast the gate and up to float32 before element-wise op because
+      # f32 is more numerically stable.
+      return (
+          jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)
+      ).astype(h.dtype)
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=tile_n, bucket_base=64
+    )
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm(x, r, gs):
+      return swiglu(gmm_fuser.gmm_v2_fusible(x, r, gs, tile_info=tile_info))
+
+    if expected_error is not None:
+      with self.assertRaisesRegex(NotImplementedError, expected_error):
+        fused_gmm(lhs, rhs, group_sizes)
+      return
+
+    actual = fused_gmm(lhs, rhs, group_sizes)
+    expected = swiglu(gmm_v2.gmm_v2(lhs, rhs, group_sizes))
+    chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+  def test_gmm_v2_fusible_non_divisible_tile_n_element_wise_op(self):
+    m, k, n, num_groups = 256, 256, 768, 4
+    k0, k1 = jax.random.split(jax.random.key(8), 2)
+    lhs = jax.random.normal(k0, (m, k), jnp.bfloat16)
+    rhs = jax.random.normal(k1, (num_groups, k, n), jnp.bfloat16)
+    group_sizes = util.get_group_sizes(m, num_groups)
+
+    tile_info = gmm_v2.TileSizes(
+        tile_m=128, tile_k=256, tile_n=512, bucket_base=64
+    )
+
+    @jax.jit
+    @op_fusion.fuse
+    def fused_gmm(x, r, gs):
+      return jax.nn.silu(
+          gmm_fuser.gmm_v2_fusible(x, r, gs, tile_info=tile_info)
+      )
+
+    actual = fused_gmm(lhs, rhs, group_sizes)
+    expected = jax.nn.silu(gmm_v2.gmm_v2(lhs, rhs, group_sizes))
+    chex.assert_trees_all_close(actual, expected, atol=2e-2, rtol=2e-2)
+
   def test_gmm_v2_fusible_rhs_prologue(self):
     m, k, n, num_groups = 256, 256, 256, 4
     k0, k1, k2 = jax.random.split(jax.random.key(1), 3)

@@ -195,7 +195,22 @@ class GmmFusionSpec:
             f" raw output {raw_out_type.shape}."
         )
       num_n = pl.cdiv(cfgs.out_size_n, tiles.tile_n)
-      out_tile_n = out_init.shape[1] // num_n
+      if out_init.shape[1] == cfgs.out_size_n:
+        # Shape-preserving output-fusion path
+        out_tile_n = tiles.tile_n
+      else:
+        # Shape-changing output-fusion path
+        if (
+            cfgs.out_size_n % tiles.tile_n != 0
+            or out_init.shape[1] % num_n != 0
+        ):
+          raise NotImplementedError(
+              "Width-changing output fusion requires raw_out"
+              f" (n={cfgs.out_size_n}, tile_n={tiles.tile_n}) and fused output"
+              f" (n={out_init.shape[1]}) to divide evenly into the same"
+              f" {num_n} N-tiles."
+          )
+        out_tile_n = out_init.shape[1] // num_n
     else:
       out_fn = out_values_type = None
       out_fusion_input_values = ()
