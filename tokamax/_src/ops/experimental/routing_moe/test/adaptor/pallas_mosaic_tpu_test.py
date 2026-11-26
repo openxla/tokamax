@@ -438,6 +438,8 @@ class AutotuningConfigsTest(absltest.TestCase):
   def test_all_specs_bind_and_produce_autotuning_configs(self):
     mosaic_op = pallas_mosaic_tpu.PallasMosaicTpuRoutingMoe()
     self.assertNotEmpty(arg_specs.ARG_SPECS)
+    projects = {spec.project for spec in arg_specs.ARG_SPECS}
+    self.assertIn("qwen3.8_max", projects)
     for spec in arg_specs.ARG_SPECS:
       with self.subTest(spec.full_name):
         bound = mosaic_op.bind(**spec.args)

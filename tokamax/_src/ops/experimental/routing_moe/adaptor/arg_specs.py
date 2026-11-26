@@ -182,22 +182,55 @@ _INFERENCEX_8K1K_NUM_TOKENS: tuple[tuple[str, int], ...] = (
 )
 
 
-def _qwen3_5_397b_specs() -> tuple[arg_spec.ArgSpec, ...]:
-  """Qwen3.5-397B MoE layer with FP8 weights and EP=8."""
+def _model_specs(
+    *,
+    project: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    tags: tuple[arg_spec.Tag, ...],
+) -> tuple[arg_spec.ArgSpec, ...]:
+  """Creates one model's specs over the InferenceX 8k/1k token counts, EP=8."""
   return tuple(
       _make_spec(
           name,
           num_tokens=tokens,
-          num_experts=512,
-          hidden_size=4096,
-          intermediate_size=1024,
-          top_k=10,
+          num_experts=num_experts,
+          hidden_size=hidden_size,
+          intermediate_size=intermediate_size,
+          top_k=top_k,
           ep=8,
-          project="qwen3.5_397b",
-          tags=("primary", "forward_only"),
+          project=project,
+          tags=tags,
       )
       for name, tokens in _INFERENCEX_8K1K_NUM_TOKENS
   )
 
 
-ARG_SPECS: tuple[arg_spec.ArgSpec, ...] = _qwen3_5_397b_specs()
+def _qwen3_5_397b_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  """Qwen3.5-397B MoE layer with FP8 weights and EP=8."""
+  return _model_specs(
+      project="qwen3.5_397b",
+      num_experts=512,
+      hidden_size=4096,
+      intermediate_size=1024,
+      top_k=10,
+      tags=("primary", "forward_only"),
+  )
+
+
+def _qwen3_8_specs() -> tuple[arg_spec.ArgSpec, ...]:
+  return _model_specs(
+      project="qwen3.8_max",
+      num_experts=512,
+      hidden_size=8192,
+      intermediate_size=2048,
+      top_k=10,
+      tags=("forward_only",),
+  )
+
+
+ARG_SPECS: tuple[arg_spec.ArgSpec, ...] = (
+    _qwen3_5_397b_specs() + _qwen3_8_specs()
+)
