@@ -205,5 +205,21 @@ class UnsignedDivRemTest(parameterized.TestCase):
       np.testing.assert_array_equal(c, [0, 1, 1, 1, 2, 4])
 
 
+class EstimateSmemBytesTest(absltest.TestCase):
+
+  def test_ref_union(self):
+    smem_union = plgpu.RefUnion(
+        (plgpu.SMEM((128,), jnp.float32), plgpu.SMEM((128,), jnp.float32)),
+        plgpu.SMEM((256,), jnp.float32),
+    )
+    self.assertEqual(common.estimate_smem_bytes(smem_union), 2048)
+
+    tmem_union = plgpu.RefUnion(
+        plgpu.TMEM((128, 64), jnp.float32),
+        plgpu.TMEM((128, 128), jnp.float16, packed=True),
+    )
+    self.assertEqual(common.estimate_smem_bytes(tmem_union), 4)
+
+
 if __name__ == "__main__":
   absltest.main()

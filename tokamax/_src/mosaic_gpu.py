@@ -372,8 +372,21 @@ def int4_as_biased_f8e4m3fn(
 
 
 def _get_smem_bytes(x: Any) -> int:
+  """Returns the aligned SMEM usage in bytes for a single scratch item."""
   if isinstance(x, (plgpu.Barrier, plgpu.ClusterBarrier)):
     return (n if isinstance(n := x.num_barriers, int) else math.prod(n)) * 8
+
+  if isinstance(x, plgpu.RefUnion):
+    if x.memory_space != plgpu.SMEM:
+      return 0
+    is_ref_union = lambda y: isinstance(y, plgpu.RefUnion)
+    return max(
+        (
+            sum(map(_get_smem_bytes, jax.tree.leaves(g, is_leaf=is_ref_union)))
+            for g in x.refs
+        ),
+        default=0,
+    )
 
   if getattr(x, "memory_space", None) == plgpu.SMEM:
     size_bytes = math.prod(x.shape) * num_bits(x.dtype) // 8
