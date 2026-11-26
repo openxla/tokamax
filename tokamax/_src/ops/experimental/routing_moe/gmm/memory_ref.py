@@ -396,6 +396,10 @@ class IndexBufferedRef(pltpu.BufferedRef):
 
     # Calculate smem address. Each odd/even n value uses a different buffer
     # to ensure first step of n + 1 never overwrites the last step of n.
+    # Within a given n_id, index reads advance incrementally from left to right
+    # over read-only HBM indices, so consecutive tiles overlapping on a shared
+    # block_size window write identical bytes to the same SMEM slots without
+    # extra SMEM/SALU deduplication.
     buffer_offset = lax.rem(n_id, buffer_count) * idx_buffer_size
     local_start = lax.rem(m_start, ring_size)
     aligned_local_start = lax.div(local_start, block_size) * block_size
