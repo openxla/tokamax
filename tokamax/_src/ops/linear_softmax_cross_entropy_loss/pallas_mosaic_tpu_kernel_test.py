@@ -912,6 +912,116 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
         kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
     )
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="small_sum_f32",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2048,
+          reduction="sum",
+          dtype=jnp.float32,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="medium_mean_bf16",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=4096,
+          reduction="mean",
+          dtype=jnp.bfloat16,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="unaligned_none_f32",
+          b_dim=2176,
+          h_dim=640,
+          v_dim=2664,
+          reduction="none",
+          dtype=jnp.float32,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="single_buffered_bf16",
+          b_dim=2048,
+          h_dim=1024,
+          v_dim=2560,
+          reduction="sum",
+          dtype=jnp.bfloat16,
+          buffer_count=1,
+      ),
+  )
+  def test_kernel_bwd_skip_w_grad_matches_full(
+      self, b_dim, h_dim, v_dim, reduction, dtype, buffer_count
+  ):
+    config = kernel.get_heuristic_bwd_config(
+        b_dim,
+        h_dim,
+        v_dim,
+        dtype=dtype,
+        buffer_count=buffer_count,
+        compute_w_grad=False,
+    )
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), dtype)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(
+        x.astype(jnp.float32) @ w.astype(jnp.float32), axis=-1
+    )
+    dout_shape = (b_dim,) if reduction == "none" else ()
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct(dout_shape, jnp.float32),), seed=42
+    )[0]
+
+    dx_only = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+        dout,
+        lse,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        b_block_size=config.b_block_size,
+        h_block_size=config.h_block_size,
+        v_block_size=config.v_block_size,
+        buffer_count=buffer_count,
+        compute_w_grad=False,
+    )
+    self.assertIsInstance(dx_only, jax.Array)
+    self.assertEqual(dx_only.shape, (b_dim, h_dim))
+
+    full_config = kernel.get_heuristic_bwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, buffer_count=buffer_count
+    )
+    dx_full, _ = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+        dout,
+        lse,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        b_block_size=full_config.b_block_size,
+        h_block_size=full_config.h_block_size,
+        v_block_size=full_config.v_block_size,
+        buffer_count=buffer_count,
+    )
+    self._assert_allclose(dx_only, dx_full, atol=1e-4, rtol=1e-4, name="dx")
+
+    ref_dx, _ = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        dout,
+        lse,
+        x.astype(jnp.float32),
+        labels,
+        w.astype(jnp.float32),
+        reduction=reduction,
+    )
+    self._assert_allclose(
+        dx_only, ref_dx, atol=5e-2, rtol=5e-2, name="dx_vs_ref"
+    )
+
 
 class HeuristicConfigTest(parameterized.TestCase):
 
@@ -1154,6 +1264,84 @@ class CostEstimateTest(parameterized.TestCase):
     self.assertEqual(cost.flops, expected_flops)
     self.assertEqual(cost.transcendentals, expected_transcendentals)
     self.assertEqual(cost.bytes_accessed, expected_bytes)
+
+  def test_bwd_cost_estimate_without_w_grad(self):
+    b, h, v = 1024, 512, 2048
+    dout = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    x = jax.ShapeDtypeStruct(shape=(b, h), dtype=jnp.bfloat16)
+    labels = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.int32)
+    w = jax.ShapeDtypeStruct(shape=(h, v), dtype=jnp.bfloat16)
+    lse = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    out_type = [jax.ShapeDtypeStruct(shape=(1, b, h), dtype=jnp.float32)]
+
+    cost = kernel.linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+        dout=dout,
+        x=x,
+        labels=labels,
+        w=w,
+        lse=lse,
+        out_type=out_type,
+        compute_w_grad=False,
+    )
+    cost_default_out = (
+        kernel.linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+            dout=dout,
+            x=x,
+            labels=labels,
+            w=w,
+            lse=lse,
+            compute_w_grad=False,
+        )
+    )
+
+    expected_flops = 2 * (2 * b * h * v) + 3 * b * v
+    expected_bytes = b * 4 + b * h * 2 + b * 4 + h * v * 2 + b * 4 + b * h * 4
+    self.assertEqual(cost.flops, expected_flops)
+    self.assertEqual(cost.transcendentals, b * v)
+    self.assertEqual(cost.bytes_accessed, expected_bytes)
+    self.assertEqual(cost_default_out, cost)
+
+  def test_bwd_vmem_and_heuristic_without_w_grad(self):
+    vmem_with = kernel._calculate_bwd_vmem_bytes(
+        1024, 512, 2048, dtype=jnp.dtype(jnp.bfloat16), compute_w_grad=True
+    )
+    vmem_without = kernel._calculate_bwd_vmem_bytes(
+        1024, 512, 2048, dtype=jnp.dtype(jnp.bfloat16), compute_w_grad=False
+    )
+    self.assertLess(vmem_without, vmem_with)
+
+    mock_tpu_info = _mock_tpu_info()
+    with mock.patch.object(
+        kernel.pltpu, "get_tpu_info", return_value=mock_tpu_info
+    ):
+      vmem_limit = 32 * 1024 * 1024
+      cfg_with = kernel.get_heuristic_bwd_config(
+          4096,
+          512,
+          32768,
+          dtype=jnp.dtype(jnp.bfloat16),
+          vmem_limit_bytes=vmem_limit,
+          compute_w_grad=True,
+      )
+      cfg_without = kernel.get_heuristic_bwd_config(
+          4096,
+          512,
+          32768,
+          dtype=jnp.dtype(jnp.bfloat16),
+          vmem_limit_bytes=vmem_limit,
+          compute_w_grad=False,
+      )
+    self.assertGreater(cfg_without.v_block_size, cfg_with.v_block_size)
+    self.assertLessEqual(
+        kernel._calculate_bwd_vmem_bytes(
+            cfg_without.b_block_size,
+            cfg_without.h_block_size,
+            cfg_without.v_block_size,
+            dtype=jnp.dtype(jnp.bfloat16),
+            compute_w_grad=False,
+        ),
+        vmem_limit,
+    )
 
 
 class SafeInputOutputBufferCountTest(parameterized.TestCase):

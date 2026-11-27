@@ -18,7 +18,7 @@
 import dataclasses
 import functools
 import math
-from typing import Literal, Sequence
+from typing import Literal, Sequence, overload
 import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -178,6 +178,7 @@ def _calculate_bwd_vmem_bytes(
     v_block_size: int,
     dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     buffer_count: tuple[int, int] | int = (2, 2),
+    compute_w_grad: bool = True,
 ) -> int:
   """Calculates VMEM memory usage in bytes for the backward kernel."""
   dtype_bytes = jnp.dtype(dtype).itemsize
@@ -185,6 +186,7 @@ def _calculate_bwd_vmem_bytes(
   # Note: grad_bytes is an upper bound when single-buffered output fallback
   # engages.
   grad_bytes = _calculate_grad_bytes_per_elem(buffer_count)
+  w_grad_bytes = grad_bytes if compute_w_grad else 0
   return (
       # (B, H) shapes:
       # x tile (B, H) in input dtype (double buff for in_specs: 2 * dt)
@@ -199,7 +201,7 @@ def _calculate_bwd_vmem_bytes(
       # 2x w tiles (w_v & w_vm1 double buff for in_specs: 4 * dt)
       # + w_grad tile accumulator (H, V) in float32 (total_buffers * 4B)
       # + dot_general intermediate result in accumulate_w_grad (float32: 4B)
-      + h_alloc * v_block_size * (4 * dtype_bytes + grad_bytes)
+      + h_alloc * v_block_size * (4 * dtype_bytes + w_grad_bytes)
       # (B, V) shapes:
       # logits/softmax tile (B, V) in float32 accumulator:
       # Ping-pong xw_scratch_ref: 2 x (B, V) explicit float32 buffers (8B/elem)
@@ -226,16 +228,20 @@ def _get_heuristic_config(
     dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
     buffer_count: tuple[int, int] | int = (2, 2),
+    compute_w_grad: bool = True,
 ) -> Config:
   """Calculates heuristic config based on VMEM size, dtype, and divisibility."""
   if vmem_limit_bytes is None:
     vmem_limit_bytes = _get_vmem_limit_bytes()
 
-  calc_vmem_fn = (
-      functools.partial(_calculate_bwd_vmem_bytes, buffer_count=buffer_count)
-      if is_bwd
-      else _calculate_fwd_vmem_bytes
-  )
+  if is_bwd:
+    calc_vmem_fn = functools.partial(
+        _calculate_bwd_vmem_bytes,
+        buffer_count=buffer_count,
+        compute_w_grad=compute_w_grad,
+    )
+  else:
+    calc_vmem_fn = _calculate_fwd_vmem_bytes
   dtype_bytes = jnp.dtype(dtype).itemsize
   tpu_info = pltpu.get_tpu_info()
   num_lanes = tpu_info.num_lanes
@@ -347,7 +353,10 @@ def _get_heuristic_config(
     #       1-2) 2x xw_scratch_ref (explicit VMEM scratch ping-pong: 8B/elem)
     #       3) diff/prob temporary on the stack during compute_s (4B/elem)
     #       Total 3 * 4 = 12 bytes per element across b_block_size
-    per_v_bytes = h_alloc * (4 * dtype_bytes + grad_bytes) + 12 * b_block_size
+    w_grad_bytes = grad_bytes if compute_w_grad else 0
+    per_v_bytes = (
+        h_alloc * (4 * dtype_bytes + w_grad_bytes) + 12 * b_block_size
+    )
   else:
     # fixed_bytes accounts for VMEM costs that do not scale with V:
     #   - x tile = 2 * b_block_size * h_alloc * dtype_bytes
@@ -460,6 +469,7 @@ def get_heuristic_bwd_config(
     dtype: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     vmem_limit_bytes: int | None = None,
     buffer_count: tuple[int, int] | int = (2, 2),
+    compute_w_grad: bool = True,
 ) -> Config:
   """Returns heuristic config for backward pass based on VMEM size and dtype."""
   return _get_heuristic_config(
@@ -470,6 +480,7 @@ def get_heuristic_bwd_config(
       dtype=dtype,
       vmem_limit_bytes=vmem_limit_bytes,
       buffer_count=buffer_count,
+      compute_w_grad=compute_w_grad,
   )
 
 
@@ -702,6 +713,7 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
     w: Real[Array, "H V"] | jax.ShapeDtypeStruct,
     lse: Real[Array, "B"] | jax.ShapeDtypeStruct,
     out_type: Sequence[jax.ShapeDtypeStruct] | None = None,
+    compute_w_grad: bool = True,
 ) -> pl.CostEstimate:
   """Calculates the theoretical hardware cost estimate for the backward pass kernel.
 
@@ -725,13 +737,13 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
     3. Weight Gradient Matrix Multiplication (W_grad = X^T @ S):
        - Transposed activations X^T: (H, B), Softmax derivatives S: (B, V)
        - Output W_grad: (H, V)
-       - Matmul FLOPs: 2 * B * H * V.
+       - Matmul FLOPs: 2 * B * H * V (omitted when compute_w_grad is False).
     4. Activation Gradient Matrix Multiplication (X_grad = S @ W^T):
        - Softmax derivatives S: (B, V), Transposed weights W^T: (V, H)
        - Output X_grad: (B, H)
        - Matmul FLOPs: 2 * B * H * V.
 
-    Total FLOPs = 6 * B * H * V + 3 * B * V.
+    Total FLOPs = (6 if compute_w_grad else 4) * B * H * V + 3 * B * V.
 
   Transcendental Operations Breakdown:
     - Exponentiation (exp) in softmax probabilities: B * V ops.
@@ -747,7 +759,8 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
     - Outputs written to HBM:
       - Activation gradients x_grad: (num_cores * B_aligned * H_aligned) or (B *
       H) * 4 bytes
-      - Weight gradients w_grad: (H_aligned * V_aligned) * 4 bytes
+      - Weight gradients w_grad: (H_aligned * V_aligned) * 4 bytes (omitted
+      when compute_w_grad is False)
     Total Bytes Accessed = sum(input_bytes) + sum(output_bytes).
 
   Args:
@@ -758,6 +771,7 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
     lse: Forward log-sum-exp tensor or ShapeDtypeStruct with shape (B,).
     out_type: Optional sequence of output ShapeDtypeStructs for x_grad and
       w_grad.
+    compute_w_grad: Whether weight gradients are computed.
 
   Returns:
     A `pl.CostEstimate` object containing flops, transcendentals, and
@@ -767,7 +781,7 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
   h_dim = x.shape[1]
   v_dim = w.shape[1]
 
-  matmul_flops = 3 * (2 * b_dim * h_dim * v_dim)
+  matmul_flops = (3 if compute_w_grad else 2) * (2 * b_dim * h_dim * v_dim)
   softmax_flops = 3 * b_dim * v_dim
   total_flops = matmul_flops + softmax_flops
 
@@ -778,7 +792,9 @@ def linear_softmax_cross_entropy_loss_bwd_cost_estimate(
   if out_type is not None:
     output_bytes = sum(_bytes(t) for t in out_type)
   else:
-    output_bytes = (b_dim * h_dim + h_dim * v_dim) * 4
+    output_bytes = (
+        b_dim * h_dim + (h_dim * v_dim if compute_w_grad else 0)
+    ) * 4
 
   return pl.CostEstimate(
       flops=int(total_flops),
@@ -1107,6 +1123,69 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
   return loss, lse
 
 
+@overload
+def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+    dout: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    lse: Real[Array, "B"],
+    *,
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    preferred_element_type: jnp.dtype,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: Literal[True] = ...,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
+  ...
+
+
+@overload
+def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+    dout: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    lse: Real[Array, "B"],
+    *,
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    preferred_element_type: jnp.dtype,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: Literal[False],
+) -> Real[Array, "B H"]:
+  ...
+
+
+@overload
+def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+    dout: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    lse: Real[Array, "B"],
+    *,
+    b_dim: int,
+    h_dim: int,
+    v_dim: int,
+    preferred_element_type: jnp.dtype,
+    b_block_size: int,
+    h_block_size: int,
+    v_block_size: int,
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: bool = ...,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]] | Real[Array, "B H"]:
+  ...
+
+
 def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     dout: Real[Array, "B"],
     x: Real[Array, "B H"],
@@ -1122,7 +1201,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     h_block_size: int,
     v_block_size: int,
     buffer_count: tuple[int, int] | int = (2, 2),
-) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
+    compute_w_grad: bool = True,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]] | Real[Array, "B H"]:
   """Pallas kernel for the backward pass of Linear Softmax Cross-Entropy Loss.
 
   Args:
@@ -1141,9 +1221,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
     buffer_count: The buffer count configuration for input/output buffering. On
       JAX versions without separate input/output buffering support, gradient
       input_output buffers are single-buffered (buffer_count=1).
+    compute_w_grad: When False, omit the `w_grad` output, skip `x^T @ s` and
+      its HBM traffic, and return `x_grad` alone.
 
   Returns:
-    A tuple of (x_grad, w_grad).
+    A tuple of `(x_grad, w_grad)`, or `x_grad` when `compute_w_grad` is False.
   """
   num_b_blocks = math.ceil(b_dim / b_block_size)
   num_h_blocks = math.ceil(h_dim / h_block_size)
@@ -1163,10 +1245,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       jax.ShapeDtypeStruct(
           (num_cores, b_dim, h_dim), dtype=jnp.float32
       ),  # x_grad
-      jax.ShapeDtypeStruct(
-          (h_dim, num_v_blocks * v_block_size), dtype=jnp.float32
-      ),  # w_grad
   ]
+  if compute_w_grad:
+    out_type.append(
+        jax.ShapeDtypeStruct(
+            (h_dim, num_v_blocks * v_block_size), dtype=jnp.float32
+        )  # w_grad
+    )
   cost_estimate = linear_softmax_cross_entropy_loss_bwd_cost_estimate(
       dout=dout,
       x=x,
@@ -1174,6 +1259,7 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       w=w,
       lse=lse,
       out_type=out_type,
+      compute_w_grad=compute_w_grad,
   )
 
   @pl.kernel(
@@ -1190,8 +1276,8 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       ),
       cost_estimate=cost_estimate,
       name=(
-          f"lce_bwd_bt_{b_block_size}_ht_{h_block_size}_vt_{v_block_size}"
-          f"_cores_{num_cores}"
+          f"lce_bwd{'' if compute_w_grad else '_dx'}_bt_{b_block_size}"
+          f"_ht_{h_block_size}_vt_{v_block_size}_cores_{num_cores}"
       ),
   )
   def bwd_kernel(
@@ -1201,9 +1287,13 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       w_hbm_ref,
       lse_hbm_ref,
       x_grad_hbm_ref,
-      w_grad_hbm_ref,
-      xw_scratch_ref,
+      *rest_refs,
   ):
+    if compute_w_grad:
+      w_grad_hbm_ref, xw_scratch_ref = rest_refs
+    else:
+      w_grad_hbm_ref = None
+      (xw_scratch_ref,) = rest_refs
     c_index = jax.lax.axis_index("core")
     grid = (
         num_b_blocks,
@@ -1284,31 +1374,23 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             lambda i, j, k: (c_index, get_b_ds(i), get_h_ds(k)),
             memory_space=pltpu.VMEM,
         ),
-        pl.BlockSpec(  # w_grad
-            (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
-            lambda i, j, k: (
-                get_h_ds(k),
-                get_v_ds_w_grad(
-                    c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1)
-                ),
-            ),
-            memory_space=pltpu.VMEM,
-        ),
     ]
+    if compute_w_grad:
+      out_specs.append(
+          pl.BlockSpec(  # w_grad
+              (pl.BoundedSlice(h_block_size), pl.BoundedSlice(v_block_size)),
+              lambda i, j, k: (
+                  get_h_ds(k),
+                  get_v_ds_w_grad(
+                      c_index * num_v_blocks_per_core + jnp.maximum(0, j - 1)
+                  ),
+              ),
+              memory_space=pltpu.VMEM,
+          )
+      )
     x_grad_revisit = None if num_h_blocks == 1 else num_h_blocks
-    # Within a B block, w_grad visits block 0 at v_step 0 and v_step 1.
-    # v_step 0 does not write to w_grad, so that recurrence is content-benign.
-    # The first real write is at v_step 1, and the block recurs at v_step 0 of
-    # the next B block, exactly num_v_blocks_per_core * num_h_blocks steps
-    # later.
-    w_grad_revisit = (
-        None if num_b_blocks == 1 else num_v_blocks_per_core * num_h_blocks
-    )
     x_grad_buffer_count = _input_output_buffer_count(
         buffer_count, x_grad_revisit
-    )
-    w_grad_buffer_count = _input_output_buffer_count(
-        buffer_count, w_grad_revisit
     )
     inner_allocs = [
         pltpu.BufferedRef.input(in_specs[0], dout.dtype),
@@ -1322,12 +1404,26 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
             jnp.float32,
             buffer_count=x_grad_buffer_count,
         ),
-        pltpu.BufferedRef.input_output(
-            out_specs[1],
-            jnp.float32,
-            buffer_count=w_grad_buffer_count,
-        ),
     ]
+    if compute_w_grad:
+      # Within a B block, w_grad visits block 0 at v_step 0 and v_step 1.
+      # v_step 0 does not write to w_grad, so that recurrence is content-benign.
+      # The first real write is at v_step 1, and the block recurs at v_step 0 of
+      # the next B block, exactly num_v_blocks_per_core * num_h_blocks steps
+      # later.
+      w_grad_revisit = (
+          None if num_b_blocks == 1 else num_v_blocks_per_core * num_h_blocks
+      )
+      w_grad_buffer_count = _input_output_buffer_count(
+          buffer_count, w_grad_revisit
+      )
+      inner_allocs.append(
+          pltpu.BufferedRef.input_output(
+              out_specs[1],
+              jnp.float32,
+              buffer_count=w_grad_buffer_count,
+          )
+      )
 
     def bwd_pipeline(
         step,
@@ -1338,9 +1434,12 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         w_vm1_ref,
         lse_ref,
         x_grad_ref,
-        w_grad_ref,
-        xw_scratch_ref,
+        *rest_refs,
     ):
+      if compute_w_grad:
+        w_grad_ref, xw_scratch_ref = rest_refs
+      else:
+        (xw_scratch_ref,) = rest_refs
       b_index, v_step, h_index = step.index
       global_v = c_index * num_v_blocks_per_core + v_step
       v_vm1 = jnp.maximum(0, v_step - 1)
@@ -1485,14 +1584,16 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
 
       # 3. Gradient calculation for current tile (v_step - 1)
       # Init W gradient
-      @pl.when((v_step > 0) & (b_index == 0))
-      @jax.named_scope("init_w_grad")
-      def init_w_grad():
-        w_grad_ref[...] = jax.lax.dot_general(
-            get_clean_x(),
-            xw_scratch_ref.at[vm1_buf_idx][...],
-            (((0,), (0,)), ((), ())),
-        )
+      if compute_w_grad:
+
+        @pl.when((v_step > 0) & (b_index == 0))
+        @jax.named_scope("init_w_grad")
+        def init_w_grad():
+          w_grad_ref[...] = jax.lax.dot_general(
+              get_clean_x(),
+              xw_scratch_ref.at[vm1_buf_idx][...],
+              (((0,), (0,)), ((), ())),
+          )
 
       # Init X gradient
       @pl.when(v_step == 1)
@@ -1505,14 +1606,16 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         )
 
       # Accumulate W grad on B dimension
-      @pl.when((v_step > 0) & (b_index != 0))
-      @jax.named_scope("accumulate_w_grad")
-      def accumulate_w_grad():
-        w_grad_ref[...] += jax.lax.dot_general(
-            get_clean_x(),
-            xw_scratch_ref.at[vm1_buf_idx][...],
-            (((0,), (0,)), ((), ())),
-        )
+      if compute_w_grad:
+
+        @pl.when((v_step > 0) & (b_index != 0))
+        @jax.named_scope("accumulate_w_grad")
+        def accumulate_w_grad():
+          w_grad_ref[...] += jax.lax.dot_general(
+              get_clean_x(),
+              xw_scratch_ref.at[vm1_buf_idx][...],
+              (((0,), (0,)), ((), ())),
+          )
 
       # Accumulate X grad on V dimension
       @pl.when(v_step > 1)
@@ -1544,18 +1647,77 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
           w_hbm_ref,
           lse_hbm_ref,
           x_grad_hbm_ref,
-          w_grad_hbm_ref,
+          *((w_grad_hbm_ref,) if compute_w_grad else ()),
           scratches=(xw_scratch_ref,),
           allocations=allocations,
       )
 
     pl.run_scoped(run_pipeline, inner_allocs)
 
-  # pylint: disable-next=unpacking-non-sequence
-  x_grad_blocks, w_grad = bwd_kernel(dout, x, labels, w, lse)
+  outs = bwd_kernel(dout, x, labels, w, lse)
+  if not compute_w_grad:
+    return jnp.sum(outs[0], axis=0)
+  x_grad_blocks, w_grad = outs  # pylint: disable=unpacking-non-sequence
   x_grad = jnp.sum(x_grad_blocks, axis=0)
   w_grad = w_grad[:, :v_dim]
   return x_grad, w_grad
+
+
+@overload
+def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+    dout: Real[Scalar, ""] | Real[Array, "B"] | float,
+    lse: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    *,
+    b_block_size: int = ...,
+    h_block_size: int = ...,
+    v_block_size: int = ...,
+    reduction: Literal["sum", "mean", "none"] = ...,
+    preferred_element_type: jnp.dtype = ...,  # pyrefly: ignore[bad-function-definition]
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: Literal[True] = ...,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
+  ...
+
+
+@overload
+def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+    dout: Real[Scalar, ""] | Real[Array, "B"] | float,
+    lse: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    *,
+    b_block_size: int = ...,
+    h_block_size: int = ...,
+    v_block_size: int = ...,
+    reduction: Literal["sum", "mean", "none"] = ...,
+    preferred_element_type: jnp.dtype = ...,  # pyrefly: ignore[bad-function-definition]
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: Literal[False],
+) -> Real[Array, "B H"]:
+  ...
+
+
+@overload
+def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+    dout: Real[Scalar, ""] | Real[Array, "B"] | float,
+    lse: Real[Array, "B"],
+    x: Real[Array, "B H"],
+    labels: Integer[Array, "B"],
+    w: Real[Array, "H V"],
+    *,
+    b_block_size: int = ...,
+    h_block_size: int = ...,
+    v_block_size: int = ...,
+    reduction: Literal["sum", "mean", "none"] = ...,
+    preferred_element_type: jnp.dtype = ...,  # pyrefly: ignore[bad-function-definition]
+    buffer_count: tuple[int, int] | int = ...,
+    compute_w_grad: bool = ...,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]] | Real[Array, "B H"]:
+  ...
 
 
 @partial(
@@ -1567,10 +1729,11 @@ def linear_softmax_cross_entropy_loss_backward_pallas_kernel(
         "reduction",
         "preferred_element_type",
         "buffer_count",
+        "compute_w_grad",
     ],
 )
 def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
-    dout: Real[Array, ""] | Real[Array, "B"],
+    dout: Real[Scalar, ""] | Real[Array, "B"] | float,
     lse: Real[Array, "B"],
     x: Real[Array, "B H"],
     labels: Integer[Array, "B"],
@@ -1582,7 +1745,8 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jnp.dtype = jnp.float32,  # pyrefly: ignore[bad-function-definition]
     buffer_count: tuple[int, int] | int = (2, 2),
-) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
+    compute_w_grad: bool = True,
+) -> tuple[Real[Array, "B H"], Real[Array, "H V"]] | Real[Array, "B H"]:
   """Pallas kernel implementation of Linear Softmax Cross-Entropy Loss backward.
 
   Computes dense Softmax gradients and applies sparse target label subtraction
@@ -1607,9 +1771,11 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
     buffer_count: The buffer count configuration for input/output buffering. On
       JAX versions without separate input/output buffering support, gradient
       input_output buffers are single-buffered (buffer_count=1).
+    compute_w_grad: When False, skip weight gradient computation and return
+      `x_grad` alone.
 
   Returns:
-    The tuple of gradient of the loss with respect to x and w.
+    The tuple `(x_grad, w_grad)`, or `x_grad` when `compute_w_grad` is False.
   """
   validate_inputs(
       x,
@@ -1649,8 +1815,26 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
   w = pltpu.with_memory_space_constraint(w, memory_space=pltpu.HBM)
 
   # Backward
-  # pylint: disable-next=unpacking-non-sequence
-  x_grad, w_grad = linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+  if compute_w_grad:
+    x_grad, w_grad = linear_softmax_cross_entropy_loss_backward_pallas_kernel(
+        dout_array,
+        x,
+        labels,
+        w,
+        lse,
+        b_dim=b_dim,
+        h_dim=h_dim,
+        v_dim=v_dim,
+        preferred_element_type=preferred_element_type,
+        b_block_size=b_block_size,
+        h_block_size=h_block_size,
+        v_block_size=v_block_size,
+        buffer_count=buffer_count,
+        compute_w_grad=True,
+    )
+    return (x_grad, w_grad)
+
+  return linear_softmax_cross_entropy_loss_backward_pallas_kernel(
       dout_array,
       x,
       labels,
@@ -1664,7 +1848,5 @@ def linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
       h_block_size=h_block_size,
       v_block_size=v_block_size,
       buffer_count=buffer_count,
+      compute_w_grad=False,
   )
-
-  # There is no gradient for the labels
-  return (x_grad, w_grad)
