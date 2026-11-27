@@ -64,6 +64,7 @@ AUTOTUNING_CACHE_TEST: Final[str] = (
     f'{PACKAGE_ROOT}/_src/autotuning/cache_test.py'
 )
 _OPS_ROOT: Final[str] = f'{PACKAGE_ROOT}/_src/ops/'
+OPS_LIST_FILE: Final[str] = f'{_OPS_ROOT}ops_list.py'
 # Checks `ops_list.OPS` against the op directories and the `tokamax.ops`
 # exports by reading source files, so no import reaches it from an op change.
 # Selected for any change under these prefixes other than an inert one, e.g. a
@@ -263,12 +264,17 @@ def op_modules(files: Sequence[str] | None = None) -> dict[str, set[str]]:
   return index
 
 
-def _reachable(start: str, edges: ImportEdges) -> set[str]:
+def _reachable(
+    start: str,
+    edges: ImportEdges,
+    allowed: Collection[str] | None = None,
+) -> set[str]:
   """Returns all package files transitively imported by `start`.
 
   Args:
     start: File path to walk from.
     edges: Forward import graph, as built by `import_graph`.
+    allowed: If given, only step into files in this set.
 
   Returns:
     All package files reachable from `start`.
@@ -276,30 +282,41 @@ def _reachable(start: str, edges: ImportEdges) -> set[str]:
   seen, stack = set(), [start]
   while stack:
     for nxt in edges.get(stack.pop(), ()):
-      if nxt not in seen:
+      if nxt not in seen and (allowed is None or nxt in allowed):
         seen.add(nxt)
         stack.append(nxt)
   return seen
 
 
 def dependents(
-    edges: ImportEdges, files: Sequence[str] | None = None
+    edges: ImportEdges,
+    files: Sequence[str] | None = None,
+    *,
+    allowed: Collection[str] | None = None,
 ) -> dict[str, set[str]]:
   """Inverts the import graph to map each file to test files reaching it.
 
-  Test files map to themselves so editing a test runs it.
+  Test files map to themselves so editing a test runs it. When `allowed` is
+  given, only paths entirely within `allowed` (including both endpoints) are
+  followed.
 
   Args:
     edges: Forward import graph, as built by `import_graph`.
     files: Files to index. Defaults to all package `.py` files.
+    allowed: Optional subgraph filter of allowed file paths.
 
   Returns:
     Mapping from each file to test files that transitively import it.
   """
   files = python_files() if files is None else files
+  allowed_set = None if allowed is None else frozenset(allowed)
   index = collections.defaultdict(set)
-  for test in (f for f in files if is_test_file(f)):
-    for dep in _reachable(test, edges) | {test}:
+  for test in files:
+    if not is_test_file(test):
+      continue
+    if allowed_set is not None and test not in allowed_set:
+      continue
+    for dep in _reachable(test, edges, allowed_set) | {test}:
       index[dep].add(test)
   return index
 
@@ -398,6 +415,8 @@ def full_run_reason(
       return f'{path} is outside {PACKAGE_ROOT}/'
     if os.path.basename(path) == 'conftest.py':
       return f'{path} configures every test in the package'
+    if path == OPS_LIST_FILE:
+      return f'{path} defines runner platforms for every op'
     if ops is not None and (name := autotuning_op_name(path)):
       if not ops.get(name):
         return (
@@ -432,11 +451,43 @@ def _ops_list_tests(
   return set()
 
 
+def _autotuning_table_tests(
+    tables: Mapping[str, str],
+    ops: Mapping[str, set[str]],
+    index: Mapping[str, set[str]],
+    edges: ImportEdges,
+    files: Sequence[str],
+    allowed: Collection[str] | None,
+) -> tuple[set[str] | None, str | None]:
+  """Returns tests affected by autotuning JSON changes, or (None, reason)."""
+  tests: set[str] = set()
+  full_index: Mapping[str, set[str]] | None = None
+  for path, name in tables.items():
+    op_tests = set().union(*(index.get(m, set()) for m in ops[name]))
+    if not op_tests:
+      if allowed is not None:
+        if full_index is None:
+          full_index = dependents(edges, files)
+        if any(full_index.get(m) for m in ops[name]):
+          continue
+      return (
+          None,
+          f'{path} is the autotuning table for {name!r}, which reaches no'
+          ' test',
+      )
+    tests |= op_tests
+  if tables:
+    tests |= index.get(AUTOTUNING_CACHE_TEST, set())
+  return tests, None
+
+
 def affected_tests(
     changed: Collection[str],
     edges: ImportEdges | None = None,
     unparsed: Collection[str] | None = None,
     files: Sequence[str] | None = None,
+    *,
+    allowed: Collection[str] | None = None,
 ) -> tuple[set[str] | None, str | None]:
   """Returns `(tests, reason)` for `changed`; `tests` is None for a full run.
 
@@ -445,6 +496,7 @@ def affected_tests(
     edges: Forward import graph. Built from `files` if omitted.
     unparsed: Files that failed AST parsing. Built from `files` if omitted.
     files: Files to cover. Defaults to all package `.py` files.
+    allowed: Optional subgraph filter of allowed file paths.
 
   Returns:
     A tuple of (tests, reason). `tests` is affected test files, or None for
@@ -462,7 +514,7 @@ def affected_tests(
   ):
     return None, reason
 
-  index = dependents(edges, files)
+  index = dependents(edges, files, allowed=allowed)
   known = set(files)
   tests = set()
   # Non-Python files that pass full_run_reason have no module name.
@@ -471,20 +523,15 @@ def affected_tests(
     tests |= index.get(path, set())
   # Deleted __init__.py files trigger a full run above, so surviving ones exist.
   if inits := [p for p in changed if _is_package_init(p)]:
-    run_by = dependents(execution_edges(edges, files), files)
+    run_by = dependents(execution_edges(edges, files), files, allowed=allowed)
     for path in inits:
       tests |= run_by.get(path, set())
-  for path, name in tables.items():
-    op_tests = set().union(*(index.get(m, set()) for m in ops[name]))
-    if not op_tests:
-      return (
-          None,
-          f'{path} is the autotuning table for {name!r}, which reaches no'
-          ' test',
-      )
-    tests |= op_tests
-  if tables:
-    tests |= index.get(AUTOTUNING_CACHE_TEST, set())
+  table_tests, reason = _autotuning_table_tests(
+      tables, ops, index, edges, files, allowed
+  )
+  if table_tests is None:
+    return None, reason
+  tests |= table_tests
   tests |= _ops_list_tests(changed, index)
 
   if deleted:
