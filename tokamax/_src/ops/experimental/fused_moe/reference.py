@@ -16,8 +16,43 @@
 
 import functools
 import jax
-import jax.numpy as jnp
 from jax import lax
+import jax.numpy as jnp
+
+
+def _as_block_scale(scale: jax.Array) -> jax.Array:
+  """Returns a weight scale normalized to [E, num_blocks, N]."""
+  match scale.ndim:
+    case 2:
+      return scale[:, None, :]
+    case 3:
+      return scale
+    case 4:
+      if scale.shape[2] != 1:
+        raise ValueError(
+            "4-D weight scale must have size 1 on axis 2, got"
+            f" {scale.shape}."
+        )
+      return scale.squeeze(2)
+  raise ValueError(f"Unsupported weight scale shape: {scale.shape}")
+
+
+def _dequantize(weight: jax.Array, scale: jax.Array) -> jax.Array:
+  """Dequantizes one expert weight with its per-block scale."""
+  scale = scale.astype(jnp.float32)
+  num_blocks = scale.shape[0]
+  if num_blocks <= 0 or weight.shape[0] % num_blocks:
+    raise ValueError(
+        f"{num_blocks} scale blocks do not divide contraction dimension"
+        f" {weight.shape[0]}."
+    )
+  if num_blocks == 1:
+    return weight * scale
+  block_size = weight.shape[0] // num_blocks
+  return (
+      weight.reshape(num_blocks, block_size, weight.shape[1])
+      * scale[:, None, :]
+  ).reshape(weight.shape)
 
 
 @functools.partial(
@@ -68,9 +103,9 @@ def fused_moe_reference(
     gating: Optional router gating logits [tokens, experts]. Required when
       `topk_weights` and `topk_ids` are not provided.
     w1_scale: Optional weight 1 scale [experts, 2 * inter], [experts, blocks, 2
-      * inter], or [experts, 1, 1, 2 * inter].
+      * inter], or [experts, blocks, 1, 2 * inter]. Blocks split `hidden`.
     w2_scale: Optional weight 2 scale [experts, hidden], [experts, blocks,
-      hidden], or [experts, 1, 1, hidden].
+      hidden], or [experts, blocks, 1, hidden]. Blocks split `inter`.
     w1_bias: Optional weight 1 bias [experts, 1, 2 * inter].
     w2_bias: Optional weight 2 bias [experts, 1, hidden].
     topk: Number of experts to select per token when `gating` is provided.
@@ -126,20 +161,16 @@ def fused_moe_reference(
   x32 = x.astype(jnp.float32)
   out = jnp.zeros((tokens, hidden), dtype=jnp.float32)
 
-  scaled = w1_scale is not None
-  if scaled:
-    assert w1_scale is not None and w2_scale is not None
-    if w1_scale.ndim == 4:
-      w1_scale = w1_scale.squeeze(1)
-    if w2_scale.ndim == 4:
-      w2_scale = w2_scale.squeeze(1)
+  w1_block_scale = _as_block_scale(w1_scale) if w1_scale is not None else None
+  w2_block_scale = _as_block_scale(w2_scale) if w2_scale is not None else None
 
   for e in range(e_total):
     w1e = w1[e].astype(jnp.float32)
     w2e = w2[e].astype(jnp.float32)
-    if scaled:
-      w1e = w1e * w1_scale[e]
-      w2e = w2e * w2_scale[e]
+    if w1_block_scale is not None:
+      w1e = _dequantize(w1e, w1_block_scale[e])
+    if w2_block_scale is not None:
+      w2e = _dequantize(w2e, w2_block_scale[e])
 
     weight = jnp.sum(
         jnp.where(topk_idx == e, topk_weights, 0.0), axis=-1
