@@ -21,7 +21,7 @@ consumed by config construction and the kernel. Keeping them separate avoids
 carrying `None` unions past planning.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 import dataclasses
 import functools
 from typing import Self
@@ -474,6 +474,62 @@ def _tile_m_candidates(
   return sorted(candidates, reverse=True)
 
 
+def _average_group_tile_m(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    bucket_base: int,
+    min_tile_m: int,
+) -> int | None:
+  """Returns a tile_m that fits an average group in one tile, or None."""
+  overrides = (
+      plan.tile_m,
+      plan.bucket_base,
+      plan.max_tile_m,
+      plan.max_num_buckets,
+  )
+  if (
+      not isinstance(spec.w.quant, tensor_spec.BlockScaledQuantSpec)
+      or not spec.has_routed_io
+      or spec.num_global_groups <= 0
+      or any(field is not None for field in overrides)
+  ):
+    return None
+  # Each tile issues a row DMA per tile row, live or not. A typical group that
+  # needs more than one default tile, with the routed target within one more
+  # bucket, would otherwise run as a full tile plus a mostly empty one.
+  max_tile_m, _ = _tile_m_limits(plan)
+  tile_m = max_tile_m + bucket_base
+  avg_group_rows = spec.size_out_m / spec.num_global_groups
+  target = _routed_target_rows(plan, spec=spec, min_tile_m=min_tile_m)
+  if avg_group_rows <= max_tile_m or target > tile_m:
+    return None
+  return tile_m
+
+
+def _fused_tile_m_candidates(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    largest_tile_m: int,
+    bucket_base: int,
+    min_tile_m: int,
+) -> Iterator[tuple[int, int]]:
+  """Yields (tile_m, bucket_base) pairs to try without k2 tiling, best first."""
+  avg_tile_m = _average_group_tile_m(
+      plan, spec=spec, bucket_base=bucket_base, min_tile_m=min_tile_m
+  )
+  if avg_tile_m is not None:
+    yield avg_tile_m, bucket_base
+  yield largest_tile_m, bucket_base
+  if plan.fuse_up_and_down and plan.tile_m is None:
+    floor_m = max(min_tile_m, plan.bucket_base or 0)
+    cand_m = largest_tile_m
+    while cand_m > floor_m:
+      cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
+      yield cand_m, min(bucket_base, cand_m)
+
+
 def _tile_k2_candidates(
     size_k2: int, w2: tensor_spec.WeightSpec, tpu_info: pltpu.TpuInfo
 ) -> list[int]:
@@ -890,17 +946,16 @@ def _fused_tiling(
   # Heuristic: It may not worth to use fusion with a smaller tile_m vs unfused
   # with a larger tile_m.
   if plan.tile_k2 is None or plan.tile_k2 == size_k2:
-    tiling = try_fit(largest_tile_m, size_k2, bucket_base)
-    if tiling is not None:
-      return tiling
-    if plan.fuse_up_and_down and plan.tile_m is None:
-      floor_m = max(min_tile_m, plan.bucket_base or 0)
-      cand_m = largest_tile_m
-      while cand_m > floor_m:
-        cand_m = max(1 << ((cand_m - 1).bit_length() - 1), floor_m)
-        tiling = try_fit(cand_m, size_k2, min(bucket_base, cand_m))
-        if tiling is not None:
-          return tiling
+    for cand_m, cand_bucket_base in _fused_tile_m_candidates(
+        plan,
+        spec=spec,
+        largest_tile_m=largest_tile_m,
+        bucket_base=bucket_base,
+        min_tile_m=min_tile_m,
+    ):
+      tiling = try_fit(cand_m, size_k2, cand_bucket_base)
+      if tiling is not None:
+        return tiling
 
   # Step 2: Slice k2 with largest possible tile_m.
   if not _may_slice_k2(plan, spec=spec):
@@ -1143,6 +1198,27 @@ def _dma_floor(
   return max(min_tile_m, i_local // (plan.dma_floor_divisor or 16))
 
 
+def _routed_target_rows(
+    plan: RoutingGmmPlan,
+    *,
+    spec: gmm_spec_lib.RoutingGmmSpec,
+    min_tile_m: int,
+) -> int:
+  """Rows a routed tile targets so most groups fit in one tile."""
+  # Align to `2 * num_sublanes` so 2-packed compact VMEM loads avoid crosslane
+  # shuffles. `9/8 * mean + min_tile_m` was tuned empirically (comparing `{9/8,
+  # 8/7, 7/6, 5/4}` up to 4x skew and `9/8` vs `1.5` on `gmm_prod_test`
+  # 128-512-expert suites): `min_tile_m` covers small-mean variance while `9/8`
+  # drops steps tightly (`mean=20`->`32`, `mean=80`->`112`, `mean=160`->`192`
+  # instead of `48`/`208` at `5/4` or `128`/`240` at `1.5`).
+  pair_tile_m = 2 * min_tile_m
+  scaled_mean = pl.cdiv(9 * spec.size_out_m, 8 * spec.num_global_groups)
+  dma_floor = _dma_floor(plan, spec=spec, min_tile_m=min_tile_m)
+  return pair_tile_m * pl.cdiv(
+      max(dma_floor, scaled_mean + min_tile_m), pair_tile_m
+  )
+
+
 def _resolve_bucket_base(
     plan: RoutingGmmPlan,
     *,
@@ -1174,17 +1250,7 @@ def _resolve_bucket_base(
       or spec.size_out_m <= 0
   ):
     return min(bucket_base, max_group_rows), True
-  # Align to `2 * num_sublanes` so 2-packed compact VMEM loads avoid crosslane
-  # shuffles. `9/8 * mean + min_tile_m` was tuned empirically (comparing `{9/8,
-  # 8/7, 7/6, 5/4}` up to 4x skew and `9/8` vs `1.5` on `gmm_prod_test`
-  # 128-512-expert suites): `min_tile_m` covers small-mean variance while `9/8`
-  # drops steps tightly (`mean=20`->`32`, `mean=80`->`112`, `mean=160`->`192`
-  # instead of `48`/`208` at `5/4` or `128`/`240` at `1.5`).
-  scaled_mean = pl.cdiv(9 * spec.size_out_m, 8 * spec.num_global_groups)
-  dma_floor = _dma_floor(plan, spec=spec, min_tile_m=min_tile_m)
-  target = pair_tile_m * pl.cdiv(
-      max(dma_floor, scaled_mean + min_tile_m), pair_tile_m
-  )
+  target = _routed_target_rows(plan, spec=spec, min_tile_m=min_tile_m)
   # When `target` already spans at least two `bucket_base` buckets (`>= 256`
   # rows) or expert weights are large (`>= 12 MiB`), keep
   # `[bucket_base, 2 * bucket_base]` so multi-tile groups avoid reloading large
