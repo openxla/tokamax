@@ -140,7 +140,7 @@ class DedupMoeTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
 
   def _mesh(self, ep):
@@ -328,7 +328,7 @@ class DedupRaceTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.skip_on_hardware(
         self, "detect_races exists only in Pallas TPU interpret mode"
     )

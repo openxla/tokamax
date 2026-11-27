@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Dual-mode test harness: CPU interpret mode, or TPU v8i hardware.
+"""Dual-mode test harness: CPU interpret mode, or TPU v7x / v8i hardware.
 
 Every kernel-executing test of the De-Dup MoE layer runs in one of two modes:
 
   * CPU (the default on a CPU host): the Pallas kernels run in TPU interpret
     mode on CPU devices and the split-phase exchange is emulated
     (interpret_util).
-  * Hardware (the test runs on TPU v8i devices, `jax.devices()`): every
+  * Hardware (the test runs on TPU v7x or v8i devices, `jax.devices()`): every
     context manager here is a no-op, so the real Mosaic kernels and the real
     split-phase exchange run, and the layer is jitted (`run`).
 
-Hardware tests are TPU v8i only: `skip_unless_v8i` skips them elsewhere.
+Hardware tests run on TPU v7x and v8i only: `skip_unless_supported` skips
+them on any other host.
 """
 
 import contextlib
@@ -40,8 +41,14 @@ from tokamax._src.ops.experimental.dedup_moe.test.common import interpret_util
 from tokamax._src.ops.experimental.fused_moe import host as fused_host
 
 AXIS = kernel_config.AXIS
-# The device kind prefix of TPU v8i devices.
+# The device kind prefixes of TPU v7x and TPU v8i devices.
+V7X_DEVICE_KIND = "TPU7x"
 V8I_DEVICE_KIND = "TPU8i"
+# The TPUs the hardware tests run on (the kernels need TPU v7x or later).
+SUPPORTED_DEVICE_KINDS = (V7X_DEVICE_KIND, V8I_DEVICE_KIND)
+# Fewest TPU devices the hardware tests run on: wave dispatch needs ep >= 3,
+# so a one-chip (two-device) host skips them.
+MIN_HW_DEVICES = 4
 
 # Hardware-legal layer shapes for the small dual-mode tests (the CPU interpret
 # shapes stay as each test defines them). The fused kernel streams the int32
@@ -83,27 +90,43 @@ def on_v8i() -> bool:
   )
 
 
-def unsupported_reason() -> str | None:
-  """Why this host can run neither mode, or None if it can run one.
-
-  The tests run on TPU v8i hardware, or in CPU interpret mode on a host whose
-  default JAX backend is the CPU. Any other host (a GPU, or another TPU
-  generation) skips them.
-
-  Returns:
-    The skip reason, or None on TPU v8i or a CPU-default host.
-  """
-  backend = jax.default_backend()
-  if on_v8i() or backend == "cpu":
-    return None
-  return (
-      "dedup_moe kernel tests need TPU v8i or the CPU interpret backend; got"
-      f" {backend}/{jax.devices()[0].device_kind}"
+def on_supported_tpu() -> bool:
+  """Whether the tests run on TPU v7x or TPU v8i devices."""
+  return on_hardware() and jax.devices()[0].device_kind.startswith(
+      SUPPORTED_DEVICE_KINDS
   )
 
 
-def skip_unless_v8i(test: Any) -> None:
-  """Skips `test` unless it runs on TPU v8i (CPU interpret mode is allowed)."""
+def unsupported_reason() -> str | None:
+  """Why this host can run neither mode, or None if it can run one.
+
+  The tests run on TPU v7x or v8i hardware with at least MIN_HW_DEVICES
+  devices, or in CPU interpret mode on a host whose default JAX backend is the
+  CPU. Any other host (a GPU, an older TPU generation, or a one-chip TPU host)
+  skips them.
+
+  Returns:
+    The skip reason, or None on TPU v7x / v8i or a CPU-default host.
+  """
+  backend = jax.default_backend()
+  if backend == "cpu":
+    return None
+  kind = jax.devices()[0].device_kind
+  if not on_supported_tpu():
+    return (
+        "dedup_moe kernel tests need TPU v7x / v8i or the CPU interpret"
+        f" backend; got {backend}/{kind}"
+    )
+  if len(jax.devices()) < MIN_HW_DEVICES:
+    return (
+        f"dedup_moe kernel tests need >= {MIN_HW_DEVICES} TPU devices (wave"
+        f" dispatch needs ep >= 3); got {len(jax.devices())} {kind}"
+    )
+  return None
+
+
+def skip_unless_supported(test: Any) -> None:
+  """Skips `test` unless it runs on TPU v7x / v8i or in CPU interpret mode."""
   reason = unsupported_reason()
   if reason is not None:
     test.skipTest(reason)
@@ -167,7 +190,8 @@ def setup_module(chip: str = "tpu8i") -> None:
     chip: The chip record for CPU interpret mode (interpret_util.CHIPS).
 
   Raises:
-    unittest.SkipTest: On a host that is neither TPU v8i nor CPU-default.
+    unittest.SkipTest: On a host that is neither TPU v7x / v8i nor
+      CPU-default.
   """
   reason = unsupported_reason()
   if reason is not None:

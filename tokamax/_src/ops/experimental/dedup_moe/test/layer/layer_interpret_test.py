@@ -103,7 +103,7 @@ class LayerInterpretTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     if "mesh" not in self._cache:
       mesh = hw_util.make_mesh(_shapes().ep, self)
       self._cache["mesh"] = mesh

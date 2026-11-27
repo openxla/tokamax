@@ -82,7 +82,7 @@ class ModularLayerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    hw_util.skip_unless_v8i(self)
+    hw_util.skip_unless_supported(self)
     hw_util.reset_interpret_state()
 
   def _setup(self, ep, board_size, g_local=G_LOCAL, fmt="fp8", **cfg_kw):
