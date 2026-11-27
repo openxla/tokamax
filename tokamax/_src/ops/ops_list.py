@@ -383,6 +383,13 @@ OPS: tuple[Op, ...] = (
                 backend=XLA,
                 module="_src/ops/experimental/flex_attention/base.py",
             ),
+            Impl(
+                name="mosaic_gpu",
+                backend=MOSAIC_GPU,
+                module=(
+                    "_src/ops/experimental/flex_attention/pallas_mosaic_gpu.py"
+                ),
+            ),
         ),
     ),
     Op(

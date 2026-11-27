@@ -20,21 +20,29 @@ from typing import Any, Final, Literal
 
 import immutabledict
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
 from tokamax._src.ops.experimental.flex_attention import base
 
-type Implementation = Literal["xla"]
+type Implementation = Literal["mosaic", "xla"]
 
 ScoreMod = Callable[[Float[Array, "B H T t"]], Float[Array, "B H T t"]]
 MaskMod = Callable[[tuple[int, int, int, int]], Bool[Array, "#B #H #T #t"]]
 
-
-_IMPLEMENTATIONS = dict(
-    xla=base.FlexAttention(),
-)
+_IMPLEMENTATIONS = dict(xla=base.FlexAttention())
 _DEFAULT_IMPLEMENTATIONS = ("xla",)
+
+try:
+  from tokamax._src.ops.experimental.flex_attention import pallas_mosaic_gpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
+
+  _IMPLEMENTATIONS["mosaic_gpu"] = (
+      pallas_mosaic_gpu.PallasMosaicGpuFlexAttention()
+  )
+  _DEFAULT_IMPLEMENTATIONS = ("mosaic",) + _DEFAULT_IMPLEMENTATIONS
+except ImportError:
+  pass
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
     immutabledict.immutabledict(_IMPLEMENTATIONS)
@@ -133,6 +141,11 @@ def flex_attention(
   errors = []
   for impl in implementation:
     if isinstance(impl, str):
+      if impl == "mosaic":
+        if "NVIDIA" in backend.get_default_device().device_kind:
+          impl = "mosaic_gpu"
+        else:
+          impl = "mosaic_tpu"
       if impl not in IMPLEMENTATIONS:
         raise ValueError(f"Unknown implementation: {impl}.")
       impl = IMPLEMENTATIONS[impl]

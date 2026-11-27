@@ -26,6 +26,7 @@ from tokamax._src import benchmarking
 from tokamax._src import shape as shape_lib
 from tokamax._src.ops.attention import api as attention_api
 from tokamax._src.ops.experimental.flex_attention import api
+from tokamax._src.ops.experimental.flex_attention import base
 from tokamax._src.ops.experimental.flex_attention import example_masks
 from tokamax._src.ops.experimental.flex_attention import example_score_mods
 
@@ -50,7 +51,71 @@ def _make_inputs(
   return dict(query=q_shape, key=kv_shape, value=kv_shape)
 
 
+def _round_f32_to_bf16(x: jax.Array) -> jax.Array:
+  if x.dtype == jnp.float32:
+    return x.astype(jnp.bfloat16).astype(jnp.float32)
+  return x
+
+
+def _get_precision(
+    dtype: jax.typing.DTypeLike, implementation: api.Implementation
+) -> jax.lax.DotAlgorithmPreset | None:
+  if dtype != jnp.float32:
+    return None
+  if implementation == 'mosaic':
+    return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+  return jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+
+
 class FlexAttentionApiTest(parameterized.TestCase):
+
+  def _run_test(
+      self,
+      fn_ref,
+      fn_flex,
+      inputs,
+      *,
+      implementation,
+      precision,
+      fwd_tol,
+      grad_atol,
+      grad_rtol,
+  ):
+    if implementation == 'mosaic':
+      mosaic_impl = api.IMPLEMENTATIONS.get(f'mosaic_{jax.default_backend()}')
+      if not isinstance(
+          mosaic_impl, base.FlexAttention
+      ) or not mosaic_impl.supported_on(jax.devices()[0]):
+        self.skipTest('Mosaic is not supported on this platform.')
+      mode = 'forward'
+    else:
+      mode = 'forward_and_vjp'
+
+    fn_ref, args_ref = benchmarking.standardize_function(
+        fn_ref, kwargs=inputs, mode=mode
+    )
+    if precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32:
+      # Bottleneck Q/K/V precision of reference inputs to match the
+      # implementation.
+      args_ref = (*map(_round_f32_to_bf16, args_ref[:3]), *args_ref[3:])
+
+    fn_flex, args_flex = benchmarking.standardize_function(
+        fn_flex, kwargs=inputs, mode=mode
+    )
+
+    if mode == 'forward':
+      out_ref = jax.jit(fn_ref)(args_ref)
+      out_flex = jax.jit(fn_flex)(args_flex)
+      chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
+    else:
+      out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
+      out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
+      chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
+      grads_ref = [g for g in grads_ref if g.dtype != jax.dtypes.float0]
+      grads_flex = [g for g in grads_flex if g.dtype != jax.dtypes.float0]
+      chex.assert_trees_all_close(
+          grads_flex, grads_ref, atol=grad_atol, rtol=grad_rtol
+      )
 
   @parameterized.product(
       dtype=(jnp.float32, jnp.bfloat16),
@@ -63,11 +128,8 @@ class FlexAttentionApiTest(parameterized.TestCase):
       self, dtype, is_causal, scale, is_mha, implementation
   ):
     soft_cap = 32.0
-    precision = (
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
-        if dtype == jnp.float32
-        else None
-    )
+    precision = _get_precision(dtype, implementation)
+    high_prec = precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
     inputs = _make_inputs(dtype=dtype, is_mha=is_mha)
 
     f_ref = functools.partial(
@@ -75,7 +137,7 @@ class FlexAttentionApiTest(parameterized.TestCase):
         logits_soft_cap=soft_cap,
         is_causal=is_causal,
         scale=scale,
-        precision=precision,
+        precision=jax.lax.Precision.HIGHEST,
         implementation='xla',
     )
     mask_mode = example_masks.causal_mask if is_causal else None
@@ -87,20 +149,21 @@ class FlexAttentionApiTest(parameterized.TestCase):
         scale=scale,
         implementation=implementation,
     )
-    fn_ref, args_ref = benchmarking.standardize_function(
-        f_ref, kwargs=inputs, mode='forward_and_vjp'
-    )
-    fn_flex, args_flex = benchmarking.standardize_function(
-        f_flex, kwargs=inputs, mode='forward_and_vjp'
-    )
-    out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
-    out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
-    fwd_tol = 3e-4 if dtype == jnp.float32 else 2e-2
-    grad_atol = 1e-4 if dtype == jnp.float32 else (6.0 if scale else 1e-1)
-    grad_rtol = 1e-4 if dtype == jnp.float32 else 1e-1
-    chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
-    chex.assert_trees_all_close(
-        grads_flex, grads_ref, atol=grad_atol, rtol=grad_rtol
+    if dtype == jnp.float32:
+      grad_atol = 1e-3
+      grad_rtol = 1e-3
+    else:
+      grad_atol = 6.0 if scale else 1e-1
+      grad_rtol = 1e-1
+    self._run_test(
+        f_ref,
+        f_flex,
+        inputs,
+        implementation=implementation,
+        precision=precision,
+        fwd_tol=3e-4 if high_prec else 2e-2,
+        grad_atol=grad_atol,
+        grad_rtol=grad_rtol,
     )
 
   @parameterized.product(
@@ -111,17 +174,14 @@ class FlexAttentionApiTest(parameterized.TestCase):
   def test_against_dot_product_attention_local_window_size(
       self, local_window_size, dtype, implementation
   ):
-    precision = (
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
-        if dtype == jnp.float32
-        else None
-    )
+    precision = _get_precision(dtype, implementation)
+    high_prec = precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
     inputs = _make_inputs(dtype=dtype)
 
     f_ref = functools.partial(
         attention_api.dot_product_attention,
         local_window_size=local_window_size,
-        precision=precision,
+        precision=jax.lax.Precision.HIGHEST,
         implementation='xla',
     )
     f_flex = functools.partial(
@@ -130,19 +190,16 @@ class FlexAttentionApiTest(parameterized.TestCase):
         precision=precision,
         implementation=implementation,
     )
-    fn_ref, args_ref = benchmarking.standardize_function(
-        f_ref, kwargs=inputs, mode='forward_and_vjp'
-    )
-    fn_flex, args_flex = benchmarking.standardize_function(
-        f_flex, kwargs=inputs, mode='forward_and_vjp'
-    )
-    out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
-    out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
-    fwd_tol = 1e-4 if dtype == jnp.float32 else 2e-2
     grad_tol = 1e-4 if dtype == jnp.float32 else 5e-2
-    chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
-    chex.assert_trees_all_close(
-        grads_flex, grads_ref, atol=grad_tol, rtol=grad_tol
+    self._run_test(
+        f_ref,
+        f_flex,
+        inputs,
+        implementation=implementation,
+        precision=precision,
+        fwd_tol=1e-4 if high_prec else 2e-2,
+        grad_atol=grad_tol,
+        grad_rtol=grad_tol,
     )
 
   @parameterized.product(
@@ -157,11 +214,8 @@ class FlexAttentionApiTest(parameterized.TestCase):
     upcast_rate = 16
     small_seq = seq_len // upcast_rate
     logits_soft_cap = 5.0
-    precision = (
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
-        if dtype == jnp.float32
-        else None
-    )
+    precision = _get_precision(dtype, implementation)
+    high_prec = precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
     inputs = dict(
         q=jax.ShapeDtypeStruct((batch_size, seq_len, 8, 128), dtype),
         k=jax.ShapeDtypeStruct((batch_size, seq_len, 1, 128), dtype),
@@ -185,7 +239,7 @@ class FlexAttentionApiTest(parameterized.TestCase):
           v,
           bias=upscale_bias(pair_bias),
           logits_soft_cap=logits_soft_cap,
-          precision=precision,
+          precision=jax.lax.Precision.HIGHEST,
           implementation='xla',
       )
 
@@ -199,17 +253,17 @@ class FlexAttentionApiTest(parameterized.TestCase):
           implementation=implementation,
       )
 
-    fn_ref, args_ref = benchmarking.standardize_function(
-        f_ref, kwargs=inputs, mode='forward_and_vjp'
+    grad_tol = 1e-4 if dtype == jnp.float32 else 3e-2
+    self._run_test(
+        f_ref,
+        f_flex,
+        inputs,
+        implementation=implementation,
+        precision=precision,
+        fwd_tol=1e-4 if high_prec else 3e-2,
+        grad_atol=grad_tol,
+        grad_rtol=grad_tol,
     )
-    fn_flex, args_flex = benchmarking.standardize_function(
-        f_flex, kwargs=inputs, mode='forward_and_vjp'
-    )
-    out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
-    out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
-    tol = 1e-4 if dtype == jnp.float32 else 3e-2
-    chex.assert_trees_all_close(out_flex, out_ref, atol=tol, rtol=tol)
-    chex.assert_trees_all_close(grads_flex, grads_ref, atol=tol, rtol=tol)
 
   @parameterized.product(
       dtype=(jnp.float32, jnp.bfloat16),
@@ -219,11 +273,8 @@ class FlexAttentionApiTest(parameterized.TestCase):
     n = 128
     num_heads = 4
     head_dim = 64
-    precision = (
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
-        if dtype == jnp.float32
-        else None
-    )
+    precision = _get_precision(dtype, implementation)
+    high_prec = precision == jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
     inputs = dict(
         query=jax.ShapeDtypeStruct((n, n, num_heads, head_dim), dtype),
         key=jax.ShapeDtypeStruct((n, n, num_heads, head_dim), dtype),
@@ -235,7 +286,7 @@ class FlexAttentionApiTest(parameterized.TestCase):
 
     f_ref = functools.partial(
         attention_api.dot_product_attention,
-        precision=precision,
+        precision=jax.lax.Precision.HIGHEST,
         implementation='xla',
     )
 
@@ -251,21 +302,48 @@ class FlexAttentionApiTest(parameterized.TestCase):
           implementation=implementation,
       )
 
-    fn_ref, args_ref = benchmarking.standardize_function(
-        f_ref, kwargs=inputs, mode='forward_and_vjp'
+    self._run_test(
+        f_ref,
+        f_flex,
+        inputs,
+        implementation=implementation,
+        precision=precision,
+        fwd_tol=1e-4 if high_prec else 2e-2,
+        grad_atol=1e-3 if dtype == jnp.float32 else 2.0,
+        grad_rtol=1e-3 if dtype == jnp.float32 else 1e-1,
     )
-    fn_flex, args_flex = benchmarking.standardize_function(
-        f_flex, kwargs=inputs, mode='forward_and_vjp'
+
+  def test_fallback_on_unsupported_reshape(self):
+    if jax.default_backend() == 'tpu' and 'mosaic' in _IMPLEMENTATIONS:
+      self.skipTest('Not supported on TPU.')
+
+    inputs = _make_inputs(dtype=jnp.bfloat16, batch_size=1, seq_len=128)
+    _, args = benchmarking.standardize_function(
+        lambda query, key, value: (query, key, value),
+        kwargs=inputs,
+        mode='forward',
     )
-    out_ref, (grads_ref,) = jax.jit(fn_ref)(args_ref)
-    out_flex, (grads_flex,) = jax.jit(fn_flex)(args_flex)
-    fwd_tol = 1e-4 if dtype == jnp.float32 else 2e-2
-    grad_atol = 1e-4 if dtype == jnp.float32 else 2.0
-    grad_rtol = 1e-4 if dtype == jnp.float32 else 1e-1
-    chex.assert_trees_all_close(out_flex, out_ref, atol=fwd_tol, rtol=fwd_tol)
-    chex.assert_trees_all_close(
-        grads_flex[:4], grads_ref[:4], atol=grad_atol, rtol=grad_rtol
-    )
+    query, key, value = args
+
+    def score_mod(scores):
+      k_len = scores.shape[-1]
+      k_idx = (
+          jnp.arange(4)[None, None, None, :, None] * (k_len // 4)
+          + jnp.arange(k_len // 4)[None, None, None, None, :]
+      )
+      return scores + k_idx.reshape(1, 1, 1, k_len).astype(scores.dtype)
+
+    actual = jax.jit(
+        functools.partial(
+            api.flex_attention, score_mod=score_mod, implementation=None
+        )
+    )(query, key, value)
+    expected = jax.jit(
+        functools.partial(
+            api.flex_attention, score_mod=score_mod, implementation='xla'
+        )
+    )(query, key, value)
+    chex.assert_trees_all_close(actual, expected)
 
 
 if __name__ == '__main__':
