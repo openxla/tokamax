@@ -247,6 +247,7 @@ def flash_attention_kernel(
   as_2d = lambda x: None if x is None else jax.lax.broadcast_to_rank(x, 2)
   k_start, k_end = map(as_2d, (k_start, k_end))
 
+  @jax.enable_x64(False)
   def kernel(
       grid_loop,
       *,

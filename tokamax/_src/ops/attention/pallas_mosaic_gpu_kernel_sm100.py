@@ -398,6 +398,7 @@ def flash_attention_kernel(
     tile_q = block_q
     collective_axis = None
 
+  @jax.enable_x64(False)
   def kernel(
       grid_loop,
       *,

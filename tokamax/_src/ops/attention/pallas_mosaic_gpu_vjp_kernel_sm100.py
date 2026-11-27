@@ -323,6 +323,7 @@ def _estimate_smem_bytes(scratch_shapes: dict[str, Any]) -> int:
   return mgpu_lib.estimate_smem_bytes(scratch_shapes) + 4096 * 2
 
 
+@jax.enable_x64(False)
 def _kernel_dq(
     q_gmem,
     k_gmem,
@@ -634,6 +635,7 @@ def _kernel_dq(
       plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
+@jax.enable_x64(False)
 def _kernel_dkv(
     q_gmem,
     k_gmem,

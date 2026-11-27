@@ -28,6 +28,7 @@ import pytest
 from tokamax._src.ops.attention import arg_specs
 from tokamax._src.ops.attention import base
 from tokamax._src.ops.attention import pallas_mosaic_gpu as fa
+from tokamax._src.ops.attention import pallas_mosaic_gpu_common as common
 from tokamax._src.ops.attention import pallas_mosaic_gpu_vjp as fa_vjp
 from tokamax._src.ops.attention import test_base
 
@@ -140,6 +141,9 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.skipTest("TODO: Fix.")
 
   def test_normalize_output(self):
+    self._test_normalize_output()
+
+  def _test_normalize_output(self):
     with test_base.override_test_args(atol=0.02):
       super().test_normalize_output()
 
@@ -460,6 +464,76 @@ class PallasMosaicGpuFlashAttentionTest(test_base.AttentionTestBase):
     self.assertEqual(dq.dtype, jnp.float32)
     self.assertEqual(dk.dtype, jnp.float32)
     self.assertEqual(dv.dtype, jnp.float32)
+
+  @parameterized.named_parameters(("non_causal", False), ("causal", True))
+  def test_x64(self, is_causal):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    with jax.enable_x64(True):
+      self._run_test(
+          q_shape=(2, 256, 4, 64),
+          bias_shape=(2, 4, 256, 256),
+          dtype=jnp.bfloat16,
+          is_causal=is_causal,
+          ref_impl=base.DotProductAttention(),
+          atol=0.02,
+          atol_grads=0.04,
+      )
+      if not is_causal:
+        self._test_normalize_output()
+        self._test_vmap([(0, 0, 0, 0, 0)])
+
+  def test_x64_decomposed_mask(self):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    with jax.enable_x64(True):
+      k_start = jnp.array([0, 16])[:, None, None]
+      k_end = jnp.array([256, 240])[:, None, None]
+      q_start = jnp.array([0, 32])[:, None, None]
+      q_end = jnp.array([256, 224])[:, None, None]
+      self.assertEqual(k_start.dtype, jnp.int64)
+      _, extracted_q_start, extracted_q_end = common.extract_q_range(
+          base.Mask(q_start=q_start, q_end=q_end), 4, None, None
+      )
+      self.assertEqual(extracted_q_start.dtype, jnp.int32)
+      self.assertEqual(extracted_q_end.dtype, jnp.int32)
+      mask = base.Mask(
+          causal_mask=base.CausalMask(offset=32, window_size=128),
+          q_start=q_start,
+          q_end=q_end,
+          k_start=k_start,
+          k_end=k_end,
+      )
+      self._run_test(
+          q_shape=(2, 256, 4, 64),
+          bias_shape=(2, 4, 256, 256),
+          dtype=jnp.bfloat16,
+          mask=mask,
+          ref_impl=base.DotProductAttention(),
+          atol=0.02,
+          atol_grads=0.08,
+      )
+
+  @parameterized.named_parameters(
+      ("q_indices", "q_indices"),
+      ("k_indices", "k_indices"),
+  )
+  def test_x64_indices(self, indices_kwarg):
+    if not self._supports_vjp:
+      self.skipTest("VJP unsupported for this implementation.")
+    with jax.enable_x64(True):
+      indices = jnp.arange(256)[None, :]
+      self.assertEqual(indices.dtype, jnp.int64)
+      self._run_test(
+          q_shape=(2, 256, 4, 64),
+          bias_shape=(2, 4, 256, 256),
+          dtype=jnp.bfloat16,
+          is_causal=True,
+          ref_impl=base.DotProductAttention(),
+          atol=0.02,
+          atol_grads=0.08,
+          **{indices_kwarg: indices},
+      )
 
   @override
   def _test_vmap(self, vmap_in_axes):

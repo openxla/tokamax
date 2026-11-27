@@ -649,6 +649,7 @@ def flash_attention_vjp_kernel(
         block_kv_dq * mgpu_lib.num_bits(ds_dtype), "ds_dq"
     )
 
+  @jax.enable_x64(False)
   def kernel_dq(
       q_gmem,
       k_gmem,
@@ -1203,6 +1204,7 @@ def flash_attention_vjp_kernel(
   epi_dk_swizzle = plgpu.find_swizzle(head_dim * elem_bits, "epi_dk")
   epi_dv_swizzle = plgpu.find_swizzle(head_dim_out * elem_bits, "epi_dv")
 
+  @jax.enable_x64(False)
   def kernel_dkv(
       q_gmem,
       k_gmem,
