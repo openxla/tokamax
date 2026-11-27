@@ -57,6 +57,11 @@ class DiffSummary:
     return abs(a - b)
 
 
+# Process large arrays in ~128 MiB float64 chunks so summary reductions do not
+# materialize multiple full-size float64 copies on host RAM.
+_DIFF_CHUNK_SIZE = 16 * 1024 * 1024
+
+
 # Defaults taken from:
 # https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.isclose.html
 def array_diff_summary(
@@ -73,44 +78,79 @@ def array_diff_summary(
   if expected.dtype.name != actual.dtype.name:
     raise ValueError('Arrays x and y must have the same dtype.')
 
-  # Calculate statistics with increased precision.
-  expected = np.array(expected).astype(np.float64)
-  actual = np.array(actual).astype(np.float64)
+  # Keep the original dtype until each chunk is cast to float64.
+  exp_flat = np.asarray(expected).ravel()
+  act_flat = np.asarray(actual).ravel()
+  size = exp_flat.size
+  if size == 0:
+    raise ValueError('Cannot compute diff summary of empty arrays.')
 
-  diff = expected - actual
-  abs_diff = np.abs(diff)
-  l2_diff = float(np.linalg.norm(diff))
+  sum_sq = 0.0
+  num_close = 0
+  max_abs_diff = -1.0
+  has_max = False
+  found_nan = False
+  expected_max_val = 0.0
+  actual_max_val = 0.0
 
-  # It's useful logging out the values that caused the max absolute
-  # difference.
-  max_diff_index = np.nanargmax(abs_diff) if equal_nan else np.argmax(abs_diff)
+  for start in range(0, size, _DIFF_CHUNK_SIZE):
+    end = start + _DIFF_CHUNK_SIZE
+    exp_chunk = exp_flat[start:end].astype(np.float64)
+    act_chunk = act_flat[start:end].astype(np.float64)
 
-  expected_max_val = float(np.ravel(expected)[max_diff_index])
-  actual_max_val = float(np.ravel(actual)[max_diff_index])
+    diff = exp_chunk - act_chunk
+    abs_diff = np.abs(diff)
+    sum_sq += float(np.sum(diff * diff))
+    # Note: this is not symmetric: "For finite values, isclose uses the
+    # following equation to test whether two floating point values are
+    # equivalent: absolute(a - b) <= (atol + rtol * absolute(b)). Unlike the
+    # built-in math.isclose, the above equation is not symmetric in a and b - it
+    # assumes b is the reference value."
+    # https://numpy.org/doc/stable/reference/generated/numpy.isclose.html#numpy.isclose
+    # As allclose calls isclose, the order matters.
+    num_close += int(
+        np.sum(
+            np.isclose(
+                act_chunk,
+                exp_chunk,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=equal_nan,
+            )
+        )
+    )
 
-  # Note: this is not symmetric: "For finite values, isclose uses the following
-  # equation to test whether two floating point values are equivalent:
-  # absolute(a - b) <= (atol + rtol * absolute(b)). Unlike the built-in
-  # math.isclose, the above equation is not symmetric in a and b – it assumes
-  # b is the reference value."
-  # https://numpy.org/doc/stable/reference/generated/numpy.isclose.html#numpy.isclose
-  # As allclose calls isclose, the order matters.
-  num_close = np.sum(
-      np.isclose(
-          actual,
-          expected,
-          rtol=rtol,
-          atol=atol,
-          equal_nan=equal_nan,
-      )
-  )
-  percent_close = num_close / actual.size
+    if found_nan:
+      continue
+    if equal_nan:
+      try:
+        idx = int(np.nanargmax(abs_diff))
+      except ValueError:
+        continue
+      chunk_max = float(abs_diff[idx])
+    else:
+      idx = int(np.argmax(abs_diff))
+      chunk_max = float(abs_diff[idx])
+      if np.isnan(chunk_max):
+        found_nan = True
+        expected_max_val = float(exp_chunk[idx])
+        actual_max_val = float(act_chunk[idx])
+        continue
+    if not has_max or chunk_max > max_abs_diff:
+      has_max = True
+      max_abs_diff = chunk_max
+      expected_max_val = float(exp_chunk[idx])
+      actual_max_val = float(act_chunk[idx])
 
+  if equal_nan and not has_max:
+    raise ValueError('All-NaN slice encountered')
+
+  percent_close = num_close / size
   return DiffSummary(
       max_absolute_diff_values=(expected_max_val, actual_max_val),
       percent_close=percent_close,
-      allclose=num_close == actual.size,
-      l2_diff=l2_diff,
+      allclose=num_close == size,
+      l2_diff=float(np.sqrt(sum_sq)),
   )
 
 
