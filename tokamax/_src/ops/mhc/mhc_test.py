@@ -21,6 +21,8 @@ parity tests check its JAX oracle against a PyTorch reference; here
 PyTorch one, with the same shapes and tolerances.
 """
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -627,6 +629,39 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
     np.testing.assert_allclose(
         _to_np(got_layer), _to_np(want_layer), rtol=BF16_RTOL, atol=BF16_ATOL
     )
+
+
+class MhcUtilsTest(parameterized.TestCase):
+  """Host-side VMEM budget and token-block selection tests."""
+
+  def test_effective_vmem_limit_bytes_without_tpu(self):
+    with mock.patch.object(
+        pltpu,
+        "get_tpu_info",
+        side_effect=ValueError("Unsupported TPU device kind: cpu"),
+    ):
+      self.assertEqual(
+          utils.effective_vmem_limit_bytes(), utils.DEFAULT_VMEM_LIMIT_BYTES
+      )
+
+  def test_select_token_block_caps_vmem_budget_to_hardware_capacity(self):
+    # DeepSeek-V4 `post_kernel` footprint (`hc_mult=4, hidden_size=7168`):
+    # `tb=128` needs 70 MiB (~73.4 MB), which fits in 100 MiB (on 128 MiB TPUs)
+    # but exceeds 64 MiB TPUs (`TPU7x`, `v5p`).
+    def post_vmem_need(token_block: int) -> int:
+      return 2 * token_block * (HC_MULT + 1) * 7168 * (2 * 2 + 4)
+
+    for chip, want_limit, want_block in (
+        (pltpu.ChipVersion.TPU_7X, 64 * 1024 * 1024, (64, 256)),
+        (pltpu.ChipVersion.TPU_V6E, utils.DEFAULT_VMEM_LIMIT_BYTES, (128, 256)),
+    ):
+      info = pltpu.get_tpu_info_for_chip(chip, 1)
+      with mock.patch.object(pltpu, "get_tpu_info", return_value=info):
+        self.assertEqual(utils.effective_vmem_limit_bytes(), want_limit)
+        self.assertEqual(
+            utils.select_token_block(256, 128, vmem_need=post_vmem_need),
+            want_block,
+        )
 
 
 if __name__ == "__main__":

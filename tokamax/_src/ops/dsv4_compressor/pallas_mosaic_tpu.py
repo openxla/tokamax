@@ -30,11 +30,10 @@ from tokamax._src.ops.dsv4_compressor import pallas_mosaic_tpu_kernel
 # vllm-torchtpu hardcodes and the default. All of these compile and match the
 # reference on TPU7x in every mode.
 #
-# As upstream, the kernel visits whole tiles up to the last token with a slot
-# and reads the token arrays for every token of those tiles without bounds
-# checks. A tile that runs past the last token faults the TPU, so only `tile_n`
-# values that divide the token count are tried (upstream's `tile_n = 4` is
-# always kept).
+# The kernel pads unaligned `num_tokens` up to a multiple of `tile_n` with `-1`
+# slots. Autotuning still restricts larger `tile_n` candidates to divisors of
+# `num_tokens` to avoid processing extra padded filler tokens (upstream's
+# `tile_n = 4` is always kept).
 _TILE_N_CANDIDATES = (4, 8, 12)
 # Only CSA and the indexer (`overlap=True`) also try these: HCA buffers larger
 # state pages, and at `tile_n >= 16` fails to compile on TPU7x with a scoped

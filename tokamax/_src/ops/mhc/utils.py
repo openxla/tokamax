@@ -17,14 +17,29 @@
 from collections.abc import Callable
 
 import jax
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
 
 # Explicit scoped-VMEM budget. Never rely on the backend default — it varies
-# by Mosaic version.
+# by Mosaic version. On TPUs with smaller physical VMEM (e.g. 64 MiB on TPU7x /
+# v5p), `effective_vmem_limit_bytes` caps the budget to hardware VMEM capacity
+# (XLA clamps `CompilerParams.vmem_limit_bytes` further for its own internal
+# reservations).
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+def effective_vmem_limit_bytes(
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> int:
+  """Caps `vmem_limit_bytes` to the active TPU's physical VMEM capacity."""
+  try:
+    device_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes)
+  except ValueError:
+    return vmem_limit_bytes
+  return min(vmem_limit_bytes, device_limit)
 
 
 def round_up(x: int, multiple: int) -> int:
@@ -42,8 +57,8 @@ def select_token_block(
   """Picks the grid token block and pads the token count to a multiple of it.
 
   When `vmem_need` is supplied, the block halves until it fits within
-  `vmem_limit_bytes`, degrading to a smaller block instead of a compile-time
-  VMEM OOM, with `SUBLANE` as the floor.
+  `effective_vmem_limit_bytes(vmem_limit_bytes)`, degrading to a smaller block
+  instead of a compile-time VMEM OOM, with `SUBLANE` as the floor.
 
   Args:
     num_tokens: Number of tokens.
@@ -54,9 +69,10 @@ def select_token_block(
   Returns:
     `(token_block, padded_tokens)`.
   """
+  limit = effective_vmem_limit_bytes(vmem_limit_bytes)
   tb = min(token_block_size, round_up(num_tokens, SUBLANE))
   if vmem_need is not None:
-    while tb > SUBLANE and vmem_need(tb) > vmem_limit_bytes:
+    while tb > SUBLANE and vmem_need(tb) > limit:
       tb //= 2
   return tb, round_up(num_tokens, tb)
 

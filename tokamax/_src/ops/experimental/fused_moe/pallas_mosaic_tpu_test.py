@@ -14,6 +14,8 @@
 # ==============================================================================
 """Unit tests for PallasMosaicTpuFusedMoe operator."""
 
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -69,6 +71,74 @@ class PallasMosaicTpuTest(parameterized.TestCase):
     np_ref = np.asarray(ref_out, dtype=np.float64)
     rel_l2 = float(np.linalg.norm(np_out - np_ref) / np.linalg.norm(np_ref))
     self.assertLess(rel_l2, 0.01)
+
+  def test_export_with_abstract_mesh(self):
+    op_wrapper = pallas_mosaic_tpu.PallasMosaicTpuFusedMoe(
+        config=pallas_mosaic_tpu.Config(
+            capacity=128, block=128, ragged_stride=1280, sharded_plan=True
+        )
+    )
+    abstract_device = jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
+    specs = (
+        jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((32, 512, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((32, 256, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((256, 32), jnp.float32),
+    )
+
+    for axis_sizes, axis_names, axis_types in (
+        ((1,), ("x",), (jax.sharding.AxisType.Auto,)),
+        ((2,), ("my_ep",), (jax.sharding.AxisType.Explicit,)),
+    ):
+      abstract_mesh = jax.sharding.AbstractMesh(
+          axis_sizes,
+          axis_names,
+          axis_types=axis_types,
+          abstract_device=abstract_device,
+      )
+      fn = jax.jit(
+          lambda x, w1, w2, gating, m=abstract_mesh: op_wrapper._fwd(
+              x,
+              w1,
+              w2,
+              gating,
+              topk=4,
+              renormalize=True,
+              act_fn="silu",
+              mesh=m,
+          )[0]
+      )
+      with (
+          jax.sharding.use_abstract_mesh(abstract_mesh),
+          mock.patch.object(
+              jax,
+              "devices",
+              side_effect=RuntimeError("jax.devices() should not be called"),
+          ),
+      ):
+        exported = jax.export.export(fn, platforms=["tpu"])(*specs)
+      self.assertEqual(exported.out_avals[0].shape, (256, 512))
+
+    bad_mesh = jax.sharding.AbstractMesh(
+        (1, 1), ("dp", "ep"), abstract_device=abstract_device
+    )
+    bad_fn = jax.jit(
+        lambda x, w1, w2, gating: op_wrapper._fwd(
+            x,
+            w1,
+            w2,
+            gating,
+            topk=4,
+            renormalize=True,
+            act_fn="silu",
+            mesh=bad_mesh,
+        )[0]
+    )
+    with jax.sharding.use_abstract_mesh(bad_mesh):
+      with self.assertRaisesRegex(
+          ValueError, "expects a single expert-parallel mesh axis"
+      ):
+        jax.export.export(bad_fn, platforms=["tpu"])(*specs)
 
 
 if __name__ == "__main__":

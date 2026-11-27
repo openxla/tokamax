@@ -359,6 +359,11 @@ def fused_ep_moe_v2(
                     f"{form.scale_layout} form {want} the kernel "
                     f"takes"
                 )
+    if len(mesh.axis_names) != 1:
+        raise ValueError(
+            "fused_moe expects a single expert-parallel mesh axis, got "
+            f"{mesh.axis_names}"
+        )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
     if mesh_ep_ranks is not None:
@@ -695,7 +700,18 @@ def fused_ep_moe_v2(
     )
     args = (x, rank, w1, w2) + scale_args + (gating,) + score_bias_args + bias_args
     NS = jax.sharding.NamedSharding
-    args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
+    if isinstance(mesh, jax.sharding.Mesh):
+        args = tuple(
+            jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs)
+        )
+    elif all(
+        axis_type == jax.sharding.AxisType.Explicit
+        for axis_type in mesh.axis_types
+    ):
+        args = tuple(
+            jax.sharding.reshard(a, NS(mesh, sp))
+            for a, sp in zip(args, in_specs)
+        )
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (

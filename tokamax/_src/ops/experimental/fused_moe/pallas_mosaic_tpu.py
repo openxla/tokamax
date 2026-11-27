@@ -59,7 +59,7 @@ class PallasMosaicTpuFusedMoe(base.FusedMoe):
       topk: int = 2,
       renormalize: bool = True,
       act_fn: str = "silu",
-      mesh: jax.sharding.Mesh,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[jax.Array, None]:

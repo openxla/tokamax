@@ -22,6 +22,7 @@ contents.
 """
 
 from collections.abc import Sequence
+import dataclasses
 from typing import Any
 
 from absl.testing import absltest
@@ -517,6 +518,38 @@ class PallasMosaicTpuKernelTest(parameterized.TestCase):
     else:
       np.testing.assert_array_equal(rope_cache, inputs.rope_cache)
 
+  @parameterized.parameters(*_MODES)
+  def test_kernel_unaligned_num_tokens(self, mode):
+    """Checks token counts not divisible by `tile_n` match the reference."""
+    case, num_windows, _ = _CASES[mode]
+    base = _build_inputs(
+        **_case_kwargs(case),
+        num_windows=num_windows,
+        windows=[[], list(range(num_windows - 5, num_windows))],
+        tile_n=8,
+        boundary_per_tile=4,
+        random_init=True,
+        seed=17,
+    )
+    for num_tokens, tile_n in ((1, 4), (1, 8), (9, 8)):
+      with self.subTest(num_tokens=num_tokens, tile_n=tile_n):
+        unallocated = (
+            slice(None, base.block_table_stride + 1)
+            if num_tokens == 1
+            else base.block_table_stride
+        )
+        block_table = base.block_table.at[unallocated].set(-1)
+        sliced = dataclasses.replace(
+            base,
+            block_table=block_table,
+            positions=base.positions[:num_tokens],
+            token_to_req_indices=base.token_to_req_indices[:num_tokens],
+            kv_slot_mapping=base.kv_slot_mapping[:num_tokens],
+            slot_mapping=base.slot_mapping[:num_tokens],
+        )
+        self.assertGreaterEqual(int(sliced.kv_slot_mapping[-1]), 0)
+        _assert_matches_reference(sliced, _run_kernel(sliced, tile_n=tile_n))
+
   def test_kernel_rejects_bad_tile_n(self):
     inputs = test_base.make_case_inputs("csa_decode_batch_seq")
     with self.assertRaisesRegex(
@@ -574,6 +607,59 @@ class KernelHelpersTest(parameterized.TestCase):
         ),
         {8: 0},
     )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="empty",
+          positions=[],
+          reqs=[],
+          slots=[],
+          want_positions=[0, 0, 0, 0],
+          want_reqs=[0, 0, 0, 0],
+          want_slots=[-1, -1, -1, -1],
+      ),
+      dict(
+          testcase_name="single_token",
+          positions=[19],
+          reqs=[3],
+          slots=[7],
+          want_positions=[19, 19, 19, 19],
+          want_reqs=[3, 3, 3, 3],
+          want_slots=[7, -1, -1, -1],
+      ),
+      dict(
+          testcase_name="unaligned_multi_token",
+          positions=[3, 7, 11, 15, 19],
+          reqs=[0, 0, 1, 1, 2],
+          slots=[0, -1, 1, 2, 3],
+          want_positions=[3, 7, 11, 15, 19, 19, 19, 19],
+          want_reqs=[0, 0, 1, 1, 2, 2, 2, 2],
+          want_slots=[0, -1, 1, 2, 3, -1, -1, -1],
+      ),
+  )
+  def test_pad_token_inputs(
+      self, positions, reqs, slots, want_positions, want_reqs, want_slots
+  ):
+    got_pos, got_reqs, got_slots = pallas_mosaic_tpu_kernel.pad_token_inputs(
+        jnp.asarray(positions, dtype=jnp.int32),
+        jnp.asarray(reqs, dtype=jnp.int32),
+        jnp.asarray(slots, dtype=jnp.int32),
+        tile_n=4,
+    )
+    np.testing.assert_array_equal(got_pos, want_positions)
+    np.testing.assert_array_equal(got_reqs, want_reqs)
+    np.testing.assert_array_equal(got_slots, want_slots)
+
+  def test_pad_token_inputs_aligned_returns_inputs(self):
+    pos = jnp.array([3, 7, 11, 15], dtype=jnp.int32)
+    reqs = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
+    slots = jnp.array([0, -1, 1, 2], dtype=jnp.int32)
+    got_pos, got_reqs, got_slots = pallas_mosaic_tpu_kernel.pad_token_inputs(
+        pos, reqs, slots, tile_n=4
+    )
+    self.assertIs(got_pos, pos)
+    self.assertIs(got_reqs, reqs)
+    self.assertIs(got_slots, slots)
 
 
 if __name__ == "__main__":

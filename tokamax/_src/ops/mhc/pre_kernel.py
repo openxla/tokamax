@@ -149,7 +149,7 @@ def mhc_pre_mixes(
 
   compiler_params = pltpu.CompilerParams(
       dimension_semantics=("parallel",),
-      vmem_limit_bytes=vmem_limit_bytes,
+      vmem_limit_bytes=utils.effective_vmem_limit_bytes(vmem_limit_bytes),
       disable_bounds_checks=True,
   )
 
@@ -247,7 +247,7 @@ def mhc_pre_mixes_collapse(
 
   compiler_params = pltpu.CompilerParams(
       dimension_semantics=("parallel",),
-      vmem_limit_bytes=vmem_limit_bytes,
+      vmem_limit_bytes=utils.effective_vmem_limit_bytes(vmem_limit_bytes),
       disable_bounds_checks=True,
   )
 

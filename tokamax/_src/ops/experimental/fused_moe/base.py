@@ -80,7 +80,7 @@ class FusedMoe(op.Op[Any, jax.Array, None, _Config, Any]):
       topk: int = 2,
       renormalize: bool = True,
       act_fn: str = "silu",
-      mesh: jax.sharding.Mesh | None = None,
+      mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
       return_residuals: bool = False,
       config: _Config | None = None,
   ) -> tuple[jax.Array, None]:

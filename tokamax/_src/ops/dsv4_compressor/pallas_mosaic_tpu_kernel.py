@@ -368,6 +368,38 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
   return is_first.flatten()[:num_tokens]
 
 
+def pad_token_inputs(
+    positions: jax.Array,
+    token_to_req_indices: jax.Array,
+    kv_slot_mapping: jax.Array,
+    tile_n: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Pads per-token 1D inputs to a positive multiple of `tile_n`.
+
+  Args:
+    positions: `[num_tokens]` token positions.
+    token_to_req_indices: `[num_tokens]` request index of each token.
+    kv_slot_mapping: `[num_tokens]` compressed-KV slots, -1 for no slot.
+    tile_n: Tokens per tile.
+
+  Returns:
+    `(positions, token_to_req_indices, kv_slot_mapping)` padded to a positive
+    multiple of `tile_n` (`positions` and `token_to_req_indices` by edge/`0`,
+    `kv_slot_mapping` with `-1`), or unchanged when already aligned.
+  """
+  num_tokens = len(positions)
+  padded_num_tokens = max(tile_n, pl.cdiv(num_tokens, tile_n) * tile_n)
+  if padded_num_tokens == num_tokens:
+    return positions, token_to_req_indices, kv_slot_mapping
+  pad = padded_num_tokens - num_tokens
+  pad_mode = "edge" if num_tokens > 0 else "constant"
+  return (
+      jnp.pad(positions, (0, pad), mode=pad_mode),
+      jnp.pad(token_to_req_indices, (0, pad), mode=pad_mode),
+      jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1),
+  )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -409,11 +441,11 @@ def compress_norm_rope_store(
   """Compresses, normalizes, applies RoPE and stores to cache.
 
   `cache` and `rope_cache` are donated and updated in place through
-  `input_output_aliases`. Bounds checks are disabled, so every index below must
-  be in bounds for every token of every tile the grid visits: the grid covers
-  the tiles up to the last token with a non-negative `kv_slot_mapping` entry,
-  and reads `positions`, `token_to_req_indices` and `kv_slot_mapping` for every
-  token of those tiles.
+  `input_output_aliases`. Bounds checks are disabled inside the kernel; when
+  `num_tokens` is not a multiple of `tile_n`, `positions`,
+  `token_to_req_indices`, and `kv_slot_mapping` are padded in the wrapper
+  (edge/`0`, edge/`0`, and `-1`) to a multiple of `tile_n` so every tile
+  visited by the grid is in bounds.
 
   Args:
     cache: The compressed KV cache (see `reference`). Also hosts the state
@@ -445,8 +477,27 @@ def compress_norm_rope_store(
   assert block_table.shape[0] % block_table_stride == 0
 
   num_tokens = positions.shape[0]
+  assert token_to_req_indices.shape == (num_tokens,)
+  assert kv_slot_mapping.shape == (num_tokens,)
   head_dim = rms_weight.shape[0]
   rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
+  mode = _select_mode(head_dim, overlap)
+
+  assert tile_n > 0, f"tile_n must be positive, got {tile_n}"
+  if mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
+    assert (
+        tile_n % 4 == 0
+    ), f"tile_n must be a multiple of 4 for {mode.value}, got {tile_n}"
+  if seq_along_lane:
+    assert config.LANE % tile_n == 0, (
+        f"tile_n must divide {config.LANE} when seq_along_lane=True, "
+        f"got {tile_n}"
+    )
+
+  positions, token_to_req_indices, kv_slot_mapping = pad_token_inputs(
+      positions, token_to_req_indices, kv_slot_mapping, tile_n
+  )
+  num_tokens = len(positions)
 
   state_operand = (
       None if state_cache is None or state_cache is cache else state_cache
@@ -454,7 +505,7 @@ def compress_norm_rope_store(
   state_source = cache if state_operand is None else state_operand
 
   cfgs = config.Configs.make(
-      _select_mode(head_dim, overlap),
+      mode,
       size_n=num_tokens,
       physical_page_size=cache.shape[1],
       state_physical_page_size=state_source.shape[1],
@@ -472,17 +523,6 @@ def compress_norm_rope_store(
         "seq_along_lane requires cache.shape[-1] =="
         f" {config.SAL_PAGE_SIZE} (cache shape [num_pages, 33, 4, 256]),"
         f" got {cache.shape}."
-    )
-
-  if cfgs.dims.mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
-    assert cfgs.tile_sizes.tile_n % 4 == 0, (
-        f"tile_n must be a multiple of 4 for {cfgs.dims.mode.value}, "
-        f"got {cfgs.tile_sizes.tile_n}"
-    )
-  if seq_along_lane:
-    assert config.LANE % cfgs.tile_sizes.tile_n == 0, (
-        f"tile_n must divide {config.LANE} when seq_along_lane=True, "
-        f"got {cfgs.tile_sizes.tile_n}"
     )
 
   if cfgs.dims.has_rope_cache and rope_cache is None:
