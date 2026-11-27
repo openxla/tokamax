@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import types
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -92,6 +94,33 @@ class PrecisionTest(parameterized.TestCase):
 
     dot = jax.jit(functools.partial(jnp.dot, precision=explicit_precision))
     chex.assert_trees_all_equal(dot(x, y), expected)
+
+  @parameterized.parameters(
+      # (compute_capability, f32 DEFAULT, f32 HIGHEST, bf16 DEFAULT)
+      ('9.0', 'TF32_TF32_F32', 'F32_F32_F32', 'BF16_BF16_F32'),
+      ('7.5', 'F32_F32_F32', 'F32_F32_F32', 'F32_F32_F32'),
+      ('gfx950', 'F32_F32_F32', 'F32_F32_F32', 'BF16_BF16_F32'),
+      ('gfx90a:sramecc+:xnack-', 'F32_F32_F32', 'F32_F32_F32', 'BF16_BF16_F32'),
+  )
+  def test_to_dot_algorithm_preset_gpu_compute_capability(
+      self, compute_capability, f32_default, f32_highest, bf16_default
+  ):
+    device = types.SimpleNamespace(compute_capability=compute_capability)
+    with (
+        mock.patch.object(jax, 'default_backend', return_value='gpu'),
+        mock.patch.object(jax, 'devices', return_value=[device]),
+    ):
+      to_preset = precision.to_dot_algorithm_preset
+      default, highest = jax.lax.Precision.DEFAULT, jax.lax.Precision.HIGHEST
+      self.assertEqual(
+          to_preset(jnp.float32, jnp.float32, default).name, f32_default
+      )
+      self.assertEqual(
+          to_preset(jnp.float32, jnp.float32, highest).name, f32_highest
+      )
+      self.assertEqual(
+          to_preset(jnp.bfloat16, jnp.bfloat16, default).name, bf16_default
+      )
 
   def test_to_dot_algorithm_preset_invalid_name(self):
     with self.assertRaisesRegex(ValueError, 'Unsupported enum value'):
