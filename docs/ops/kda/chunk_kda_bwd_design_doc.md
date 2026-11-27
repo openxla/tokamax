@@ -319,7 +319,7 @@ This has two benefits:
 
 Inputs are usually bf16, but matmuls use fp32 accumulate.
 
-Inside the main fusion kernel, fp32 inputs select `jax.lax.Precision.HIGHEST`, while bf16 inputs use the default dot precision with fp32 accumulation. The reverse-cumsum dot explicitly uses `jax.lax.Precision.HIGHEST` for both input dtypes. These choices matter for `dg`, where cumulative gate contributions can nearly cancel.
+Inside the main fusion kernel, fp32 inputs select `jax.lax.Precision.HIGHEST`, while bf16 inputs use the default dot precision with fp32 accumulation. The reverse-cumsum dot and the intra-chunk matmuls of `compute_intra_backward(...)` explicitly use `jax.lax.Precision.HIGHEST` for both input dtypes. These choices matter for `dg`, where cumulative gate contributions can nearly cancel. With a per-channel gate, the intra-chunk matmuls take `q` and `k` rescaled by `exp2` of gate differences, which are not bf16-exact; on each diagonal sub-block, the `q_t · k_t` terms that reach `dg_intra` through `dq` and through `dk` cancel only when both products are exact.
 
 ### 3.3 VMEM Scratch Retains Cross-Stage Intermediates
 
