@@ -29,6 +29,8 @@ from tokamax._src import shape
 from tokamax._src.ops import op
 from tokamax._src.ops.kda import base
 from tokamax._src.ops.kda import common
+from tokamax._src.ops.kda import packing
+from tokamax._src.ops.kda import compact
 from tokamax._src.ops.kda.cp_utils import (
     ContextParallelMetadata,
     ContextParallelMetadataArg,
@@ -81,14 +83,46 @@ class Config:
   per-chunk `h` (plus KDA `v_new`) in `float32` (doubling saved `h` residual
   memory unless `rematerialize_for_backward=True`), while returning outputs in
   the input activation dtype.
+  `fuse_forward=True` keeps the non-CP forward bridge tensors in VMEM for
+  128-aligned K/V. Other shapes and CP retain the staged implementation.
+  `packed_forward=True` reads non-CP packed input windows directly while
+  retaining aligned outputs and backward residuals. It requires fused forward.
+  `packed_output=True` uses Pallas output compaction when its full head-group
+  buffers fit VMEM; other shapes retain gather. It is independently opt-in.
+  `packed_backward=True` reads original packed V and unnormalized Q/K.
+  Normalized Q/K and scalar beta reuse aligned residuals.
+  `packed_gradients=True` compacts feature gradients after gate and
+  normalization backward; beta retains its existing gather.
+  `fuse_backward=True` also fuses the non-CP saved-state backward. Manual
+  state rematerialization is fused separately with `fuse_rematerialization=True`;
+  CP retains its existing backward path.
+  `compact_forward=True` selects the original-token grid for supported non-CP
+  BF16 saved-state profiles. The paired compact backward consumes its tape.
+  `compact_sorted_segments=True` declares grouped labels and trailing padding,
+  omitting the general input permutation and its worst-case temporary buffers.
   """
 
+  # Internal recursion guard; ordinary public calls must keep this enabled.
+  canonicalize_packed_inputs: bool = True
   chunk_size: Annotated[int, pydantic.Field(gt=0)] = 64
   mini_batch: Annotated[int, pydantic.Field(gt=0)] | None = None
   safe_gate: bool | None = None
   rematerialize_for_backward: bool = False
   residual_checkpoint_name: str | None = None
   two_pass_bf16: bool = False
+  fuse_forward: bool = False
+  # Opt-in until TPU lowering, allocation and device-time validation completes.
+  packed_forward: bool = False
+  packed_output: bool = False
+  packed_backward: bool = False
+  packed_gradients: bool = False
+  fuse_backward: bool = False
+  # Opt-in until TPU compilation and device-time validation completes.
+  fuse_rematerialization: bool = False
+  # Original-token grid; the dependent backward increment consumes its tape.
+  compact_forward: bool = False
+  # Static packed-input contract avoids allocating an interleaved-label fallback.
+  compact_sorted_segments: bool = False
 
 
 def _resolve_safe_gate(
@@ -556,9 +590,7 @@ def check_inputs_support(
 
 
 @dataclasses.dataclass(frozen=True)
-class PallasMosaicTpuKimiDeltaAttention(
-    base.KimiDeltaAttention[Config, Any]
-):
+class PallasMosaicTpuKimiDeltaAttention(base.KimiDeltaAttention[Config, Any]):
   """Pallas/Mosaic TPU KDA backend.
 
   This adapter preserves Tokamax's experimental head-first KDA contract:
@@ -586,14 +618,20 @@ class PallasMosaicTpuKimiDeltaAttention(
       }
     return super().replace(**kwargs)
 
+  def bind(self, *args, _packing_order=None, **kwargs):
+    bound = super().bind(*args, **kwargs)
+    if _packing_order is None:
+      return bound
+    return op.BoundArguments(
+        self, {**bound.arguments, "_packing_order": _packing_order}
+    )
+
   @override
   def _get_heuristics_config(self, ba: op.BoundArguments) -> Config:
     return Config(chunk_size=_requested_chunk_size(ba))
 
   @override
-  def _get_autotuning_configs(
-      self, ba: op.BoundArguments
-  ) -> set[Config]:
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     args = getattr(ba, "arguments", None)
     if not args:
       return {Config(chunk_size=_requested_chunk_size(ba))}
@@ -707,7 +745,9 @@ class PallasMosaicTpuKimiDeltaAttention(
       context_parallel_metadata: ContextParallelMetadata | None,
       chunk_size: int,
       max_num_segments: int | None,
+      token_order=None,
       use_conv1d_in_kernel: bool = False,
+      require_alignment: bool = False,
   ) -> _PreparedKdaInputs:
     """Canonicalizes inputs shared by the forward and backward kernels."""
     cp_enabled = (
@@ -715,7 +755,8 @@ class PallasMosaicTpuKimiDeltaAttention(
         and context_parallel_metadata.is_cp_enabled
     )
     use_inplace_packed = (
-        segment_ids is not None
+        not require_alignment
+        and segment_ids is not None
         and initial_state is None
         and not output_final_state
         and (not cp_enabled or q.shape[2] % chunk_size == 0)
@@ -789,6 +830,7 @@ class PallasMosaicTpuKimiDeltaAttention(
           [beta],
           cu_seqlens,
           align=chunk_size,
+          token_order=token_order,
       )
       _, _, aligned_seq_len, _ = q_aligned.shape
       chunk_indices = prepare_chunk_indices(
@@ -802,17 +844,25 @@ class PallasMosaicTpuKimiDeltaAttention(
         aligned_starts = aligned_cu_seqlens[..., :-1]
         positions = jnp.arange(aligned_seq_len)
         for batch_index in range(cu_seqlens.shape[0]):
-          in_range = (
-              positions[None, :]
-              >= aligned_starts[batch_index, :, None]
-          ) & (
-              positions[None, :]
-              < (
-                  aligned_starts[batch_index]
-                  + original_lengths[batch_index]
-              )[:, None]
-          )
-          valid_mask = in_range.any(axis=0)
+          if cu_seqlens.shape[-1] > 8193:
+            boundaries = aligned_cu_seqlens[batch_index]
+            seq = jnp.minimum(
+                jnp.searchsorted(boundaries[1:], positions, side="right"),
+                original_lengths.shape[-1] - 1,
+            )
+            valid_mask = (positions < boundaries[-1]) & (
+                positions - boundaries[seq] < original_lengths[batch_index, seq]
+            )
+          else:
+            in_range = (
+                positions[None, :] >= aligned_starts[batch_index, :, None]
+            ) & (
+                positions[None, :]
+                < (aligned_starts[batch_index] + original_lengths[batch_index])[
+                    :, None
+                ]
+            )
+            valid_mask = in_range.any(axis=0)
           g_aligned = g_aligned.at[:, batch_index].set(
               jnp.where(
                   valid_mask[None, :, None],
@@ -925,8 +975,13 @@ class PallasMosaicTpuKimiDeltaAttention(
       conv_bias_v: Float[Array, "H V"] | None = None,
       use_conv1d_in_kernel: bool = False,
       residual_checkpoint_name: str | None = None,
+      _packing_order: jax.Array | None = None,
       config: Config,
   ) -> tuple[base.Output, base.Residuals]:
+    if config.canonicalize_packed_inputs and segment_ids is not None:
+      arguments = locals().copy()
+      arguments.pop("self")
+      arguments.pop("config")
     if chunk_size is not None:
       _check_chunk_size_support(chunk_size, per_channel_gate=per_channel_gate)
     effective_chunk_size = (
@@ -966,6 +1021,59 @@ class PallasMosaicTpuKimiDeltaAttention(
         mini_batch=config.mini_batch,
     )
 
+    if (
+        per_channel_gate
+        and not config.two_pass_bf16
+        and not use_conv1d_in_kernel
+        and config.mini_batch is None
+        and compact.supported(
+            query,
+            value,
+            segment_ids=segment_ids,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm=use_qk_l2norm,
+            context_parallel_metadata=context_parallel_metadata,
+            config=config,
+        )
+    ):
+      return compact.forward(
+          query,
+          key,
+          value,
+          gate,
+          beta,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+          scale=scale,
+          segment_ids=segment_ids,
+          lower_bound=lower_bound,
+          use_gate_in_kernel=use_gate_in_kernel,
+          return_residuals=return_residuals,
+          sorted_segments=config.compact_sorted_segments,
+          max_num_segments=max_num_segments,
+      )
+
+    if config.canonicalize_packed_inputs and segment_ids is not None:
+      return packing.invoke(self, config, arguments)
+
+    inline_qk_norm = (
+        config.fuse_forward
+        and config.packed_forward
+        and use_qk_l2norm
+        and not use_conv1d_in_kernel
+        and per_channel_gate
+        and config.mini_batch is None
+        and effective_chunk_size == 64
+        and not config.two_pass_bf16
+        and segment_ids is not None
+        and query.shape[-1] % 128 == 0
+        and value.shape[-1] % 128 == 0
+        and not (
+            context_parallel_metadata is not None
+            and context_parallel_metadata.is_cp_enabled
+        )
+    )
     prepared = self._preprocess_inputs(
         query,
         key,
@@ -974,15 +1082,28 @@ class PallasMosaicTpuKimiDeltaAttention(
         beta,
         initial_state=initial_state,
         output_final_state=output_final_state,
-        use_qk_l2norm=use_qk_l2norm,
+        use_qk_l2norm=use_qk_l2norm and not inline_qk_norm,
         use_gate_in_kernel=use_gate_in_kernel,
         segment_ids=segment_ids,
         context_parallel_metadata=context_parallel_metadata,
         chunk_size=effective_chunk_size,
         max_num_segments=max_num_segments,
+        token_order=None if _packing_order is None else _packing_order[0],
         use_conv1d_in_kernel=use_conv1d_in_kernel,
+        require_alignment=(
+            _packing_order is not None
+            or (
+                not config.two_pass_bf16
+                and (
+                    config.fuse_forward
+                    or config.fuse_backward
+                    or config.fuse_rematerialization
+                    or config.packed_gradients
+                    or config.packed_backward
+                )
+            )
+        ),
     )
-
     ckpt_name = residual_checkpoint_name or config.residual_checkpoint_name
     cp_enabled = (
         prepared.context_parallel_metadata is not None
@@ -997,6 +1118,27 @@ class PallasMosaicTpuKimiDeltaAttention(
         else None
     )
 
+    packed_inputs = None
+    if (
+        config.packed_forward
+        and config.fuse_forward
+        and prepared.cu_seqlens is not None
+        and not (
+            prepared.context_parallel_metadata is not None
+            and prepared.context_parallel_metadata.is_cp_enabled
+        )
+        and query.shape[-1] % 128 == 0
+        and value.shape[-1] % 128 == 0
+    ):
+      packed_q = (
+          query if inline_qk_norm or not use_qk_l2norm else l2norm_fwd(query)[0]
+      )
+      packed_k = (
+          key if inline_qk_norm or not use_qk_l2norm else l2norm_fwd(key)[0]
+      )
+      packed_inputs = (packed_q, packed_k, value, gate, beta)
+
+    inverse_order = None if _packing_order is None else _packing_order[1]
     output, residuals = chunk_kda_fwd_custom(
         prepared.q,
         prepared.k,
@@ -1014,6 +1156,11 @@ class PallasMosaicTpuKimiDeltaAttention(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         disable_recompute=save_intermediates_for_backward,
+        fuse_forward=config.fuse_forward,
+        packed_inputs=packed_inputs,
+        normalize_packed_qk=inline_qk_norm,
+        token_unpermute=inverse_order,
+        packed_output=config.packed_output,
         context_parallel_metadata=prepared.context_parallel_metadata,
         chunk_size=effective_chunk_size,
         return_residuals=return_residuals,
@@ -1035,6 +1182,12 @@ class PallasMosaicTpuKimiDeltaAttention(
         two_pass_bf16=config.two_pass_bf16,
         cp_checkpoint_name=cp_ckpt_name,
     )
+    if residuals is not None and _packing_order is not None:
+      residuals = dataclasses.replace(
+          residuals,
+          token_order=_packing_order[0],
+          token_unpermute=inverse_order,
+      )
     out_val, final_state = output
     if out_val.shape[2] != query.shape[2]:
       out_val = out_val[:, :, : query.shape[2], :]
@@ -1068,9 +1221,7 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     )
 
   @override
-  def _get_autotuning_configs(
-      self, ba: op.BoundArguments
-  ) -> set[Config]:
+  def _get_autotuning_configs(self, ba: op.BoundArguments) -> set[Config]:
     args = getattr(ba, "arguments", None)
     if not args:
       return {Config(chunk_size=_requested_chunk_size(ba))}
@@ -1104,7 +1255,9 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
 
   def _fwd(
       self,
-      residuals: KdaResiduals,
+      residuals: (
+          KdaResiduals | compact.CompactResiduals | packing.PackingResiduals
+      ),
       out: base.Output,
       dout: base.Output,
       query: jax.Array,
@@ -1135,13 +1288,36 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
       conv_bias_v: jax.Array | None = None,
       use_conv1d_in_kernel: bool = False,
       residual_checkpoint_name: str | None = None,
+      _packing_order: jax.Array | None = None,
       config: Config,
   ) -> tuple[dict[str, jax.Array], None]:
-    # Tokamax's VJP contract replays the original inputs here, but the backward
-    # kernel consumes the aligned and optionally L2-normalized copies retained
-    # in `residuals`. Reusing these arguments would skip that preprocessing.
-    del out, query, key, value, gate, beta
-    del output_final_state, return_residuals, use_conv1d_in_kernel
+    if isinstance(residuals, packing.PackingResiduals):
+      return packing.backward(residuals, dout, segment_ids)
+    primal_dtypes = {
+        name: value.dtype
+        for name, value in locals().items()
+        if name in packing.ARRAY_NAMES and value is not None
+    }
+    if isinstance(residuals, compact.CompactResiduals):
+      gradients = compact.backward(
+          residuals,
+          dout,
+          query=query,
+          value=value,
+          gate=gate,
+          scale=scale,
+          lower_bound=lower_bound,
+          use_gate_in_kernel=use_gate_in_kernel,
+          a_log=a_log,
+          delta_time_bias=delta_time_bias,
+      )
+      if segment_ids is not None:
+        gradients["segment_ids"] = jnp.zeros_like(segment_ids)
+      return gradients, None
+    # Normalized Q/K reuse the aligned residuals; other feature inputs may
+    # still use original packed windows.
+    del out, gate, output_final_state, return_residuals
+    del use_conv1d_in_kernel
     del residual_checkpoint_name, chunk_size
     effective_chunk_size = residuals.chunk_size
     effective_two_pass = (
@@ -1164,6 +1340,24 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
     # state means backward can use the saved-state path; otherwise it must
     # rematerialize the forward state recurrence.
     use_saved_state = residuals.h is not None
+
+    packed_inputs = None
+    if (
+        config.packed_backward
+        and config.fuse_backward
+        and (use_saved_state or config.fuse_rematerialization)
+        and residuals.cu_seqlens is not None
+        and not (
+            context_parallel_metadata is not None
+            and context_parallel_metadata.is_cp_enabled
+        )
+        and query.shape[-1] % 128 == 0
+        and value.shape[-1] % 128 == 0
+    ):
+      # Unit Q/K already exist in aligned residuals; avoid normalization replay.
+      packed_q = None if use_qk_l2norm else query
+      packed_k = None if use_qk_l2norm else key
+      packed_inputs = (packed_q, packed_k, value, beta)
 
     (
         dq,
@@ -1193,6 +1387,10 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
         initial_state is not None,
         residuals,
         dout,
+        fuse_backward=config.fuse_backward,
+        fuse_rematerialization=config.fuse_rematerialization,
+        packed_inputs=packed_inputs,
+        packed_gradients=config.packed_gradients,
         per_channel_gate=per_channel_gate,
         mini_batch=config.mini_batch,
         two_pass_bf16=effective_two_pass,
@@ -1245,6 +1443,9 @@ class PallasMosaicTpuKimiDeltaAttentionVjp(
           if dsegment_ids is not None
           else jnp.zeros_like(segment_ids)
       )
+    for name in packing.ARRAY_NAMES:
+      if name in grads:
+        grads[name] = grads[name].astype(primal_dtypes[name])
     return grads, None
 
 
