@@ -15,28 +15,60 @@
 """Lightning Indexer Op API."""
 
 from collections.abc import Sequence
+import importlib
+import importlib.util
 from typing import Final, Literal
 
 import immutabledict
 import jax
 from jaxtyping import Array, Float, Int, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+from tokamax._src.ops import ops_list
 from tokamax._src.ops.lightning_indexer import base
 from tokamax._src.ops.lightning_indexer.kernel import config
 
 type Implementation = Literal["mosaic", "xla"]
 
-_IMPLEMENTATIONS: dict[str, base.LightningIndexer] = dict(
-    xla=base.LightningIndexer()
+
+def _load_impl_class(
+    impl: ops_list.Impl,
+) -> type[base.LightningIndexer] | None:
+  """Loads `impl.cls`, skipping unlinked or unavailable optional backends."""
+  if impl.cls is None or impl.vjp:
+    return None
+  module_name = "tokamax." + impl.module.removesuffix(".py").replace("/", ".")
+  if (
+      impl.backend != ops_list.XLA
+      and importlib.util.find_spec(module_name) is None
+  ):
+    return None
+  try:
+    module = importlib.import_module(module_name)
+  except ImportError as exc:
+    if impl.backend == ops_list.XLA or (exc.name or "").startswith("tokamax"):
+      raise
+    return None
+  return vars(module)[impl.cls]
+
+
+def _implementation_classes(
+    op_name: str,
+) -> dict[str, type[base.LightningIndexer]]:
+  op_entry = next(entry for entry in ops_list.OPS if entry.name == op_name)
+  classes: dict[str, type[base.LightningIndexer]] = {}
+  for impl in op_entry.impls:
+    cls = _load_impl_class(impl)
+    if cls is not None:
+      classes[impl.name] = cls
+  return classes
+
+
+_IMPLEMENTATIONS: dict[str, base.LightningIndexer] = {
+    name: cls()
+    for name, cls in _implementation_classes("lightning_indexer").items()
+}
+_DEFAULT_IMPLEMENTATION: tuple[str, ...] = (
+    ("mosaic", "xla") if "mosaic" in _IMPLEMENTATIONS else ("xla",)
 )
-_DEFAULT_IMPLEMENTATION: tuple[str, ...] = ("xla",)
-
-try:
-  from tokamax._src.ops.lightning_indexer import pallas_mosaic_tpu  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-module-attribute]
-
-  _IMPLEMENTATIONS["mosaic"] = pallas_mosaic_tpu.PallasTpuLightningIndexer()
-  _DEFAULT_IMPLEMENTATION = ("mosaic",) + _DEFAULT_IMPLEMENTATION
-except ImportError:
-  pass
 
 IMPLEMENTATIONS: Final[
     immutabledict.immutabledict[str, base.LightningIndexer]

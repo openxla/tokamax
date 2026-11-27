@@ -40,6 +40,14 @@ class LightningIndexerBaseTest(test_base.LightningIndexerTestBase):
   def __init__(self, *args):
     super().__init__(*args, topk_fn=base.LightningIndexer())
 
+  def test_api_implementations(self):
+    self.assertEqual(set(api.IMPLEMENTATIONS), {"xla", "mosaic"})
+    self.assertIsInstance(api.IMPLEMENTATIONS["xla"], base.LightningIndexer)
+    self.assertIsInstance(
+        api.IMPLEMENTATIONS["mosaic"],
+        pallas_mosaic_tpu.PallasTpuLightningIndexer,
+    )
+
   def test_validation_errors(self):
     op = base.LightningIndexer()
     inputs = test_base.make_test_inputs([1, 2], [128, 256], seed=0)
