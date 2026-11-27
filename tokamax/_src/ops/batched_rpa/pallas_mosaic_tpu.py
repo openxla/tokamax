@@ -131,6 +131,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
       attention_scope: base.AttentionScope | str = base.AttentionScope.FULL,
       return_lse: bool = False,
       quantize_p: bool = False,
+      decode_only: bool = False,
       return_residuals: bool = False,
       config: Config | None = None,
   ) -> tuple[
@@ -217,6 +218,7 @@ class PallasTpuBatchedRpa(base.BatchedRpa[Config]):
         decode_query_size=decode_query_size,
         return_lse=return_lse,
         quantize_p=quantize_p,
+        decode_only=decode_only,
     )
 
     if return_lse:

@@ -77,6 +77,7 @@ def batched_ragged_paged_attention(
     attention_scope: AttentionScope | str = AttentionScope.FULL,
     return_lse: bool = False,
     quantize_p: bool = False,
+    decode_only: bool = False,
     implementation: Implementation | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
   """Computes batched ragged paged attention using the selected implementation."""
@@ -121,6 +122,7 @@ def batched_ragged_paged_attention(
       attention_scope=attention_scope,
       return_lse=return_lse,
       quantize_p=quantize_p,
+      decode_only=decode_only,
   )
 
 
