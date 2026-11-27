@@ -418,6 +418,13 @@ class SplashConfig:
   # common grid). Set smaller to decouple block sizes that aren't multiples.
   dropout_block_q: int | None = None
   dropout_block_kv: int | None = None
+  # [experimental] On an aligned sliding-window mask (CausalMask & LocalMask
+  # with left window block_q - 1, equal square blocks), every partial dkv block
+  # is a diagonal block or the block left of it, and only one compute-tile-wide
+  # q band of each compute tile is a triangle: the dkv kernel masks that band
+  # and treats the rest as statically visible or masked. Ignored for other
+  # masks. Bit-identical to False.
+  local_band_mask: bool = False
   # [experimental] In the fused dkv kernel, reuse the
   # LOG2E-scaled q for the dK matmul and undo the scale with dk /= LOG2E
   # (exact grad w.r.t. the rounded fp8 q; one fewer q tile live).
@@ -635,9 +642,51 @@ def _apply_mask_and_soft_cap(
     k_in_lanes=True,
     mask_function=None,
     has_partial_mask: bool = False,
+    band_span: tuple[int, int, bool] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
   assert mask_ref is None or q_sequence_ref is None
   assert (q_sequence_ref is None) == (mask_function is None)
+
+  if band_span is not None:
+    # (lo, hi, after_visible): only q [lo, hi) needs the partial mask; q after
+    # hi is visible iff after_visible, q before lo is the opposite.
+    lo, hi, after_visible = band_span
+    nq = qk.shape[-2] if k_in_lanes else qk.shape[-1]
+
+    def q_part(start, stop, visible, partial_mask):
+      def view(ref):
+        return ref.at[start:stop] if k_in_lanes else ref.at[:, start:stop]
+
+      if k_in_lanes:
+        qk_part = qk[..., start:stop, :]
+      else:
+        qk_part = qk[..., start:stop]
+      if not visible:
+        # Same value the full mask writes. A constant fill (jnp.full) is not
+        # bit-exact: on some shapes it changed a few dq values in the last bit.
+        return jnp.minimum(qk_part, mask_value)
+      return _apply_mask_and_soft_cap(
+          qk_part,
+          mask_value,
+          None if mask_ref is None else view(mask_ref),
+          None if q_sequence_ref is None else view(q_sequence_ref),
+          None if q_segment_ids_ref is None else view(q_segment_ids_ref),
+          kv_segment_ids_ref,
+          attn_logits_soft_cap=attn_logits_soft_cap,
+          k_slice=k_slice,
+          k_offset=k_offset,
+          bq=stop - start,
+          k_in_lanes=k_in_lanes,
+          mask_function=mask_function,
+          has_partial_mask=partial_mask,
+      )
+
+    parts = [q_part(lo, hi, True, has_partial_mask)]
+    if lo > 0:
+      parts.insert(0, q_part(0, lo, not after_visible, False))
+    if hi < nq:
+      parts.append(q_part(hi, nq, after_visible, False))
+    return jnp.concatenate(parts, axis=-2 if k_in_lanes else -1)
 
   masks = []
   if has_partial_mask:
@@ -2697,7 +2746,7 @@ def _flash_attention_dkv_kernel(
           grid_idx == last,
           col(jnp.minimum(grid_idx + 1, last)) != col(grid_idx),
       )
-    if dropout_rate:
+    if dropout_rate or config.local_band_mask:
       # Mirrors the fwd indices: rows are kv blocks and cols are q blocks here.
       q_head = (
           pl.program_id(0) * q_heads_per_kv_head + pl.program_id(2)
@@ -2751,7 +2800,7 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
     dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
-  def body(i, _, has_partial_mask=False):
+  def body(i, _, has_partial_mask=False, band=None):
     dropout_mask = None
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]  # We keep q potentially transposed, since it's always RHS
@@ -2935,6 +2984,7 @@ def _flash_attention_dkv_kernel(
         k_in_lanes=False,
         mask_function=mask_function,
         has_partial_mask=has_partial_mask,
+        band_span=band,
     )
     exp = jnp.exp2 if config.use_base2_exp else jnp.exp
     p = exp(qk - logsumexp)
@@ -3050,9 +3100,21 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(jnp.logical_and(_not(should_not_mask), should_run))
   def _():
-    lax.fori_loop(
-        0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
-    )
+    if config.local_band_mask and block_mask_ref is not None:
+
+      def band_body(diag_block):
+        @pl.when(q_index == kv_index if diag_block else q_index != kv_index)
+        def _():
+          for c in range(num_iters):
+            span = (c * bkv_compute, (c + 1) * bkv_compute, diag_block)
+            body(c, None, has_partial_mask=True, band=span)
+
+      band_body(True)  # Diagonal block.
+      band_body(False)  # The block left of it.
+    else:
+      lax.fori_loop(
+          0, num_iters, partial(body, has_partial_mask=True), None, unroll=True
+      )
 
   if dq_scratch_ref is not None:
 
@@ -4010,6 +4072,10 @@ def _make_splash_attention(
 
   dkv_mask_info = None
   if config.has_backward_blocks:
+    if config.local_band_mask and not _local_band_mask_applies(
+        mask, config, q_seq_shards
+    ):
+      config = dataclasses.replace(config, local_band_mask=False)
     bq_dkv, bkv_dkv = config.block_q_dkv, config.block_kv_dkv
     dkv_mask_info, mask_function_dkv = process_fn(
         mask,
@@ -4042,6 +4108,42 @@ def _make_splash_attention(
       mask_function=mask_function_fwd,
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
+  )
+
+
+def _local_band_mask_applies(
+    mask: mask_lib.Mask, config: SplashConfig, q_seq_shards: int
+) -> bool:
+  """Whether `config.local_band_mask` holds for `mask` (see SplashConfig)."""
+  if not isinstance(mask, mask_lib.LogicalAnd):
+    return False
+  parts = {type(mask.left): mask.left, type(mask.right): mask.right}
+  causal = parts.get(mask_lib.CausalMask)
+  local = parts.get(mask_lib.LocalMask)
+  if causal is None or local is None:
+    return False
+  assert isinstance(causal, mask_lib.CausalMask)
+  assert isinstance(local, mask_lib.LocalMask)
+  b = config.block_q
+  blocks = [config.block_kv]
+  if config.has_backward_blocks:
+    blocks += [config.block_q_dkv, config.block_kv_dkv]
+  q_len, kv_len = mask.shape
+  left, right = local.window_size
+  identity = np.arange(q_len)
+  return (
+      causal.offset == 0
+      and local.offset == 0
+      and left == b - 1
+      and (right is None or right >= 0)
+      and all(x == b for x in blocks)
+      and q_len == kv_len
+      and q_len % b == 0
+      and q_seq_shards == 1
+      and not config.dropout_rate
+      and config.num_stacked_q_heads == 1
+      and np.array_equal(causal.q_sequence, identity)
+      and np.array_equal(local.q_sequence, identity)
   )
 
 
@@ -4083,6 +4185,7 @@ def _make_dynamic_splash_attention(
 
   config = dataclasses.replace(
       config,
+      local_band_mask=False,
       dq_reduction_steps=(
           3 if config.dq_reduction_steps is None else config.dq_reduction_steps
       ),
