@@ -69,7 +69,7 @@ def _assert_no_xla_slices_or_joins(
 
   kernels = hlo_utils.get_kernel_info(lowered, include_xla_kernels=True)
   testcase.assertLen(kernels, 1)
-  if implementation == "mosaic":
+  if implementation in ("mosaic", "mosaic_gpu"):
     testcase.assertIsInstance(kernels[0], hlo_utils_common.MosaicGpuKernelInfo)
   elif implementation == "triton":
     testcase.assertIsInstance(kernels[0], hlo_utils_common.TritonKernelInfo)
@@ -95,9 +95,20 @@ class GatedLinearUnitTest(parameterized.TestCase):
     if implementation == "triton" and not gpu_utils.has_triton_support():
       self.skipTest("Triton not supported on this platform.")
 
-    if not gpu_utils.has_mosaic_gpu_support() and implementation is not None:
-      if "mosaic" in implementation:
-        self.skipTest("Mosaic not supported on this platform.")
+    if implementation == "mosaic_gpu" or (
+        implementation == "mosaic" and jax.default_backend() != "tpu"
+    ):
+      if not gpu_utils.has_mosaic_gpu_support():
+        self.skipTest("Mosaic GPU not supported on this platform.")
+
+    if implementation == "mosaic_tpu" or (
+        implementation == "mosaic" and jax.default_backend() == "tpu"
+    ):
+      if (
+          jax.default_backend() != "tpu"
+          or "mosaic_tpu" not in api.IMPLEMENTATIONS
+      ):
+        self.skipTest("Mosaic TPU not supported on this platform.")
 
     if implementation == "cutedsl":
       if not gpu_utils.is_sm100():
@@ -146,13 +157,23 @@ class GatedLinearUnitTest(parameterized.TestCase):
           # Ensure either a Triton or Mosaic kernel is used.
           self.assertTrue(
               isinstance(op, api.IMPLEMENTATIONS["triton"].__class__)
-              or isinstance(op, api.IMPLEMENTATIONS["mosaic"].__class__)
+              or isinstance(op, api.IMPLEMENTATIONS["mosaic_gpu"].__class__)
           )
+        elif jax.default_backend() == "tpu":
+          self.assertIsInstance(op, api.IMPLEMENTATIONS["mosaic_tpu"].__class__)
       else:
-        self.assertIsInstance(op, api.IMPLEMENTATIONS[implementation].__class__)
+        impl_key = (
+            f"mosaic_{jax.default_backend()}"
+            if implementation == "mosaic"
+            else implementation
+        )
+        self.assertIsInstance(op, api.IMPLEMENTATIONS[impl_key].__class__)
 
-    if implementation in ("mosaic", "triton") or (
-        implementation is None and jax.default_backend() == "gpu"
+    if jax.default_backend() == "gpu" and implementation in (
+        "mosaic",
+        "mosaic_gpu",
+        "triton",
+        None,
     ):
       with self.subTest("no_xla_slices_or_joins"):
         _assert_no_xla_slices_or_joins(
@@ -352,6 +373,22 @@ class GatedLinearUnitMosaicGpuTest(test_base.GatedLinearUnitTestBase):
   def __init__(self, *args):
     fn = functools.partial(api.gated_linear_unit, implementation="mosaic")
     super().__init__(*args, glu_fn=fn)
+
+
+class GatedLinearUnitMosaicTpuTest(test_base.GatedLinearUnitTestBase):
+
+  def __init__(self, *args):
+    super().__init__(*args, glu_fn=self._run_mosaic_tpu)
+
+  def _run_mosaic_tpu(self, x, weights, **kwargs):
+    if (
+        jax.default_backend() != "tpu"
+        or "mosaic_tpu" not in api.IMPLEMENTATIONS
+    ):
+      self.skipTest("Mosaic TPU not supported on this platform.")
+    return api.gated_linear_unit(
+        x, weights, implementation="mosaic_tpu", **kwargs
+    )
 
 
 if __name__ == "__main__":
