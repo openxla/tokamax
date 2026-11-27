@@ -251,3 +251,168 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}"
         )
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("quantized", [True, False], ids=["fp8", "bf16"])
+def test_shard_slab_tables_matches_scatter_reference(
+    ep, t_local, g_local, topk, skew, quantized
+):
+    """Merged unique-index slab scatter matches the original scatter-adds."""
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=skew, seed=11
+    )
+    whole = host.build_routing_tables(idx, **kwargs)
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    n_tokens = t_local * ep
+    rng = np.random.default_rng(19)
+    scales_f32 = rng.uniform(0.125, 4.0, size=(n_tokens,)).astype(np.float32)
+    scale_bits = None
+    if quantized:
+        scale_bits = jax.lax.bitcast_convert_type(
+            jnp.asarray(scales_f32), jnp.int32
+        )
+    token_of_pair = jnp.broadcast_to(
+        jnp.arange(n_tokens, dtype=jnp.int32)[:, None], (n_tokens, topk)
+    ).reshape(-1)
+    lo, hi = host.gather_clamp_bounds(n_tokens)
+    scale_rows = host.act_scale_slab_rows(stride)
+
+    flat = np.asarray(idx)
+    counts = np.stack(
+        [
+            np.bincount(
+                flat[d * t_local : (d + 1) * t_local].reshape(-1),
+                minlength=e_total,
+            )
+            for d in range(ep)
+        ]
+    ).astype(np.int32)
+    def jit_slab(plan, me, sb):
+        # The plan is closed over rather than passed in: its pair_grid
+        # (`ShardRoutingTables.n_tokens` / `topk`, plain Python ints) sizes
+        # arrays, and as a jit argument those ints would become tracers.
+        return jax.jit(
+            lambda m, s: host.shard_slab_tables(
+                plan, m, shard_stride=stride, scale_bits=s
+            )
+        )(me, sb)
+
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx,
+            jnp.int32(me),
+            all_gather_rows=lambda _row: jnp.asarray(counts),
+            **kwargs,
+        )
+        slab_row = host.local_slab_rows(whole, me, shard_stride=stride)
+        ref_tok = jnp.clip(
+            jnp.zeros((stride,), jnp.int32)
+            .at[slab_row]
+            .add(token_of_pair, mode="drop"),
+            jnp.int32(lo),
+            jnp.int32(hi),
+        )
+        ref_scale = None
+        if scale_bits is not None:
+            ref_bits = (
+                jnp.zeros((scale_rows * host.HIDDEN_LANE_BLOCK,), jnp.int32)
+                .at[slab_row]
+                .add(jnp.repeat(scale_bits, topk), mode="drop")
+            )
+            ref_scale = jax.lax.bitcast_convert_type(
+                ref_bits, jnp.float32
+            ).reshape(scale_rows, host.HIDDEN_LANE_BLOCK)
+
+        for label, plan in (("whole", whole), ("sharded", shard)):
+            tok, scale_slab = jit_slab(plan, jnp.int32(me), scale_bits)
+            np.testing.assert_array_equal(
+                np.asarray(tok),
+                np.asarray(ref_tok),
+                err_msg=f"{label} token_gather mismatch on shard {me}",
+            )
+            if ref_scale is not None:
+                assert scale_slab is not None
+                assert scale_slab.shape == (scale_rows, host.HIDDEN_LANE_BLOCK)
+                flat_got = np.asarray(scale_slab).reshape(-1)
+                flat_ref = np.asarray(ref_scale).reshape(-1)
+                np.testing.assert_array_equal(
+                    flat_got[:stride],
+                    flat_ref[:stride],
+                    err_msg=f"{label} scale_slab mismatch on shard {me}",
+                )
+                assert not flat_got[stride:].any(), (
+                    f"{label} trailing scale padding non-zero on shard {me}"
+                )
+            else:
+                assert scale_slab is None
+
+
+
+def test_unique_scatter_rows_are_distinct_and_off_shard_rows_drop():
+    """On-shard rows pass through; off-shard ones land past the table, uniquely.
+
+    The slab scatters declare `unique_indices=True` on the strength of this.
+    An off-shard index inside the table would overwrite a live slab row, and a
+    repeated one would make the scatter's result undefined.
+    """
+    base, n_pairs = 96, 400
+    rng = np.random.default_rng(23)
+    on_shard = rng.random(n_pairs) < 0.2
+    rows = np.full(n_pairs, base, np.int32)
+    rows[on_shard] = rng.permutation(base)[: on_shard.sum()]
+    got = np.asarray(
+        host.unique_scatter_rows(
+            jnp.asarray(rows), jnp.asarray(on_shard), base
+        )
+    )
+    np.testing.assert_array_equal(got[on_shard], rows[on_shard])
+    assert (got[~on_shard] >= base).all(), "off-shard pair indexes a live row"
+    assert len(np.unique(got)) == n_pairs, "scatter indices are not unique"
+
+
+@pytest.mark.parametrize("quantized", [True, False], ids=["fp8", "bf16"])
+def test_shard_slab_tables_lowers_to_one_unique_scatter(quantized):
+    """Both slab tables come from a single scatter declared unique.
+
+    The bit-exact parity test cannot see this: dropping `unique_indices` or
+    splitting the scatter back in two gives the same tables, only slower.
+    """
+    ep, t_local, g_local, topk = 8, 64, 64, 10
+    routing, _ = _routing(ep, t_local, g_local, topk, skew=False, seed=3)
+    stride = host.ragged_stride_bound(ep * t_local, topk, g_local * ep, 128)
+    rows = host.local_slab_rows(routing, 0, shard_stride=stride)
+    scale_bits = (
+        jnp.zeros((ep * t_local,), jnp.int32) if quantized else None
+    )
+    text = (
+        jax.jit(
+            lambda r, sb: host.shard_slab_tables(
+                routing, jnp.int32(0), shard_stride=stride, rows=r,
+                scale_bits=sb,
+            )
+        )
+        .lower(rows, scale_bits)
+        .as_text()
+    )
+    scatters = [
+        line for line in text.splitlines() if "stablehlo.scatter" in line
+    ]
+    assert len(scatters) == 1, scatters
+    assert "unique_indices = true" in scatters[0], scatters[0]
+
+if __name__ == "__main__":
+    # A py_test that runs this file directly would otherwise collect nothing
+    # and pass vacuously; CI invokes pytest on the file instead. absl.app.run
+    # comes first because some JAX builds refuse calls before it has run.
+    import sys
+
+    from absl import app
+
+    def _main(argv):
+        flags = ["-q", "-p", "no:cacheprovider"]
+        sys.exit(pytest.main([__file__] + flags + argv[1:]))
+
+    app.run(_main)
