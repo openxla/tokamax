@@ -175,8 +175,8 @@ class ApiTest(parameterized.TestCase):
         jax.random.key(42), b_dim, h_dim, v_dim
     )
 
-    def failing_impl(x, labels, weights, *, reduction="sum"):
-      del x, labels, weights, reduction
+    def failing_impl(x, labels, weights, *, reduction="sum", precision=None):
+      del x, labels, weights, reduction, precision
       raise NotImplementedError("Not implemented on this hardware.")
 
     result = api.linear_softmax_cross_entropy_loss(
@@ -184,6 +184,81 @@ class ApiTest(parameterized.TestCase):
     )
     expected = api.linear_softmax_cross_entropy_loss(
         x_input, labels, weights, implementation="xla"
+    )
+    self.assertTrue(jnp.allclose(result, expected, atol=1e-4, rtol=1e-4))
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default",
+          precision=jax.lax.Precision.DEFAULT,
+      ),
+      dict(
+          testcase_name="high",
+          precision=jax.lax.Precision.HIGH,
+      ),
+      dict(
+          testcase_name="highest",
+          precision=jax.lax.Precision.HIGHEST,
+      ),
+      dict(
+          testcase_name="bf16_bf16_f32",
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+      ),
+      dict(
+          testcase_name="bf16_bf16_f32_x3",
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+      ),
+      dict(
+          testcase_name="bf16_bf16_f32_x6",
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+      ),
+  )
+  def test_precision_matches_reference(self, precision):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 1024, 512, 2048, dtype=jnp.bfloat16
+    )
+    loss, (dx, dw) = jax.value_and_grad(
+        api.linear_softmax_cross_entropy_loss, argnums=(0, 2)
+    )(x, labels, w, reduction="mean", precision=precision)
+    ref_loss, (ref_dx, ref_dw) = jax.value_and_grad(
+        api.linear_softmax_cross_entropy_loss, argnums=(0, 2)
+    )(
+        x,
+        labels,
+        w,
+        reduction="mean",
+        precision=precision,
+        implementation="xla",
+    )
+    self.assertTrue(jnp.allclose(loss, ref_loss, atol=1e-3, rtol=1e-3))
+    self.assertTrue(jnp.allclose(dx, ref_dx, atol=2e-2, rtol=2e-2))
+    self.assertTrue(jnp.allclose(dw, ref_dw, atol=2e-2, rtol=2e-2))
+
+  def test_invalid_precision_raises_value_error(self):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 128, 64, 256
+    )
+    with self.assertRaises(ValueError):
+      api.linear_softmax_cross_entropy_loss(
+          x, labels, w, precision="not_a_precision", implementation="xla"
+      )
+
+  def test_unsupported_tpu_precision_falls_back_to_xla(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("TPU fallback test only runs on TPU.")
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 1024, 512, 2048
+    )
+    unsupported = (jax.lax.Precision.HIGH, jax.lax.Precision.DEFAULT)
+    with self.assertRaises(NotImplementedError):
+      api.linear_softmax_cross_entropy_loss(
+          x, labels, w, precision=unsupported, implementation="mosaic_tpu"
+      )
+    result = api.linear_softmax_cross_entropy_loss(
+        x, labels, w, precision=unsupported
+    )
+    expected = api.linear_softmax_cross_entropy_loss(
+        x, labels, w, precision=unsupported, implementation="xla"
     )
     self.assertTrue(jnp.allclose(result, expected, atol=1e-4, rtol=1e-4))
 

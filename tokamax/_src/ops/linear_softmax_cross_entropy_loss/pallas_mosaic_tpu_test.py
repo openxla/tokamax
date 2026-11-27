@@ -111,6 +111,64 @@ class FlashLcePallasMosaicTpuTest(parameterized.TestCase):
         jnp.allclose(ref_grad_w, kernel_grad_w, atol=3e-2, rtol=3e-2)
     )
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="bf16_default",
+          dtype=jnp.bfloat16,
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+          tol=3e-2,
+      ),
+      dict(
+          testcase_name="bf16_x3",
+          dtype=jnp.bfloat16,
+          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+          tol=1e-2,
+      ),
+      dict(
+          testcase_name="bf16_highest",
+          dtype=jnp.bfloat16,
+          precision=jax.lax.Precision.HIGHEST,
+          tol=1e-2,
+      ),
+      dict(
+          testcase_name="f32_high",
+          dtype=jnp.float32,
+          precision=jax.lax.Precision.HIGH,
+          tol=1e-3,
+      ),
+      dict(
+          testcase_name="f32_highest",
+          dtype=jnp.float32,
+          precision=jax.lax.Precision.HIGHEST,
+          tol=1e-4,
+      ),
+  )
+  def test_op_wrapper_precision(self, dtype, precision, tol):
+    x, labels, w = generate_random_data(
+        jax.random.key(42), 1024, 512, 2048, dtype=dtype
+    )
+    fn_pallas = PallasMosaicTpuLinearSoftmaxCrossEntropyLoss()
+    fn_reference = LinearSoftmaxCrossEntropyLoss()
+
+    kernel_loss, (kernel_dx, kernel_dw) = jax.value_and_grad(
+        fn_pallas, argnums=(0, 2)
+    )(x, labels, w, reduction="mean", precision=precision)
+    ref_loss, (ref_dx, ref_dw) = jax.value_and_grad(
+        fn_reference, argnums=(0, 2)
+    )(x, labels, w, reduction="mean", precision=precision)
+
+    self.assertTrue(jnp.allclose(ref_loss, kernel_loss, atol=tol, rtol=tol))
+    self.assertTrue(jnp.allclose(ref_dx, kernel_dx, atol=tol, rtol=tol))
+    self.assertTrue(jnp.allclose(ref_dw, kernel_dw, atol=tol, rtol=tol))
+
+  def test_op_wrapper_unsupported_precision_raises(self):
+    x, labels, w = generate_random_data(jax.random.key(42), 1024, 512, 2048)
+    fn_pallas = PallasMosaicTpuLinearSoftmaxCrossEntropyLoss()
+    with self.assertRaises(NotImplementedError):
+      fn_pallas(
+          x, labels, w, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X9
+      )
+
 
 def _mock_tpu_info(**overrides: int) -> pallas_mosaic_tpu.pltpu.TpuInfo:
   """Returns a hermetic TpuInfo based on TPU v6e with the given overrides."""
