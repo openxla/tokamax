@@ -151,6 +151,8 @@ class ActivationSpec:
               f"quant block_col_size ({block_col_size}) must divide col_size"
               f" ({self.col_size})."
           )
+      case _:
+        raise NotImplementedError(f"Not supported QuantSpec {self.quant}.")
 
   @property
   def quant_col_size(self) -> int:
@@ -158,17 +160,15 @@ class ActivationSpec:
     match self.quant:
       case None:
         return 0
-      case SubchannelQuantSpec():
-        raise NotImplementedError(
-            "Only LaneStridedQuantSpec is supported for compact activations."
-        )
-      case LaneStridedQuantSpec(block_col_size=block_col_size):
-        if block_col_size != self.col_size:
-          raise NotImplementedError(
-              "Sub-row LaneStridedQuantSpec is not supported yet."
-          )
+      case SubchannelQuantSpec(block_size=block_size) | LaneStridedQuantSpec(
+          block_col_size=block_size
+      ):
+        if block_size != self.col_size:
+          raise NotImplementedError("Sub-row QuantSpec is not supported yet.")
         lanes = 128
         return lanes * layout_util.get_packing(self.dtype)
+      case _:
+        raise NotImplementedError(f"Not supported QuantSpec {self.quant}.")
 
   @property
   def num_logical_chunks(self) -> int:

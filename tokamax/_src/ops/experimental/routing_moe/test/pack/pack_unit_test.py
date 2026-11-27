@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import benchmarking
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
 from tokamax._src.ops.experimental.routing_moe.pack import kernel
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
@@ -76,6 +77,49 @@ def _assert_bitwise_equal(actual: jax.Array, expected: jax.Array) -> None:
 
 def _xla_reshape(arr: jax.Array, out_shape: tuple[int, ...]) -> jax.Array:
   return arr.reshape(out_shape)
+
+
+_QUANT_OUT_FORMAT = out_format_lib.ActivationFormat(
+    dtype=jnp.float8_e4m3fn,
+    quant=out_format_lib.Subchannel(block_size=out_format_lib.tile_size),
+)
+
+
+def _split_data_and_scale(actual: jax.Array) -> tuple[np.ndarray, np.ndarray]:
+  """Splits compact `actual` into 2D data and `f32[rows, 128]` scales."""
+  # The scale is read on the host because a device-side bitcast of the fp8
+  # array rewrites f32 scale bytes that match the fp8 NaN bit pattern.
+  actual_np = np.asarray(actual)
+  payload = actual_np[:, :-1]
+  data = payload.reshape(layout_util.to_large_shape(payload.shape))
+  scale_bytes = np.ascontiguousarray(np.swapaxes(actual_np[:, -1], 1, 2))
+  scale = scale_bytes.view(np.float32)[..., 0]
+  return data, scale
+
+
+def _assert_uniform_lane_scales(scale: np.ndarray) -> None:
+  """Asserts all 128 lane scales in each row are bitwise identical."""
+  np.testing.assert_equal(scale.ndim, 2)
+  np.testing.assert_equal(scale.shape[1], 128)
+  expected = np.broadcast_to(scale[:, :1], scale.shape)
+  np.testing.assert_array_equal(scale, expected)
+  scale_u32 = np.ascontiguousarray(scale).view(np.uint32)
+  np.testing.assert_array_equal(
+      scale_u32, np.broadcast_to(scale_u32[:, :1], scale_u32.shape)
+  )
+
+
+def _assert_dequantizes_to(
+    data: np.ndarray, scale: np.ndarray, x: jax.Array
+) -> None:
+  """Asserts quantized `data` and `scale` dequantize to `[rows, cols]` `x`."""
+  dequant = (
+      data.astype(np.float32).reshape(data.shape[0], -1, scale.shape[-1])
+      * scale[:, None, :]
+  ).reshape(data.shape)
+  np.testing.assert_allclose(
+      dequant, np.asarray(x.astype(jnp.float32)), rtol=0.07, atol=1e-4
+  )
 
 
 class InputPackUnitTest(parameterized.TestCase):
@@ -405,6 +449,47 @@ class InputPackUnitTest(parameterized.TestCase):
     self.assertEqual(actual.data.dtype, dtype)
     _assert_bitwise_equal(actual.data, x.reshape(expected_shape))
 
+  @parameterized.product(
+      batch_size=[8, 16, 32, 64],
+      dim_size=[512, 2048],
+  )
+  def test_input_pack_quantized_out(self, batch_size: int, dim_size: int):
+    shape = (batch_size, dim_size)
+    x = _random_input(jax.random.key(11), shape, jnp.bfloat16.dtype)
+
+    actual = kernel.input_pack(x, _QUANT_OUT_FORMAT)
+
+    data, scale = _split_data_and_scale(actual.data)
+    _assert_uniform_lane_scales(scale)
+    _assert_dequantizes_to(data, scale, x)
+
+  @parameterized.product(
+      batch_size=[5, 100, 257, 1000],
+      tile_size=[None, 64],
+      dtype=[jnp.bfloat16, jnp.float32],
+  )
+  def test_input_pack_quantized_out_edge_shapes(
+      self, batch_size: int, tile_size: int | None, dtype: jnp.dtype
+  ):
+    # Ragged and multi-tile batches, plus an all-zero row whose scale is 0.
+    shape = (batch_size, 1024)
+    x = _random_input(jax.random.key(11), shape, jnp.dtype(dtype))
+    x = x.at[batch_size // 2].set(0)
+    # A float32 row maximum of 3.49 gives a scale with a 0xFF byte, which is
+    # the fp8 NaN bit pattern.
+    x = x.at[1].multiply(0.5).at[1, 0].set(3.49)
+
+    actual = kernel.input_pack(
+        x, _QUANT_OUT_FORMAT, plan=kernel.InputPackPlan(tile_rows=tile_size)
+    )
+
+    self.assertIsNone(actual.scale)
+    self.assertEqual(actual.spec.row_size, batch_size)
+    self.assertEqual(actual.spec.col_size, 1024)
+    data, scale = _split_data_and_scale(actual.data)
+    _assert_uniform_lane_scales(scale)
+    _assert_dequantizes_to(data, scale, x)
+
   def test_input_pack_invalid_shapes_raise_value_error(self):
     with self.assertRaisesRegex(ValueError, "Expected 2D input"):
       kernel.input_pack(jnp.zeros((16, 16, 256), dtype=jnp.bfloat16))
@@ -516,6 +601,38 @@ class InputPackUnitTest(parameterized.TestCase):
     # The XLA reshape pads/relayouts ragged batches, so `input_pack` is >= 1.5x
     # faster across these sizes.
     self.assertLess(pack_us, xla_us)
+
+  @parameterized.product(
+      batch_size=[
+          *[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+          *[100, 257, 500, 777, 1000, 1500, 2050, 4100, 8200],
+      ],
+      dtype=[jnp.bfloat16, jnp.float32],
+  )
+  def test_benchmark_input_pack_quantized(
+      self, batch_size: int, dtype: jnp.dtype
+  ):
+    # Same aligned and ragged batches as the unquantized benchmarks. The
+    # unquantized `input_pack` of the same input is the baseline.
+    dim_size = 4096
+    x = jax.random.normal(
+        jax.random.key(0), (batch_size, dim_size), dtype=dtype
+    )
+
+    pack_us = _measure_us(lambda x: kernel.input_pack(x).data, x)
+    quant_us = _measure_us(
+        lambda x: kernel.input_pack(x, _QUANT_OUT_FORMAT).data, x
+    )
+    logging.info(
+        "BENCHMARK_QUANT dtype=%s batch=%4d dim=%4d | input_pack=%.2f us"
+        " | quantized=%.2f us (%.2fx)",
+        jnp.dtype(dtype).name,
+        batch_size,
+        dim_size,
+        pack_us,
+        quant_us,
+        quant_us / pack_us,
+    )
 
 
 if __name__ == "__main__":

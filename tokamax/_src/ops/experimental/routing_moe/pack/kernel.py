@@ -29,6 +29,7 @@ from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import dataclass_util
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import quant_util
 from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 
 
@@ -62,7 +63,8 @@ class ResolvedInputPackPlan:
       batch_size: int,
       dim_size: int,
       vmem_chunks: int,
-      dtype: jax.typing.DTypeLike,
+      in_dtype: jax.typing.DTypeLike,
+      out_dtype: jax.typing.DTypeLike,
       tpu_info: pltpu.TpuInfo,
       requested_tile_rows: int | None,
       num_buffers: int,
@@ -70,8 +72,14 @@ class ResolvedInputPackPlan:
       max_scratch_vmem_ratio: float,
   ) -> int:
     """Selects a sublane-aligned tile size within VMEM capacity."""
-    x_dtype = jax.dtypes.canonicalize_dtype(dtype)
-    sublane_size = tpu_info.get_sublane_tiling(x_dtype)
+    x_dtype = jax.dtypes.canonicalize_dtype(in_dtype)
+    out_dtype = jax.dtypes.canonicalize_dtype(out_dtype)
+    # I think output dtype will always be the same or smaller than input dtype
+    # but... just in case?
+    sublane_size = max(
+        tpu_info.get_sublane_tiling(x_dtype),
+        tpu_info.get_sublane_tiling(out_dtype),
+    )
     batch_sublanes = max(1, batch_size // sublane_size)
     if requested_tile_rows is None:
       # Cap at ceil(total_sublanes / 2) when possible so HBM DMAs overlap with
@@ -96,7 +104,8 @@ class ResolvedInputPackPlan:
       if requested_tile_rows <= 0 or requested_tile_rows % sublane_size != 0:
         raise ValueError(
             f"tile_rows ({requested_tile_rows}) must be a positive multiple of"
-            f" sublane_size ({sublane_size}) for dtype {x_dtype}."
+            f" sublane_size ({sublane_size}) for {x_dtype} input and"
+            f" {out_dtype} output."
         )
       tile_sublanes = min(batch_sublanes, requested_tile_rows // sublane_size)
 
@@ -109,10 +118,11 @@ class ResolvedInputPackPlan:
     # (preserving sublane alignment) until all scratch tensors fit within the
     # VMEM budget (`max_scratch_vmem_ratio` of capacity, leaving headroom for
     # compiler-managed VMEM allocations).
-    packing = layout_util.get_packing(x_dtype)
+    out_packing = layout_util.get_packing(out_dtype)
     bytes_per_row = (
-        dim_size + vmem_chunks * packing * tpu_info.num_lanes
-    ) * x_dtype.itemsize
+        dim_size * x_dtype.itemsize
+        + vmem_chunks * out_packing * tpu_info.num_lanes * out_dtype.itemsize
+    )
 
     max_scratch_bytes = int(
         tpu_info.vmem_capacity_bytes * max_scratch_vmem_ratio
@@ -138,13 +148,15 @@ class ResolvedInputPackPlan:
       batch_size: int,
       dim_size: int,
       vmem_chunks: int,
-      dtype: jax.typing.DTypeLike,
+      in_dtype: jax.typing.DTypeLike,
+      out_spec: spec_lib.ActivationSpec,
       tpu_info: pltpu.TpuInfo,
   ) -> Self:
     """Resolves unset plan fields into concrete execution parameters."""
     if plan is None:
       plan = InputPackPlan()
 
+    out_dtype = out_spec.dtype
     max_num_buffers = 2 if plan.num_buffers is None else plan.num_buffers
     if max_num_buffers <= 0:
       raise ValueError(f"num_buffers ({max_num_buffers}) must be positive.")
@@ -176,7 +188,8 @@ class ResolvedInputPackPlan:
         batch_size=batch_size,
         dim_size=dim_size,
         vmem_chunks=vmem_chunks,
-        dtype=dtype,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
         tpu_info=tpu_info,
         requested_tile_rows=plan.tile_rows,
         num_buffers=max_num_buffers,
@@ -199,7 +212,8 @@ class _InputPackConfig:
 
   batch_size: int
   dim_size: int
-  dtype: jnp.dtype
+  in_dtype: jnp.dtype
+  out_spec: spec_lib.ActivationSpec
   plan: ResolvedInputPackPlan
   tpu_info: pltpu.TpuInfo
 
@@ -221,40 +235,75 @@ class _InputPackConfig:
     resolved_format = out_format_lib.ResolvedActivationFormat.create(
         out_format,
         default_dtype=x.dtype,
+        default_quant=out_format_lib.ResolvedSubchannel(
+            block_size=out_format_lib.tile_size
+        ),
     )
-    if resolved_format.dtype != x.dtype:
-      raise NotImplementedError(
-          "input_pack does not support dtype conversion yet."
-      )
-    if resolved_format.quant is not None:
-      raise NotImplementedError("input_pack does not support quantization yet.")
-
     batch_size, dim_size = x.shape
-    dtype = x.dtype
-    packing = layout_util.get_packing(dtype)
+    in_dtype, out_dtype = x.dtype, resolved_format.dtype
+    quant_spec = out_format_lib.to_quant_spec(
+        resolved_format.quant, tile_col_size=dim_size
+    )
+
+    match quant_spec:
+      case None:
+        if out_dtype != in_dtype:
+          raise NotImplementedError(
+              "input_pack does not support dtype conversion without"
+              " quantization."
+          )
+      case spec_lib.SubchannelQuantSpec(block_size=block_size):
+        if (
+            in_dtype not in (jnp.bfloat16, jnp.float32)
+            or out_dtype != jnp.float8_e4m3fn
+        ):
+          raise NotImplementedError(
+              "input_pack only quantizes bfloat16 or float32 to float8_e4m3fn."
+              f" Got {in_dtype} to {out_dtype}."
+          )
+        if block_size != dim_size:
+          raise NotImplementedError(
+              "input_pack only supports SubChannelQuant with"
+              f" block_size=dim_size. Got {block_size=}"
+          )
+      case _:
+        raise NotImplementedError(
+            "input_pack only supports no output quantization or"
+            f" SubChannelQuant. Got {quant_spec}."
+        )
+
+    packing = layout_util.get_packing(out_dtype)
     num_lanes = tpu_info.num_lanes
     if dim_size % (packing * num_lanes) != 0:
       raise ValueError(
           f"dim_size ({dim_size}) must be divisible by packing * num_lanes"
-          f" ({packing * num_lanes}) for dtype {dtype}."
+          f" ({packing * num_lanes}) for dtype {out_dtype}."
       )
 
-    num_packed_chunks = dim_size // (packing * num_lanes)
+    out_spec = spec_lib.ActivationSpec(
+        row_size=batch_size,
+        col_size=dim_size,
+        dtype=out_dtype,
+        quant=quant_spec,
+    )
+
     vmem_chunks = layout_util.to_bank_conflict_aware_stride(
-        num_packed_chunks, num_steps=tpu_info.num_sublanes
+        out_spec.num_physical_chunks, num_steps=tpu_info.num_sublanes
     )
     resolved_plan = ResolvedInputPackPlan.create(
         plan,
         batch_size=batch_size,
         dim_size=dim_size,
         vmem_chunks=vmem_chunks,
-        dtype=dtype,
+        in_dtype=in_dtype,
+        out_spec=out_spec,
         tpu_info=tpu_info,
     )
     return cls(
         batch_size=batch_size,
         dim_size=dim_size,
-        dtype=dtype,
+        in_dtype=in_dtype,
+        out_spec=out_spec,
         plan=resolved_plan,
         tpu_info=tpu_info,
     )
@@ -269,17 +318,21 @@ class _InputPackConfig:
 
   @property
   def packing(self) -> int:
-    return layout_util.get_packing(self.dtype)
+    return layout_util.get_packing(self.out_spec.dtype)
 
   @property
-  def num_packed_chunks(self) -> int:
-    return self.dim_size // (self.packing * self.num_lanes)
+  def num_logical_chunks(self) -> int:
+    return self.out_spec.num_logical_chunks
+
+  @property
+  def num_physical_chunks(self) -> int:
+    return self.out_spec.num_physical_chunks
 
   @property
   def vmem_chunks(self) -> int:
     # `store_large_to_compact` stores with stride `vmem_chunks * packing`.
     return layout_util.to_bank_conflict_aware_stride(
-        self.num_packed_chunks, num_steps=self.num_sublanes
+        self.num_physical_chunks, num_steps=self.num_sublanes
     )
 
   @property
@@ -300,18 +353,7 @@ class _InputPackConfig:
 
   @property
   def out_shape(self) -> tuple[int, ...]:
-    return layout_util.to_compact_shape(
-        (self.batch_size, self.dim_size), self.dtype
-    )
-
-  @property
-  def out_spec(self) -> spec_lib.ActivationSpec:
-    return spec_lib.ActivationSpec(
-        row_size=self.batch_size,
-        col_size=self.dim_size,
-        dtype=self.dtype,
-        quant=None,
-    )
+    return self.out_spec.physical_compact_shape
 
   @property
   def vmem_limit_bytes(self) -> int:
@@ -321,13 +363,16 @@ class _InputPackConfig:
 
   @property
   def kernel_name(self) -> str:
-    return f"input_pack_b{self.batch_size}_d{self.dim_size}_t{self.tile_rows}"
+    name = f"input_pack_b{self.batch_size}_d{self.dim_size}_t{self.tile_rows}"
+    if self.out_spec.quant is not None:
+      name += f"_q{self.out_spec.dtype}"
+    return name
 
   def scratch_types(self) -> dict[str, pl.MemoryRef]:
     """Scratch buffers of `_input_pack_kernel`, keyed by its parameter names."""
     return dict(
         in_scratch_ref=pltpu.VMEM(
-            (self.num_buffers, self.tile_rows, self.dim_size), self.dtype
+            (self.num_buffers, self.tile_rows, self.dim_size), self.in_dtype
         ),
         out_scratch_ref=pltpu.VMEM(
             (
@@ -337,11 +382,25 @@ class _InputPackConfig:
                 self.packing,
                 self.num_lanes,
             ),
-            self.dtype,
+            self.out_spec.dtype,
         ),
         send_sem_ref=pltpu.SemaphoreType.DMA((self.num_buffers,)),
         recv_sem_ref=pltpu.SemaphoreType.DMA((self.num_buffers,)),
     )
+
+
+def _quantize_rows(
+    x: jax.Array,  # [rows, dim_size]
+    *,
+    dtype: jnp.dtype,
+    quant: spec_lib.SubchannelQuantSpec,
+    num_lanes: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Returns `x` quantized per row and its `f32[rows, num_lanes]` scales."""
+  scale, inv_scale = quant_util.compute_scale(x, dtype, quant)
+  # The scale chunk holds one f32 per lane, so the row scale is replicated.
+  scale = jnp.broadcast_to(scale.astype(jnp.float32), (x.shape[0], num_lanes))
+  return quant_util.quantize(x, inv_scale, dtype), scale
 
 
 def _input_pack_kernel(
@@ -394,7 +453,7 @@ def _input_pack_kernel(
     start_row = tile_idx * cfg.tile_rows
     num_rows = num_dma_rows(tile_idx, cfg.batch_size)
     return pltpu.make_async_copy(
-        out_scratch_ref.at[slot, pl.ds(0, num_rows), : cfg.num_packed_chunks],
+        out_scratch_ref.at[slot, pl.ds(0, num_rows), : cfg.num_physical_chunks],
         out_hbm_ref.at[pl.ds(start_row, num_rows)],
         send_sem_ref.at[slot],
     )
@@ -421,14 +480,27 @@ def _input_pack_kernel(
     # Step 2: Wait for current input tile DMA and load into VREGs.
     copy_in(tile_idx, slot).wait()
 
-    # Step 3: Relayout from large VREG layout to bank-conflict-free VMEM.
+    # Step 3: Fetch inputs from VMEM to VREG. Optionally quantize depending
+    # on output requirement.
     val = in_scratch_ref.at[slot][...]
+    if (quant := cfg.out_spec.quant) is not None:
+      # Making linter happy despite config already having assertion.
+      assert isinstance(quant, spec_lib.SubchannelQuantSpec)
+      val, scale = _quantize_rows(
+          val, dtype=cfg.out_spec.dtype, quant=quant, num_lanes=cfg.num_lanes
+      )
+      scale_u32 = pltpu.bitcast(scale, jnp.uint32)
+      layout_util.store_compact_chunk(
+          out_scratch_ref.at[slot], 0, cfg.num_logical_chunks, scale_u32
+      )
+
+    # Step 4: Store large VREG to compact VMEM using strided store.
     layout_util.store_large_to_compact(out_scratch_ref.at[slot], val)
 
-    # Step 4: Write current compact tile to HBM.
+    # Step 5: Write current compact tile to HBM.
     copy_out(tile_idx, slot).start(priority=1)
 
-    # Step 5: Prefetch next input tile into this buffer slot now that `val`
+    # Step 6: Prefetch next input tile into this buffer slot now that `val`
     # has been loaded into VREGs.
     next_tile_idx = tile_idx + cfg.num_buffers
 
@@ -464,7 +536,7 @@ def input_pack(
   # XLA's default layout and lets producers in the same jit match the kernel.
   out = pl.kernel(
       functools.partial(_input_pack_kernel, cfg=cfg),
-      out_type=jax.ShapeDtypeStruct(cfg.out_shape, cfg.dtype),
+      out_type=jax.ShapeDtypeStruct(cfg.out_shape, cfg.out_spec.dtype),
       mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
       scratch_types=cfg.scratch_types(),
       compiler_params=pltpu.CompilerParams(

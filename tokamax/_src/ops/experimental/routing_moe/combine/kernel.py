@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from tokamax._src.ops.experimental.routing_moe.common import arg
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,6 +111,7 @@ class Config:
     """Derives batching parameters and validates SMEM capacity."""
     spec = rows.spec
     chunks = spec.num_physical_chunks
+    quant = spec.quant
     num_tokens, topk = weights.shape
     out_dtype = jnp.dtype(out_dtype)
     acc_dtype = jnp.dtype(acc_dtype)
@@ -135,7 +137,7 @@ class Config:
         out_dtype=out_dtype,
         in_dtype=spec.dtype,
         acc_dtype=acc_dtype,
-        is_quantized=spec.quant is not None,
+        is_quantized=quant is not None,
     )
     if cfg.smem_allocation >= cfg.smem_threshold:
       raise ValueError(
@@ -154,6 +156,12 @@ class Config:
       raise ValueError(
           f"weights must be [T, K] with T * K == {spec.row_size}, got"
           f" {weights.shape}"
+      )
+    if quant is not None and not isinstance(
+        quant, spec_lib.LaneStridedQuantSpec
+    ):
+      raise NotImplementedError(
+          f"Only LaneStridedQuantSpec is supported. Got {quant}"
       )
     return cfg
 

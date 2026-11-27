@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.routing_moe.combine import kernel
-from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
+from tokamax._src.ops.experimental.routing_moe.common import out_format
 from tokamax._src.ops.experimental.routing_moe.pack import kernel as pack
 from tokamax._src.ops.experimental.routing_moe.test.combine import combine_test_lib
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_cases
@@ -193,14 +193,19 @@ class OutputReduceUnitTest(parameterized.TestCase):
       kernel.output_reduce_unpack(rows_i8, weights)
 
   def test_non_strided_activation_quant_raises(self):
-    spec = spec_lib.ActivationSpec(
-        row_size=16,
-        col_size=512,
-        dtype=jnp.dtype(jnp.float8_e4m3fn),
-        quant=spec_lib.SubchannelQuantSpec(block_size=512),
+    num_tokens, top_k, hidden_size = 16, 4, 512
+    rows = pack.input_pack(
+        jnp.zeros((num_tokens * top_k, hidden_size), dtype=jnp.bfloat16),
+        out_format=out_format.ResolvedActivationFormat(
+            dtype=jnp.float8_e4m3fn.dtype,
+            quant=out_format.ResolvedSubchannel(
+                block_size=out_format.tile_size
+            ),
+        ),
     )
+    weights = jnp.ones((num_tokens, top_k), dtype=jnp.float32)
     with self.assertRaisesRegex(NotImplementedError, "LaneStridedQuantSpec"):
-      _ = spec.quant_col_size
+      kernel.output_reduce_unpack(rows, weights)
 
 
 if __name__ == "__main__":
