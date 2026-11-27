@@ -912,6 +912,251 @@ class FlashLcePallasMosaicTpuKernelTest(parameterized.TestCase):
         kernel_grad_w, ref_grad_w, atol=5e-2, rtol=5e-2, name="grad_w"
     )
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="small_sum_f32",
+          b_dim=1024,
+          h_dim=512,
+          v_dim=2048,
+          reduction="sum",
+          dtype=jnp.float32,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="medium_mean_bf16",
+          b_dim=4096,
+          h_dim=1024,
+          v_dim=4096,
+          reduction="mean",
+          dtype=jnp.bfloat16,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="unaligned_none_f32",
+          b_dim=2176,
+          h_dim=640,
+          v_dim=2664,
+          reduction="none",
+          dtype=jnp.float32,
+          buffer_count=(2, 2),
+      ),
+      dict(
+          testcase_name="single_buffered_bf16",
+          b_dim=2048,
+          h_dim=1024,
+          v_dim=2560,
+          reduction="sum",
+          dtype=jnp.bfloat16,
+          buffer_count=1,
+      ),
+  )
+  def test_kernel_bwd_skip_w_grad_matches_full(
+      self, b_dim, h_dim, v_dim, reduction, dtype, buffer_count
+  ):
+    config = kernel.get_heuristic_bwd_config(
+        b_dim,
+        h_dim,
+        v_dim,
+        dtype=dtype,
+        buffer_count=buffer_count,
+        compute_w_grad=False,
+    )
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), dtype)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    lse = jax.nn.logsumexp(
+        x.astype(jnp.float32) @ w.astype(jnp.float32), axis=-1
+    )
+    dout_shape = (b_dim,) if reduction == "none" else ()
+    dout = numerics.random_initialize(
+        (jax.ShapeDtypeStruct(dout_shape, jnp.float32),), seed=42
+    )[0]
+
+    dx_only = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+        dout,
+        lse,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        b_block_size=config.b_block_size,
+        h_block_size=config.h_block_size,
+        v_block_size=config.v_block_size,
+        buffer_count=buffer_count,
+        compute_w_grad=False,
+    )
+    self.assertIsInstance(dx_only, jax.Array)
+    self.assertEqual(dx_only.shape, (b_dim, h_dim))
+
+    full_config = kernel.get_heuristic_bwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, buffer_count=buffer_count
+    )
+    dx_full, _ = kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+        dout,
+        lse,
+        x,
+        labels,
+        w,
+        reduction=reduction,
+        b_block_size=full_config.b_block_size,
+        h_block_size=full_config.h_block_size,
+        v_block_size=full_config.v_block_size,
+        buffer_count=buffer_count,
+    )
+    self._assert_allclose(dx_only, dx_full, atol=1e-4, rtol=1e-4, name="dx")
+
+    ref_dx, _ = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        dout,
+        lse,
+        x.astype(jnp.float32),
+        labels,
+        w.astype(jnp.float32),
+        reduction=reduction,
+    )
+    self._assert_allclose(
+        dx_only, ref_dx, atol=5e-2, rtol=5e-2, name="dx_vs_ref"
+    )
+
+  def test_resolve_tpu_precision(self):
+    self.assertEqual(
+        kernel._resolve_tpu_precision(None), jax.lax.Precision.DEFAULT
+    )
+    self.assertEqual(
+        kernel._resolve_tpu_precision(jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+        jax.lax.Precision.DEFAULT,
+    )
+    self.assertEqual(
+        kernel._resolve_tpu_precision(
+            jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3
+        ),
+        jax.lax.Precision.HIGH,
+    )
+    self.assertEqual(
+        kernel._resolve_tpu_precision(
+            jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6
+        ),
+        jax.lax.Precision.HIGHEST,
+    )
+    self.assertEqual(
+        kernel._resolve_tpu_precision(jax.lax.DotAlgorithmPreset.F32_F32_F32),
+        jax.lax.Precision.HIGHEST,
+    )
+    for unsupported in (
+        jax.lax.DotAlgorithmPreset.F16_F16_F32,
+        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X9,
+        (jax.lax.Precision.HIGH, jax.lax.Precision.DEFAULT),
+    ):
+      with self.assertRaises(NotImplementedError):
+        kernel._resolve_tpu_precision(unsupported)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="bf16_full_grads",
+          dtype=jnp.bfloat16,
+          compute_w_grad=True,
+      ),
+      dict(
+          testcase_name="bf16_dx_only",
+          dtype=jnp.bfloat16,
+          compute_w_grad=False,
+      ),
+      dict(
+          testcase_name="f32_full_grads",
+          dtype=jnp.float32,
+          compute_w_grad=True,
+      ),
+  )
+  def test_kernel_bwd_precision_accuracy(self, dtype, compute_w_grad):
+    b_dim, h_dim, v_dim = 1024, 512, 2048
+    config = kernel.get_heuristic_bwd_config(
+        b_dim, h_dim, v_dim, dtype=dtype, compute_w_grad=compute_w_grad
+    )
+    x_shape = jax.ShapeDtypeStruct((b_dim, h_dim), dtype)
+    labels_shape = numerics.RangedArrayInitializer(
+        (b_dim,), jnp.int32, 0, v_dim
+    )
+    w_shape = jax.ShapeDtypeStruct((h_dim, v_dim), dtype)
+    x, labels, w = numerics.random_initialize(
+        (x_shape, labels_shape, w_shape), seed=42
+    )
+    # Use high-precision f32 reference so precision differences in the backward
+    # contractions (especially f32 s x bf16 w/x) are measured cleanly.
+    x_f32 = x.astype(jnp.float32)
+    w_f32 = w.astype(jnp.float32)
+    lse = jax.nn.logsumexp(
+        jnp.matmul(x_f32, w_f32, precision=jax.lax.Precision.HIGHEST), axis=-1
+    )
+    ref_dx, ref_dw = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        1.0,
+        lse,
+        x_f32,
+        labels,
+        w_f32,
+        reduction="mean",
+        precision=jax.lax.Precision.HIGHEST,
+    )
+
+    def run_bwd(prec):
+      return kernel.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu(
+          1.0,
+          lse,
+          x,
+          labels,
+          w,
+          reduction="mean",
+          b_block_size=config.b_block_size,
+          h_block_size=config.h_block_size,
+          v_block_size=config.v_block_size,
+          compute_w_grad=compute_w_grad,
+          precision=prec,
+      )
+
+    res_default = run_bwd(jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
+    res_high = run_bwd(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3)
+    res_highest = run_bwd(jax.lax.DotAlgorithmPreset.F32_F32_F32)
+
+    if compute_w_grad:
+      dx_default, dw_default = res_default
+      dx_high, dw_high = res_high
+      dx_highest, dw_highest = res_highest
+    else:
+      dx_default, dx_high, dx_highest = res_default, res_high, res_highest
+      dw_default = dw_high = dw_highest = None
+
+    err_dx_default = float(jnp.max(jnp.abs(dx_default - ref_dx)))
+    err_dx_high = float(jnp.max(jnp.abs(dx_high - ref_dx)))
+    err_dx_highest = float(jnp.max(jnp.abs(dx_highest - ref_dx)))
+    # 2-pass hilo (BF16_BF16_F32_X3) recovers ~16 mantissa bits vs 7 for 1-pass.
+    self.assertLess(err_dx_high, err_dx_default / 10.0)
+    self._assert_allclose(
+        dx_high, ref_dx, atol=5e-4, rtol=5e-4, name="dx_high"
+    )
+    self._assert_allclose(
+        dx_highest, ref_dx, atol=1e-4, rtol=1e-4, name="dx_highest"
+    )
+    self.assertLessEqual(err_dx_highest, err_dx_high + 1e-6)
+
+    if compute_w_grad:
+      assert (
+          dw_default is not None
+          and dw_high is not None
+          and dw_highest is not None
+      )
+      err_dw_default = float(jnp.max(jnp.abs(dw_default - ref_dw)))
+      err_dw_high = float(jnp.max(jnp.abs(dw_high - ref_dw)))
+      self.assertLess(err_dw_high, err_dw_default / 10.0)
+      self._assert_allclose(
+          dw_high, ref_dw, atol=5e-4, rtol=5e-4, name="dw_high"
+      )
+      self._assert_allclose(
+          dw_highest, ref_dw, atol=1e-4, rtol=1e-4, name="dw_highest"
+      )
+
 
 class HeuristicConfigTest(parameterized.TestCase):
 
@@ -1154,6 +1399,84 @@ class CostEstimateTest(parameterized.TestCase):
     self.assertEqual(cost.flops, expected_flops)
     self.assertEqual(cost.transcendentals, expected_transcendentals)
     self.assertEqual(cost.bytes_accessed, expected_bytes)
+
+  def test_bwd_cost_estimate_without_w_grad(self):
+    b, h, v = 1024, 512, 2048
+    dout = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    x = jax.ShapeDtypeStruct(shape=(b, h), dtype=jnp.bfloat16)
+    labels = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.int32)
+    w = jax.ShapeDtypeStruct(shape=(h, v), dtype=jnp.bfloat16)
+    lse = jax.ShapeDtypeStruct(shape=(b,), dtype=jnp.float32)
+    out_type = [jax.ShapeDtypeStruct(shape=(1, b, h), dtype=jnp.float32)]
+
+    cost = kernel.linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+        dout=dout,
+        x=x,
+        labels=labels,
+        w=w,
+        lse=lse,
+        out_type=out_type,
+        compute_w_grad=False,
+    )
+    cost_default_out = (
+        kernel.linear_softmax_cross_entropy_loss_bwd_cost_estimate(
+            dout=dout,
+            x=x,
+            labels=labels,
+            w=w,
+            lse=lse,
+            compute_w_grad=False,
+        )
+    )
+
+    expected_flops = 2 * (2 * b * h * v) + 3 * b * v
+    expected_bytes = b * 4 + b * h * 2 + b * 4 + h * v * 2 + b * 4 + b * h * 4
+    self.assertEqual(cost.flops, expected_flops)
+    self.assertEqual(cost.transcendentals, b * v)
+    self.assertEqual(cost.bytes_accessed, expected_bytes)
+    self.assertEqual(cost_default_out, cost)
+
+  def test_bwd_vmem_and_heuristic_without_w_grad(self):
+    vmem_with = kernel._calculate_bwd_vmem_bytes(
+        1024, 512, 2048, dtype=jnp.dtype(jnp.bfloat16), compute_w_grad=True
+    )
+    vmem_without = kernel._calculate_bwd_vmem_bytes(
+        1024, 512, 2048, dtype=jnp.dtype(jnp.bfloat16), compute_w_grad=False
+    )
+    self.assertLess(vmem_without, vmem_with)
+
+    mock_tpu_info = _mock_tpu_info()
+    with mock.patch.object(
+        kernel.pltpu, "get_tpu_info", return_value=mock_tpu_info
+    ):
+      vmem_limit = 32 * 1024 * 1024
+      cfg_with = kernel.get_heuristic_bwd_config(
+          4096,
+          512,
+          32768,
+          dtype=jnp.dtype(jnp.bfloat16),
+          vmem_limit_bytes=vmem_limit,
+          compute_w_grad=True,
+      )
+      cfg_without = kernel.get_heuristic_bwd_config(
+          4096,
+          512,
+          32768,
+          dtype=jnp.dtype(jnp.bfloat16),
+          vmem_limit_bytes=vmem_limit,
+          compute_w_grad=False,
+      )
+    self.assertGreater(cfg_without.v_block_size, cfg_with.v_block_size)
+    self.assertLessEqual(
+        kernel._calculate_bwd_vmem_bytes(
+            cfg_without.b_block_size,
+            cfg_without.h_block_size,
+            cfg_without.v_block_size,
+            dtype=jnp.dtype(jnp.bfloat16),
+            compute_w_grad=False,
+        ),
+        vmem_limit,
+    )
 
 
 class SafeInputOutputBufferCountTest(parameterized.TestCase):
