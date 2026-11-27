@@ -338,6 +338,8 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "batched_only",
+        "prefill_only",
     ),
 )
 def fused_conv1d_gdn(
@@ -377,6 +379,8 @@ def fused_conv1d_gdn(
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
     max_mixed_tile_size: int | None = None,
+    batched_only: bool = False,
+    prefill_only: bool = False,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
   """Perform conv1d and gdn in a single fused kernel.
 
@@ -445,6 +449,12 @@ def fused_conv1d_gdn(
     decode_tile_size: Tile size along sequence dimension for decode sequences.
     mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
       sequences.
+    max_mixed_tile_size: Optional upper bound on the auto-selected
+      `mixed_tile_size`.
+    batched_only: If True, launch only the batched decode/verify kernel over
+      sequences `[0, distribution[0])`.
+    prefill_only: If True, launch only the per-sequence prefill/mixed kernel
+      over sequences `[distribution[0], distribution[-1])`.
 
   Returns:
     new_states: Updated unified state pool or `(new_conv_state,
@@ -716,18 +726,25 @@ def fused_conv1d_gdn(
         weights,
     )
 
-  # Phase 1: The first segment holds verify windows of up to
-  # `num_spec_tokens + 1` tokens, or plain 1-token decodes without
-  # speculative decoding.
-  out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
+  if batched_only and prefill_only:
+    raise ValueError("batched_only and prefill_only cannot both be True.")
+  if prefill_only:
+    out_act, out_states = call_kernel(states, None, config.GDNMode.PER_SEQ)
+  elif batched_only:
+    out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
+  else:
+    # Phase 1: The first segment holds verify windows of up to
+    # `num_spec_tokens + 1` tokens, or plain 1-token decodes without
+    # speculative decoding.
+    out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
 
-  # Phase 2: Prefill/mixed pass over sequences
-  # [distribution[0], distribution[-1])
-  out_act, out_states = call_kernel(
-      out_states,
-      out_act,
-      config.GDNMode.PER_SEQ,
-  )
+    # Phase 2: Prefill/mixed pass over sequences
+    # [distribution[0], distribution[-1])
+    out_act, out_states = call_kernel(
+        out_states,
+        out_act,
+        config.GDNMode.PER_SEQ,
+    )
 
   out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
   if not is_shared:

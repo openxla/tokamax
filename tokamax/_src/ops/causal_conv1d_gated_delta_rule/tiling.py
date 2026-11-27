@@ -27,27 +27,31 @@ def decode_tile_target(
     n_v: int,
     tile_sizes: tuple[int, ...] = GDNConfig.DECODE_TILE_SIZES,
     step_cost_in_head_transfers: int = 16,
+    window_size: int = 1,
+    rec_state_bytes: int = 4,
 ) -> int:
-  """Returns the largest candidate T with T^2 * n_v <= K * num_seqs, else 1.
+  """Returns the largest candidate T with T^2 * eff_n_v <= budget, else 1.
 
-  Each grid step pays a fixed pipeline overhead across (num_seqs / T) steps,
-  while the unoverlapped first state fetch and last write-back scale with
-  T * n_v. Balancing those terms gives T^2 * n_v <= K * num_seqs, where K
-  (step_cost_in_head_transfers) is the step overhead in per-head state
-  transfers.
+  For non-power-of-two head counts (e.g. Qwen3.8 48 v-heads -> n_v in
+  {6, 12, 24, 48}), round n_v down to its leading power-of-two sublane tier
+  and scale the 1-token step budget for bf16 recurrent state (keeping
+  window_size > 1 uninflated so multi-token verify retains >= 4 pipeline steps).
 
   Args:
-    num_seqs: Upper bound on active sequences in the decode batch.
-    n_v: Number of value heads per device.
+    num_seqs: Number of active sequences in the batch.
+    n_v: Number of value heads per device shard.
     tile_sizes: Candidate sequence tile sizes in descending order.
-    step_cost_in_head_transfers: Per-step pipeline overhead in per-head state
-      transfers (K).
-
-  Returns:
-    Target decode sequence tile size T.
+    step_cost_in_head_transfers: Step overhead measured in head state transfers.
+    window_size: Query tokens processed per sequence in each step.
+    rec_state_bytes: Element byte width of the recurrent state tensor.
   """
-  budget = step_cost_in_head_transfers * num_seqs
-  return next((t for t in tile_sizes if t * t * n_v <= budget), 1)
+  eff_n_v = 1 << (max(1, n_v).bit_length() - 1)
+  if (n_v & (n_v - 1)) != 0 and window_size == 1:
+    dtype_scale = max(1, 4 // max(1, rec_state_bytes))
+    budget = step_cost_in_head_transfers * dtype_scale * num_seqs
+  else:
+    budget = step_cost_in_head_transfers * num_seqs
+  return next((t for t in tile_sizes if t * t * eff_n_v <= budget), 1)
 
 
 def align_to(x: int, alignment: int) -> int:
@@ -410,6 +414,7 @@ def get_tile_sizes(
   # A batch of padded_batch_size tokens spans at most padded_batch_size
   # active sequences even when num_seqs reflects a larger static slot table.
   active_num_seqs = max(1, min(padded_batch_size, num_seqs))
+  rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
   if decode_tile_size is None or decode_tile_size <= 0:
     vmem_fit = calculate_decode_tile_size(
         batch_size=active_num_seqs,
@@ -426,7 +431,15 @@ def get_tile_sizes(
         window_size=window_size,
         attention_mode=attention_mode,
     )
-    decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
+    decode_tile_size = min(
+        decode_tile_target(
+            active_num_seqs,
+            n_v,
+            window_size=window_size,
+            rec_state_bytes=rec_state_bytes,
+        ),
+        vmem_fit,
+    )
 
   if mixed_tile_size is None or mixed_tile_size <= 0:
     # Size C from the token bucket: a static (B, N, W) shape cannot tell a
