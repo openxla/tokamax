@@ -15,6 +15,7 @@
 """Input generation and routing helpers shared across routing_moe tests."""
 
 import dataclasses
+import functools
 import math
 import statistics
 from typing import Self
@@ -52,6 +53,27 @@ def make_mesh(
   )
 
 
+@functools.lru_cache(maxsize=64)
+def _lognormal_base_probabilities(
+    num_experts: int, max_to_mean_load: float
+) -> np.ndarray:
+  """Returns sorted base lognormal routing probabilities for `num_experts`."""
+  normal = statistics.NormalDist()
+  quantiles = (np.arange(num_experts) + 0.5) / num_experts
+  z = np.array([normal.inv_cdf(q) for q in quantiles])
+  z_max = z[-1]
+  if max_to_mean_load <= 1.0 or 2 * math.log(max_to_mean_load) > z_max**2:
+    raise ValueError(
+        f"max_to_mean_load must be in (1, {math.exp(z_max**2 / 2):.4g}] for"
+        f" {num_experts} experts. Got {max_to_mean_load}."
+    )
+  sigma = z_max - math.sqrt(z_max**2 - 2 * math.log(max_to_mean_load))
+  p = np.exp(sigma * z)
+  probs = p / p.sum()
+  probs.setflags(write=False)
+  return probs
+
+
 def _lognormal_popularity(
     key: jax.Array, num_experts: int, max_to_mean_load: float
 ) -> np.ndarray:
@@ -71,19 +93,88 @@ def _lognormal_popularity(
   Returns:
     A `float64[num_experts]` array of probabilities that sums to 1.
   """
-  normal = statistics.NormalDist()
-  quantiles = (np.arange(num_experts) + 0.5) / num_experts
-  z = np.array([normal.inv_cdf(q) for q in quantiles])
-  z_max = z[-1]
-  if max_to_mean_load <= 1.0 or 2 * math.log(max_to_mean_load) > z_max**2:
-    raise ValueError(
-        f"max_to_mean_load must be in (1, {math.exp(z_max**2 / 2):.4g}] for"
-        f" {num_experts} experts. Got {max_to_mean_load}."
-    )
-  sigma = z_max - math.sqrt(z_max**2 - 2 * math.log(max_to_mean_load))
-  p = np.exp(sigma * z)
+  base = _lognormal_base_probabilities(num_experts, max_to_mean_load)
   perm = np.asarray(jax.random.permutation(key, num_experts))
-  return (p / p.sum())[perm]
+  return base[perm]
+
+
+def _apply_gating_masks(
+    gating_output: jax.Array,
+    num_experts: int,
+    num_skipped: int,
+    force_expert: int | None,
+    dtype: jnp.dtype,
+) -> jax.Array:
+  """Pushes skipped experts below and forced expert above every other logit."""
+  # Skipped experts go below and the forced expert above every other logit,
+  # which is -1 and 2 for uniform logits.
+  if num_skipped:
+    skipped = jnp.minimum(-1.0, gating_output.min() - 1).astype(dtype)
+    gating_output = gating_output.at[:, num_experts - num_skipped :].set(
+        skipped
+    )
+  if force_expert is not None:
+    forced = jnp.maximum(2.0, gating_output[0].max() + 1).astype(dtype)
+    gating_output = gating_output.at[0, force_expert].set(forced)
+  return gating_output
+
+
+@jax.jit(
+    static_argnames=(
+        "num_tokens",
+        "num_experts",
+        "num_skipped",
+        "force_expert",
+        "dtype",
+    )
+)
+def _random_gating_uniform(
+    key: jax.Array,
+    num_tokens: int,
+    num_experts: int,
+    num_skipped: int,
+    force_expert: int | None,
+    dtype: jnp.dtype,
+) -> jax.Array:
+  """Generates uniform router logits with optional skipped and forced masks."""
+  k_logits, _ = jax.random.split(key)
+  gating_output = jax.random.uniform(
+      k_logits, (num_tokens, num_experts), dtype=dtype
+  )
+  return _apply_gating_masks(
+      gating_output, num_experts, num_skipped, force_expert, dtype
+  )
+
+
+@jax.jit(
+    static_argnames=(
+        "num_tokens",
+        "num_experts",
+        "num_skipped",
+        "force_expert",
+        "dtype",
+    )
+)
+def _random_gating_skewed(
+    key: jax.Array,
+    base_probs: jax.Array,
+    num_tokens: int,
+    num_experts: int,
+    num_skipped: int,
+    force_expert: int | None,
+    dtype: jnp.dtype,
+) -> jax.Array:
+  """Generates lognormal-skewed Gumbel router logits with optional masks."""
+  k_logits, k_popularity = jax.random.split(key)
+  perm = jax.random.permutation(k_popularity, num_experts)
+  popularity = base_probs[perm]
+  # Top-k of log probabilities plus Gumbel noise samples experts in
+  # proportion to `popularity`, without replacement.
+  gumbel = jax.random.gumbel(k_logits, (num_tokens, num_experts))
+  gating_output = (jnp.log(popularity) + gumbel).astype(dtype)
+  return _apply_gating_masks(
+      gating_output, num_experts, num_skipped, force_expert, dtype
+  )
 
 
 def random_gating(
@@ -114,32 +205,29 @@ def random_gating(
   Returns:
     `[num_tokens, num_experts]` router logits.
   """
-  k_logits, k_popularity = jax.random.split(key)
+  resolved_dtype = jnp.dtype(dtype)
   if max_to_mean_load == 1.0:
-    gating_output = jax.random.uniform(
-        k_logits, (num_tokens, num_experts), dtype=dtype
+    return _random_gating_uniform(
+        key,
+        num_tokens,
+        num_experts,
+        num_skipped,
+        force_expert,
+        resolved_dtype,
     )
-  else:
-    popularity = _lognormal_popularity(
-        k_popularity, num_experts, max_to_mean_load
-    )
-    # Top-k of log probabilities plus Gumbel noise samples experts in
-    # proportion to `popularity`, without replacement.
-    gumbel = jax.random.gumbel(k_logits, (num_tokens, num_experts))
-    gating_output = (jnp.log(popularity) + gumbel).astype(dtype)
-  # Skipped experts go below and the forced expert above every other logit,
-  # which is -1 and 2 for uniform logits.
-  if num_skipped:
-    skipped = jnp.minimum(-1.0, gating_output.min() - 1).astype(dtype)
-    gating_output = gating_output.at[:, num_experts - num_skipped :].set(
-        skipped
-    )
-  if force_expert is not None:
-    forced = jnp.maximum(2.0, gating_output[0].max() + 1).astype(dtype)
-    gating_output = gating_output.at[0, force_expert].set(forced)
-  return gating_output
+  base_probs = _lognormal_base_probabilities(num_experts, max_to_mean_load)
+  return _random_gating_skewed(
+      key,
+      jnp.asarray(base_probs),
+      num_tokens,
+      num_experts,
+      num_skipped,
+      force_expert,
+      resolved_dtype,
+  )
 
 
+@jax.jit(static_argnames=("k", "renormalize"))
 def top_k(
     gating_output: jax.Array, k: int, *, renormalize: bool = True
 ) -> tuple[jax.Array, jax.Array]:
@@ -151,6 +239,7 @@ def top_k(
   return weights, indices.astype(jnp.int32)
 
 
+@jax.jit(static_argnames=("num_tokens", "topk", "num_experts", "ep_size"))
 def balanced_topk_indices(
     key: jax.Array, num_tokens: int, topk: int, num_experts: int, ep_size: int
 ) -> jax.Array:
@@ -164,27 +253,35 @@ def balanced_topk_indices(
   return (local_indices + shard_offsets).reshape(num_tokens, topk)
 
 
+@jax.jit(static_argnames=("quant_dtype", "block_size"))
+def _sub_channel_quantize_impl(
+    x: jax.Array,
+    quant_dtype: jnp.dtype,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array]:
+  """JIT-compiled vectorized sub-channel quantization kernel."""
+  if jnp.issubdtype(quant_dtype, jnp.floating):
+    dtype_max = float(jnp.finfo(quant_dtype).max)
+  else:
+    dtype_max = float(jnp.iinfo(quant_dtype).max)
+  num_blocks = x.shape[-2] // block_size
+  y = x.reshape(*x.shape[:-2], num_blocks, block_size, x.shape[-1])
+  abs_max = jnp.abs(y).max(axis=-2, keepdims=True)
+  scale = (abs_max / dtype_max).astype(jnp.float32)
+  return (y / scale).astype(quant_dtype).reshape(x.shape), scale
+
+
 def sub_channel_quantize(
     x: jax.Array,
     quant_dtype: jax.typing.DTypeLike,
     block_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Quantizes `x` along its second-most-minor axis and returns `(q, scale)`."""
+  assert x.ndim >= 2
   if block_size is None:
     block_size = x.shape[-2]
-  if jnp.issubdtype(quant_dtype, jnp.floating):
-    dtype_max = float(jnp.finfo(quant_dtype).max)
-  else:
-    dtype_max = float(jnp.iinfo(quant_dtype).max)
-  assert x.ndim >= 2 and x.shape[-2] % block_size == 0
-  w_lst, scale_lst = [], []
-  for i in range(0, x.shape[-2], block_size):
-    y = x[:, i : i + block_size, :]
-    abs_max = jnp.abs(y).max(axis=1, keepdims=True)
-    scale = (abs_max / dtype_max).astype(jnp.float32)
-    w_lst.append((y / scale).astype(quant_dtype))
-    scale_lst.append(scale)
-  return jnp.concat(w_lst, axis=1), jnp.concat(scale_lst, axis=1)[:, :, None]
+  assert block_size > 0 and x.shape[-2] % block_size == 0
+  return _sub_channel_quantize_impl(x, jnp.dtype(quant_dtype), block_size)
 
 
 @jax.jit(static_argnames=("quant_dtype", "k_shards"))
@@ -360,6 +457,26 @@ class MoEInputs:
     )
 
 
+@jax.jit(static_argnames=("num_experts",))
+def _compute_routing_arrays(
+    topk_indices: jax.Array,
+    num_experts: int,
+    group_offset: jax.Array | int,
+    num_local_experts: jax.Array | int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Sorts `topk_indices` by expert and extracts shard row bounds."""
+  flat = topk_indices.flatten()
+  row_group, sorted_to_flat = jax.lax.sort_key_val(
+      flat, jnp.arange(flat.size, dtype=jnp.int32), is_stable=True
+  )
+  group_sizes = jnp.bincount(flat, length=num_experts)
+  group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+  row_bounds = group_cum_sum[
+      jnp.array([group_offset, group_offset + num_local_experts])
+  ]
+  return group_sizes, row_group, sorted_to_flat, row_bounds
+
+
 @dataclasses.dataclass(frozen=True)
 class Routing:
   """A top-k routing sorted by expert, and the slice one EP shard serves.
@@ -445,12 +562,12 @@ class Routing:
     """Sorts `topk_indices` by expert and locates the shard's row range."""
     if num_local_experts is None:
       num_local_experts = num_experts
-    flat = topk_indices.flatten()
-    row_group, sorted_to_flat = jax.lax.sort_key_val(
-        flat, jnp.arange(flat.size, dtype=jnp.int32), is_stable=True
+    group_sizes, row_group, sorted_to_flat, row_bounds = (
+        _compute_routing_arrays(
+            topk_indices, num_experts, group_offset, num_local_experts
+        )
     )
-    group_sizes = jnp.bincount(flat, length=num_experts)
-    group_cum_sum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    row_start, row_end = (int(x) for x in np.asarray(row_bounds))
     return cls(
         topk_indices=topk_indices,
         group_sizes=group_sizes,
@@ -458,6 +575,6 @@ class Routing:
         sorted_to_flat=sorted_to_flat,
         group_offset=group_offset,
         num_local_experts=num_local_experts,
-        row_start=int(group_cum_sum[group_offset]),
-        row_end=int(group_cum_sum[group_offset + num_local_experts]),
+        row_start=row_start,
+        row_end=row_end,
     )
