@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
 from tokamax._src import jaxtyping
+from tokamax._src.ops.kda import pallas_mosaic_tpu_gdn_kernel
 from tokamax._src.ops.kda.common import (
     RCP_LN2,
     estimate_mini_batch,
@@ -3189,6 +3190,37 @@ def chunk_gdn_fwd_custom(
     assert query is not None and key is not None and value is not None
     B, T, _, _ = query.shape
     act_dtype = query.dtype
+
+  if (
+      qkv_conv is None
+      and query is not None
+      and key is not None
+      and value is not None
+      and act_dtype == jnp.bfloat16
+      and segment_ids is None
+      and not _cp_active
+      and initial_state is None
+      and not output_final_state
+      and not use_gate_in_kernel
+      and a_log is None
+      and delta_time_bias is None
+      and not two_pass_bf16
+      and BT == pallas_mosaic_tpu_gdn_kernel.CHUNK_SIZE
+      and K % 128 == 0
+      and V % 128 == 0
+  ):
+    return pallas_mosaic_tpu_gdn_kernel.gdn_fwd(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        return_residuals=return_residuals,
+        save_for_backward=save_for_backward,
+    )
 
   interpret = get_interpret()
   can_native_qkv = (
