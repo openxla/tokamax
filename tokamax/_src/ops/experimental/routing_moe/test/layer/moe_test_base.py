@@ -167,13 +167,31 @@ class MoEUnitTest(MoETestCase):
         helper_shapes.BASIC, layout, reduce_output=False
     )
 
-  @parameterized.product(sharding=_UNIT_SHARDINGS, use_sp=[True, False])
+  @parameterized.product(
+      sharding=_UNIT_SHARDINGS,
+      use_sp=[True, False],
+      reduce_output=[True, False],
+  )
   def test_shared_expert(
-      self, sharding: helper_cases.MoESharding, use_sp: bool
+      self,
+      sharding: helper_cases.MoESharding,
+      use_sp: bool,
+      reduce_output: bool,
   ):
+    """Checks the shared expert, replicated under SP and TP-sharded otherwise."""
     shape = dataclasses.replace(helper_shapes.BASIC, has_shared_expert=True)
     layout = moe_test_lib.WeightLayout(sharding, use_sp=use_sp)
-    self.check_matches_reference(shape, layout, reduce_output=False)
+    self.check_matches_reference(shape, layout, reduce_output=reduce_output)
+
+  @parameterized.product(use_sp=[True, False])
+  def test_shared_expert_remote_scatter(self, use_sp: bool):
+    """Checks the shared expert combined with EP remote scatter."""
+    shape = dataclasses.replace(helper_shapes.BASIC, has_shared_expert=True)
+    layout = moe_test_lib.WeightLayout(
+        helper_cases.MoESharding(ep=2), use_sp=use_sp
+    )
+    moe_plan = moe_plan_lib.RoutingMoEPlan(remote_scatter=True)
+    self.check_matches_reference(shape, layout, moe_plan=moe_plan)
 
   def test_unreduced_output_with_remote_scatter_raises(self):
     with self.assertRaisesRegex(

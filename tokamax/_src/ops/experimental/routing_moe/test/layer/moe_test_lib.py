@@ -49,6 +49,8 @@ class WeightLayout:
   Attributes:
     sharding: Data-, expert-, and tensor-parallel shard counts.
     use_sp: Whether tokens are sharded on input and output (sequence parallel).
+      The shared expert weights are replicated under SP and TP-sharded over the
+      reduction axis otherwise.
     fold_shared_expert: Whether to append the shared expert to the routed
       experts and route to it with a sigmoid gate. Only valid when `sharding.ep
       == 1` and for entries that take an external top-k.
@@ -126,7 +128,11 @@ def _shard_inputs(
         w1_scale=_maybe_interleave(moe_in.w1_scale, sharding_spec.tp),
         w1_bias=_maybe_interleave(moe_in.w1_bias, sharding_spec.tp),
     )
-  if moe_in.w1_shared is not None and sharding_spec.num_cores > 1:
+  if (
+      moe_in.w1_shared is not None
+      and sharding_spec.num_cores > 1
+      and not layout.use_sp
+  ):
     moe_in = dataclasses.replace(
         moe_in,
         w1_shared=_interleave_gate_up(
@@ -150,6 +156,7 @@ def _shard_inputs(
   ep = layout.sharding.ep_axis
   tp = layout.sharding.tp_axis
   red = layout.sharding.reduction_axis
+  shared = None if layout.use_sp else red
   act = P(red, None) if layout.use_sp else P(None, None)
 
   return helper_inputs.MoEInputs(
@@ -171,18 +178,18 @@ def _shard_inputs(
       ),
       w1_bias=_maybe_put(moe_in.w1_bias, P(ep, None, tp)),
       w2_bias=_maybe_put(moe_in.w2_bias, P(ep, None, None)),
-      w1_shared=_maybe_put(moe_in.w1_shared, P(None, None, red)),
-      w2_shared=_maybe_put(moe_in.w2_shared, P(None, red, None)),
+      w1_shared=_maybe_put(moe_in.w1_shared, P(None, None, shared)),
+      w2_shared=_maybe_put(moe_in.w2_shared, P(None, shared, None)),
       w1_shared_scale=_maybe_put(
           moe_in.w1_shared_scale,
           layer_config.w1_scale_pspec(
-              _scale_shape(moe_in.w1_shared_scale), ep_axis=None, tp_axis=red
+              _scale_shape(moe_in.w1_shared_scale), ep_axis=None, tp_axis=shared
           ),
       ),
       w2_shared_scale=_maybe_put(
           moe_in.w2_shared_scale,
           layer_config.w2_scale_pspec(
-              _scale_shape(moe_in.w2_shared_scale), ep_axis=None, tp_axis=red
+              _scale_shape(moe_in.w2_shared_scale), ep_axis=None, tp_axis=shared
           ),
       ),
       w_shared_gate=_maybe_put(moe_in.w_shared_gate, P(None, None)),
@@ -219,7 +226,9 @@ def _make_case_inputs(
   # Each TP shard of w2 quantizes and pads its K-dimension scale rows locally.
   w2_shards = layout.sharding.tp
   shared_shards = (
-      layout.sharding.num_cores if base.w2_shared is not None else 1
+      layout.sharding.num_cores
+      if base.w2_shared is not None and not layout.use_sp
+      else 1
   )
   if w2_shards == 1 and shared_shards == 1:
     return raw, raw
@@ -246,17 +255,13 @@ def _shared_expert_local(
     reduce_output: bool,
 ) -> jax.Array:
   """Computes the shared expert on one shard and optionally reduces it."""
-  if use_sp:
-    x = jax.lax.all_gather(x, axis_name=axis, axis=0, tiled=True)
+  # Under SP, the weights are replicated, so `out` is final for local tokens.
+  # Otherwise, they are TP-sharded and `out` is partial over all tokens.
   out = helper_reference.shared_expert(
       x, w1, w2, w1_scale, w2_scale, w_gate, activation=activation
   )
-  if not reduce_output:
+  if use_sp or not reduce_output:
     return out
-  if use_sp:
-    return jax.lax.psum_scatter(
-        out, axis_name=axis, scatter_dimension=0, tiled=True
-    )
   return jax.lax.psum(out, axis_name=axis)
 
 
@@ -268,26 +273,28 @@ def _shared_expert(
     activation: str,
     reduce_output: bool,
 ) -> jax.Array:
-  """Computes the TP-sharded shared expert output on `mesh`."""
+  """Computes the shared expert output on `mesh`."""
   assert moe.w1_shared is not None
   assert moe.w2_shared is not None
   assert moe.w_shared_gate is not None
   axis = layout.sharding.reduction_axis
-  act_spec = P(axis, None) if layout.use_sp else P(None, None)
-  if reduce_output and not layout.use_sp:
-    out_spec = P(None, None)
+  if layout.use_sp:
+    w_axis = None
+    act_spec = out_spec = P(axis, None)
   else:
-    out_spec = P(axis, None)
+    w_axis = axis
+    act_spec = P(None, None)
+    out_spec = P(None, None) if reduce_output else P(axis, None)
 
   w1_scale_spec = None
   if moe.w1_shared_scale is not None:
     w1_scale_spec = layer_config.w1_scale_pspec(
-        moe.w1_shared_scale.shape, ep_axis=None, tp_axis=axis
+        moe.w1_shared_scale.shape, ep_axis=None, tp_axis=w_axis
     )
   w2_scale_spec = None
   if moe.w2_shared_scale is not None:
     w2_scale_spec = layer_config.w2_scale_pspec(
-        moe.w2_shared_scale.shape, ep_axis=None, tp_axis=axis
+        moe.w2_shared_scale.shape, ep_axis=None, tp_axis=w_axis
     )
 
   return jax.shard_map(
@@ -301,8 +308,8 @@ def _shared_expert(
       mesh=mesh,
       in_specs=(
           act_spec,
-          P(None, None, axis),
-          P(None, axis, None),
+          P(None, None, w_axis),
+          P(None, w_axis, None),
           w1_scale_spec,
           w2_scale_spec,
           P(None, None),
@@ -397,16 +404,24 @@ def _run_moe(
           **routed_kwargs,
       )
 
+  shared_out = None
   if moe.w1_shared is not None:
-    out += _shared_expert(
+    shared_out = _shared_expert(
         moe,
         mesh=mesh,
         layout=layout,
         activation=shape.activation,
         reduce_output=reduce_output,
     )
+  # Under SP, the shared output is already final, so add it after reducing the
+  # routed output. Otherwise, add it before `_reduce` so unreduced outputs
+  # share one reduction.
+  if shared_out is not None and not layout.use_sp:
+    out += shared_out
   if not reduce_output:
     out = _reduce(out, mesh=mesh, layout=layout)
+  if shared_out is not None and layout.use_sp:
+    out += shared_out
   return out
 
 
