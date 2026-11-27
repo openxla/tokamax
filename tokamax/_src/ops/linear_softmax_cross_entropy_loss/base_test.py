@@ -68,6 +68,43 @@ class LinearSoftmaxCrossEntropyLossBaseTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(ref_grad_x, op_grad_x, atol=1e-5, rtol=1e-5))
     self.assertTrue(jnp.allclose(ref_grad_w, op_grad_w, atol=1e-5, rtol=1e-5))
 
+  def test_precision_bind_canonicalization_and_vjp(self):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 256, 128, 512
+    )
+    fn = base.LinearSoftmaxCrossEntropyLoss()
+    ba_default = fn.bind(x, labels, w)
+    self.assertEqual(
+        ba_default.arguments["precision"],
+        (jax.lax.Precision.DEFAULT, jax.lax.Precision.DEFAULT),
+    )
+    ba_high = fn.bind(x, labels, w, precision="high")
+    self.assertEqual(
+        ba_high.arguments["precision"],
+        (jax.lax.Precision.HIGH, jax.lax.Precision.HIGH),
+    )
+    ba_preset = fn.bind(x, labels, w, precision="BF16_BF16_F32_X3")
+    self.assertEqual(
+        ba_preset.arguments["precision"],
+        jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3,
+    )
+
+    prec = jax.lax.Precision.HIGHEST
+    op_loss, (op_dx, op_dw) = jax.value_and_grad(fn, argnums=(0, 2))(
+        x, labels, w, precision=prec
+    )
+    ref_loss, ref_lse = (
+        reference.linear_softmax_cross_entropy_loss_fwd_reference(
+            x, labels, w, precision=prec
+        )
+    )
+    ref_dx, ref_dw = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        1.0, ref_lse, x, labels, w, precision=prec
+    )
+    self.assertTrue(jnp.allclose(ref_loss, op_loss, atol=1e-5, rtol=1e-5))
+    self.assertTrue(jnp.allclose(ref_dx, op_dx, atol=1e-5, rtol=1e-5))
+    self.assertTrue(jnp.allclose(ref_dw, op_dw, atol=1e-5, rtol=1e-5))
+
 
 if __name__ == "__main__":
   absltest.main()

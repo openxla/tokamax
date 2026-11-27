@@ -354,6 +354,32 @@ class ChunkedXlaTest(parameterized.TestCase):
     self.assertFalse(jnp.any(jnp.isinf(chunked_dx)))
     self.assertFalse(jnp.any(jnp.isinf(chunked_dw)))
 
+  @parameterized.named_parameters(
+      ("highest", jax.lax.Precision.HIGHEST),
+      ("bf16_x3", jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
+  )
+  def test_precision_matches_reference(self, precision):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 256, 128, 512
+    )
+    op_instance = chunked_xla.ChunkedXlaLinearSoftmaxCrossEntropyLoss(
+        config=chunked_xla.Config(b_block_size=128, v_block_size=256)
+    )
+    loss, (dx, dw) = jax.value_and_grad(op_instance, argnums=(0, 2))(
+        x, labels, w, reduction="mean", precision=precision
+    )
+    ref_loss, ref_lse = (
+        reference.linear_softmax_cross_entropy_loss_fwd_reference(
+            x, labels, w, reduction="mean", precision=precision
+        )
+    )
+    ref_dx, ref_dw = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        1.0, ref_lse, x, labels, w, reduction="mean", precision=precision
+    )
+    self.assertTrue(jnp.allclose(loss, ref_loss, atol=1e-4, rtol=1e-4))
+    self.assertTrue(jnp.allclose(dx, ref_dx, atol=1e-4, rtol=1e-4))
+    self.assertTrue(jnp.allclose(dw, ref_dw, atol=1e-4, rtol=1e-4))
+
 
 def _plain_reference_loss(x_input, weights, labels, reduction="sum"):
   logits = jnp.dot(x_input, weights)

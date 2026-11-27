@@ -157,6 +157,25 @@ class FlashLceReferenceTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(ref_grad_x, jax_grad_x, atol=3e-2, rtol=3e-2))
     self.assertTrue(jnp.allclose(ref_grad_w, jax_grad_w, atol=3e-2, rtol=3e-2))
 
+  @parameterized.named_parameters(
+      ("highest", jax.lax.Precision.HIGHEST),
+      ("bf16_x3", jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3),
+  )
+  def test_reference_precision_bwd_matches_jax_grad(self, precision):
+    x, labels, w = test_utils.generate_random_data(
+        jax.random.key(42), 256, 128, 512
+    )
+    (jax_dx, jax_dw), lse = jax.grad(
+        reference.linear_softmax_cross_entropy_loss_fwd_reference,
+        argnums=(0, 2),
+        has_aux=True,
+    )(x, labels, w, reduction="mean", precision=precision)
+    ref_dx, ref_dw = reference.linear_softmax_cross_entropy_loss_bwd_reference(
+        1.0, lse, x, labels, w, reduction="mean", precision=precision
+    )
+    self.assertTrue(jnp.allclose(ref_dx, jax_dx, atol=1e-4, rtol=1e-4))
+    self.assertTrue(jnp.allclose(ref_dw, jax_dw, atol=1e-4, rtol=1e-4))
+
 
 if __name__ == "__main__":
   absltest.main()

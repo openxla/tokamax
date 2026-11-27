@@ -21,16 +21,17 @@ import jax.numpy as jnp
 from jaxtyping import Array, Integer, Real  # pylint: disable=g-multiple-import
 
 
-@partial(jax.jit, static_argnames=["reduction"])
+@partial(jax.jit, static_argnames=["reduction", "precision"])
 def linear_softmax_cross_entropy_loss_fwd_reference(
     x: Real[Array, "B H"],
     labels: Integer[Array, "B"],
     w: Real[Array, "H V"],
     *,
     reduction: Literal["sum", "mean", "none"] = "sum",
+    precision: jax.lax.PrecisionLike = None,
 ) -> tuple[Real[Array, "*"], Real[Array, "B"]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss."""
-  logits = x @ w
+  logits = jnp.matmul(x, w, precision=precision)
   log_probs = jax.nn.log_softmax(logits, axis=-1)
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
   loss = -labels_one_hot * log_probs
@@ -47,7 +48,7 @@ def linear_softmax_cross_entropy_loss_fwd_reference(
     raise ValueError(f"Unsupported reduction method: {reduction}")
 
 
-@partial(jax.jit, static_argnames=["reduction"])
+@partial(jax.jit, static_argnames=["reduction", "precision"])
 def linear_softmax_cross_entropy_loss_bwd_reference(
     dout: Real[Array, "*"],
     lse: Real[Array, "B"],
@@ -56,23 +57,25 @@ def linear_softmax_cross_entropy_loss_bwd_reference(
     w: Real[Array, "H V"],
     *,
     reduction: Literal["sum", "mean", "none"] = "sum",
+    precision: jax.lax.PrecisionLike = None,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The reference Jax implementation of the linear softmax cross-entropy loss backward kernel."""
   labels_one_hot = jax.nn.one_hot(labels, num_classes=w.shape[1], dtype=x.dtype)
-  s = -labels_one_hot + jnp.exp(x @ w - lse[:, None])
+  logits = jnp.matmul(x, w, precision=precision)
+  s = -labels_one_hot + jnp.exp(logits - lse[:, None])
   num_tokens = x.shape[0]
 
   if reduction == "none":
     s_scaled = s * dout[:, None]
-    x_grad = s_scaled @ w.T
-    w_grad = x.T @ s_scaled
+    x_grad = jnp.matmul(s_scaled, w.T, precision=precision)
+    w_grad = jnp.matmul(x.T, s_scaled, precision=precision)
   elif reduction == "mean":
     scale = dout / num_tokens
-    x_grad = (s @ w.T) * scale
-    w_grad = (x.T @ s) * scale
+    x_grad = jnp.matmul(s, w.T, precision=precision) * scale
+    w_grad = jnp.matmul(x.T, s, precision=precision) * scale
   elif reduction == "sum":
-    x_grad = (s @ w.T) * dout
-    w_grad = (x.T @ s) * dout
+    x_grad = jnp.matmul(s, w.T, precision=precision) * dout
+    w_grad = jnp.matmul(x.T, s, precision=precision) * dout
   else:
     raise ValueError(f"Unsupported reduction method: {reduction}")
 

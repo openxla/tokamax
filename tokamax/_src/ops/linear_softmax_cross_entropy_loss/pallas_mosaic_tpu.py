@@ -106,6 +106,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
       w: Real[Array, "H V"],
       *,
       reduction: Literal["sum", "mean", "none"] = "sum",
+      precision: base.CanonicalPrecision = base.DEFAULT_PRECISION,
       config: Config,
       return_residuals: bool,
   ) -> tuple[jax.Array, base.Residuals]:
@@ -117,6 +118,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLoss(
         h_block_size=config.h_block_size,
         v_block_size=config.v_block_size,
         reduction=reduction,
+        precision=precision,
     )
     return loss, (lse,)
 
@@ -236,6 +238,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
       w: Real[Array, "H V"],
       *,
       reduction: Literal["sum", "mean", "none"] = "sum",
+      precision: base.CanonicalPrecision = base.DEFAULT_PRECISION,
       config: Config,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
@@ -253,6 +256,7 @@ class PallasMosaicTpuLinearSoftmaxCrossEntropyLossVjp(
             h_block_size=config.h_block_size,
             v_block_size=config.v_block_size,
             reduction=reduction,
+            precision=precision,
             buffer_count=config.buffer_count,
         )
     )
