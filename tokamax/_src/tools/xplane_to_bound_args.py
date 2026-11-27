@@ -33,6 +33,7 @@ import sys
 from absl import app
 from absl import flags
 from tokamax._src import hlo_utils
+from tokamax._src.autotuning import api as autotuning_api
 from tensorflow.compiler.xla.service import hlo_pb2
 from tensorflow.tsl.profiler.protobuf import xplane_pb2
 
@@ -110,8 +111,7 @@ def main(argv):
   print(f"Found {len(all_opspecs)} op specs.")
 
   with open(FLAGS.output_file, "w") as f:
-    for opspec in all_opspecs:
-      f.write(str(opspec) + "\n")
+    f.write(autotuning_api.dump_bound_args_to_json(all_opspecs))
 
   print(f"Results written to {FLAGS.output_file}")
 

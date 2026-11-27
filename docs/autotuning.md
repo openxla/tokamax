@@ -7,7 +7,7 @@ every input of interest, via *autotuning*. Tokamax provides a framework both to
 perform autotuning, and to simplify the management of this process and its
 outputs.
 
-### High-level Overview
+### High-Level Overview
 
 Every `tokamax.Op` implementation defines its set of tunable hyperparameters,
 and the range of values each of those configs can assume, in
@@ -34,11 +34,20 @@ autotuner uses StableHLO metadata to extract information about every Op and its
 respective inputs, and autotunes each one.
 
 ```python
-# Autotune all Tokamax kernels in f, which can be a JAX function with multiple Tokamax ops and non-Tokamax ops as well. Assume f takes a dictionary of args as input.
-autotune_result: tokamax.AutotuningResult = tokamax.autotune(f, **args)
-# Best possible result
+# Autotune all Tokamax kernels in f, which can be a JAX function with multiple
+# Tokamax ops and non-Tokamax ops as well. args is passed positionally to f.
+autotune_result: tokamax.AutotuningResult = tokamax.autotune(f, *args)
 with autotune_result:
-    out_autotuned = f(**args)
+    out_autotuned = f(*args)
+```
+
+If `f` requires keyword arguments, use `tokamax.autotuning.get_bound_args` instead:
+
+```python
+bound_args = tokamax.autotuning.get_bound_args(f, **kwargs)
+autotune_result = tokamax.autotune(bound_args)
+with autotune_result:
+    out_autotuned = f(**kwargs)
 ```
 
 Tokamax VJP ops may be implemented as their own Op class and have their own
@@ -65,8 +74,11 @@ The autotuner can take in a sequence of `BoundArguments` as input, and autotunes
 each one.
 
 ```python
-ragged_dot_ba = tokamax.PallasMosaicTpuRaggedDot.bind(x, y, group)
-attention_ba = tokamax.PallasMosaicTpuAttention.bind(q, k, v)
+from tokamax._src.ops.ragged_dot.pallas_mosaic_tpu import PallasMosaicTpuRaggedDot
+from tokamax._src.ops.attention.pallas_mosaic_tpu import PallasMosaicTpuFlashAttention
+
+ragged_dot_ba = PallasMosaicTpuRaggedDot().bind(x, y, group)
+attention_ba = PallasMosaicTpuFlashAttention().bind(q, k, v)
 
 autotune_result: tokamax.AutotuningResult = tokamax.autotune([ragged_dot_ba, attention_ba])
 
@@ -96,7 +108,7 @@ and autotune all the Tokamax ops used like this:
 ```python
 import tokamax
 
-bound_args = tokamax.autotuning.bound_args_from_json("/tmp/bound_args.json")
+bound_args = tokamax.autotuning.bound_args_from_json_file("/tmp/bound_args.json")
 autotune_result = tokamax.autotune(bound_args)
 ```
 
@@ -109,15 +121,7 @@ different ways to suit your needs.
 #### Context Manager
 
 You may directly utilize the autotuning result as a context manager in your
-code.
-
-```python
-# Autotune all Tokamax kernels in f, which can be a JAX function with multiple Tokamax ops and non-Tokamax ops as well. Assume f takes a dictionary of args as input.
-autotune_result: tokamax.AutotuningResult = tokamax.autotune(f, **args)
-# Best possible result
-with autotune_result:
-    out_autotuned = f(**args)
-```
+code, as shown in the [Callable Function](#callable-function) example above.
 
 #### Serialized `AutotuningResult`
 
@@ -138,8 +142,8 @@ Multiple AutotuningResult objects can also be merged together into a single
 object, by reading the results in as a JSON string using `load`.
 
 ```python
-autotune_result_1 = tokamax.AutotuningResult.load(path_to_file_1)
-autotune_result_2 = tokamax.AutotuningResult.load(path_to_file_2)
+autotune_result_1 = tokamax.AutotuningResult.load(open(path_to_file_1))
+autotune_result_2 = tokamax.AutotuningResult.load(open(path_to_file_2))
 merged_results = autotune_result_1 | autotune_result_2
 
 with merged_results:
