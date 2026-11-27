@@ -412,6 +412,7 @@ SHARDS: ShardMap = {
     'experimental-routing-moe-layer-unit': Spec(
         paths=(
             'tokamax/_src/ops/experimental/routing_moe/test/layer/modular_unit_test.py',
+            'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_aot_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_block_scaled_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_config_unit_test.py',
             'tokamax/_src/ops/experimental/routing_moe/test/layer/moe_plan_unit_test.py',

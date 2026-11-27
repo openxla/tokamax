@@ -15,6 +15,7 @@
 
 """Modular MoE entry point accepting pre-computed top-k weights and indices."""
 
+import dataclasses
 import functools
 
 import jax
@@ -66,6 +67,25 @@ def _prepare_ep_inputs(
   return global_num_experts, group_offset, w2_bias, topk_weights
 
 
+def _all_gather_activation(
+    x_compact: arg.ActivationWrapper[jax.Array], axis_name: tuple[str, ...]
+) -> arg.ActivationWrapper[jax.Array]:
+  """Perform all-gather with zero-cost compact <-> large layout conversion."""
+  x_shape = x_compact.data.shape
+  # Because XLA all-gather only supports large layout, we need to perform
+  # reshape into large layout first. But since large layout with last dim
+  # of 128 has the same data arrangement as compact layout, the reshape is free.
+  x_large = jax.lax.all_gather(
+      x_compact.data.reshape(-1, x_shape[-1]),
+      axis_name=axis_name,
+      axis=0,
+      tiled=True,
+  )
+  x_new = x_large.reshape(-1, *x_shape[1:])
+  spec_new = dataclasses.replace(x_compact.spec, row_size=x_new.shape[0])
+  return arg.ActivationWrapper(data=x_new, scale=None, spec=spec_new)
+
+
 def _routing_moe_local(
     x: jax.Array,
     topk_weights: jax.Array,
@@ -86,7 +106,7 @@ def _routing_moe_local(
   local_num_experts = w1.shape[0]
   topk = topk_indices.shape[-1]
 
-  # Step 1: Book keep sharding related logictics.
+  # Step 1: Bookkeep sharding related logistics.
   global_num_experts, group_offset, w2_bias, topk_weights = _prepare_ep_inputs(
       topk_weights,
       w2_bias,
@@ -95,8 +115,12 @@ def _routing_moe_local(
       cfg=cfg,
   )
 
+  # Step 2: Preprocess inputs for routing gmm.
+  # If SP is used, this must be done before all-gather to reduce cost.
+  x_compact = pack.input_pack(x, cfg.gmm_in_format)
+
   if cfg.use_sp:
-    # Step 2: If input is not replicated (SP), perform all-gather.
+    # Step 3: If input is not replicated (SP), perform all-gather.
     if not cfg.plan.remote_scatter:
       topk_weights = jax.lax.all_gather(
           topk_weights, axis_name=cfg.reduction_axis, axis=0, tiled=True
@@ -104,14 +128,7 @@ def _routing_moe_local(
     topk_indices = jax.lax.all_gather(
         topk_indices, axis_name=cfg.reduction_axis, axis=0, tiled=True
     )
-    x = jax.lax.all_gather(x, axis_name=cfg.reduction_axis, axis=0, tiled=True)
-
-  # Step 3: Preprocess inputs for routing gmm.
-  # NOTE: all-gather only supports large layout. Therefore, performing
-  # repacking triggers both input and output relayout. Thus, we need to perform
-  # repacking after all-gather.
-  # TODO: Support all-gather with compact layout.
-  x_compact = pack.input_pack(x, cfg.gmm_in_format)
+    x_compact = _all_gather_activation(x_compact, axis_name=cfg.reduction_axis)
 
   # Step 4: Sort indices and compute expert group sizes.
   # NOTE: Unlike topk, index sorting has to be done after all-gather to ensure
