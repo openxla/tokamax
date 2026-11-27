@@ -293,12 +293,6 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
   ) -> tuple[jax.Array, Residuals]:
     del config, zero_initialize
 
-    # JAX/XLA does not implement group_offset.
-    if group_offset is not None:
-      raise NotImplementedError(
-          "The base XLA implementation does not support group_offset."
-      )
-
     if isinstance(group_sizes, GroupSizes):
       group_sizes = jnp.asarray(group_sizes.value)
 
@@ -321,6 +315,7 @@ class RaggedDot[C, K](op.Op[Any, jax.Array, Residuals, C, K]):
         ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
         precision=precision,
         preferred_element_type=preferred_element_type,
+        group_offset=group_offset,
     ).astype(out_dtype)
 
     if fuse_gateup_activation is not None:
