@@ -20,14 +20,12 @@ from typing import Literal
 import jax
 from jaxtyping import Array, Integer, Real  # pylint: disable=g-multiple-import, g-importing-member
 from tokamax._src.ops.linear_softmax_cross_entropy_loss import base
-from tokamax._src.ops.linear_softmax_cross_entropy_loss import chunked_xla
 
 
-type Implementation = Literal["mosaic_tpu", "xla", "chunked_xla"]
+type Implementation = Literal["mosaic_tpu", "xla"]
 
 IMPLEMENTATIONS = dict(
     xla=base.LinearSoftmaxCrossEntropyLoss(),
-    chunked_xla=chunked_xla.ChunkedXlaLinearSoftmaxCrossEntropyLoss(),
 )
 _DEFAULT_IMPLEMENTATION = ("xla",)
 
@@ -75,12 +73,11 @@ def linear_softmax_cross_entropy_loss(
       "sum", "mean", or "none" explicitly.
     precision: The precision used for jax.lax.dot_general for the linear
       projection and gradient calculation.
-    implementation: By default "None" will be used to pick the best available
-      backend. Can be set to "mosaic_tpu", "xla" or "chunked_xla" explicitly,
-      or a sequence of implementations/callables to try in order.
-      The "mosaic_tpu" and "chunked_xla" implementations are memory efficient
-      and have almost 0 additional buffer overhead while the "xla"
-      implementation needs to materialize the full logits.
+    implementation: By default `None` will be used to pick the best available
+      backend. Can be set to `"mosaic_tpu"` or `"xla"` explicitly, or a sequence
+      of implementations/callables to try in order. Both implementations chunk
+      over batch and vocabulary dimensions to avoid materializing the full `(B,
+      V)` logits matrix.
 
   Returns:
     The Cross-Entropy loss. If reduction is "none", returns loss of shape (B,).
