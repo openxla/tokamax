@@ -53,6 +53,7 @@ def _forward_v_step(
     v_block_sz,
     dtype,
     preferred_element_type,
+    precision,
     pad_mask=None,
 ):
   """Computes forward step for a single vocab block."""
@@ -60,7 +61,10 @@ def _forward_v_step(
   v_start = j * v_block_sz
   w_j = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
   logits_bv = jnp.dot(
-      x_b, w_j, preferred_element_type=preferred_element_type
+      x_b,
+      w_j,
+      precision=precision,
+      preferred_element_type=preferred_element_type,
   )
   logits_f32 = logits_bv.astype(jnp.float32)
   if pad_mask is not None:
@@ -97,6 +101,7 @@ def _forward_b_step(
     reduction,
     dtype,
     preferred_element_type,
+    precision,
 ):
   """Computes forward step for a batch block across all vocab blocks."""
   lse_all, loss_acc = carry
@@ -113,6 +118,7 @@ def _forward_b_step(
       v_block_sz=v_block_sz,
       dtype=dtype,
       preferred_element_type=preferred_element_type,
+      precision=precision,
   )
 
   init_v_carry = (
@@ -179,6 +185,7 @@ def _backward_v_step(
     dtype,
     reduction,
     preferred_element_type,
+    precision,
 ):
   """Computes backward step for a single vocab block."""
   dx_b, dw_acc = v_carry
@@ -186,7 +193,10 @@ def _backward_v_step(
 
   w_v = jax.lax.dynamic_slice(w_padded, (0, v_start), (h_dim, v_block_sz))
   logits_bv = jnp.dot(
-      x_b, w_v, preferred_element_type=preferred_element_type
+      x_b,
+      w_v,
+      precision=precision,
+      preferred_element_type=preferred_element_type,
   )
 
   labels_one_hot_bv = jax.nn.one_hot(
@@ -208,12 +218,20 @@ def _backward_v_step(
     )
 
   dx_b += jnp.dot(
-      s_bv, w_v.T, preferred_element_type=preferred_element_type
+      s_bv,
+      w_v.T,
+      precision=precision,
+      preferred_element_type=preferred_element_type,
   )
 
   dw_v = jax.lax.dynamic_slice(
       dw_acc, (0, v_start), (h_dim, v_block_sz)
-  ) + jnp.dot(x_b.T, s_bv, preferred_element_type=preferred_element_type)
+  ) + jnp.dot(
+      x_b.T,
+      s_bv,
+      precision=precision,
+      preferred_element_type=preferred_element_type,
+  )
   dw_acc = jax.lax.dynamic_update_slice(dw_acc, dw_v, (0, v_start))
   return dx_b, dw_acc
 
@@ -236,6 +254,7 @@ def _backward_b_step(
     reduction,
     dtype,
     preferred_element_type,
+    precision,
 ):
   """Computes backward step for a batch block across all vocab blocks."""
   dx, dw = b_carry
@@ -269,6 +288,7 @@ def _backward_b_step(
       dtype=dtype,
       reduction=reduction,
       preferred_element_type=preferred_element_type,
+      precision=precision,
   )
 
   dx_b_init = jnp.zeros((b_block_sz, h_dim), dtype=preferred_element_type)
@@ -293,6 +313,7 @@ def _backward_b_step(
         "v_block_sz",
         "unroll_factor",
         "preferred_element_type",
+        "precision",
     ),
 )
 def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
@@ -305,6 +326,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     v_block_sz: int = 1024,
     unroll_factor: int | bool = False,
     preferred_element_type: jax.typing.DTypeLike | None = None,
+    precision: jax.lax.PrecisionLike = None,
 ) -> tuple[Real[Array, "*"], Real[Array, "B"]]:
   """Chunked XLA implementation of linear softmax cross-entropy loss forward.
 
@@ -320,6 +342,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
     v_block_sz: The block size for the vocabulary dimension.
     unroll_factor: The unroll factor for the inner V loop.
     preferred_element_type: The preferred element type for computation.
+    precision: The precision used for dot products.
 
   Returns:
     A tuple (loss, lse).
@@ -361,6 +384,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
       reduction=reduction,
       dtype=dtype,
       preferred_element_type=preferred_element_type,
+      precision=precision,
   )
 
   if reduction == "none":
@@ -392,6 +416,7 @@ def linear_softmax_cross_entropy_loss_fwd_chunked_xla(
         "v_block_sz",
         "reduction",
         "preferred_element_type",
+        "precision",
     ),
 )
 def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
@@ -405,6 +430,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     v_block_sz: int = 2048,
     reduction: Literal["sum", "mean", "none"] = "sum",
     preferred_element_type: jax.typing.DTypeLike | None = None,
+    precision: jax.lax.PrecisionLike = None,
 ) -> tuple[Real[Array, "B H"], Real[Array, "H V"]]:
   """The chunked XLA implementation of linear softmax cross-entropy loss backward pass.
 
@@ -421,6 +447,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
     v_block_sz: The block size for the vocabulary dimension.
     reduction: The reduction method ("sum", "mean", or "none").
     preferred_element_type: The preferred element type for computation.
+    precision: The precision used for dot products.
 
   Returns:
     A tuple (dx, dw).
@@ -467,6 +494,7 @@ def linear_softmax_cross_entropy_loss_bwd_chunked_xla(
       reduction=reduction,
       dtype=dtype,
       preferred_element_type=preferred_element_type,
+      precision=precision,
   )
 
   dx_init = jnp.zeros((b_dim_padded, h_dim), dtype=preferred_element_type)
@@ -508,6 +536,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLoss(
       w: Real[Array, "H V"],
       *,
       reduction: Literal["sum", "mean", "none"] = "sum",
+      precision: base.CanonicalPrecision = base.DEFAULT_PRECISION,
       config: Config,
       return_residuals: bool,
   ) -> tuple[jax.Array, base.Residuals]:
@@ -518,6 +547,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLoss(
         reduction=reduction,
         b_block_sz=config.b_block_size,
         v_block_sz=config.v_block_size,
+        precision=precision,
     )
     return loss.astype(jnp.float32), (lse,)
 
@@ -543,6 +573,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLossVjp(
       w: Real[Array, "H V"],
       *,
       reduction: Literal["sum", "mean", "none"] = "sum",
+      precision: base.CanonicalPrecision = base.DEFAULT_PRECISION,
       config: Config,
       return_residuals: bool,
   ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
@@ -560,6 +591,7 @@ class ChunkedXlaLinearSoftmaxCrossEntropyLossVjp(
         b_block_sz=config.b_block_size,
         v_block_sz=config.v_block_size,
         reduction=reduction,
+        precision=precision,
     )
 
     labels_grad = jnp.zeros_like(labels)

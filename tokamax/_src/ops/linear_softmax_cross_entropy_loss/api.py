@@ -92,12 +92,6 @@ def linear_softmax_cross_entropy_loss(
     ExceptionGroup: If all implementations failed.
   """
 
-  if precision is not None:
-    # TODO: Add support for precision customization.
-    raise NotImplementedError(
-        "Customization of precision is currently not supported."
-    )
-
   if implementation is None:
     implementation = _DEFAULT_IMPLEMENTATION
   elif isinstance(implementation, str):
@@ -118,6 +112,7 @@ def linear_softmax_cross_entropy_loss(
           labels,
           weights,
           reduction=reduction,
+          precision=precision,
       )
     except NotImplementedError as e:
       if len(implementation) == 1:
