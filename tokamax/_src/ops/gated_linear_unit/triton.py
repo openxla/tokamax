@@ -237,6 +237,8 @@ def _unbatched_weights_x_shape(x, weights) -> tuple[int, ...]:
 
 
 def _max_smem_bytes() -> int:
+  if (capacity := gpu_utils.smem_capacity()) is not None:
+    return capacity
   if gpu_utils.is_sm90() or gpu_utils.is_sm100():
     return 224 * 1024
   return 160 * 1024

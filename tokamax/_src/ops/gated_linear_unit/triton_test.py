@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import chex
 import jax
+from jax.extend import backend
 import jax.numpy as jnp
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
@@ -86,6 +87,46 @@ class TritonGatedLinearUnitTest(test_base.GatedLinearUnitTestBase):
     glu_bound_args = glu.bind(x, w)
     autotuning_configs = glu_bound_args.autotuning_configs
     self.assertNotEmpty(autotuning_configs)
+
+  def test_configs_fit_shared_memory(self):
+    assert triton_glu is not None
+    # RTX PRO 4500 Blackwell: 82 SMs, 101376 bytes of shared memory per block.
+    device = mock.MagicMock(platform="gpu", compute_capability="12.0")
+    device.core_count = 82
+    limit = gpu_utils.SMEM_CAPACITY_BYTES["sm_120"]
+    glu = triton_glu.TritonGatedLinearUnit()
+    x = jnp.zeros((64, 384), jnp.float32)
+    w = jnp.zeros((384, 2, 4096), jnp.float32)
+
+    devices = mock.patch.object(jax, "devices", return_value=[device])
+    default_device = mock.patch.object(
+        backend, "get_default_device", return_value=device
+    )
+    with devices, default_device:
+      bound_args = glu.bind(x, w)
+      heuristics_config = bound_args.heuristics_config
+      configs = bound_args.autotuning_configs
+
+    self.assertEqual(
+        (
+            heuristics_config.block_m,
+            heuristics_config.block_n,
+            heuristics_config.block_k,
+            heuristics_config.num_stages,
+        ),
+        (32, 64, 32, 4),
+    )
+    self.assertNotEmpty(configs)
+    for config in configs:
+      smem = triton_glu._smem_bytes(
+          config.block_m,
+          config.block_n,
+          config.block_k,
+          config.num_stages,
+          4,
+          8,
+      )
+      self.assertLessEqual(smem, limit)
 
   @parameterized.named_parameters(
       dict(testcase_name="bfloat16", dtype=jnp.bfloat16, precision=None),
