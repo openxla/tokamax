@@ -876,11 +876,14 @@ def tgmm_kernel_main(
 
   num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
   num_n = pl.cdiv(cfgs.dims.size_n, cfgs.tiles.tile_n)
+  # Dense training calls rarely have empty 16-group chunks, so the compact walk
+  # avoids compiling the decode fast paths.
   num_gm = gmm_v2.fill_metadata(
       lhs_group_sizes_ref,
       group_offset_ref,
       metadata_ref,
       cfgs=cfgs,
+      chunked=False,
   )
 
   (lhs_spec, rhs_spec, partial_sum_spec), out_specs = generate_tgmm_block_specs(
@@ -1023,7 +1026,8 @@ def tgmm_v2(
   Args:
     lhs: The left-hand side array with shape [size_m, size_k].
     rhs: The right-hand side array with shape [size_m, size_n].
-    group_sizes: The group sizes of lhs with shape [size_lhs_group].
+    group_sizes: Nonnegative int32 group sizes of lhs with shape
+      [size_lhs_group].
     num_actual_groups: The actual number of groups: weight.shape[0].
     rhs_scale: The per-N scale of the rhs.
     group_offset: An optional offset for the group indices.

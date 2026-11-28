@@ -398,6 +398,9 @@ class TileSizes:
   tile_n: int
   bucket_base: int
   lhs_buffer_count: int = 2
+  # Pipeline depth of the `gmm_v2` RHS weight tiles. `tgmm_v2` builds its own
+  # block specs and ignores both buffer counts.
+  rhs_buffer_count: int = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -504,6 +507,8 @@ class TilingRequest:
   fuse_act: str | None = None
   has_partial_sum: bool = False
   is_out_fused: bool = False
+  zero_initialize: bool = False
+  out_dtype: jnp.dtype | None = None
 
 
 TileFn = Callable[[TilingRequest], TileSizes]
@@ -702,13 +707,13 @@ def generate_block_specs(
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_n, cfgs.tiles.tile_k),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.tiles.rhs_buffer_count),
     )
   else:
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=cfgs.tiles.rhs_buffer_count),
     )
   rhs_scale_block_spec = rhs_bias_block_spec = partial_sum_block_spec = None
   if cfgs.rhs_cfgs.has_bias:
@@ -1162,6 +1167,8 @@ def inner_kernel(
     else:
       acc_ref[:acc_m] = acc
 
+  num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+
   def run_matmul_step(bucket_idx: int):
     bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
 
@@ -1169,34 +1176,45 @@ def inner_kernel(
     def matmul_first_last():
       _matmul(is_first_k_step=True, is_last_k_step=True, bucket_m=bucket_m)
 
+    if num_k == 1:
+      matmul_first_last()
+      return
+
     @jax.named_scope(f"bm{bucket_m}_first")
     def matmul_first():
       _matmul(is_first_k_step=True, is_last_k_step=False, bucket_m=bucket_m)
-
-    @jax.named_scope(f"bm{bucket_m}_mid")
-    def matmul_mid():
-      _matmul(is_first_k_step=False, is_last_k_step=False, bucket_m=bucket_m)
 
     @jax.named_scope(f"bm{bucket_m}_last")
     def matmul_last():
       _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
 
-    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     k_id = step.index[2]
     is_first_k_step = k_id == 0
-    is_last_k_step = k_id == (num_k - 1)
+    if num_k == 2:
+      lax.cond(is_first_k_step, matmul_first, matmul_last)
+      return
 
+    @jax.named_scope(f"bm{bucket_m}_mid")
+    def matmul_mid():
+      _matmul(is_first_k_step=False, is_last_k_step=False, bucket_m=bucket_m)
+
+    is_last_k_step = k_id == (num_k - 1)
     lax.cond(
         is_first_k_step,
         lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
         lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
     )
 
-  branches = []
-  for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
-    branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-  bucket_idx = select_bucket_idx(m_end_local, cfgs.tiles.bucket_base)
-  lax.switch(bucket_idx, branches)
+  num_buckets = cfgs.tiles.tile_m // cfgs.tiles.bucket_base
+  if num_buckets == 1:
+    run_matmul_step(bucket_idx=0)
+  else:
+    branches = [
+        functools.partial(run_matmul_step, bucket_idx=bucket_idx)
+        for bucket_idx in range(num_buckets)
+    ]
+    bucket_idx = select_bucket_idx(m_end_local, cfgs.tiles.bucket_base)
+    lax.switch(bucket_idx, branches)
 
 
 def select_bucket_idx(m_end_local: jax.Array, bucket_base: int) -> jax.Array:
@@ -1220,19 +1238,41 @@ def select_bucket_idx(m_end_local: jax.Array, bucket_base: int) -> jax.Array:
 def _start_m_offset(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset: jax.Array,
+    unroll: int = 8,
 ) -> jax.Array:
   """Returns the sum of the sizes of the groups before group_offset.
 
   Args:
-    lhs_group_sizes_ref: The group sizes of lhs.
+    lhs_group_sizes_ref: The nonnegative int32 group sizes of lhs.
     group_offset: Offset of the first group to process.
+    unroll: Groups summed per loop iteration.
   """
+  num_chunks = group_offset // unroll
+  tail_start = num_chunks * unroll
+
+  @jax.named_scope("skip_group_chunk_loop")
+  def skip_group_chunk_loop(chunk_idx, start_m_offset):
+    base = chunk_idx * unroll
+    vals = [lhs_group_sizes_ref[base + k] for k in range(unroll)]
+    while len(vals) > 1:
+      vals = [
+          vals[j] + vals[j + 1] if j + 1 < len(vals) else vals[j]
+          for j in range(0, len(vals), 2)
+      ]
+    return start_m_offset + vals[0]
 
   @jax.named_scope("skip_group_loop")
   def skip_group_loop(lhs_group_id, start_m_offset):
     return start_m_offset + lhs_group_sizes_ref[lhs_group_id]
 
-  return lax.fori_loop(0, group_offset, skip_group_loop, 0)
+  if unroll == 1:
+    return lax.fori_loop(0, group_offset, skip_group_loop, jnp.int32(0))
+  start_m_offset = lax.fori_loop(
+      0, num_chunks, skip_group_chunk_loop, jnp.int32(0)
+  )
+  return lax.fori_loop(
+      tail_start, group_offset, skip_group_loop, start_m_offset
+  )
 
 
 def fill_metadata(
@@ -1241,6 +1281,7 @@ def fill_metadata(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    chunked: bool = True,
 ) -> jax.Array:
   """Fills the metadata for the given lhs group sizes and group offset.
 
@@ -1249,81 +1290,193 @@ def fill_metadata(
   that are needed to process it and fills starting and ending offset
   (gm_id_to_m_offset), and the group id (gm_id_to_group_id) for each gm tile.
 
+  With `chunked`, processes local groups in chunks so all-empty chunks skip in
+  a single scalar branch. Chunks whose groups are guaranteed to fit in a single
+  M tile (`max_gs <= tile_m - (sublane - 1)`) bypass sublane modulo, integer
+  cdiv, and the inner tile loop.
+
   Args:
-    lhs_group_sizes_ref: The group sizes of lhs.
+    lhs_group_sizes_ref: The nonnegative int32 group sizes of lhs.
     group_offset_ref: Offset of the first group to process.
     metadata_ref: Metadata that is used to determine the group id and m offsets
       for each gmm tile.
     cfgs: GmmConfigs.
+    chunked: Whether to use the chunked walk with the empty-chunk and
+      single-tile fast paths. Without it, one compact loop with no branches
+      visits every group, which compiles faster but scans each group serially.
 
   Returns:
       The number of gm tiles to process lhs with given group offset.
   """
 
   group_offset = group_offset_ref[0]
-  max_num_group = group_offset + cfgs.dims.size_group
-  metadata_ref.gm_id_to_m_offset[0] = 0
+  size_group = cfgs.dims.size_group
+  max_num_group = group_offset + size_group
+  tile_m = cfgs.tiles.tile_m
+  sublane = cfgs.dims.size_lhs_sublane
+  # Any group with size <= single_tile_max is guaranteed to fit in 1 M tile
+  # regardless of `start_m_offset % sublane` (at most `sublane - 1`).
+  single_tile_max = tile_m - (sublane - 1)
 
   @jax.named_scope("inner_tm_loop")
   def inner_tm_loop(tm_id, curr_m_offset, *, end_m_offset, group_id):
-    local_offset = curr_m_offset % cfgs.dims.size_lhs_sublane
-    tm_size = jnp.minimum(
-        cfgs.tiles.tile_m - local_offset, end_m_offset - curr_m_offset
-    )
+    local_offset = curr_m_offset % sublane
+    tm_size = jnp.minimum(tile_m - local_offset, end_m_offset - curr_m_offset)
 
     metadata_ref.gm_id_to_group_id[tm_id] = group_id
 
     next_m_offset = curr_m_offset + tm_size
-    metadata_ref.gm_id_to_m_offset[tm_id] = curr_m_offset
     metadata_ref.gm_id_to_m_offset[tm_id + 1] = next_m_offset
 
     return next_m_offset
 
-  @jax.named_scope("outer_group_loop")
-  def outer_group_loop(lhs_group_id, carry):
-    num_gm, start_m_offset = carry
+  def emit_single_group(num_gm, start_m_offset, group_id, group_size):
+    def active():
+      end_m_offset = start_m_offset + group_size
+      metadata_ref.gm_id_to_group_id[num_gm] = group_id
+      metadata_ref.gm_id_to_m_offset[num_gm + 1] = end_m_offset
+      return num_gm + 1, end_m_offset
 
-    group_id = lhs_group_id - group_offset
+    return lax.cond(group_size > 0, active, lambda: (num_gm, start_m_offset))
+
+  def emit_general_group(num_gm, start_m_offset, group_id, group_size):
+    def active():
+      end_m_offset = start_m_offset + group_size
+
+      # Assume following arguments:
+      # - size_lhs_sublane & tile_m = 4
+      # - group_size = 3
+      # - start_m_offset = 7
+      #
+      # If we visualize it, it will look like this where:
+      # - |: denotes boundaries between sublanes
+      # - 0: denotes values for other groups
+      # - 1: denotes values for the current group
+      # | 0 0 0 0 | 0 0 0 1 | 1 1 0 0 |
+      #
+      # In this example, we see that we require processing 2 m tiles.
+      # But, performing a naive cdiv(group_size, tile_m) will return 1.
+      # Instead, adding local_offset will give us the correct value.
+      local_offset = start_m_offset % sublane
+      aligned_group_size = group_size + local_offset
+
+      def single_tile():
+        metadata_ref.gm_id_to_group_id[num_gm] = group_id
+        metadata_ref.gm_id_to_m_offset[num_gm + 1] = end_m_offset
+        return num_gm + 1
+
+      def multi_tile():
+        curr_num_gm = pl.cdiv(aligned_group_size, tile_m)
+        next_num_gm = num_gm + curr_num_gm
+        tm_loop_fn = functools.partial(
+            inner_tm_loop,
+            end_m_offset=end_m_offset,
+            group_id=group_id,
+        )
+        lax.fori_loop(num_gm, next_num_gm, tm_loop_fn, start_m_offset)
+        return next_num_gm
+
+      next_num_gm = lax.cond(
+          aligned_group_size <= tile_m, single_tile, multi_tile
+      )
+      return next_num_gm, end_m_offset
+
+    return lax.cond(group_size > 0, active, lambda: (num_gm, start_m_offset))
+
+  def general_group_loop(lhs_group_id, carry):
+    num_gm, start_m_offset = carry
+    group_size = lhs_group_sizes_ref[lhs_group_id]
+    return emit_general_group(
+        num_gm, start_m_offset, lhs_group_id - group_offset, group_size
+    )
+
+  def compact_group_loop(lhs_group_id, carry):
+    num_gm, start_m_offset = carry
     group_size = lhs_group_sizes_ref[lhs_group_id]
     end_m_offset = start_m_offset + group_size
-
-    # Assume following arguments:
-    # - size_lhs_sublane & tile_m = 4
-    # - group_size = 3
-    # - start_m_offset = 7
-    #
-    # If we visualize it, it will look like this where:
-    # - |: denotes boundaries between sublanes
-    # - 0: denotes values for other groups
-    # - 1: denotes values for the current group
-    # | 0 0 0 0 | 0 0 0 1 | 1 1 0 0 |
-    #
-    # In this example, we see that we require processing 2 m tiles.
-    # But, performing a naive cdiv(group_size, tile_m) will return 1.
-    # Instead, adding local_offset will give us the correct value.
-    local_offset = start_m_offset % cfgs.dims.size_lhs_sublane
-    aligned_group_size = group_size + local_offset
-    curr_num_gm = pl.cdiv(aligned_group_size, cfgs.tiles.tile_m)
-
+    # See `emit_general_group` for why the sublane offset is added.
+    local_offset = start_m_offset % sublane
+    curr_num_gm = pl.cdiv(group_size + local_offset, tile_m)
     # Even if group_size is 0, if local_offset is not 0, cdiv will return 1.
-    curr_num_gm = jnp.where(group_size > 0, curr_num_gm, 0)
-    next_num_gm = num_gm + curr_num_gm
-
+    next_num_gm = num_gm + jnp.where(group_size > 0, curr_num_gm, 0)
     tm_loop_fn = functools.partial(
         inner_tm_loop,
         end_m_offset=end_m_offset,
-        group_id=group_id,
+        group_id=lhs_group_id - group_offset,
     )
     lax.fori_loop(num_gm, next_num_gm, tm_loop_fn, start_m_offset)
-
     return next_num_gm, end_m_offset
+
+  chunk_size = 16
+  num_chunks = size_group // chunk_size if chunked else 0
+  tail_start = group_offset + num_chunks * chunk_size
+
+  @jax.named_scope("outer_group_chunk_loop")
+  def outer_group_chunk_loop(chunk_idx, carry):
+    num_gm, start_m_offset = carry
+    base_lhs = group_offset + chunk_idx * chunk_size
+    base_gid = chunk_idx * chunk_size
+    gs = [lhs_group_sizes_ref[base_lhs + k] for k in range(chunk_size)]
+
+    # Single tree reduction yields the chunk maximum, which determines both
+    # whether any group is active (max > 0) and whether all groups are
+    # guaranteed to fit in a single tile (max <= single_tile_max).
+    max_vals = list(gs)
+    while len(max_vals) > 1:
+      max_vals = [
+          jnp.maximum(max_vals[j], max_vals[j + 1])
+          if j + 1 < len(max_vals)
+          else max_vals[j]
+          for j in range(0, len(max_vals), 2)
+      ]
+    max_gs = max_vals[0]
+
+    def process_nonempty_chunk():
+      def do_all_single():
+        c_ngm, c_off = num_gm, start_m_offset
+        for k in range(chunk_size):
+          c_ngm, c_off = emit_single_group(c_ngm, c_off, base_gid + k, gs[k])
+        return c_ngm, c_off
+
+      def do_general():
+        return lax.fori_loop(
+            base_lhs,
+            base_lhs + chunk_size,
+            general_group_loop,
+            (num_gm, start_m_offset),
+        )
+
+      return lax.cond(max_gs <= single_tile_max, do_all_single, do_general)
+
+    return lax.cond(
+        max_gs > 0, process_nonempty_chunk, lambda: (num_gm, start_m_offset)
+    )
 
   # Groups before group_offset get no gm tiles; they only move where the local
   # groups start. Sum their sizes in a separate loop instead of walking them
-  # through outer_group_loop, which runs before the first DMA of the call.
-  start_m_offset = _start_m_offset(lhs_group_sizes_ref, group_offset)
-  num_gm, _ = lax.fori_loop(
-      group_offset, max_num_group, outer_group_loop, (0, start_m_offset)
+  # through outer_group_chunk_loop, which runs before the first DMA of the call.
+  start_m_offset = _start_m_offset(
+      lhs_group_sizes_ref, group_offset, unroll=8 if chunked else 1
+  )
+  # Seed slot 0 so each active tile only writes `gm_id_to_m_offset[k + 1]`,
+  # keeping `gm_id_to_m_offset[num_gm] == start_m_offset`.
+  metadata_ref.gm_id_to_m_offset[0] = start_m_offset
+  num_gm = jnp.int32(0)
+  if num_chunks > 0:
+    num_gm, start_m_offset = lax.fori_loop(
+        0, num_chunks, outer_group_chunk_loop, (num_gm, start_m_offset)
+    )
+  if num_chunks * chunk_size < size_group:
+    with jax.named_scope("outer_group_tail_loop"):
+      num_gm, _ = lax.fori_loop(
+          tail_start,
+          max_num_group,
+          general_group_loop if chunked else compact_group_loop,
+          (num_gm, start_m_offset),
+      )
+  # Preserve exact convention: when no local groups are active, slot 0 is 0.
+  metadata_ref.gm_id_to_m_offset[0] = jnp.where(
+      num_gm == 0, jnp.int32(0), metadata_ref.gm_id_to_m_offset[0]
   )
   return num_gm
 
@@ -1341,7 +1494,6 @@ def zero_out_start(
 
   num_lanes = pltpu.get_tpu_info().num_lanes
   assert num_lanes == zero_ref.shape[-1]
-  zero_ref[...] = jnp.zeros_like(zero_ref)
 
   zero_dma = zero_ref.reshape(-1, dims.size_lhs_sublane, num_lanes)
   out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
@@ -1353,40 +1505,48 @@ def zero_out_start(
   left_zero_start = 0
   left_zero_end = compute_start // dims.size_lhs_sublane
   left_zero_size = left_zero_end - left_zero_start
-  left_num_loops = pl.cdiv(left_zero_size, row_size)
 
   right_zero_start = pl.cdiv(compute_end, dims.size_lhs_sublane)
   right_zero_end = out_dma.shape[0]
   right_zero_size = right_zero_end - right_zero_start
-  right_num_loops = pl.cdiv(right_zero_size, row_size)
 
-  def fill_zero(i, zero_size, *, start, end):
-    dma_start = start + i * row_size
-    dma_end = jnp.minimum(dma_start + row_size, end)
-    dma_size = dma_end - dma_start
+  def do_zero_out():
+    zero_ref[...] = jnp.zeros_like(zero_ref)
+    left_num_loops = pl.cdiv(left_zero_size, row_size)
+    right_num_loops = pl.cdiv(right_zero_size, row_size)
 
-    # Static loop. Will be unrolled during compile time.
-    for n_start in range(0, out_dma.shape[-1], num_lanes):
-      n_end = n_start + num_lanes
-      pltpu.make_async_copy(
-          src_ref=zero_dma.at[pl.ds(0, dma_size)],
-          dst_ref=out_dma.at[pl.ds(dma_start, dma_size), :, n_start:n_end],
-          sem=semaphore_ref.at[0],
-      ).start(priority=1)
+    def fill_zero(i, zero_size, *, start, end):
+      dma_start = start + i * row_size
+      dma_end = jnp.minimum(dma_start + row_size, end)
+      dma_size = dma_end - dma_start
 
-    return zero_size + dma_size
+      # Static loop. Will be unrolled during compile time.
+      for n_start in range(0, out_dma.shape[-1], num_lanes):
+        n_end = n_start + num_lanes
+        pltpu.make_async_copy(
+            src_ref=zero_dma.at[pl.ds(0, dma_size)],
+            dst_ref=out_dma.at[pl.ds(dma_start, dma_size), :, n_start:n_end],
+            sem=semaphore_ref.at[0],
+        ).start(priority=1)
 
-  @jax.named_scope("left_fill_zero")
-  def left_fill_zero(i, zero_size):
-    return fill_zero(i, zero_size, start=left_zero_start, end=left_zero_end)
+      return zero_size + dma_size
 
-  @jax.named_scope("right_fill_zero")
-  def right_fill_zero(i, zero_size):
-    return fill_zero(i, zero_size, start=right_zero_start, end=right_zero_end)
+    @jax.named_scope("left_fill_zero")
+    def left_fill_zero(i, zero_size):
+      return fill_zero(i, zero_size, start=left_zero_start, end=left_zero_end)
 
-  zero_size = lax.fori_loop(0, left_num_loops, left_fill_zero, 0)
-  zero_size = lax.fori_loop(0, right_num_loops, right_fill_zero, zero_size)
-  return zero_size
+    @jax.named_scope("right_fill_zero")
+    def right_fill_zero(i, zero_size):
+      return fill_zero(i, zero_size, start=right_zero_start, end=right_zero_end)
+
+    zero_size = lax.fori_loop(0, left_num_loops, left_fill_zero, jnp.int32(0))
+    return lax.fori_loop(0, right_num_loops, right_fill_zero, zero_size)
+
+  return lax.cond(
+      (left_zero_size > 0) | (right_zero_size > 0),
+      do_zero_out,
+      lambda: jnp.int32(0),
+  )
 
 
 def zero_out_end(
@@ -1396,12 +1556,14 @@ def zero_out_end(
     *,
     dims: Dimensions,
 ):
-  out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-  pltpu.make_async_copy(
-      src_ref=out_dma.at[pl.ds(0, zero_size)],
-      dst_ref=out_dma.at[pl.ds(0, zero_size)],
-      sem=semaphore_ref.at[0],
-  ).wait()
+  @pl.when(zero_size > 0)
+  def _wait():
+    out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
+    pltpu.make_async_copy(
+        src_ref=out_dma.at[pl.ds(0, zero_size)],
+        dst_ref=out_dma.at[pl.ds(0, zero_size)],
+        sem=semaphore_ref.at[0],
+    ).wait()
 
 
 def kernel_main(
@@ -1469,6 +1631,7 @@ def kernel_main(
       group_offset_ref,
       metadata_ref,
       cfgs=cfgs,
+      chunked=_is_low_batch_decode(cfgs.dims, cfgs.transpose_rhs),
   )
 
   if cfgs.zero_init:
@@ -1599,10 +1762,32 @@ def calculate_tiling_from_request(req: TilingRequest) -> TileSizes:
       req.fuse_act,
       req.has_partial_sum,
       req.is_out_fused,
+      zero_initialize=req.zero_initialize,
+      out_dtype=req.out_dtype,
   )
 
 
-def calculate_tiling(
+def _zero_init_tile_m(size_m: int, out_dtype: jax.typing.DTypeLike) -> int:
+  """Returns the rows of the [rows, num_lanes] zero-initialization scratch."""
+  # TODO: Create better heuristics for determining this value.
+  target_zero_ref_bytes = 2 * 1024 * 1024
+
+  # Zero initialization is done by tiling size_m dim where each tile invokes
+  # zero initializing DMA for up-to tile_zero_m rows. This means larger
+  # tile_zero_m will result in fewer number of tiles and lead to smaller
+  # overhead. However, in order to invoke DMA call up-to tile_zero_m rows, we
+  # need to store equivalent sized memory in VMEM buffer for the duration of
+  # DMA. Storing [tile_zero_m, size_n] in buffer will trigger OOM if
+  # tile_zero_m is too large. Instead, if we set column size as num_lanes
+  # (which is smallest allowed column size for DMA) and reuse the buffer by
+  # size_n//num_lanes times in a single tile, we can significantly increase
+  # tile_zero_m without triggering OOM.
+  num_lanes = pltpu.get_tpu_info().num_lanes
+  out_bytes = jnp.dtype(out_dtype).itemsize
+  return min(target_zero_ref_bytes // num_lanes // out_bytes, size_m)
+
+
+def _default_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
     rhs_cfgs: InputConfigs,
@@ -1611,7 +1796,7 @@ def calculate_tiling(
     has_partial_sum: bool = False,
     is_out_fused: bool = False,
 ) -> TileSizes:
-  """Calculate optimal tile sizes for GMM kernel."""
+  """Returns the default tile sizes for the GMM kernel."""
 
   lhs_dtype = lhs_cfgs.dtype
   rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
@@ -1805,6 +1990,256 @@ def calculate_tiling(
       tile_n=tile_n,
       bucket_base=bucket_base,
       lhs_buffer_count=lhs_buffer_count,
+  )
+
+
+def calculate_tiling(
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    fuse_act: str | None = None,
+    has_partial_sum: bool = False,
+    is_out_fused: bool = False,
+    *,
+    zero_initialize: bool = False,
+    out_dtype: jax.typing.DTypeLike | None = None,
+) -> TileSizes:
+  """Calculate optimal tile sizes for GMM kernel.
+
+  Low-batch MoE decode calls start from the default tiling and shrink its M
+  buckets (see `_decode_tiling`). All other calls use the default tiling.
+  """
+  tiles = _default_tiling(
+      dims,
+      lhs_cfgs,
+      rhs_cfgs,
+      vmem_limit_bytes,
+      fuse_act,
+      has_partial_sum,
+      is_out_fused,
+  )
+  if not _is_low_batch_decode(dims, rhs_cfgs.is_transposed):
+    return tiles
+  return _decode_tiling(
+      tiles,
+      dims,
+      lhs_cfgs,
+      rhs_cfgs,
+      vmem_limit_bytes,
+      fuse_act=fuse_act,
+      has_partial_sum=has_partial_sum,
+      zero_initialize=zero_initialize,
+      out_dtype=out_dtype,
+  )
+
+
+def _is_low_batch_decode(dims: Dimensions, is_transposed: bool) -> bool:
+  """Whether a forward call averages at most 8 rows per group."""
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  return not is_transposed and num_groups > 1 and dims.size_m <= 8 * num_groups
+
+
+def _decode_tiling(
+    default: TileSizes,
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    vmem_limit_bytes: int,
+    *,
+    fuse_act: str | None,
+    has_partial_sum: bool,
+    zero_initialize: bool,
+    out_dtype: jax.typing.DTypeLike | None,
+) -> TileSizes:
+  """Shrinks the M buckets of the default tiling for low-batch MoE decode.
+
+  With few rows per group, a large `bucket_base` makes every small group run
+  an oversized matmul and online LHS quantization, which exposes VPU and MXU
+  time past the weight DMA. The decode tiles keep the default `tile_k` and
+  `tile_n`, use at most the default `tile_m` and RHS buffer count, and at most
+  the default LHS buffer bytes, so no explicit tile buffer is larger than for
+  the default tiles. Extra M buckets can still add a little Mosaic scratch
+  (up to about 20 KiB at `tile_m=32` on v5e), so compile compatibility with
+  the default tiles is measured rather than guaranteed.
+
+  Args:
+    default: The default tiling for the call.
+    dims: Problem dimensions.
+    lhs_cfgs: LHS input configs.
+    rhs_cfgs: RHS input configs.
+    vmem_limit_bytes: Scoped VMEM limit.
+    fuse_act: Fused activation, if any.
+    has_partial_sum: Whether a partial sum is accumulated into the output.
+    zero_initialize: Whether unvisited output rows are zeroed.
+    out_dtype: Output dtype.
+  """
+  gen = getattr(pltpu.get_tpu_info(), "generation", None)
+  tpu_generation = gen if type(gen) is int else 0
+  max_num_buckets = 2 if tpu_generation >= 8 else 4
+  max_lhs_buffers = 4 if tpu_generation >= 8 else 3
+  sublane = dims.size_lhs_sublane
+  num_groups = max(1, dims.size_group, dims.size_lhs_group)
+  decode_bucket_base = align_to(
+      max(16, pl.cdiv(dims.size_m, num_groups) + sublane - 1), sublane
+  )
+  # Leave room for the largest bucket to cover a hot expert in at most four M
+  # tiles.
+  min_hot_expert_base = align_to(
+      pl.cdiv(dims.size_m, max_num_buckets * 4), sublane
+  )
+  decode_base = max(decode_bucket_base, min_hot_expert_base)
+  bucket_base = decode_base
+  if (
+      decode_bucket_base < min_hot_expert_base
+      and pl.cdiv(dims.size_k, default.tile_k) > 1
+  ):
+    # With split K, every M tile streams the hot expert's weights again, so
+    # prefer the default tile_m and only split it into smaller buckets. The
+    # estimate below can still fall back to a smaller tile_m.
+    bucket_base = next(
+        (
+            base
+            for base in range(bucket_base, default.tile_m + 1, sublane)
+            if default.tile_m % base == 0
+            and default.tile_m // base <= max_num_buckets
+        ),
+        default.bucket_base,
+    )
+  if bucket_base >= default.bucket_base:
+    return default
+  tile_m = bucket_base * min(max_num_buckets, default.tile_m // bucket_base)
+  # If nothing fits at the preferred tile_m, smaller tile_m with decode_base
+  # buckets come next.
+  m_tiles = [(bucket_base, tile_m)] + [
+      (decode_base, decode_base * count)
+      for count in range(default.tile_m // decode_base, 0, -1)
+      if decode_base * count < tile_m and count <= max_num_buckets
+  ]
+
+  # No choice below exceeds the default tiling's LHS bytes or RHS buffer
+  # count, so the estimate only ranks tiles whose explicit buffers are no
+  # larger than the default ones. Within each tile_m it prefers more LHS
+  # buffers, then three RHS buffers. If the estimate rejects everything, the
+  # first choice, which is closest to the default tiles, is kept.
+  choices = []
+  for bucket_base, tile_m in m_tiles:
+    max_lhs = min(
+        max_lhs_buffers, default.lhs_buffer_count * default.tile_m // tile_m
+    )
+    choices += [(bucket_base, tile_m, lhs, 3) for lhs in range(max_lhs, 1, -1)]
+    choices.append((bucket_base, tile_m, 2, 2))
+
+  def fits(choice):
+    _, tm, lhs_buffer_count, rhs_buffer_count = choice
+    estimate = _decode_vmem_estimate(
+        dims,
+        lhs_cfgs,
+        rhs_cfgs,
+        tile_m=tm,
+        tile_k=default.tile_k,
+        tile_n=default.tile_n,
+        lhs_buffer_count=lhs_buffer_count,
+        rhs_buffer_count=rhs_buffer_count,
+        fuse_act=fuse_act,
+        has_partial_sum=has_partial_sum,
+        zero_initialize=zero_initialize,
+        out_dtype=out_dtype,
+    )
+    return estimate <= vmem_limit_bytes
+
+  bucket_base, tile_m, lhs_buffer_count, rhs_buffer_count = next(
+      filter(fits, choices), choices[0]
+  )
+  return TileSizes(
+      tile_m=tile_m,
+      tile_k=default.tile_k,
+      tile_n=default.tile_n,
+      bucket_base=bucket_base,
+      lhs_buffer_count=lhs_buffer_count,
+      rhs_buffer_count=rhs_buffer_count,
+  )
+
+
+def _decode_vmem_estimate(
+    dims: Dimensions,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    *,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    lhs_buffer_count: int,
+    rhs_buffer_count: int,
+    fuse_act: str | None,
+    has_partial_sum: bool,
+    zero_initialize: bool,
+    out_dtype: jax.typing.DTypeLike | None,
+) -> int:
+  """Estimates the scoped VMEM of decode tiles, in bytes.
+
+  Beyond the default estimate, this counts the zero-init scratch, scale and
+  bias rows padded to 8 sublanes, and compiler scratch for the MXU LHS operand
+  and the 32-bit matmul result. On v5e the compiler scratch stayed below one
+  such LHS tile plus one f32 result tile.
+
+  Args:
+    dims: Problem dimensions.
+    lhs_cfgs: LHS input configs.
+    rhs_cfgs: RHS input configs.
+    tile_m: M tile.
+    tile_k: K tile.
+    tile_n: N tile of each RHS.
+    lhs_buffer_count: LHS pipeline depth.
+    rhs_buffer_count: RHS weight pipeline depth.
+    fuse_act: Fused activation, if any.
+    has_partial_sum: Whether a partial sum is accumulated into the output.
+    zero_initialize: Whether unvisited output rows are zeroed.
+    out_dtype: Output dtype.
+  """
+  lhs_bytes = jnp.dtype(lhs_cfgs.dtype).itemsize
+  matmul_lhs_bytes = lhs_bytes
+  lhs_vmem = lhs_buffer_count * tile_m * tile_k * lhs_bytes
+  if lhs_cfgs.should_quantize:
+    assert lhs_cfgs.quant_dtype is not None
+    matmul_lhs_bytes = jnp.dtype(lhs_cfgs.quant_dtype).itemsize
+    lhs_vmem += tile_m * tile_k * matmul_lhs_bytes
+
+  rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+  scale_rows = 0
+  if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
+    scale_rows = pl.cdiv(tile_k, rhs_cfgs.quant_block_size)
+  num_rhs = 1 if fuse_act is None else 2
+  rhs_vmem = num_rhs * (
+      rhs_buffer_count * tile_k * tile_n * rhs_bits // 8
+      + 2 * scale_rows * 8 * tile_n * 4
+      + (2 * 8 * tile_n * 4 if rhs_cfgs.has_bias else 0)
+  )
+
+  acc_cols = num_rhs * tile_n
+  acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
+  out_bytes = lhs_bytes
+  if out_dtype is not None:
+    out_bytes = max(out_bytes, jnp.dtype(out_dtype).itemsize)
+  out_vmem = (4 if has_partial_sum else 2) * tile_m * tile_n * out_bytes
+
+  zero_init_vmem = 0
+  if zero_initialize:
+    zero_dtype = lhs_cfgs.dtype if out_dtype is None else out_dtype
+    zero_init_vmem = (
+        _zero_init_tile_m(dims.size_m, zero_dtype)
+        * pltpu.get_tpu_info().num_lanes
+        * jnp.dtype(zero_dtype).itemsize
+    )
+
+  compiler_vmem = tile_m * tile_k * matmul_lhs_bytes + tile_m * acc_cols * 4
+  return (
+      lhs_vmem
+      + rhs_vmem
+      + tile_m * acc_cols * acc_bytes
+      + out_vmem
+      + zero_init_vmem
+      + compiler_vmem
   )
 
 
@@ -2136,6 +2571,8 @@ def make_gmm_configs(
             fuse_act=fuse_act,
             has_partial_sum=partial_sum is not None,
             is_out_fused=is_out_fused,
+            zero_initialize=zero_initialize,
+            out_dtype=jnp.dtype(out_dtype),
         )
     )
 
@@ -2213,7 +2650,8 @@ def gmm_v2(
     rhs: rhs with shape [size_group, size_k, size_n] (or [size_group, size_n,
       size_k] if transpose_rhs) if native else [size_group, size_k // 8, size_n]
       if packed.
-    group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
+    group_sizes: Nonnegative int32 group sizes of lhs rows of shape
+      [size_lhs_group].
     rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
     rhs_bias: The rhs bias of shape [size_group, 1, out_size].
     group_offset: Optional. The group offset of shape [1,].
@@ -2357,23 +2795,7 @@ def gmm_v2(
   ]
 
   if cfgs.zero_init:
-    # TODO: Create better heuristics for determining this value.
-    target_zero_ref_bytes = 2 * 1024 * 1024
-
-    # Zero initialization is done by tiling size_m dim where each tile invokes
-    # zero initializing DMA for up-to tile_zero_m rows. This means larger
-    # tile_zero_m will result in fewer number of tiles and lead to smaller
-    # overhead. However, in order to invoke DMA call up-to tile_zero_m rows, we
-    # need to store equivalent sized memory in VMEM buffer for the duration of
-    # DMA. Storing [tile_zero_m, size_n] in buffer will trigger OOM if
-    # tile_zero_m is too large. Instead, if we set column size as num_lanes
-    # (which is smallest allowed column size for DMA) and reuse the buffer by
-    # size_n//num_lanes times in a single tile, we can significantly increase
-    # tile_zero_m without triggering OOM.
-    out_bytes = jnp.dtype(out_init.dtype).itemsize
-    tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
-    tile_zero_m = min(tile_zero_m, dims.size_m)
-
+    tile_zero_m = _zero_init_tile_m(dims.size_m, out_init.dtype)
     scratch_shapes += [
         pltpu.VMEM((tile_zero_m, num_lanes), out_init.dtype),
         pltpu.SemaphoreType.DMA((1,)),

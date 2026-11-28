@@ -14,6 +14,7 @@
 # ==============================================================================
 import collections
 import inspect
+import itertools
 import math
 from unittest import mock
 
@@ -238,7 +239,9 @@ def _reference_fill_metadata(
   return num_gm, group_ids, m_offsets
 
 
-def _run_fill_metadata(group_sizes, group_offset, cfgs, max_num_gm):
+def _run_fill_metadata(
+    group_sizes, group_offset, cfgs, max_num_gm, chunked=True
+):
   """Runs gmm_v2.fill_metadata in a kernel and returns its outputs."""
 
   def kernel(
@@ -253,7 +256,11 @@ def _run_fill_metadata(group_sizes, group_offset, cfgs, max_num_gm):
         gm_id_to_group_id=group_id_ref, gm_id_to_m_offset=m_offset_ref
     )
     num_gm_ref[0] = gmm_v2.fill_metadata(
-        group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+        group_sizes_ref,
+        group_offset_ref,
+        metadata_ref,
+        cfgs=cfgs,
+        chunked=chunked,
     )
 
   smem = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -793,9 +800,25 @@ class GmmTest(parameterized.TestCase):
       ("ep16_384_last_shard", 384, 24, 360, 128, 16, "random"),
       ("ep8_512_last_shard", 512, 64, 448, 256, 16, "random"),
       ("offset_451", 512, 61, 451, 32, 8, "random"),
+      ("decode_512_sparse_72x1", 512, 512, 0, 64, 8, "sparse_m1"),
+      ("decode_512_single_active", 512, 512, 0, 64, 8, "single_active"),
+      ("decode_512_all_empty", 512, 512, 0, 64, 8, "empty_local"),
+      ("non_chunk_multiple_513_mixed", 513, 513, 0, 32, 8, "random"),
+      # The compact walk used by tgmm_v2.
+      ("compact_offset_7", 64, 8, 7, 32, 8, "random", False),
+      ("compact_ep8_512_last_shard", 512, 64, 448, 256, 16, "random", False),
+      ("compact_decode_sparse_72x1", 512, 512, 0, 64, 8, "sparse_m1", False),
+      ("compact_empty_local_groups", 64, 8, 21, 32, 16, "empty_local", False),
   )
   def test_fill_metadata_matches_reference(
-      self, num_groups, size_group, group_offset, tile_m, sublane, pattern
+      self,
+      num_groups,
+      size_group,
+      group_offset,
+      tile_m,
+      sublane,
+      pattern,
+      chunked=True,
   ):
     """The metadata matches a walk over every group from group 0.
 
@@ -810,14 +833,22 @@ class GmmTest(parameterized.TestCase):
       tile_m: Rows per gm tile.
       sublane: Rows per lhs sublane.
       pattern: How group sizes are drawn.
+      chunked: Whether to use the chunked walk.
     """
     rng = np.random.default_rng(num_groups + group_offset)
-    group_sizes = rng.integers(1, 3 * tile_m, num_groups)
-    group_sizes[rng.random(num_groups) < 0.3] = 0
-    if pattern == "empty_before":
-      group_sizes[:group_offset] = 0
-    elif pattern == "empty_local":
-      group_sizes[group_offset : group_offset + size_group] = 0
+    if pattern == "sparse_m1":
+      group_sizes = np.zeros(num_groups, dtype=np.int32)
+      group_sizes[np.linspace(0, num_groups - 1, 72, dtype=int)] = 1
+    elif pattern == "single_active":
+      group_sizes = np.zeros(num_groups, dtype=np.int32)
+      group_sizes[num_groups // 2] = 1
+    else:
+      group_sizes = rng.integers(1, 3 * tile_m, num_groups)
+      group_sizes[rng.random(num_groups) < 0.3] = 0
+      if pattern == "empty_before":
+        group_sizes[:group_offset] = 0
+      elif pattern == "empty_local":
+        group_sizes[group_offset : group_offset + size_group] = 0
     group_sizes = group_sizes.astype(np.int32)
 
     size_m = max(math.ceil(int(group_sizes.sum()) / sublane), 1) * sublane
@@ -852,6 +883,7 @@ class GmmTest(parameterized.TestCase):
         jnp.array([group_offset], jnp.int32),
         cfgs,
         max_num_gm,
+        chunked=chunked,
     )
     exp_num_gm, exp_group_ids, exp_m_offsets = _reference_fill_metadata(
         group_sizes, group_offset, size_group, tile_m, sublane, max_num_gm
@@ -2996,12 +3028,14 @@ def _bf16_input_configs(is_transposed: bool = False) -> gmm_v2.InputConfigs:
   )
 
 
-def _mock_tpu_info(num_cores: int, generation: int = 5) -> mock.Mock:
+def _mock_tpu_info(
+    num_cores: int, generation: int = 5, mxu_column_size: int = 128
+) -> mock.Mock:
   mock_tpu_info = mock.create_autospec(
       gmm_v2.pltpu.TpuInfo, instance=True, spec_set=False
   )
   mock_tpu_info.num_lanes = 128
-  mock_tpu_info.mxu_column_size = 128
+  mock_tpu_info.mxu_column_size = mxu_column_size
   mock_tpu_info.generation = generation
   mock_tpu_info.num_cores = num_cores
   mock.seal(mock_tpu_info)
@@ -4049,6 +4083,588 @@ class GmmV2OddLaneMultipleMegaCoreTest(parameterized.TestCase):
         )
         self.assertEqual(actual.shape, (num_groups, in_size, out_size))
         assert_arrays_all_close(actual, expected)
+
+
+class DecodeTilingAndSparseGroupsTest(parameterized.TestCase):
+  """Tests for low-batch MoE decode tiling, chunked metadata, and edge cases."""
+
+  @parameterized.named_parameters(
+      ("e512_72x1_gen5", 72, 16, 64),
+      ("e512_72x2_gen5", 144, 16, 64),
+      ("e512_72x4_gen5", 288, 24, 96),
+      ("e512_32x4_gen5", 128, 16, 64),
+      ("e512_8x1_gen5", 8, 8, 8),
+      ("e512_1x1_gen5", 1, 1, 1),
+      dict(
+          testcase_name="ep8_9x1_gen5",
+          size_m=128,
+          size_group=64,
+          want_bucket_base=16,
+          want_tile_m=64,
+      ),
+      ("e512_1x256_gen5", 256, 16, 64),
+      ("e512_1x512_gen5", 512, 32, 128),
+      dict(
+          testcase_name="e512_1x512_gen5_split_k",
+          size_m=512,
+          want_bucket_base=32,
+          want_tile_m=128,
+          vmem_limit_bytes=3 * 1024**2,
+          want_tile_k=2048,
+          want_rhs_buffer_count=2,
+      ),
+      # The zero-initialization scratch does not leave room for three RHS
+      # buffers at the largest bucket.
+      dict(
+          testcase_name="e512_1x512_gen5_split_k_zero_init",
+          size_m=512,
+          want_bucket_base=32,
+          want_tile_m=128,
+          vmem_limit_bytes=3328 * 1024,
+          zero_initialize=True,
+          want_tile_k=2048,
+          want_rhs_buffer_count=2,
+          want_lhs_buffer_count=2,
+      ),
+      # Two LHS and three RHS buffers fit, so the RHS keeps three.
+      dict(
+          testcase_name="e512_1x512_gen5_split_k_keeps_rhs_buffers",
+          size_m=512,
+          want_bucket_base=32,
+          want_tile_m=128,
+          vmem_limit_bytes=3552 * 1024,
+          want_tile_k=2048,
+          want_rhs_buffer_count=3,
+          want_lhs_buffer_count=2,
+      ),
+      # With split K, each M tile streams the hot expert's weights again, so
+      # the decode tiles keep the default tile_m of 256 and only shrink its
+      # buckets.
+      dict(
+          testcase_name="e64_1x512_gen5_n384_zero_init",
+          size_m=512,
+          size_group=64,
+          size_lhs_group=64,
+          size_n=384,
+          want_bucket_base=64,
+          want_tile_m=256,
+          vmem_limit_bytes=5324 * 1024,
+          zero_initialize=True,
+          want_tile_k=2048,
+          want_tile_n=256,
+          want_rhs_buffer_count=2,
+          want_lhs_buffer_count=2,
+      ),
+      # Subchannel scales: the decode tiles keep the default (1536, 256) N and
+      # K tiles instead of growing tile_k past them.
+      dict(
+          testcase_name="e64_1x192_gen5_subchannel_scales",
+          size_m=192,
+          size_group=64,
+          size_lhs_group=64,
+          size_k=3072,
+          size_n=384,
+          rhs_quant_block_size=192,
+          want_bucket_base=16,
+          want_tile_m=64,
+          vmem_limit_bytes=3364 * 1024,
+          zero_initialize=True,
+          want_tile_k=1536,
+          want_tile_n=256,
+          want_rhs_buffer_count=3,
+          want_lhs_buffer_count=3,
+      ),
+      ("e512_1x2048_gen5", 2048, 128, 512),
+      dict(
+          testcase_name="prefill_avg16_gen5",
+          size_m=2048,
+          size_group=128,
+          size_lhs_group=128,
+          want_bucket_base=128,
+          want_tile_m=512,
+      ),
+      dict(
+          testcase_name="e512_72x1_gen7x_fp8",
+          size_m=80,
+          generation=7,
+          sublane=16,
+          mxu_column_size=256,
+          quant_dtype=jnp.float8_e4m3fn,
+          want_bucket_base=16,
+          want_tile_m=64,
+      ),
+      dict(
+          testcase_name="e512_72x1_gen8i_prequantized_fp8",
+          size_m=96,
+          generation=8,
+          sublane=32,
+          mxu_column_size=256,
+          quant_dtype=jnp.float8_e4m3fn,
+          prequantized_lhs=True,
+          want_bucket_base=32,
+          want_tile_m=64,
+      ),
+      dict(
+          testcase_name="e512_72x1_gen8t",
+          size_m=96,
+          generation=8,
+          sublane=32,
+          mxu_column_size=256,
+          want_bucket_base=32,
+          want_tile_m=64,
+      ),
+      dict(
+          testcase_name="e512_72x1_gen5p_megacore",
+          size_m=72,
+          size_n=1024,
+          num_cores=2,
+          want_bucket_base=16,
+          want_tile_m=64,
+          want_tile_n=512,
+      ),
+  )
+  def test_calculate_tiling_low_batch_decode(
+      self,
+      size_m: int,
+      want_bucket_base: int,
+      want_tile_m: int,
+      *,
+      size_group: int = 512,
+      size_lhs_group: int = 512,
+      size_k: int = 4096,
+      size_n: int = 256,
+      rhs_quant_block_size: int | None = None,
+      generation: int = 5,
+      sublane: int = 8,
+      mxu_column_size: int = 128,
+      num_cores: int = 1,
+      quant_dtype: jax.typing.DTypeLike = jnp.int8,
+      prequantized_lhs: bool = False,
+      vmem_limit_bytes: int = _VMEM_LIMIT_BYTES,
+      zero_initialize: bool = False,
+      want_tile_k: int = 4096,
+      want_tile_n: int = 256,
+      want_rhs_buffer_count: int = 3,
+      want_lhs_buffer_count: int | None = None,
+  ):
+    dims = gmm_v2.Dimensions(
+        size_m=size_m,
+        size_k=size_k,
+        size_n=size_n,
+        size_group=size_group,
+        size_lhs_group=size_lhs_group,
+        size_lhs_sublane=min(sublane, size_m),
+    )
+    lhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(quant_dtype if prequantized_lhs else jnp.bfloat16),
+        quant_dtype=jnp.dtype(quant_dtype),
+        quant_block_size=size_k if prequantized_lhs else 512,
+        has_scale=prequantized_lhs,
+    )
+    rhs_cfgs = gmm_v2.InputConfigs(
+        dtype=jnp.dtype(quant_dtype),
+        quant_dtype=jnp.dtype(quant_dtype),
+        quant_block_size=rhs_quant_block_size or size_k,
+        has_scale=True,
+    )
+    with mock.patch.object(
+        gmm_v2.pltpu,
+        "get_tpu_info",
+        return_value=_mock_tpu_info(num_cores, generation, mxu_column_size),
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims=dims,
+          lhs_cfgs=lhs_cfgs,
+          rhs_cfgs=rhs_cfgs,
+          vmem_limit_bytes=vmem_limit_bytes,
+          zero_initialize=zero_initialize,
+          out_dtype=jnp.dtype(jnp.bfloat16),
+      )
+    self.assertEqual(tiles.bucket_base, want_bucket_base)
+    self.assertEqual(tiles.tile_m, want_tile_m)
+    self.assertEqual(tiles.tile_k, want_tile_k)
+    self.assertEqual(tiles.tile_n, want_tile_n)
+    self.assertEqual(tiles.rhs_buffer_count, want_rhs_buffer_count)
+    if want_lhs_buffer_count is not None:
+      self.assertEqual(tiles.lhs_buffer_count, want_lhs_buffer_count)
+
+  @parameterized.named_parameters(
+      ("e1_bf16_n128_zero_init", 512, 1, 128, 5324),
+      ("e64_dense_bf16_n128_zero_init", 576, 64, 128, 5340),
+  )
+  def test_calculate_tiling_keeps_default_outside_decode(
+      self, size_m: int, num_groups: int, size_n: int, vmem_limit_kib: int
+  ):
+    dims = gmm_v2.Dimensions(
+        size_m=size_m,
+        size_k=4096,
+        size_n=size_n,
+        size_group=num_groups,
+        size_lhs_group=num_groups,
+        size_lhs_sublane=8,
+    )
+    with mock.patch.object(
+        gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(1)
+    ):
+      tiles = gmm_v2.calculate_tiling(
+          dims,
+          _bf16_input_configs(),
+          _bf16_input_configs(),
+          vmem_limit_kib * 1024,
+          zero_initialize=True,
+          out_dtype=jnp.dtype(jnp.bfloat16),
+      )
+      default = gmm_v2._default_tiling(
+          dims,
+          _bf16_input_configs(),
+          _bf16_input_configs(),
+          vmem_limit_kib * 1024,
+      )
+    self.assertEqual(tiles, default)
+    self.assertEqual(
+        tiles,
+        gmm_v2.TileSizes(tile_m=128, tile_k=4096, tile_n=128, bucket_base=128),
+    )
+
+  def test_decode_tiling_never_exceeds_default_buffers(self):
+    """Each decode buffer is at most as large as for the default tiles."""
+    int8 = jnp.dtype(jnp.int8)
+    bf16 = jnp.dtype(jnp.bfloat16)
+    for (
+        (size_m, num_groups, size_k, size_n),
+        quantized,
+        block,
+        limit_kib,
+        zi,
+    ) in itertools.product(
+        (
+            (72, 512, 4096, 256),
+            (192, 64, 3072, 384),
+            (512, 64, 4096, 384),
+            (512, 512, 4096, 256),
+            (1280, 512, 1024, 4096),
+        ),
+        (True, False),
+        (None, 192),
+        (2500, 3072, 3328, 5324, 9952, 58982),
+        (True, False),
+    ):
+      if block is not None and (not quantized or size_k % block):
+        continue
+      dims = gmm_v2.Dimensions(
+          size_m=size_m,
+          size_k=size_k,
+          size_n=size_n,
+          size_group=num_groups,
+          size_lhs_group=num_groups,
+          size_lhs_sublane=8,
+      )
+      lhs_cfgs = gmm_v2.InputConfigs(
+          dtype=bf16,
+          quant_dtype=int8 if quantized else None,
+          quant_block_size=512,
+      )
+      rhs_cfgs = gmm_v2.InputConfigs(
+          dtype=int8 if quantized else bf16,
+          quant_dtype=int8 if quantized else None,
+          quant_block_size=block or size_k,
+          has_scale=quantized,
+      )
+      args = (dims, lhs_cfgs, rhs_cfgs, limit_kib * 1024)
+      with (
+          self.subTest(
+              dims=dims,
+              quantized=quantized,
+              block=block,
+              limit_kib=limit_kib,
+              zero_initialize=zi,
+          ),
+          mock.patch.object(
+              gmm_v2.pltpu, "get_tpu_info", return_value=_mock_tpu_info(1)
+          ),
+      ):
+        try:
+          default = gmm_v2._default_tiling(*args)
+        except ValueError:
+          continue
+        tiles = gmm_v2.calculate_tiling(
+            *args, zero_initialize=zi, out_dtype=bf16
+        )
+        self.assertEqual(tiles.tile_k, default.tile_k)
+        self.assertEqual(tiles.tile_n, default.tile_n)
+        self.assertLessEqual(tiles.tile_m, default.tile_m)
+        self.assertLessEqual(
+            tiles.lhs_buffer_count * tiles.tile_m,
+            default.lhs_buffer_count * default.tile_m,
+        )
+        self.assertLessEqual(tiles.rhs_buffer_count, default.rhs_buffer_count)
+        self.assertEqual(tiles.tile_m % tiles.bucket_base, 0)
+        self.assertLessEqual(tiles.tile_m // tiles.bucket_base, 4)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="e512_72x1_bf16_zi_true",
+          num_groups=512,
+          pattern="sparse_72x1",
+          quantized=False,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_72x1_int8_zi_false",
+          num_groups=512,
+          pattern="sparse_72x1",
+          quantized=True,
+          zero_initialize=False,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_72x2_int8_numk2",
+          num_groups=512,
+          pattern="sparse_72x2",
+          quantized=True,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=2,
+      ),
+      dict(
+          testcase_name="e512_72x2_bf16_numk2_bias_and_partial_sum",
+          num_groups=512,
+          pattern="sparse_72x2",
+          quantized=False,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=2,
+          use_bias_and_partial_sum=True,
+      ),
+      dict(
+          testcase_name="e512_skewed_int8",
+          num_groups=512,
+          pattern="skewed",
+          quantized=True,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_all_empty_zi_true",
+          num_groups=512,
+          pattern="all_empty",
+          quantized=False,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_single_active_zi_true",
+          num_groups=512,
+          pattern="single_active",
+          quantized=False,
+          zero_initialize=True,
+          group_offset=0,
+          local_groups=512,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_ep8_offset448_zi_true",
+          num_groups=512,
+          pattern="ep_offset",
+          quantized=False,
+          zero_initialize=True,
+          group_offset=448,
+          local_groups=64,
+          num_k_tiles=1,
+      ),
+      dict(
+          testcase_name="e512_ep8_offset448_zi_false",
+          num_groups=512,
+          pattern="ep_offset",
+          quantized=False,
+          zero_initialize=False,
+          group_offset=448,
+          local_groups=64,
+          num_k_tiles=1,
+      ),
+  )
+  def test_decode_sparse_groups_e2e(
+      self,
+      num_groups: int,
+      pattern: str,
+      quantized: bool,
+      zero_initialize: bool,
+      group_offset: int,
+      local_groups: int,
+      num_k_tiles: int,
+      use_bias_and_partial_sum: bool = False,
+  ):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+
+    in_size, out_size = 512, 256
+    gs = np.zeros(num_groups, dtype=np.int32)
+    if pattern == "sparse_72x1":
+      gs[np.linspace(0, num_groups - 1, 72, dtype=int)] = 1
+      batch_size = 72
+    elif pattern == "sparse_72x2":
+      gs[np.linspace(0, num_groups - 1, 72, dtype=int)] = 2
+      batch_size = 144
+    elif pattern == "skewed":
+      idx = np.linspace(0, num_groups - 1, 72, dtype=int)
+      gs[idx[:70]] = 1
+      gs[idx[70:]] = 32
+      batch_size = 134
+    elif pattern == "all_empty":
+      batch_size = 16
+    elif pattern == "single_active":
+      gs[257] = 3
+      batch_size = 16
+    elif pattern == "ep_offset":
+      gs[:group_offset:8] = 1
+      gs[group_offset + np.linspace(0, local_groups - 1, 9, dtype=int)] = 1
+      batch_size = int(gs.sum()) + 4
+    else:
+      raise ValueError(f"Unknown pattern: {pattern}")
+
+    k0, k1 = jax.random.split(jax.random.key(42), 2)
+    lhs = jax.random.normal(k0, (batch_size, in_size), dtype=jnp.bfloat16)
+    group_sizes = jnp.asarray(gs)
+    go = jnp.array([group_offset], dtype=jnp.int32) if group_offset else None
+    if quantized:
+      rhs = jax.random.randint(
+          k1, (local_groups, in_size, out_size), -127, 127, dtype=jnp.int8
+      )
+      rhs_scale = (
+          jnp.ones((local_groups, 1, 1, out_size), dtype=jnp.float32) * 0.001
+      )
+      maybe_q = True
+    else:
+      rhs = jax.random.normal(
+          k1, (local_groups, in_size, out_size), dtype=jnp.bfloat16
+      )
+      rhs_scale = None
+      maybe_q = False
+
+    if num_k_tiles == 2:
+      tile_info = gmm_v2.TileSizes(
+          tile_m=64, tile_k=in_size // 2, tile_n=out_size, bucket_base=16
+      )
+    else:
+      tile_info = gmm_v2.calculate_tiling_from_request
+
+    rhs_bias = partial_sum = None
+    if use_bias_and_partial_sum:
+      rhs_bias = jnp.full((local_groups, 1, out_size), 4, dtype=jnp.bfloat16)
+      partial_sum = jnp.full((batch_size, out_size), 6, dtype=jnp.bfloat16)
+
+    actual = gmm_v2.gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=go,
+        tile_info=tile_info,
+        maybe_quantize_lhs=maybe_q,
+        zero_initialize=zero_initialize,
+    )
+    expected = reference_gmm(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        partial_sum=partial_sum,
+        group_offset=go,
+    )
+    start = int(gs[:group_offset].sum())
+    end = start + int(gs[group_offset : group_offset + local_groups].sum())
+    assert_arrays_all_close(actual[start:end], expected[start:end])
+    if zero_initialize:
+      np.testing.assert_array_equal(actual[:start], 0)
+      np.testing.assert_array_equal(actual[end:], 0)
+
+  @parameterized.named_parameters(
+      # On v5e, the default tiling compiles at 5,324 KiB and the round-3 decode
+      # tiles did not.
+      ("hot_n384_zero_init_5324k", 512, 64, 4096, 384, True, None, True, 5324),
+      # The default tiling runs out of scoped VMEM at 3,328 KiB with zero init
+      # and at 3,072 KiB without it. The decode tiles drop an RHS buffer.
+      ("hot_n256_zero_init_3328k", 512, 64, 4096, 256, True, None, True, 3328),
+      ("hot_n256_3072k", 512, 64, 4096, 256, True, None, False, 3072),
+      # 192-wide subchannel RHS scales. The default tiling compiles here and
+      # the round-3 decode tiles did not.
+      ("hot_subchannel_3364k", 192, 64, 3072, 384, True, 192, True, 3364),
+      # Not a decode call, so the default tiling is used unchanged.
+      ("dense_n128_zi_5324k", 512, 1, 4096, 128, False, None, True, 5324),
+  )
+  def test_tiling_fits_tight_vmem_limit(
+      self,
+      size_m: int,
+      num_groups: int,
+      size_k: int,
+      size_n: int,
+      quantized: bool,
+      scale_block: int | None,
+      zero_initialize: bool,
+      vmem_limit_kib: int,
+  ):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_V5E:
+      self.skipTest("The VMEM limits were measured on TPU v5e.")
+
+    # Inputs with an exact result. LHS entries are +-1, so online int8
+    # quantization is lossless. Each RHS column of each expert has a single
+    # +-1 at an expert-dependent row, so every integer partial sum is 0 or
+    # +-127 and stays exact in the bf16 accumulator, and each output checks
+    # which expert and LHS row were used.
+    rng = np.random.default_rng(size_m * size_n)
+    lhs = rng.choice([-1.0, 1.0], (size_m, size_k)).astype(np.float32)
+    rhs = np.zeros((num_groups, size_k, size_n), np.float32)
+    cols = np.arange(size_n)
+    for g in range(num_groups):
+      rhs[g, (7 * cols + 13 * g) % size_k, cols] = rng.choice([-1, 1], size_n)
+    gs = np.zeros(num_groups, dtype=np.int32)
+    if num_groups > 1:
+      # One hot expert owns all rows except a few routed to its neighbours.
+      gs[[20, 22]] = 3
+      gs[21] = size_m - 6
+    else:
+      gs[0] = size_m
+    expected = np.zeros((size_m, size_n), np.float32)
+    starts = np.concatenate([[0], np.cumsum(gs)])
+    for g in np.flatnonzero(gs):
+      expected[starts[g] : starts[g + 1]] = (
+          lhs[starts[g] : starts[g + 1]] @ rhs[g]
+      )
+
+    rhs_scale = None
+    if quantized:
+      num_blocks = size_k // (scale_block or size_k)
+      rhs_scale = jnp.full(
+          (num_groups, num_blocks, 1, size_n), 2**-7, jnp.float32
+      )
+      expected *= 2**-7
+    actual = gmm_v2.gmm_v2(
+        jnp.asarray(lhs, jnp.bfloat16),
+        jnp.asarray(rhs, jnp.int8 if quantized else jnp.bfloat16),
+        jnp.asarray(gs),
+        rhs_scale=rhs_scale,
+        tile_info=gmm_v2.calculate_tiling_from_request,
+        vmem_limit_bytes=vmem_limit_kib * 1024,
+        maybe_quantize_lhs=quantized,
+        zero_initialize=zero_initialize,
+    )
+    np.testing.assert_array_equal(np.asarray(actual, np.float32), expected)
 
 
 if __name__ == "__main__":
