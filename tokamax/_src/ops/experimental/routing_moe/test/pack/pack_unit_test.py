@@ -23,8 +23,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src import benchmarking
+from tokamax._src.ops.experimental.routing_moe.common import arg as arg_lib
 from tokamax._src.ops.experimental.routing_moe.common import layout_util
 from tokamax._src.ops.experimental.routing_moe.common import out_format as out_format_lib
+from tokamax._src.ops.experimental.routing_moe.common import spec as spec_lib
 from tokamax._src.ops.experimental.routing_moe.pack import kernel
 from tokamax._src.ops.experimental.routing_moe.test.helper import helper_util
 
@@ -85,16 +87,23 @@ _QUANT_OUT_FORMAT = out_format_lib.ActivationFormat(
 )
 
 
-def _split_data_and_scale(actual: jax.Array) -> tuple[np.ndarray, np.ndarray]:
-  """Splits compact `actual` into 2D data and `f32[rows, 128]` scales."""
-  # The scale is read on the host because a device-side bitcast of the fp8
-  # array rewrites f32 scale bytes that match the fp8 NaN bit pattern.
-  actual_np = np.asarray(actual)
-  payload = actual_np[:, :-1]
+def _split_data_and_scales(
+    actual: arg_lib.ActivationWrapper[jax.Array],
+) -> tuple[np.ndarray, np.ndarray]:
+  """Splits compact `actual` into 2D data and 2D f32 block scales."""
+  # Scales are read on the host because a device-side bitcast of the fp8 array
+  # rewrites f32 scale bytes that match the fp8 NaN bit pattern.
+  actual_np = np.asarray(actual.data)
+  num_logical_chunks = actual.spec.num_logical_chunks
+  payload = actual_np[:, :num_logical_chunks]
   data = payload.reshape(layout_util.to_large_shape(payload.shape))
-  scale_bytes = np.ascontiguousarray(np.swapaxes(actual_np[:, -1], 1, 2))
-  scale = scale_bytes.view(np.float32)[..., 0]
-  return data, scale
+  scale_chunks = actual_np[:, num_logical_chunks:]
+  # Each lane across the trailing scale chunks stores one block's f32 scale,
+  # packed along the `packing` axis.
+  scales = np.ascontiguousarray(scale_chunks.transpose(0, 1, 3, 2)).view(
+      np.float32
+  )
+  return data, scales.reshape(data.shape[0], -1)
 
 
 def _assert_uniform_lane_scales(scale: np.ndarray) -> None:
@@ -110,13 +119,17 @@ def _assert_uniform_lane_scales(scale: np.ndarray) -> None:
 
 
 def _assert_dequantizes_to(
-    data: np.ndarray, scale: np.ndarray, x: jax.Array
+    data: np.ndarray,
+    scales: np.ndarray,
+    x: jax.Array,
+    quant: spec_lib.SubchannelQuantSpec,
 ) -> None:
-  """Asserts quantized `data` and `scale` dequantize to `[rows, cols]` `x`."""
-  dequant = (
-      data.astype(np.float32).reshape(data.shape[0], -1, scale.shape[-1])
-      * scale[:, None, :]
-  ).reshape(data.shape)
+  """Asserts quantized `data` and `scales` dequantize to `[rows, cols]` `x`."""
+  _, cols = x.shape
+  block_size = quant.block_size
+  num_blocks = (cols + block_size - 1) // block_size
+  col_scales = np.repeat(scales[:, :num_blocks], block_size, axis=1)[:, :cols]
+  dequant = data.astype(np.float32) * col_scales
   np.testing.assert_allclose(
       dequant, np.asarray(x.astype(jnp.float32)), rtol=0.07, atol=1e-4
   )
@@ -447,7 +460,95 @@ class InputPackUnitTest(parameterized.TestCase):
     expected_shape = layout_util.to_compact_shape(shape, x.dtype)
     self.assertEqual(actual.data.shape, expected_shape)
     self.assertEqual(actual.data.dtype, dtype)
-    _assert_bitwise_equal(actual.data, x.reshape(expected_shape))
+
+  @parameterized.product(
+      batch_size=[8, 16, 32, 64],
+      dim_size=[1536, 2048],
+      block_size=[128, 256, 512, 1024, 2048],
+  )
+  def test_input_pack_quantized_block_out(
+      self, batch_size: int, dim_size: int, block_size: int
+  ):
+    shape = (batch_size, dim_size)
+    x = _random_input(jax.random.key(11), shape, jnp.bfloat16.dtype)
+    out_format = out_format_lib.ActivationFormat(
+        dtype=jnp.float8_e4m3fn,
+        quant=out_format_lib.Subchannel(block_size=block_size),
+    )
+
+    actual = kernel.input_pack(x, out_format)
+
+    num_blocks = (dim_size + block_size - 1) // block_size
+    expected_scale_chunks = (num_blocks + 127) // 128
+    self.assertEqual(actual.spec.num_scale_chunks, expected_scale_chunks)
+    assert isinstance(actual.spec.quant, spec_lib.SubchannelQuantSpec)
+    self.assertEqual(
+        actual.spec.quant.is_replicated_scale, block_size == dim_size
+    )
+    data, scales = _split_data_and_scales(actual)
+    if actual.spec.quant.is_replicated_scale:
+      _assert_uniform_lane_scales(scales)
+    _assert_dequantizes_to(data, scales, x, actual.spec.quant)
+
+  def test_input_pack_quantized_multi_scale_chunks(self):
+    # 16896 / 128 = 132 blocks, spanning 2 trailing scale chunks.
+    x = _random_input(jax.random.key(13), (32, 16896), jnp.bfloat16.dtype)
+    out_format = out_format_lib.ActivationFormat(
+        dtype=jnp.float8_e4m3fn,
+        quant=out_format_lib.Subchannel(block_size=128),
+    )
+
+    actual = kernel.input_pack(x, out_format)
+
+    self.assertEqual(actual.spec.num_scale_chunks, 2)
+    assert isinstance(actual.spec.quant, spec_lib.SubchannelQuantSpec)
+    self.assertFalse(actual.spec.quant.is_replicated_scale)
+    data, scales = _split_data_and_scales(actual)
+    _assert_dequantizes_to(data, scales, x, actual.spec.quant)
+
+  def test_input_pack_rejects_unaligned_quant_block_size(self):
+    x = jnp.zeros((32, 1024), dtype=jnp.bfloat16)
+    out_format = out_format_lib.ActivationFormat(
+        dtype=jnp.float8_e4m3fn,
+        quant=out_format_lib.Subchannel(block_size=64),
+    )
+    with self.assertRaisesRegex(NotImplementedError, "multiple of num_lanes"):
+      kernel.input_pack(x, out_format)
+
+  def test_activation_spec_sub_row_quant_col_size(self):
+    packing = layout_util.get_packing(jnp.dtype(jnp.float8_e4m3fn))
+    # Subchannel allows non-dividing block sizes and packs 128 scales per chunk.
+    single_chunk = spec_lib.ActivationSpec(
+        row_size=16,
+        col_size=2048,
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant=spec_lib.SubchannelQuantSpec(
+            block_size=300, is_replicated_scale=False
+        ),
+    )
+    self.assertEqual(single_chunk.quant_col_size, 128 * packing)
+
+    two_chunks = spec_lib.ActivationSpec(
+        row_size=16,
+        col_size=2048,
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant=spec_lib.SubchannelQuantSpec(
+            block_size=12, is_replicated_scale=False
+        ),
+    )
+    self.assertEqual(two_chunks.quant_col_size, 2 * 128 * packing)
+
+    # Lane-strided sub-row quantization remains unsupported.
+    lane_strided = spec_lib.ActivationSpec(
+        row_size=16,
+        col_size=2048,
+        dtype=jnp.dtype(jnp.float8_e4m3fn),
+        quant=spec_lib.LaneStridedQuantSpec(block_col_size=512),
+    )
+    with self.assertRaisesRegex(
+        NotImplementedError, "Sub-row LaneStridedQuantSpec"
+    ):
+      _ = lane_strided.quant_col_size
 
   @parameterized.product(
       batch_size=[8, 16, 32, 64],
@@ -459,9 +560,11 @@ class InputPackUnitTest(parameterized.TestCase):
 
     actual = kernel.input_pack(x, _QUANT_OUT_FORMAT)
 
-    data, scale = _split_data_and_scale(actual.data)
-    _assert_uniform_lane_scales(scale)
-    _assert_dequantizes_to(data, scale, x)
+    assert isinstance(actual.spec.quant, spec_lib.SubchannelQuantSpec)
+    self.assertTrue(actual.spec.quant.is_replicated_scale)
+    data, scales = _split_data_and_scales(actual)
+    _assert_uniform_lane_scales(scales)
+    _assert_dequantizes_to(data, scales, x, actual.spec.quant)
 
   @parameterized.product(
       batch_size=[5, 100, 257, 1000],
@@ -486,9 +589,11 @@ class InputPackUnitTest(parameterized.TestCase):
     self.assertIsNone(actual.scale)
     self.assertEqual(actual.spec.row_size, batch_size)
     self.assertEqual(actual.spec.col_size, 1024)
-    data, scale = _split_data_and_scale(actual.data)
-    _assert_uniform_lane_scales(scale)
-    _assert_dequantizes_to(data, scale, x)
+    assert isinstance(actual.spec.quant, spec_lib.SubchannelQuantSpec)
+    self.assertTrue(actual.spec.quant.is_replicated_scale)
+    data, scales = _split_data_and_scales(actual)
+    _assert_uniform_lane_scales(scales)
+    _assert_dequantizes_to(data, scales, x, actual.spec.quant)
 
   def test_input_pack_invalid_shapes_raise_value_error(self):
     with self.assertRaisesRegex(ValueError, "Expected 2D input"):
@@ -615,23 +720,38 @@ class InputPackUnitTest(parameterized.TestCase):
     # Same aligned and ragged batches as the unquantized benchmarks. The
     # unquantized `input_pack` of the same input is the baseline.
     dim_size = 4096
+    block_sizes = (256, 512, 1024, 4096)
     x = jax.random.normal(
         jax.random.key(0), (batch_size, dim_size), dtype=dtype
     )
 
     pack_us = _measure_us(lambda x: kernel.input_pack(x).data, x)
-    quant_us = _measure_us(
-        lambda x: kernel.input_pack(x, _QUANT_OUT_FORMAT).data, x
-    )
+    quant_results = {}
+    for bs in block_sizes:
+      out_fmt = out_format_lib.ActivationFormat(
+          dtype=jnp.float8_e4m3fn,
+          quant=out_format_lib.Subchannel(block_size=bs),
+      )
+      fn_quant = functools.partial(
+          lambda x, fmt: kernel.input_pack(x, fmt).data, fmt=out_fmt
+      )
+      quant_results[bs] = _measure_us(fn_quant, x)
     logging.info(
         "BENCHMARK_QUANT dtype=%s batch=%4d dim=%4d | input_pack=%.2f us"
-        " | quantized=%.2f us (%.2fx)",
+        " | bs256=%.2f us (%.2fx) | bs512=%.2f us (%.2fx)"
+        " | bs1024=%.2f us (%.2fx) | bs4096=%.2f us (%.2fx)",
         jnp.dtype(dtype).name,
         batch_size,
         dim_size,
         pack_us,
-        quant_us,
-        quant_us / pack_us,
+        quant_results[256],
+        quant_results[256] / pack_us,
+        quant_results[512],
+        quant_results[512] / pack_us,
+        quant_results[1024],
+        quant_results[1024] / pack_us,
+        quant_results[4096],
+        quant_results[4096] / pack_us,
     )
 
 

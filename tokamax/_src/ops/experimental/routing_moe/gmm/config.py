@@ -143,7 +143,9 @@ def _make_compute_config(
               " quantization."
           )
         matmul_mode = MatmulMode.QUANTIZED
-        dynamic_quant = tensor_spec.SubchannelQuantSpec(block_size=block_size)
+        dynamic_quant = tensor_spec.SubchannelQuantSpec(
+            block_size=block_size, is_replicated_scale=False
+        )
 
   return ComputeConfig(
       matmul_mode=matmul_mode,

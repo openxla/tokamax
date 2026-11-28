@@ -52,13 +52,17 @@ class ComputeScaleTest(parameterized.TestCase):
       dict(
           testcase_name="subchannel",
           batch_shape=(8,),
-          quant=spec.SubchannelQuantSpec(block_size=512),
+          quant=spec.SubchannelQuantSpec(
+              block_size=512, is_replicated_scale=False
+          ),
           cols=512,
       ),
       dict(
           testcase_name="subchannel_short",
           batch_shape=(8,),
-          quant=spec.SubchannelQuantSpec(block_size=512),
+          quant=spec.SubchannelQuantSpec(
+              block_size=512, is_replicated_scale=False
+          ),
           cols=256,
       ),
   )
@@ -81,7 +85,7 @@ class ComputeScaleTest(parameterized.TestCase):
     np.testing.assert_allclose(inv_scale, 1 / expected, rtol=1e-6)
 
   @parameterized.parameters(
-      spec.SubchannelQuantSpec(block_size=4),
+      spec.SubchannelQuantSpec(block_size=4, is_replicated_scale=False),
       spec.LaneStridedQuantSpec(block_col_size=4 * 128),
   )
   def test_zero_group_has_zero_scale(self, quant: spec.QuantSpec):
@@ -98,7 +102,7 @@ class ComputeScaleTest(parameterized.TestCase):
   @parameterized.parameters(jnp.float8_e4m3fn, jnp.int8)
   def test_quantize_round_trips(self, dtype: jax.typing.DTypeLike):
     target_dtype = jnp.dtype(dtype)
-    quant = spec.SubchannelQuantSpec(block_size=64)
+    quant = spec.SubchannelQuantSpec(block_size=64, is_replicated_scale=False)
     x = jax.random.normal(jax.random.key(1), (8, 64), jnp.float32)
 
     scale, inv_scale = quant_util.compute_scale(x, target_dtype, quant)

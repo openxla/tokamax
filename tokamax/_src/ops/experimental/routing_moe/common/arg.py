@@ -127,7 +127,9 @@ class SingleWeightWrapper[T]:
         case 4:
           num_blocks = scale.shape[1]
           block_size = 0 if num_blocks == 0 else in_size // num_blocks
-          quant = spec_lib.SubchannelQuantSpec(block_size=block_size)
+          quant = spec_lib.SubchannelQuantSpec(
+              block_size=block_size, is_replicated_scale=False
+          )
         case _:
           raise ValueError(
               "Weight scale must be 3D (block-scaled) or 4D (subchannel) when"

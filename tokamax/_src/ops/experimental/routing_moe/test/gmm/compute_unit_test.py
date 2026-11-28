@@ -32,14 +32,17 @@ _X_Q_BLOCK_SIZE = 512
 def _compute_config(
     mode: config.MatmulMode, matmul_dtype: jax.typing.DTypeLike
 ) -> config.ComputeConfig:
+  quant = None
+  if mode == config.MatmulMode.QUANTIZED:
+    quant = spec.SubchannelQuantSpec(
+        block_size=_X_Q_BLOCK_SIZE, is_replicated_scale=False
+    )
   return config.ComputeConfig(
       matmul_mode=mode,
       matmul_dtype=jnp.dtype(matmul_dtype),
       acc_dtype=jnp.dtype(jnp.bfloat16),
       tpu_info=pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
-      dynamic_quant=spec.SubchannelQuantSpec(block_size=_X_Q_BLOCK_SIZE)
-      if mode == config.MatmulMode.QUANTIZED
-      else None,
+      dynamic_quant=quant,
       w_quant=None,
   )
 

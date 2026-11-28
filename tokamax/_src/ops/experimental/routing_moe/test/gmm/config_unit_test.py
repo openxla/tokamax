@@ -61,14 +61,17 @@ def _make_config(
       dtype=jnp.dtype(jnp.bfloat16),
       quant=None,
   )
+  w_quant = None
+  if quantize_w:
+    w_quant = spec.SubchannelQuantSpec(
+        block_size=w_q_block_size, is_replicated_scale=False
+    )
   w = spec.WeightSpec(
       group_size=num_experts // ep_size,
       in_size=size_k,
       out_size=size_n,
       dtype=jnp.dtype(jnp.float8_e4m3fn if quantize_w else jnp.bfloat16),
-      quant=spec.SubchannelQuantSpec(block_size=w_q_block_size)
-      if quantize_w
-      else None,
+      quant=w_quant,
       has_bias=False,
       fused_gate_up=fuse_act is not None,
   )
@@ -80,9 +83,7 @@ def _make_config(
         in_size=size_n // 2,
         out_size=size_k,
         dtype=jnp.dtype(jnp.float8_e4m3fn if quantize_w else jnp.bfloat16),
-        quant=spec.SubchannelQuantSpec(block_size=w_q_block_size)
-        if quantize_w
-        else None,
+        quant=w_quant,
         has_bias=False,
         fused_gate_up=False,
     )
@@ -500,7 +501,9 @@ class OutSpecAndValidationTest(parameterized.TestCase):
       dict(testcase_name="w2_unquantized", w2_quant=None),
       dict(
           testcase_name="w2_subchannel",
-          w2_quant=spec.SubchannelQuantSpec(block_size=512),
+          w2_quant=spec.SubchannelQuantSpec(
+              block_size=512, is_replicated_scale=False
+          ),
       ),
   )
   def test_block_scaled_config_rejects_mismatched_w2_quant(

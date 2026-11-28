@@ -47,7 +47,9 @@ def _make_spec(
         in_size=in_size,
         out_size=out_size,
         dtype=jnp.dtype(jnp.float8_e4m3fn),
-        quant=spec.SubchannelQuantSpec(block_size=in_size),
+        quant=spec.SubchannelQuantSpec(
+            block_size=in_size, is_replicated_scale=False
+        ),
         has_bias=False,
         fused_gate_up=fused_gate_up,
     )
@@ -197,7 +199,8 @@ class SubchannelWeightWrapperTest(absltest.TestCase):
     weight = jnp.zeros((4, 512, 64), dtype=jnp.float8_e4m3fn)
     wrapped = arg.SingleWeightWrapper.create(weight, _e8m0((4, 16, 1, 64)))
     self.assertEqual(
-        wrapped.spec.quant, spec.SubchannelQuantSpec(block_size=32)
+        wrapped.spec.quant,
+        spec.SubchannelQuantSpec(block_size=32, is_replicated_scale=False),
     )
     self.assertEqual(wrapped.spec.scale_shape, (4, 16, 1, 64))
 

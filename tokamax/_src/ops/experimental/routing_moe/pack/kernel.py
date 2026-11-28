@@ -261,10 +261,11 @@ class _InputPackConfig:
               "input_pack only quantizes bfloat16 or float32 to float8_e4m3fn."
               f" Got {in_dtype} to {out_dtype}."
           )
-        if block_size != dim_size:
+        if block_size % tpu_info.num_lanes != 0:
           raise NotImplementedError(
-              "input_pack only supports SubChannelQuant with"
-              f" block_size=dim_size. Got {block_size=}"
+              "input_pack requires SubchannelQuantSpec.block_size to be a"
+              f" multiple of num_lanes ({tpu_info.num_lanes}). Got"
+              f" {block_size=}."
           )
       case _:
         raise NotImplementedError(
@@ -364,8 +365,9 @@ class _InputPackConfig:
   @property
   def kernel_name(self) -> str:
     name = f"input_pack_b{self.batch_size}_d{self.dim_size}_t{self.tile_rows}"
-    if self.out_spec.quant is not None:
-      name += f"_q{self.out_spec.dtype}"
+    if (quant := self.out_spec.quant) is not None:
+      assert isinstance(quant, spec_lib.SubchannelQuantSpec)
+      name += f"_q{self.out_spec.dtype}_bs{quant.block_size}"
     return name
 
   def scratch_types(self) -> dict[str, pl.MemoryRef]:
@@ -396,11 +398,20 @@ def _quantize_rows(
     quant: spec_lib.SubchannelQuantSpec,
     num_lanes: int,
 ) -> tuple[jax.Array, jax.Array]:
-  """Returns `x` quantized per row and its `f32[rows, num_lanes]` scales."""
-  scale, inv_scale = quant_util.compute_scale(x, dtype, quant)
-  # The scale chunk holds one f32 per lane, so the row scale is replicated.
-  scale = jnp.broadcast_to(scale.astype(jnp.float32), (x.shape[0], num_lanes))
-  return quant_util.quantize(x, inv_scale, dtype), scale
+  """Quantizes `x` by `quant.block_size` and packs block scales into lanes."""
+  cols = x.shape[-1]
+  block_size = quant.block_size
+  q_blocks = []
+  block_scales = []
+  for start in range(0, cols, block_size):
+    block = x[:, start : min(start + block_size, cols)]
+    scale, inv_scale = quant_util.compute_scale(block, dtype, quant)
+    q_blocks.append(quant_util.quantize(block, inv_scale, dtype))
+    block_scales.append(scale)
+
+  q_x = jnp.concat(q_blocks, axis=-1)
+  scales = layout_util.concat_along_lane(block_scales, lanesize=num_lanes)
+  return q_x, scales.astype(jnp.float32)
 
 
 def _input_pack_kernel(
@@ -486,13 +497,15 @@ def _input_pack_kernel(
     if (quant := cfg.out_spec.quant) is not None:
       # Making linter happy despite config already having assertion.
       assert isinstance(quant, spec_lib.SubchannelQuantSpec)
-      val, scale = _quantize_rows(
+      val, scales = _quantize_rows(
           val, dtype=cfg.out_spec.dtype, quant=quant, num_lanes=cfg.num_lanes
       )
-      scale_u32 = pltpu.bitcast(scale, jnp.uint32)
-      layout_util.store_compact_chunk(
-          out_scratch_ref.at[slot], 0, cfg.num_logical_chunks, scale_u32
-      )
+      scale_chunks = jnp.split(scales, cfg.out_spec.num_scale_chunks, axis=-1)
+      for i, scale_chunk in enumerate(scale_chunks):
+        scale_u32 = pltpu.bitcast(scale_chunk, jnp.uint32)
+        layout_util.store_compact_chunk(
+            out_scratch_ref.at[slot], 0, cfg.num_logical_chunks + i, scale_u32
+        )
 
     # Step 4: Store large VREG to compact VMEM using strided store.
     layout_util.store_large_to_compact(out_scratch_ref.at[slot], val)

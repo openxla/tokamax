@@ -88,7 +88,8 @@ def _make_spec(
     quant = None
     if quantized:
       quant = spec.SubchannelQuantSpec(
-          block_size=w_q_block_size or in_size // num_w_q_blocks
+          block_size=w_q_block_size or in_size // num_w_q_blocks,
+          is_replicated_scale=False,
       )
     return spec.WeightSpec(
         group_size=num_experts // ep_size,
@@ -617,7 +618,10 @@ class W2MatmulDtypeTest(parameterized.TestCase):
     gmm_spec = _make_spec(8, with_down=True)
     assert gmm_spec.w2 is not None
     small_block_w2 = dataclasses.replace(
-        gmm_spec.w2, quant=spec.SubchannelQuantSpec(block_size=128)
+        gmm_spec.w2,
+        quant=spec.SubchannelQuantSpec(
+            block_size=128, is_replicated_scale=False
+        ),
     )
     gmm_spec = dataclasses.replace(gmm_spec, w2=small_block_w2)
     out_fmt = out_format_lib.ResolvedActivationFormat.create(

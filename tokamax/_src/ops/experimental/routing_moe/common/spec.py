@@ -31,6 +31,8 @@ class SubchannelQuantSpec:
   """Contiguous blocks of `block_size` elements share a scale."""
 
   block_size: int
+  # Set to True when scale value is replicated along lane dimension.
+  is_replicated_scale: bool
 
   def __post_init__(self) -> None:
     if self.block_size <= 0:
@@ -124,6 +126,10 @@ class BlockScaledQuantSpec:
 type WeightQuantSpec = SubchannelQuantSpec | BlockScaledQuantSpec
 
 
+def _cdiv(a: int, b: int) -> int:
+  return (a + b - 1) // b
+
+
 @dataclass_util.require_no_default
 @dataclasses.dataclass(frozen=True)
 class ActivationSpec:
@@ -137,14 +143,8 @@ class ActivationSpec:
 
   def __post_init__(self) -> None:
     match self.quant:
-      case None:
+      case None | SubchannelQuantSpec():
         return
-      case SubchannelQuantSpec(block_size=block_size):
-        if self.col_size % block_size != 0:
-          raise ValueError(
-              f"quant block_size ({block_size}) must divide col_size"
-              f" ({self.col_size})."
-          )
       case LaneStridedQuantSpec(block_col_size=block_col_size):
         if self.col_size % block_col_size != 0:
           raise ValueError(
@@ -157,15 +157,20 @@ class ActivationSpec:
   @property
   def quant_col_size(self) -> int:
     """Extra physical column width in dtype elements for embedded scales."""
+    lanes = 128
     match self.quant:
       case None:
         return 0
-      case SubchannelQuantSpec(block_size=block_size) | LaneStridedQuantSpec(
-          block_col_size=block_size
-      ):
-        if block_size != self.col_size:
-          raise NotImplementedError("Sub-row QuantSpec is not supported yet.")
-        lanes = 128
+      case SubchannelQuantSpec(block_size=block_size):
+        # Each lane in a scale chunk holds one block's f32 scale.
+        num_blocks = _cdiv(self.col_size, block_size)
+        num_scale_chunks = _cdiv(num_blocks, lanes)
+        return num_scale_chunks * lanes * layout_util.get_packing(self.dtype)
+      case LaneStridedQuantSpec(block_col_size=block_col_size):
+        if block_col_size != self.col_size:
+          raise NotImplementedError(
+              "Sub-row LaneStridedQuantSpec is not supported yet."
+          )
         return lanes * layout_util.get_packing(self.dtype)
       case _:
         raise NotImplementedError(f"Not supported QuantSpec {self.quant}.")
@@ -173,6 +178,10 @@ class ActivationSpec:
   @property
   def num_logical_chunks(self) -> int:
     return self.logical_compact_shape[1]
+
+  @property
+  def num_scale_chunks(self) -> int:
+    return self.num_physical_chunks - self.num_logical_chunks
 
   @property
   def num_physical_chunks(self) -> int:

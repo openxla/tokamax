@@ -193,3 +193,25 @@ def store_compact_chunk(
   flat = vmem.bitcast(jnp.uint32).reshape(-1, lanes)
   start = first_row * stride + chunk
   flat[start : start + words.shape[0] * stride : stride] = words
+
+
+# TODO: add split_along_lane that mirrors this function.
+def concat_along_lane(vregs: list[jax.Array], lanesize: int = 128) -> jax.Array:
+  """Concat list of [rows, 1] along lane dimension."""
+  num_blocks = len(vregs)
+  rows, cols = vregs[0].shape
+  assert cols == 1
+
+  uint_dtype = get_uint_dtype(vregs[0].dtype.itemsize)
+  lane_iota = jax.lax.broadcasted_iota(uint_dtype, (rows, lanesize), 1)
+  new_chunks = []
+  for chunk_start in range(0, num_blocks, lanesize):
+    chunk_list = vregs[chunk_start : chunk_start + lanesize]
+    new_chunk = jnp.broadcast_to(chunk_list[0], lane_iota.shape)
+    for lane, chunk in enumerate(chunk_list[1:], start=1):
+      assert chunk.shape == (rows, 1)
+      bcast_chunk = jnp.broadcast_to(chunk, lane_iota.shape)
+      new_chunk = jnp.where(lane_iota == lane, bcast_chunk, new_chunk)
+    new_chunks.append(new_chunk)
+  return jnp.concat(new_chunks, axis=-1)
+

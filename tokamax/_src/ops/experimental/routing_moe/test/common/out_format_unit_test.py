@@ -111,11 +111,11 @@ class OutFormatTest(parameterized.TestCase):
           out_format_lib.ResolvedSubchannel(
               block_size=out_format_lib.tile_size
           ),
-          spec.SubchannelQuantSpec(block_size=1024),
+          spec.SubchannelQuantSpec(block_size=1024, is_replicated_scale=True),
       ),
       (
           out_format_lib.ResolvedSubchannel(block_size=512),
-          spec.SubchannelQuantSpec(block_size=512),
+          spec.SubchannelQuantSpec(block_size=512, is_replicated_scale=False),
       ),
       (
           out_format_lib.ResolvedLaneStrided(

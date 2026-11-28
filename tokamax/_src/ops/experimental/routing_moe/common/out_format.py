@@ -205,8 +205,11 @@ def to_quant_spec(
     case None:
       return None
     case ResolvedSubchannel(block_size=block_size):
+      block_size = _resolve_tile_size(block_size, tile_col_size)
+      num_blocks, rem = divmod(tile_col_size, block_size)
+      is_replicated_scale = num_blocks == 1 and rem == 0
       return spec.SubchannelQuantSpec(
-          block_size=_resolve_tile_size(block_size, tile_col_size)
+          block_size=block_size, is_replicated_scale=is_replicated_scale
       )
     case ResolvedLaneStrided(block_col_size=block_col_size):
       return spec.LaneStridedQuantSpec(
